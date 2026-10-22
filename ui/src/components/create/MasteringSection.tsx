@@ -4,9 +4,14 @@
 // - Toggle: enable/disable reference mastering
 // - Reference track selector with upload support
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, Upload, Trash2, Sparkles, Music2 } from 'lucide-react';
 import { masteringApi } from '../../services/api';
+// The reference list is global-models' snapshot, shared with the top bar's
+// mastering controls so an upload here refreshes both.
+import { referencesOptions } from '../../queries/global-models/options';
+import { keysPlan, writeAndInvalidate } from '../../queries/writes';
 import { useAuth } from '../../context/AuthContext';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
@@ -45,15 +50,9 @@ export const MasteringSection: React.FC<MasteringSectionProps> = ({
 }) => {
   const { token } = useAuth();
   const [open, setOpen] = useState(false);
-  const [references, setReferences] = useState<ReferenceTrack[]>([]);
+  const queryClient = useQueryClient();
+  const references: ReferenceTrack[] = useQuery(referencesOptions()).data?.references ?? [];
   const [uploading, setUploading] = useState(false);
-
-  // Load references on mount
-  useEffect(() => {
-    masteringApi.listReferences()
-      .then(data => setReferences(data.references))
-      .catch(() => {});
-  }, []);
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -61,30 +60,24 @@ export const MasteringSection: React.FC<MasteringSectionProps> = ({
 
     try {
       setUploading(true);
-      const result = await masteringApi.uploadReference(file, token);
+      // The write dirties the shared reference list (top bar included).
+      const result = await writeAndInvalidate(queryClient, () => masteringApi.uploadReference(file),
+        keysPlan(referencesOptions().queryKey));
       onMasteringReferenceChange(result.name);
-      // Refresh list
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
-    } catch (err) {
-      console.error('[Mastering] Upload failed:', err);
-    } finally {
+    } catch { /* transport failure already toasted by the global handler */ } finally {
       setUploading(false);
       e.target.value = '';
     }
-  }, [token, onMasteringReferenceChange]);
+  }, [token, queryClient, onMasteringReferenceChange]);
 
   const handleDelete = useCallback(async (name: string) => {
     if (!token) return;
     try {
-      await masteringApi.deleteReference(name, token);
+      await writeAndInvalidate(queryClient, () => masteringApi.deleteReference(name),
+        keysPlan(referencesOptions().queryKey));
       if (masteringReference === name) onMasteringReferenceChange('');
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
-    } catch (err) {
-      console.error('[Mastering] Delete failed:', err);
-    }
-  }, [token, masteringReference, onMasteringReferenceChange]);
+    } catch { /* transport failure already toasted by the global handler */ }
+  }, [token, queryClient, masteringReference, onMasteringReferenceChange]);
 
   return (
     <div className="space-y-1 pt-3 border-t border-zinc-200 dark:border-white/5">

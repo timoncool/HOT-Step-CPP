@@ -164,6 +164,8 @@ export interface Mm3PropsResult {
 }
 
 export interface Mm3SynthRequest {
+  /** Shared opt-in to runtime DiT DoRA rescaling. Default false. */
+  adapter_runtime_dora?: boolean;
   /** DiT renderer. GGML is the portable default; TensorRT needs a prepared engine. */
   dit_backend?: 'ggml' | 'tensorrt' | 'auto';
   /** Depth decoder: fused one-graph frame with GPU sampling (default true). */

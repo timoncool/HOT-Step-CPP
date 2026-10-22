@@ -86,12 +86,19 @@ function tokenMatches(given: string | undefined, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** Loopback socket, and every hop the dev proxy (Vite, `xfwd`) forwarded
+ *  for is loopback too: a LAN browser on :3000 reaches us over loopback. */
+function isLocal(req: Request): boolean {
+  const hops = req.get('x-forwarded-for')?.split(',').map(h => h.trim()) ?? [];
+  return [req.socket.remoteAddress ?? '', ...hops].every(a => LOOPBACK.has(a));
+}
+
 /** WORKER_TOKEN set: API calls from other machines must carry it. The
  *  worker's own batch runner calls itself over loopback, as does a browser
  *  on the worker itself. */
 export function workerTokenGate(req: Request, res: Response, next: NextFunction): void {
   const token = config.workers.acceptToken;
-  if (!token || LOOPBACK.has(req.socket.remoteAddress ?? '') || tokenMatches(req.get(TOKEN_HEADER), token)) { next(); return; }
+  if (!token || isLocal(req) || tokenMatches(req.get(TOKEN_HEADER), token)) { next(); return; }
   res.status(401).json({ error: 'This HOT-Step is a training worker: the request needs its WORKER_TOKEN' });
 }
 
@@ -222,7 +229,7 @@ function mirrorFiles(run: Yue2AitkRunRecord, previews: Yue2JointPreviewRecord[])
   add(path.join(run.output, 'style-norms.json'));
   for (const c of run.checkpoints) {
     if (!c.arPath || !c.narPath) continue;
-    for (const name of ['native-ar.safetensors', 'native-nar.safetensors', 'meters.json']) add(path.join(c.dir, name));
+    for (const file of [c.arPath, c.narPath, path.join(c.dir, 'meters.json')]) add(file);
   }
   for (const p of previews) {
     const wav = p.status === 'done' && p.file ? resolveYue2JointPreview(run.output, p.file) : null;
@@ -599,6 +606,12 @@ export async function proxyToWorker(req: Request, res: Response): Promise<void> 
   const w = getWorker(req.params.name as string);
   if (!w) { res.status(404).json({ error: `No training worker named ${req.params.name}` }); return; }
   if (!req.url.startsWith('/training/')) { res.status(403).json({ error: 'Only training routes are forwarded to a worker' }); return; }
+  // An operation names its worker in its body and is accepted here; it never
+  // travels through "Train on" (contracts/trainingOperation.ts).
+  if (/^\/training\/ops(\/|\?|$)/.test(req.url)) {
+    res.status(403).json({ error: 'Training operations go to this machine with an explicit worker, not through the worker proxy' });
+    return;
+  }
   const ac = new AbortController();
   res.on('close', () => ac.abort());
   const headers: Record<string, string> = {};

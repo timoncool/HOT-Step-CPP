@@ -45,6 +45,8 @@ import { restartAceServer, stopAceServer } from '../aceEngineProcess.js';
 import { YUE2_LICENSE_NOTICE } from '../backends/yue2/index.js';
 import { aceTrainExe } from './aceTrain.js';
 import { getDataset } from './datasetsRepo.js';
+import { buildSamples } from './datasetScan.js';
+import { selectYue2Audio, stageYue2Audio } from './yue2AudioStaging.js';
 import { refreshYue2PresetsForNewRun } from './lyricStudioExport.js';
 import {
   buildYue2PreprocessArgs, buildYue2TrainArgs, missingYue2TrainModels,
@@ -525,21 +527,19 @@ export async function runYue2PreprocessJob(job: TrainingJob): Promise<void> {
     return;
   }
 
-  const args = buildYue2PreprocessArgs(opts);
-
   const st: RelayState = { fatalMessage: '', doneSeen: false, lastStep: 0, totalSteps: 0 };
   try {
+    const ds = getDataset(job.datasetId);
+    if (!ds) throw new Error('Dataset not found');
+    const samples = await buildSamples(ds);
+    if (isCancelled(job)) return;
+    const selected = selectYue2Audio(samples);
+    const audioDir = stageYue2Audio(samples, opts.outDir);
+    const args = buildYue2PreprocessArgs({ ...opts, audioDir });
+    log(job, 'info', `Staged ${selected.files.length} of ${samples.length} dataset rows for YuE2 preprocessing.`);
     log(job, 'info',
       `Encoding to YuE2 latents at ${opts.clipSeconds} s clips (caption mode: ${opts.captionMode}). `
       + `Peak VRAM about ${(YUE2_VRAM_MODEL.encodeComputeMb / 1024).toFixed(1)} GB.`);
-    // The one thing the engine cannot tell the user, because it never sees the
-    // dataset: --audio is scanned FLAT and the dataset's exclusions and its
-    // recursive flag do not reach it (11 §4.2). Said once, plainly, rather
-    // than left to be discovered as a clip count that does not add up.
-    log(job, 'warn',
-      'yue2-preprocess scans the source folder directly: subfolders are not searched, and rows you '
-      + 'excluded in the dataset grid ARE encoded. Compare the source count below with the dataset\'s.');
-
     await runYue2AceTrain(job, 'yue2-preprocess', args, YUE2_IDLE_MS, () => {
       if (!fs.existsSync(opts.manifestPath)) return 'yue2-preprocess finished but wrote no manifest';
       const s = readYue2PreprocessSummary(opts.manifestPath);

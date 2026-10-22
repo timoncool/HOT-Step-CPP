@@ -6,8 +6,9 @@
 //
 // SCOPE (increment 1): merge one or more LoRAs into the flow DiT's weights at
 // load time, in the seam between mm3_load_rest_tensors() and wctx_alloc() —
-// exactly where ACE merges in dit.h. Deliberately NOT in scope yet: LoKr, DoRA,
-// basin re-base, and runtime (unmerged) mode. Those exist for ACE and can be
+// exactly where ACE merges in dit.h. DoRA magnitudes merge too (see "The merge"
+// below). Deliberately NOT in scope yet: LoKr, basin re-base, and runtime
+// (unmerged) mode. Those exist for ACE and can be
 // lifted across once there is an MM3 adapter corpus that needs them.
 //
 // Everything expensive is REUSED from adapter-merge.h: the safetensors reader,
@@ -56,7 +57,10 @@
 #include "weight-ctx.h"
 #include "weight-source.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cfloat>
+#include <cmath>
 #include <map>
 #include <string>
 #include <sys/stat.h>
@@ -106,6 +110,14 @@ static char mm3_lora_suffix(const std::string & key, std::string & module_out) {
         if (key.size() > n && key.compare(key.size() - n, n, s) == 0) {
             module_out = key.substr(0, key.size() - n);
             return 'a';
+        }
+    }
+    // PEFT DoRA magnitude, saved with or without the ".weight" leaf.
+    for (const char * s : { ".lora_magnitude_vector.weight", ".lora_magnitude_vector" }) {
+        size_t n = strlen(s);
+        if (key.size() > n && key.compare(key.size() - n, n, s) == 0) {
+            module_out = key.substr(0, key.size() - n);
+            return 'M';
         }
     }
     return 0;
@@ -236,12 +248,89 @@ static int mm3_read_swiglu_gate_first(const STFile & st) {
     return out;
 }
 
+// A string-valued __metadata__ entry, or "" when absent.
+static std::string mm3_read_meta_str(const STFile & st, const char * key) {
+    std::string out;
+    if (st.data_offset <= 8) {
+        return out;
+    }
+    yyjson_doc * doc = yyjson_read((const char *) st.mapping + 8, st.data_offset - 8, 0);
+    if (!doc) {
+        return out;
+    }
+    yyjson_val * meta = yyjson_obj_get(yyjson_doc_get_root(doc), "__metadata__");
+    yyjson_val * v    = meta ? yyjson_obj_get(meta, key) : nullptr;
+    if (v && yyjson_is_str(v)) {
+        out = yyjson_get_str(v);
+    }
+    yyjson_doc_free(doc);
+    return out;
+}
+
+// adapter_config.json's use_dora in `dir`: 1 / 0, or -1 when the file or the
+// key is absent (a bare safetensors, or a config that never mentions DoRA).
+static int mm3_read_cfg_use_dora(const std::string & dir) {
+    FILE * f = hs_fopen(dir + "/adapter_config.json", "rb");
+    if (!f) {
+        return -1;
+    }
+    std::string buf;
+    char        chunk[4096];
+    size_t      n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        buf.append(chunk, n);
+    }
+    fclose(f);
+    int          out = -1;
+    yyjson_doc * doc = yyjson_read(buf.data(), buf.size(), 0);
+    yyjson_val * v   = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "use_dora") : nullptr;
+    if (v && yyjson_is_bool(v)) {
+        out = yyjson_get_bool(v) ? 1 : 0;
+    }
+    yyjson_doc_free(doc);
+    return out;
+}
+
+// Whether `backend` can turn a `type` tensor into F32 with ggml_cast: what the
+// DoRA build needs to read W0 in-graph. Same probe adapter-merge.h uses to
+// pick its split path, sized to one block so quant types are well formed.
+static bool mm3_backend_can_cast_f32(ggml_backend_t backend, enum ggml_type type) {
+    if (type == GGML_TYPE_F32) {
+        return true;
+    }
+    ggml_init_params ip  = { ggml_tensor_overhead() * 4 + 1024, nullptr, true };
+    ggml_context *   ctx = ggml_init(ip);
+    ggml_tensor *    src = ggml_new_tensor_1d(ctx, type, ggml_blck_size(type));
+    const bool       ok  = ggml_backend_supports_op(backend, ggml_cast(ctx, src, GGML_TYPE_F32));
+    ggml_free(ctx);
+    return ok;
+}
+
 // ── The merge ───────────────────────────────────────────────────────────────
+//
+// ── DoRA (ace-train mm3-train-dit --dora, or PEFT use_dora) ──
+//
+// A module carrying `<module>.lora_magnitude_vector[.weight]` merges as
+//
+//     W' = m * (W + s*BA) / max(||W + s*BA||_col, 1e-12)       per output row
+//
+// and the user strength u gives W0 + u*(W' - W0), so 0 is the base and 1 is
+// what the trainer's forward computed. The norm is per output row, so the
+// fused-qkv and SwiGLU handling is row bookkeeping: a diffusers to_q/to_k/to_v
+// magnitude fills its third of the rows, a gate-first file swaps its halves
+// with B, and rows no magnitude covers keep W + s*BA. The floor is
+// mm3-dit-train-run.h's MM3_DORA_NRM_FLOOR. No LyCORIS eps: this is the
+// trainer's own formula, not adapter-merge.h's dora_scale convention.
+//
+// Validation runs over the whole file BEFORE any tensor is touched: a DoRA
+// file with a missing, mis-sized or non-finite magnitude, a magnitude without
+// its factors, or a base type we cannot cast, merges nothing at all.
 
 // One (A, B, alpha) triple bound for a slot of one GGUF tensor.
 struct MM3LoraFactor {
     const STEntry * a     = nullptr;
     const STEntry * b     = nullptr;
+    const STEntry * mag   = nullptr;  // DoRA magnitude, F32/F16/BF16 [rows of this slot]
     float           alpha = 0.0f;   // 0 => default to rank (scaling 1.0)
     MM3QkvSlot      slot  = MM3_QKV_WHOLE;
 };
@@ -284,13 +373,34 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
         }
     }
 
-    // Pass 2: the A/B factors.
-    std::map<std::string, const STEntry *> a_by_module, b_by_module;
+    // Pass 2: the A/B factors, and DoRA magnitudes.
+    std::map<std::string, const STEntry *> a_by_module, b_by_module, m_by_module;
     for (const auto & e : st.entries) {
         std::string mod;
         char        which = mm3_lora_suffix(e.name, mod);
         if (which == 'A') { a_by_module[mod] = &e; }
         else if (which == 'B') { b_by_module[mod] = &e; }
+        else if (which == 'M') { m_by_module[mod] = &e; }
+    }
+    // DoRA is declared by safetensors metadata or a PEFT adapter_config.json,
+    // and carried by magnitude tensors. A declaration with no magnitudes is
+    // refused below (every factor must have one); a config that says
+    // use_dora=false over a file that has them is refused here. Either way
+    // nothing has been touched yet.
+    const int  cfg_dora = mm3_read_cfg_use_dora(cfg_dir);
+    const bool dora     = !m_by_module.empty() || cfg_dora == 1 || mm3_read_meta_str(st, "use_dora") == "true";
+    if (cfg_dora == 0 && !m_by_module.empty()) {
+        fprintf(stderr, "[MM3-Adapter] ERROR: adapter_config.json says use_dora=false but the file carries %zu "
+                        "lora_magnitude_vector tensor(s), refusing the adapter\n", m_by_module.size());
+        return -1;
+    }
+    for (const auto & kv : m_by_module) {
+        if (!a_by_module.count(kv.first) || !b_by_module.count(kv.first) ||
+            mm3_lora_target(kv.first).gguf_name.empty()) {
+            fprintf(stderr, "[MM3-Adapter] ERROR: DoRA magnitude %s has no mergeable lora_A/lora_B, "
+                            "refusing the adapter\n", kv.first.c_str());
+            return -1;
+        }
     }
 
     for (const auto & kv : a_by_module) {
@@ -309,6 +419,13 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
         f.a    = kv.second;
         f.b    = bit->second;
         f.slot = t.slot;
+        auto mit = m_by_module.find(mod);
+        f.mag    = (mit != m_by_module.end()) ? mit->second : nullptr;
+        if (dora && !f.mag) {
+            fprintf(stderr, "[MM3-Adapter] ERROR: DoRA adapter has no magnitude for %s, refusing the adapter\n",
+                    mod.c_str());
+            return -1;
+        }
         auto ait = alpha_by_module.find(mod);
         f.alpha  = (ait != alpha_by_module.end()) ? ait->second : (float) cfg_alpha;
         groups[t.gguf_name].push_back(f);
@@ -317,6 +434,78 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
     if (unmapped) {
         fprintf(stderr, "[MM3-Adapter] %d adapter module(s) target tensors we do not merge "
                         "(conv/timestep/norm) — ignored\n", unmapped);
+    }
+
+    // DoRA: validate the whole file before the first tensor is touched. The
+    // merge loop below skips a bad LoRA tensor with a warning; for DoRA that
+    // would leave a half-merged DiT, so here anything wrong refuses it all.
+    if (dora) {
+        std::string why;
+        for (const auto & kv : groups) {
+            const std::string & name = kv.first;
+            if (!ws.exists(name.c_str())) {
+                why = name + " is not in the base model";
+                break;
+            }
+            enum ggml_type ttype;
+            ws.data(name.c_str(), ttype);
+            int     n_dims;
+            int64_t ne[4];
+            ws.shape(name.c_str(), n_dims, ne);
+            for (size_t i = 0; i < wctx->pending.size(); i++) {
+                if (wctx->pending[i].tensor && name == ggml_get_name(wctx->pending[i].tensor)) {
+                    ttype = wctx->pending[i].tensor->type;   // stacked onto an earlier adapter
+                }
+            }
+            // The DoRA build reads W0 in-graph, so the backend must cast this
+            // type to F32 (F16/BF16 and the Q/K quants on CPU and CUDA). The
+            // merged result then goes back through the shared pipeline's
+            // encode or host requant, which cannot do imatrix-only types.
+            if (!mm3_backend_can_cast_f32(backend, ttype) || ggml_quantize_requires_imatrix(ttype)) {
+                why = name + " is " + ggml_type_name(ttype) +
+                      ", which this backend cannot dequantize in-graph or requantize without an imatrix";
+                break;
+            }
+            const bool sliced = kv.second.size() > 1 || kv.second[0].slot != MM3_QKV_WHOLE;
+            if (sliced && ne[1] % 3 != 0) {
+                why = name + " cannot be split into q,k,v";
+                break;
+            }
+            for (const MM3LoraFactor & f : kv.second) {
+                const int64_t want_out = (f.slot == MM3_QKV_WHOLE) ? ne[1] : ne[1] / 3;
+                auto float_dt = [](const std::string & d) { return d == "F32" || d == "F16" || d == "BF16"; };
+                if (f.a->n_dims != 2 || f.b->n_dims != 2 || f.a->shape[1] != ne[0] || f.b->shape[0] != want_out ||
+                    f.b->shape[1] != f.a->shape[0] || !float_dt(f.a->dtype) || !float_dt(f.b->dtype)) {
+                    why = name + ": lora_A/lora_B do not fit the base";
+                    break;
+                }
+                int64_t mn = 1;
+                for (int d = 0; d < f.mag->n_dims; d++) {
+                    mn *= f.mag->shape[d];
+                }
+                std::vector<float> mv((size_t) std::max<int64_t>(mn, 0));
+                if (mn != want_out || !adapter_to_f32(st_data(st, *f.mag), mv.data(), mn, f.mag->dtype)) {
+                    why = name + ": magnitude is not " + std::to_string(want_out) + " F32/F16/BF16 values";
+                    break;
+                }
+                for (float v : mv) {
+                    if (!std::isfinite(v)) {
+                        why = name + ": magnitude is not finite";
+                        break;
+                    }
+                }
+                if (!why.empty()) {
+                    break;
+                }
+            }
+            if (!why.empty()) {
+                break;
+            }
+        }
+        if (!why.empty()) {
+            fprintf(stderr, "[MM3-Adapter] ERROR: DoRA %s, refusing the adapter (nothing merged)\n", why.c_str());
+            return -1;
+        }
     }
 
     // pending lookups: by src pointer for adapter_merge_on_backend, and by
@@ -375,7 +564,7 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
 
         // Load every factor to F32 up front; the build lambda closes over these.
         struct LoadedFactor {
-            std::vector<float> a, b;
+            std::vector<float> a, b, mag;
             int64_t            rank = 0;
             float              scaling = 1.0f;
             MM3QkvSlot         slot = MM3_QKV_WHOLE;
@@ -430,6 +619,15 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
                 memcpy(sw.data() + (size_t) (half * lf.rank), lf.b.data(), (size_t) (half * lf.rank) * sizeof(float));
                 lf.b.swap(sw);
             }
+            if (f.mag) {
+                // Validated above. A magnitude is per output row, so it takes
+                // the same SwiGLU half swap as B's rows.
+                lf.mag.resize((size_t) want_out);
+                adapter_to_f32(st_data(st, *f.mag), lf.mag.data(), want_out, f.mag->dtype);
+                if (is_ffn_in && swiglu_swap) {
+                    std::rotate(lf.mag.begin(), lf.mag.begin() + want_out / 2, lf.mag.end());
+                }
+            }
 
             lf.scaling = (f.alpha > 0.0f) ? (f.alpha / (float) lf.rank) : 1.0f;
             loaded.push_back(std::move(lf));
@@ -437,6 +635,25 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
         if (bad) {
             continue;
         }
+
+        // DoRA: magnitudes over the full fused height. has_row marks rows some
+        // slot's magnitude covers; the rest (an untrained q/k/v third) keep
+        // W + s*BA, which is W there.
+        std::vector<float> mag_full, has_row;
+        bool               full_cover = true;
+        if (dora) {
+            mag_full.assign((size_t) out_feat, 0.0f);
+            has_row.assign((size_t) out_feat, 0.0f);
+            for (const LoadedFactor & lf : loaded) {
+                const size_t o0 = (lf.slot == MM3_QKV_WHOLE) ? 0 : (size_t) lf.slot * (size_t) sub_out;
+                std::copy(lf.mag.begin(), lf.mag.end(), mag_full.begin() + o0);
+                std::fill(has_row.begin() + o0, has_row.begin() + o0 + lf.mag.size(), 1.0f);
+            }
+            for (float h : has_row) {
+                full_cover = full_cover && h != 0.0f;
+            }
+        }
+        const size_t dora_base_nb = ggml_row_size(ttype, in_feat) * (size_t) out_feat;
 
         // delta = scaling * B @ A, per factor. For a sliced (diffusers-form)
         // qkv the three sub-deltas are concatenated along ne1 in q,k,v order,
@@ -489,9 +706,33 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
                 tdelta = ggml_concat(ctx, ggml_concat(ctx, blocks[0], blocks[1], 1), blocks[2], 1);
             }
 
+            // DoRA: hand back W' - W0, so the shared pipeline's W0 + u*delta
+            // is the strength blend. W0 is the same bytes it merges into
+            // (the running value when stacking), uploaded a second time here
+            // because the pipeline does not expose its own copy.
+            struct ggml_tensor * tbase = nullptr, * tmag = nullptr, * thas = nullptr, * tkeep = nullptr;
+            if (dora) {
+                tmag = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, out_feat);
+                if (!full_cover) {
+                    thas  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, out_feat);
+                    tkeep = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, out_feat);
+                }
+                tbase                    = ggml_new_tensor_2d(ctx, ttype, in_feat, out_feat);
+                struct ggml_tensor * w0  = ggml_cast(ctx, tbase, GGML_TYPE_F32);
+                struct ggml_tensor * w1  = ggml_add(ctx, w0, tdelta);
+                struct ggml_tensor * nr  = ggml_clamp(ctx, ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, w1))),
+                                                      1e-12f, FLT_MAX);   // [1, out]
+                struct ggml_tensor * fac = ggml_div(ctx, tmag, nr);
+                if (tkeep) {
+                    fac = ggml_add(ctx, ggml_mul(ctx, fac, thas), tkeep);
+                }
+                tdelta = ggml_sub(ctx, ggml_mul(ctx, w1, fac), w0);
+            }
+
             adapter_delta_build db;
             db.tdelta = tdelta;
-            db.upload = [uploads, tzero, in_feat, sub_out]() {
+            db.upload = [uploads, tzero, in_feat, sub_out, tbase, base_ptr, dora_base_nb, tmag, thas, tkeep,
+                         &mag_full, &has_row]() {
                 for (const auto & u : uploads) {
                     const std::vector<float> & src = *u.second;
                     GGML_ASSERT(ggml_nelements(u.first) == (int64_t) src.size());
@@ -500,6 +741,18 @@ static int mm3_adapter_merge_st(WeightCtx *         wctx,
                 if (tzero) {
                     std::vector<float> zeros((size_t) (in_feat * sub_out), 0.0f);
                     ggml_backend_tensor_set(tzero, zeros.data(), 0, zeros.size() * sizeof(float));
+                }
+                if (tbase) {
+                    ggml_backend_tensor_set(tbase, base_ptr, 0, dora_base_nb);
+                    ggml_backend_tensor_set(tmag, mag_full.data(), 0, mag_full.size() * sizeof(float));
+                }
+                if (tkeep) {
+                    std::vector<float> keep(has_row.size());
+                    for (size_t r = 0; r < keep.size(); r++) {
+                        keep[r] = 1.0f - has_row[r];
+                    }
+                    ggml_backend_tensor_set(thas, has_row.data(), 0, has_row.size() * sizeof(float));
+                    ggml_backend_tensor_set(tkeep, keep.data(), 0, keep.size() * sizeof(float));
                 }
             };
             return db;

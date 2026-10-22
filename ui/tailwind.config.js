@@ -45,5 +45,8 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [
+    // Portrait screens at desktop width (e.g. 1080x1920): stacked layout + mobile nav.
+    ({ addVariant }) => addVariant('portrait-wide', '@media (orientation: portrait) and (min-width: 1024px)'),
+  ],
 };

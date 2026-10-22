@@ -10,6 +10,7 @@ import { getDb } from '../db/database.js';
 import { config } from '../config.js';
 import { getUserId } from './auth.js';
 import { deleteAudioGenerationsByJobIds } from '../db/lireekDb.js';
+import { cleanupDeletedSongs } from '../services/compare/store.js';
 import { cropWavFile, cropLrcFile } from '../services/audioCrop.js';
 import { analyzeAndSaveDiscoData } from '../services/disco-analyzer.js';
 import {
@@ -17,6 +18,8 @@ import {
   getRePostProcessJob, findRePostProcessJobBySong,
 } from '../services/generation/rePostProcess.js';
 import { importTrackFile, IMPORT_EXTENSIONS } from '../services/library/importTrack.js';
+import { SONG_EDITABLE_FIELDS } from '../contracts/songs.js';
+import { planZipEntries, parseZipIds, streamZip, MAX_ZIP_IDS, MAX_ZIP_BYTES } from '../services/library/exportZip.js';
 
 const router = Router();
 
@@ -259,10 +262,7 @@ router.patch('/:id', (req, res) => {
   if (!song) { res.status(404).json({ error: 'Song not found' }); return; }
 
   const updates = req.body;
-  const allowed = ['title', 'lyrics', 'style', 'caption', 'cover_url', 'is_public',
-    'bpm', 'key_scale', 'time_signature', 'dit_model', 'cover_art_subject'];
-
-  for (const key of allowed) {
+  for (const key of SONG_EDITABLE_FIELDS) {
     if (updates[key] !== undefined) {
       const value = key === 'is_public' ? (updates[key] ? 1 : 0) : updates[key];
       getDb().prepare(`UPDATE songs SET ${key} = ? WHERE id = ?`).run(value, req.params.id);
@@ -343,6 +343,7 @@ router.delete('/:id', (req, res) => {
   }
 
   getDb().prepare('DELETE FROM songs WHERE id = ?').run(req.params.id);
+  cleanupDeletedSongs([req.params.id]);
 
   // Cascade to Lireek DB — remove matching audio_generation records
   try { deleteAudioGenerationsByJobIds([req.params.id]); } catch { /* lireek DB may not be initialized */ }
@@ -373,6 +374,7 @@ router.delete('/', (req, res) => {
   const allIds = allSongs.map((s: any) => s.id);
 
   const result = getDb().prepare('DELETE FROM songs WHERE user_id = ?').run(userId);
+  cleanupDeletedSongs(allIds);
 
   // Cascade to Lireek DB
   try { deleteAudioGenerationsByJobIds(allIds); } catch { /* lireek DB may not be initialized */ }
@@ -417,6 +419,7 @@ router.post('/bulk-delete', (req, res) => {
   const result = getDb()
     .prepare(`DELETE FROM songs WHERE id IN (${placeholders}) AND user_id = ?`)
     .run(...ids, userId);
+  cleanupDeletedSongs(ids.filter((id: string) => !getDb().prepare('SELECT 1 FROM songs WHERE id = ?').get(id)));
 
   console.log(`[Songs] Bulk deleted ${result.changes}/${ids.length} songs`);
 
@@ -424,6 +427,42 @@ router.post('/bulk-delete', (req, res) => {
   try { deleteAudioGenerationsByJobIds(ids); } catch { /* lireek DB may not be initialized */ }
 
   res.json({ success: true, deletedCount: result.changes });
+});
+
+// POST /api/songs/export-zip — stream the selected songs' audio as one zip
+router.post('/export-zip', (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+
+  const ids = parseZipIds(req.body?.ids);
+  if (!ids) {
+    res.status(400).json({ error: `ids must be a non-empty array of id strings (max ${MAX_ZIP_IDS})` });
+    return;
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = getDb()
+    .prepare(`SELECT id, title, audio_url FROM songs WHERE id IN (${placeholders}) AND user_id = ?`)
+    .all(...ids, userId) as any[];
+  const order = new Map(ids.map((id, i) => [id, i]));
+  rows.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+
+  const { entries, totalBytes } = planZipEntries(rows, config.data.audioDir);
+  if (entries.length === 0) {
+    res.status(404).json({ error: 'No audio files found for the selected songs' });
+    return;
+  }
+  if (totalBytes > MAX_ZIP_BYTES) {
+    res.status(413).json({
+      error: `Selection is ${Math.ceil(totalBytes / 1048576)} MB; a zip export is limited to ${MAX_ZIP_BYTES / 1048576} MB. Select fewer tracks.`,
+    });
+    return;
+  }
+
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="hotstep-library-${stamp}.zip"`);
+  streamZip(res, entries, err => console.error('[Songs] export-zip failed:', err));
 });
 
 // POST /api/songs/nuke-generations — delete ALL generated audio across both databases + disk
@@ -471,6 +510,7 @@ router.post('/nuke-generations', (req, res) => {
   // 3. Delete all songs from main DB
   const songIds = songs.map((s: any) => s.id);
   const songResult = getDb().prepare('DELETE FROM songs WHERE user_id = ?').run(userId);
+  cleanupDeletedSongs(songIds);
 
   // 4. Delete all audio_generations (same DB now)
   let lireekDeleted = 0;

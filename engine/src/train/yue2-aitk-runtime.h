@@ -39,6 +39,9 @@ struct Config {
     // LoKr alpha, defaulting to --lokr-dim (scale 1) when not given. The DiT
     // defaults (dim 512 / factor 6) are a trap at YuE2's dims: larger than a
     // rank-64 LoRA. dim 32 / factor 8 is 14 MB.
+    // "dora" is LoRA plus a learned magnitude per output row (detached norm,
+    // refreshed after every update); --rank and --alpha mean what they do
+    // for lora.
     std::string adapter_type = "lora";
     std::int32_t lokr_dim = 32;
     std::int32_t lokr_factor = 8;
@@ -125,6 +128,13 @@ struct Config {
     // {"stage":"eval"} line each to stdout and <output>/base-loss.jsonl, then a
     // summary. --steps and --save-every are not needed.
     bool eval_base_loss = false;
+    // Held-out adapted-loss evaluation: with --resume, restore the checkpoint's
+    // adapters and, for every item of --eval-dataset (a prepared dataset kept
+    // apart from the training one; default: --dataset), score the base and the
+    // adapted planner CE and decoder flow MSE on the same samples (the
+    // --eval-base-loss recipe). No update, no dropout. Pass the run's --steps.
+    bool eval_adapted = false;
+    std::string eval_dataset;
     // Spike guard. A step whose pre-clip gradient norm exceeds spike_factor x
     // the median of the last 50 applied steps skips its update (0 = off; it
     // arms once 20 norms are in the window, and the window restarts when the
@@ -228,6 +238,13 @@ struct Config {
     // (0.9, 0.999) is what every run before this flag had.
     float beta1 = 0.9f;
     float beta2 = 0.999f;
+    // AdamW epsilon on the LmOptim AdamW rule (adamw-lm, and Muon's AdamW
+    // parameters). 0 = the optimizer's own value (1e-8), so a run that never
+    // passes --adam-eps is byte-identical to before.
+    float adam_eps = 0.0f;
+    // --fixture-replay <dir>: one pinned step against a reference fixture,
+    // then exit (yue2-aitk-fixture-replay.h). Nothing is trained or saved.
+    std::string fixture_replay;
     // Which AR positions the cross-entropy covers.
     //   tuned  every suffix token, MUSIC_START included, and ABC_END even when
     //          the sheet is dropped (the AITK recipe; yue2_model.py:447-456)
@@ -286,7 +303,7 @@ inline void usage(FILE * out) {
         "--dataset <schema1-manifest.json> --output <new-run-dir> "
         "--steps N --save-every N --seed N --device CUDA0 [--resume <record>] [--pause-at N] "
         "[--cursor-weight 0.08 (0 disables lyric timing)] [--rank N] [--alpha F] "
-        "[--adapter-type lora|lokr] [--lokr-dim 32] [--lokr-factor 8] "
+        "[--adapter-type lora|lokr|dora] [--lokr-dim 32] [--lokr-factor 8] "
         "[--optimizer adamw|adamw-lm|prodigy|muon] [--cautious] [--lr F] [--warmup N] [--weight-decay F] "
         "[--prodigy-d0 F] [--muon-lr-scale F] [--muon-ns-steps N] "
         "[--target-loss F (0 disables)] [--target-kl F (0 disables)] [--target-loss-window N] [--target-kl-mode mean|trend] "
@@ -294,6 +311,7 @@ inline void usage(FILE * out) {
         "[--nar-extra-steps N (with --target-kl: freeze the planner at its KL, train the decoder N more steps)] "
         "[--nar-drift (log the decoder's drift from base and its reconstruction error at every checkpoint)] "
         "[--meter-only (with --resume: write the checkpoint's meters.json and exit)] "
+        "[--eval-adapted (with --resume: held-out base vs adapted planner CE and decoder MSE to <output>/adapted-loss.jsonl, no training)] [--eval-dataset <dataset.json> (the held-out set for --eval-adapted)] "
         "[--eval-base-loss (no training: per-item base planner CE and decoder flow MSE to <output>/base-loss.jsonl)] "
         "[--recon-stop F (planner frozen: stop when a line fitted through the last --recon-stop-window 3 reconstruction readings gains under F)] [--recon-reset (with --resume: empty window)] "
         "[--unfreeze-planner (with --resume: train the planner on past its freeze)] [--kl-checkpoint-every 0.1 (a checkpoint at each KL rung)] "
@@ -305,7 +323,8 @@ inline void usage(FILE * out) {
         "[--ar-crop-frames 0 (planner trains on the first N frames; 0 = whole song; needs --cursor-weight 0)] "
         "[--companion <nar_lora_joint_v9.safetensors> (the tokenizer's companion decoder adapter, frozen)] "
         "[--ar-loss-weight 1.0 (planner CE weight against the flow loss; the base trained at 0.25)] "
-        "[--beta1 0.9] [--beta2 0.999 (Adam betas; the base trained at 0.9 / 0.95)] "
+        "[--beta1 0.9] [--beta2 0.999 (Adam betas; the base trained at 0.9 / 0.95)] [--adam-eps 1e-8 (adamw-lm / muon)] "
+        "[--fixture-replay <dir> (one pinned step against a reference fixture, then exit)] "
         "[--ar-targets tuned|base (base: CE only on tokens the model generates at inference)] "
         "[--grad-accum 1 (songs per optimizer update; needs --cursor-weight 0 above 1)] "
         "[--text-dropout 0] [--lyric-dropout 0] [--both-dropout 0 (condition dropout rates; need a dataset prepared with the variants, no --caption-dropout, --cursor-weight 0)]\n");
@@ -426,8 +445,8 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
             parsed.alpha_explicit = true;
         } else if (!std::strcmp(arg, "--adapter-type")) {
             if (!detail::value(arg, argc, argv, &i, &parsed.adapter_type, error)) return ParseResult::error;
-            if (parsed.adapter_type != "lora" && parsed.adapter_type != "lokr") {
-                if (error) *error = "--adapter-type must be lora or lokr";
+            if (parsed.adapter_type != "lora" && parsed.adapter_type != "lokr" && parsed.adapter_type != "dora") {
+                if (error) *error = "--adapter-type must be lora, lokr or dora";
                 return ParseResult::error;
             }
         } else if (!std::strcmp(arg, "--lokr-dim")) {
@@ -564,6 +583,10 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
             parsed.nar_drift = true;
         } else if (!std::strcmp(arg, "--eval-base-loss")) {
             parsed.eval_base_loss = true;
+        } else if (!std::strcmp(arg, "--eval-adapted")) {
+            parsed.eval_adapted = true;
+        } else if (!std::strcmp(arg, "--eval-dataset")) {
+            if (!detail::value(arg, argc, argv, &i, &parsed.eval_dataset, error)) return ParseResult::error;
         } else if (!std::strcmp(arg, "--meter-only")) {
             parsed.meter_only = true; parsed.nar_drift = true;
         } else if (!std::strcmp(arg, "--nar-extra-steps")) {
@@ -578,6 +601,11 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
         } else if (!std::strcmp(arg, "--beta2")) {
             std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
                 !detail::finite_float(text.c_str(), &parsed.beta2) || parsed.beta2 < 0.0f || parsed.beta2 >= 1.0f) { if (error) *error = "--beta2 must be in [0, 1)"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--adam-eps")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::finite_float(text.c_str(), &parsed.adam_eps) || !(parsed.adam_eps > 0.0f) || parsed.adam_eps > 1e-2f) { if (error) *error = "--adam-eps must be in (0, 0.01]"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--fixture-replay")) {
+            if (!detail::value(arg, argc, argv, &i, &parsed.fixture_replay, error)) return ParseResult::error;
         } else if (!std::strcmp(arg, "--ar-targets")) {
             if (!detail::value(arg, argc, argv, &i, &parsed.ar_targets, error)) return ParseResult::error;
             if (parsed.ar_targets != "tuned" && parsed.ar_targets != "base") { if (error) *error = "--ar-targets must be tuned or base"; return ParseResult::error; }

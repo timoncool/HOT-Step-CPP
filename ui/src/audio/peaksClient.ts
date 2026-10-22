@@ -4,6 +4,11 @@
 // so the browser never downloads or decodes audio to draw a waveform. A payload
 // is ~25 KB against the 48–96 MB the file itself weighs.
 
+import { queryOptions } from '@tanstack/react-query';
+import { queryClient } from '../queries/client';
+import { resourceKey, sharedKeys, SHARED } from '../queries/keys';
+import { ApiError } from '../services/httpClient';
+
 export interface Peaks {
   version: number;
   duration: number;
@@ -14,71 +19,47 @@ export interface Peaks {
   unsupported?: string;
 }
 
-/** Keyed by audio URL. Small enough to keep a decent number of them — 25 KB
- *  each, so 60 entries is under 2 MB and covers any realistic listening
- *  session without the map becoming the thing that eats the tab. */
-const cache = new Map<string, Peaks>();
-const inFlight = new Map<string, Promise<Peaks | null>>();
-const MAX_CACHED = 60;
+// Query owns the cache (shared key `peaks`, one entry per audio URL), so
+// concurrent calls for a URL share one request and failures are never cached.
+// A file's peaks only change when the file is rewritten under the same URL,
+// which forgetPeaks reports; nothing else makes them stale.
+const peaksOptions = (url: string) => queryOptions({
+  queryKey: sharedKeys.peaks(url),
+  queryFn: async ({ signal }) => {
+    const res = await fetch(`/api/audio/peaks?url=${encodeURIComponent(url)}`, { signal });
+    if (!res.ok) throw new ApiError(res.status, `peaks ${res.status} for ${url}`, null);
+    return await res.json() as Peaks;
+  },
+  staleTime: Infinity,
+  gcTime: 30 * 60_000,
+});
+
+const usable = (peaks: Peaks | undefined): Peaks | null => (peaks && !peaks.unsupported ? peaks : null);
 
 /** Already-fetched peaks for this URL, or null. Synchronous, for the paint
  *  that happens before the fetch resolves. */
 export function peaksCached(url: string): Peaks | null {
-  return cache.get(url) ?? null;
-}
-
-function remember(url: string, peaks: Peaks): void {
-  // Map preserves insertion order, so the first key is the oldest.
-  if (cache.size >= MAX_CACHED) {
-    const oldest = cache.keys().next().value;
-    if (oldest !== undefined) cache.delete(oldest);
-  }
-  cache.set(url, peaks);
+  return usable(queryClient.getQueryData<Peaks>(sharedKeys.peaks(url)));
 }
 
 /**
  * Peaks for one audio URL. Returns null when the server could not produce
  * them, which callers must treat as "draw nothing" rather than as a failure to
  * play — a missing waveform is cosmetic.
- *
- * Concurrent calls for the same URL share one request.
  */
-export function fetchPeaks(url: string): Promise<Peaks | null> {
-  const hit = cache.get(url);
-  if (hit) return Promise.resolve(hit);
-
-  const pending = inFlight.get(url);
-  if (pending) return pending;
-
-  const req = (async (): Promise<Peaks | null> => {
-    try {
-      const res = await fetch(`/api/audio/peaks?url=${encodeURIComponent(url)}`);
-      if (!res.ok) {
-        console.warn(`[peaks] ${res.status} for ${url}`);
-        return null;
-      }
-      const data = await res.json() as Peaks;
-      if (data.unsupported) {
-        console.warn(`[peaks] ${url}: ${data.unsupported}`);
-        return null;
-      }
-      remember(url, data);
-      return data;
-    } catch (err) {
-      console.warn('[peaks] fetch failed for', url, err);
-      return null;
-    } finally {
-      inFlight.delete(url);
-    }
-  })();
-
-  inFlight.set(url, req);
-  return req;
+export async function fetchPeaks(url: string): Promise<Peaks | null> {
+  try {
+    const data = await queryClient.query(peaksOptions(url));
+    if (data.unsupported) console.warn(`[peaks] ${url}: ${data.unsupported}`);
+    return usable(data);
+  } catch (err) {
+    console.warn('[peaks] fetch failed for', url, err);
+    return null;
+  }
 }
 
-/** Drop everything cached. For the reload-after-edit path, where a file keeps
- *  its URL but its contents changed. */
+/** Drop cached peaks, for one URL or all. For the reload-after-edit path,
+ *  where a file keeps its URL but its contents changed. */
 export function forgetPeaks(url?: string): void {
-  if (url) cache.delete(url);
-  else cache.clear();
+  queryClient.removeQueries({ queryKey: url ? sharedKeys.peaks(url) : resourceKey(SHARED.peaks) });
 }

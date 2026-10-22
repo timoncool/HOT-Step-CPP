@@ -105,9 +105,9 @@ export const DatasetList: React.FC = () => {
 
   return (
     <>
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-sm font-bold text-zinc-900 dark:text-white">{t('trainingStudio.list.title')}</h2>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {isYue2 && (
             <button
               onClick={() => setYue2BatchOpen(true)}
@@ -133,12 +133,12 @@ export const DatasetList: React.FC = () => {
         </div>
       </div>
 
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <input
           value={query}
           onChange={e => setQuery(e.target.value)}
           placeholder={t('trainingStudio.list.filter', 'Filter by dataset, artist or album…') as string}
-          className="flex-1 max-w-md rounded-lg bg-zinc-100 dark:bg-black/20 px-3 py-1.5 text-xs"
+          className="flex-1 max-[1023px]:max-w-full max-w-md rounded-lg bg-zinc-100 dark:bg-black/20 px-3 py-1.5 text-xs"
         />
         {isYue2 && (
           <div className="flex flex-col gap-1">

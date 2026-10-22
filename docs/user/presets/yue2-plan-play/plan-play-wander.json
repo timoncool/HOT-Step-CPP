@@ -1,0 +1,31 @@
+{
+  "name": "Plan Play: Wander",
+  "backend": "yue2",
+  "description": "Plan-Loose scheduler (loose 0.35), CADS 0.1, Ancestral Euler churn 0.5.",
+  "data": {
+    "_format": "hot-step-preset",
+    "_version": 2,
+    "_mergeMaps": true,
+    "backendParams": {
+      "yue2NarSolver": "ancestral",
+      "yue2NarScheduler": "plan_loose",
+      "yue2CadsStrength": 0.1,
+      "yue2CadsT1": 0.6,
+      "yue2CadsT2": 0.9,
+      "yue2CadsRescale": true,
+      "yue2PlanWStart": 1,
+      "yue2PlanWEnd": 1,
+      "yue2PlanWCurve": "linear",
+      "yue2PlanCfg": 1,
+      "yue2PlanCfgT1": 0,
+      "yue2PlanCfgT2": 1,
+      "yue2PlanCfgRescale": 0.7,
+      "yue2PlanCfgLevelMatch": true
+    },
+    "pluginParams": {
+      "md_ancestral_yue2:churn": 0.5,
+      "md_plan_loose_yue2:loose": 0.35,
+      "md_plan_loose_yue2:lock_at": 0.5
+    }
+  }
+}

@@ -32,6 +32,7 @@ export interface SampleLabelRecord {
     bpm: number | null; key: string; scale: string;
     loudness: number | null; danceability: number | null;
   } | null;
+  essentiaTempo?: { minTempo?: number; maxTempo?: number } | null;
   understand: {                     // raw /understand result, unmerged
     caption: string; lyrics: string; bpm: number | null;
     keyscale: string; timesignature: string; vocalLanguage: string;

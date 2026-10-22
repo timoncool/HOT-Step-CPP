@@ -142,6 +142,8 @@
     "settings.ai.unslothUsernameDesc": "Unsloth 身份验证的用户名。",
     "settings.ai.unslothPassword": "Unsloth 密码",
     "settings.ai.unslothPasswordDesc": "Unsloth 身份验证的密码。",
+    "settings.ai.unslothKeyless": "无密钥本地 Studio",
+    "settings.ai.unslothKeylessDesc": "如果本地 Unsloth Studio 启用了其「keyless API access（无密钥 API 访问）」设置，请打开此项——这样就不需要用户名和密码。否则请保持关闭；在开启此项或同时填写两个凭据之前，该提供者将保持隐藏。",
     "settings.ai.llamacppUrl": "llama.cpp URL",
     "settings.ai.llamacppUrlDesc": "llama.cpp 服务器 (llama-server) 的基础 URL。",
     "settings.ai.openaiCompatUrl": "兼容端点 URL",

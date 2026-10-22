@@ -6,9 +6,10 @@
 // write a .lrc, but Whisper's .lyrics.json carries the same [Section] labels per
 // line — so fall back to that, exactly as LyricsBar already does.
 
-import React, { useState, useEffect } from 'react';
+import React, { useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { parseSectionMarkers, type SectionMarker } from '../../utils/lrcUtils';
-import { fetchLyricsJson, sidecarUrl } from '../../utils/wordLrcUtils';
+import { lrcOptions, lyricsJsonOptions } from '../../queries/shell-queue/lyrics';
 
 interface SectionMarkersProps {
   audioUrl?: string;
@@ -16,38 +17,21 @@ interface SectionMarkersProps {
 }
 
 export const SectionMarkers: React.FC<SectionMarkersProps> = ({ audioUrl, duration }) => {
-  const [markers, setMarkers] = useState<SectionMarker[]>([]);
+  // Shared sidecar queries, joined with LyricsBar's reads of the same track.
+  const lrc = useQuery(lrcOptions(audioUrl ?? '')).data ?? null;
+  const json = useQuery(lyricsJsonOptions(audioUrl ?? '')).data ?? null;
 
-  useEffect(() => {
-    if (!audioUrl) { setMarkers([]); return; }
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const res = await fetch(sidecarUrl(audioUrl, '.lrc'));
-        if (res.ok) {
-          const text = await res.text();
-          if (cancelled) return;
-          if (text.includes('[')) {
-            const fromLrc = parseSectionMarkers(text);
-            if (fromLrc.length) { setMarkers(fromLrc); return; }
-          }
-        }
-      } catch { /* no LRC — try the word-level lyrics below */ }
-
-      const json = await fetchLyricsJson(audioUrl);
-      if (cancelled) return;
-      const fromJson: SectionMarker[] = [];
-      for (const line of json?.lines ?? []) {
-        if (line.section && line.section !== fromJson[fromJson.length - 1]?.label) {
-          fromJson.push({ time: line.start, label: line.section });
-        }
+  const markers = useMemo<SectionMarker[]>(() => {
+    const fromLrc = lrc ? parseSectionMarkers(lrc) : [];
+    if (fromLrc.length) return fromLrc;
+    const fromJson: SectionMarker[] = [];
+    for (const line of json?.lines ?? []) {
+      if (line.section && line.section !== fromJson[fromJson.length - 1]?.label) {
+        fromJson.push({ time: line.start, label: line.section });
       }
-      setMarkers(fromJson);
-    })();
-
-    return () => { cancelled = true; };
-  }, [audioUrl]);
+    }
+    return fromJson;
+  }, [lrc, json]);
 
   if (markers.length === 0 || !duration) return null;
 

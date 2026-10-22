@@ -634,12 +634,21 @@ def build_vae(src_dir, bundle, type_, variant):
     expect_config(dec_cfg, "final_tanh", VAE_FINAL_TANH, "VAE decoder_config")
     if tuple(dec_cfg["strides"]) != VAE_STRIDES:
         die(f"VAE decoder_config.strides = {dec_cfg['strides']!r}, expected {VAE_STRIDES}")
+    # A grown fine-tuned decoder (tools/yue2-vae-train) records its residual
+    # units per block; the released ones have none and use 3. More units widen
+    # the receptive field, so such a config also carries its own halo.
+    dec_res_units = int(dec_cfg.get("res_units", 3))
+    dec_dilations = [VAE_RES_DILATIONS[i % 3] for i in range(dec_res_units)]
+    required_halo = int(cfg.get("required_halo", VAE_REQUIRED_HALO))
+    decode_halo = int(cfg.get("decode_halo_frames", VAE_DECODE_HALO_FRAMES))
+    if decode_halo < required_halo:
+        die(f"decode_halo_frames {decode_halo} < required_halo {required_halo}")
 
     st_path = os.path.join(src_dir, "model.safetensors")
     src = Source(st_path)
 
     manifest_path = os.path.join(src_dir, "weights_manifest.json")
-    match = sha256_matches_pin(manifest_path, PINS[variant]["sha256"])
+    match = sha256_matches_pin(manifest_path, PINS[variant]["sha256"]) if variant in PINS else False
     pin = PINS[variant] if match else {"repo": "unknown", "revision": "unknown", "sha256": "unknown"}
     if match is False:
         log(f"WARNING: {manifest_path} sha256 does not match the pinned {variant} VAE "
@@ -665,6 +674,8 @@ def build_vae(src_dir, bundle, type_, variant):
     b.meta("add_uint32", "yue2vae.channels", VAE_BASE_CHANNELS)
     b.meta("add_array", "yue2vae.strides", list(VAE_STRIDES))
     b.meta("add_array", "yue2vae.res_dilations", list(VAE_RES_DILATIONS))
+    if dec_res_units != 3:
+        b.meta("add_array", "yue2vae.dec_res_dilations", dec_dilations)
     b.meta("add_bool", "yue2vae.use_snake", True)
     b.meta("add_string", "yue2vae.snake_type", "vanilla")
     b.meta("add_float32", "yue2vae.snake_eps", VAE_SNAKE_EPS)
@@ -677,8 +688,8 @@ def build_vae(src_dir, bundle, type_, variant):
     b.meta("add_bool", "yue2vae.weight_norm_folded", True)
     b.meta("add_bool", "yue2vae.has_encoder", True)
     b.meta("add_uint32", "yue2vae.decode_core_frames", VAE_DECODE_CORE_FRAMES)
-    b.meta("add_uint32", "yue2vae.decode_halo_frames", VAE_DECODE_HALO_FRAMES)
-    b.meta("add_uint32", "yue2vae.required_halo", VAE_REQUIRED_HALO)
+    b.meta("add_uint32", "yue2vae.decode_halo_frames", decode_halo)
+    b.meta("add_uint32", "yue2vae.required_halo", required_halo)
     b.meta("add_string", "yue2vae.pinned.repo", pin["repo"])
     b.meta("add_string", "yue2vae.pinned.revision", pin["revision"])
     b.meta("add_string", "yue2vae.pinned.sha256", pin["sha256"])
@@ -714,7 +725,7 @@ def build_vae(src_dir, bundle, type_, variant):
         base = f"decoder.layers.{bi}"
         alpha_beta(f"dec.blk.{bi}.snake_pre", f"{base}.layers.0", cin)
         wn(f"dec.blk.{bi}.upsample", f"{base}.layers.1", (cin, cout, 2 * stride), cout)
-        for ri in range(3):
+        for ri in range(dec_res_units):
             rbase = f"{base}.layers.{ri + 2}"
             alpha_beta(f"dec.blk.{bi}.res.{ri}.snake1", f"{rbase}.layers.0", cout)
             wn(f"dec.blk.{bi}.res.{ri}.conv1", f"{rbase}.layers.1", (cout, cout, 7), cout)
@@ -764,6 +775,8 @@ def main():
     ap.add_argument("--src-lm", metavar="DIR", help="YuE2-3B model dir")
     ap.add_argument("--src-vae", metavar="DIR", help="YuE2-Vae (standard) model dir")
     ap.add_argument("--src-vae-legacy", metavar="DIR", help="YuE2-Vae-legacy model dir")
+    ap.add_argument("--src-vae-dec2x", metavar="DIR",
+                    help="fine-tuned grown decoder exported by tools/yue2-vae-train/export.py")
     ap.add_argument("--tokenizer-dir", metavar="DIR",
                      help="output dir of yue2-tokenizer-convert.py (vocab.json/merges.txt/"
                           "special_tokens.json/pretokenizer.json); if missing, that script "
@@ -827,7 +840,8 @@ def main():
 
     if "vae" in want:
         for flag, srcdir, variant in (("--src-vae", args.src_vae, "standard"),
-                                       ("--src-vae-legacy", args.src_vae_legacy, "legacy")):
+                                       ("--src-vae-legacy", args.src_vae_legacy, "legacy"),
+                                       ("--src-vae-dec2x", args.src_vae_dec2x, "dec2x")):
             if not srcdir:
                 log(f"skip {variant} VAE: {flag} not given")
                 continue

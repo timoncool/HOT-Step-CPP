@@ -1179,9 +1179,11 @@ static int yue2_preprocess_run(const Yue2PreprocessArgs & a) {
         (void) sidecar_hit;
 
         // The loudness target is part of the key: normalized latents are a
-        // different encoding of the file. Off keeps the old key byte for byte.
+        // different encoding of the file. Off is tagged "|peak" since overs
+        // were peak-scaled rather than clamped (2026-10-16): a new stem, so the
+        // codes and sheets keyed on it are rebuilt from the new level too.
         const bool   loud_on   = a.loudness_lufs != 0.0;
-        char         loud_tag[32] = "";
+        char         loud_tag[32] = "|peak";
         if (loud_on) snprintf(loud_tag, sizeof(loud_tag), "|lufs%.2f", a.loudness_lufs);
         const std::string key = yp_key_hex(name + "|" + std::to_string(fbytes) + "|" + std::to_string(fmtime) + "|" +
                                            variant_name + "|" + vae_base + "|v1" + loud_tag);
@@ -1191,16 +1193,16 @@ static int yue2_preprocess_run(const Yue2PreprocessArgs & a) {
         s.latent_rel = latent_rel;
 
         // The gain rides beside the latent, so a cache hit still knows it.
+        // Loudness off records one too: the peak-scale gain, usually 0.
         const std::string gain_path = a.out_dir + "/latents/" + s.stem + ".gain";
-        bool gain_known = !loud_on;
-        if (loud_on) {
-            if (FILE * gf = hs_fopen(gain_path.c_str(), "rb")) { gain_known = fscanf(gf, "%lf", &s.gain_db) == 1; fclose(gf); }
-        }
+        bool gain_known = false;
+        if (FILE * gf = hs_fopen(gain_path.c_str(), "rb")) { gain_known = fscanf(gf, "%lf", &s.gain_db) == 1; fclose(gf); }
         int64_t frames = 0;
         if (gain_known && yp_cache_frames(latent_path, LD, &frames)) {
             s.cache_hit = true;
             n_cached++;
         } else {
+            s.gain_db = 0.0;  // a .gain beside a missing or short latent is stale
             // ── decode ──
             const bool use_ffmpeg = (a.decode == "ffmpeg") || !(ext == ".wav" || ext == ".mp3");
             if (use_ffmpeg && a.ffmpeg.empty()) {
@@ -1245,15 +1247,14 @@ static int yue2_preprocess_run(const Yue2PreprocessArgs & a) {
                 fprintf(stderr, "[yue2-preprocess] %zu/%zu loudness %s: %.1f LUFS, gain %+.1f dB%s\n", i + 1,
                         picked.size(), name.c_str(), lufs, s.gain_db, capped ? " (boost capped at -1 dBFS peak)" : "");
             }
-            const size_t n_samp = (size_t) T * 2;
-            for (size_t k = 0; k < n_samp; k++) {
-                if (planar[k] > 1.0f) {
-                    planar[k] = 1.0f;
-                } else if (planar[k] < -1.0f) {
-                    planar[k] = -1.0f;
-                } else if (!(planar[k] == planar[k])) {  // NaN
-                    planar[k] = 0.0f;
-                }
+            // Overs (a hot master, or a boost-free cut that still peaks past 0
+            // dBFS) are peak-scaled, not clamped (yue2-loudness.h). The gain is
+            // folded into the recorded one, so tokenize/sheet decode to the
+            // same level the latents were encoded at.
+            if (const double over_db = yue2_peak_scale(planar, (size_t) T * 2); over_db != 0.0) {
+                s.gain_db += over_db;
+                fprintf(stderr, "[yue2-preprocess] %zu/%zu %s over full scale: scaled %.1f dB to -0.3 dBFS peak\n",
+                        i + 1, picked.size(), name.c_str(), over_db);
             }
 
             // ── encode ──
@@ -1301,7 +1302,7 @@ static int yue2_preprocess_run(const Yue2PreprocessArgs & a) {
                 n_failed++;
                 continue;
             }
-            if (loud_on) {
+            {
                 FILE * gf = hs_fopen(gain_path.c_str(), "wb");
                 if (!gf || fprintf(gf, "%.6f\n", s.gain_db) < 0) {
                     if (gf) fclose(gf);
@@ -1432,7 +1433,7 @@ static int yue2_preprocess_run(const Yue2PreprocessArgs & a) {
         yyjson_mut_obj_add_int(doc, so, "clips", s.clips);
         yyjson_mut_obj_add_real(doc, so, "duration_sec", s.seconds);
         yyjson_mut_obj_add_bool(doc, so, "cache_hit", s.cache_hit);
-        if (a.loudness_lufs != 0.0) yyjson_mut_obj_add_real(doc, so, "loudness_gain_db", s.gain_db);
+        yyjson_mut_obj_add_real(doc, so, "loudness_gain_db", s.gain_db);
         yyjson_mut_arr_append(sarr, so);
 
         for (int64_t k = 0; k < s.clips; k++) {

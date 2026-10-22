@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Melody</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1"><attributes><divisions>4</divisions><key><fifths>0</fifths></key><time><beats>4</beats><beat-type>4</beat-type></time></attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>16</duration></note></measure>
+    <measure number="2"><direction><direction-type><words>To Coda</words></direction-type><sound tocoda="c1"/></direction><note><pitch><step>D</step><octave>4</octave></pitch><duration>16</duration></note></measure>
+    <measure number="3"><direction><direction-type><words>D.C. al Coda</words></direction-type><sound dacapo="yes"/></direction><note><pitch><step>E</step><octave>4</octave></pitch><duration>16</duration></note></measure>
+    <measure number="4"><direction><direction-type><coda/></direction-type><sound coda="c1"/></direction><note><pitch><step>F</step><octave>4</octave></pitch><duration>16</duration></note></measure>
+    <measure number="5"><note><pitch><step>G</step><octave>4</octave></pitch><duration>16</duration></note></measure>
+  </part>
+</score-partwise>

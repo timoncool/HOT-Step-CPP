@@ -119,8 +119,6 @@ interface ActivitySidebarProps {
   showToast: (msg: string, type?: 'success' | 'error') => void;
   /** Filter recent songs by source — e.g. 'lyric-studio', 'cover-studio', 'create', or undefined for all */
   source?: string;
-  /** External refresh trigger (e.g. when a generation completes elsewhere) */
-  refreshKey?: number;
   /** Use single-column layout for recent songs */
   compact?: boolean;
   /** Color accent for queue count badge */
@@ -132,7 +130,6 @@ interface ActivitySidebarProps {
 export const ActivitySidebar: React.FC<ActivitySidebarProps> = ({
   showToast,
   source,
-  refreshKey = 0,
   compact = false,
   queueCountColor = 'bg-pink-500/20 text-pink-300',
   showTerminal = false,
@@ -141,12 +138,8 @@ export const ActivitySidebar: React.FC<ActivitySidebarProps> = ({
   const queueCount = useAudioGenQueueSelector(s =>
     s.items.filter(i => i.status === 'pending' || i.status === 'loading-adapter' || i.status === 'generating').length
   );
-  const completionCounter = useAudioGenQueueSelector(s => s.completionCounter);
   const playlistCount = usePlaylist().items.length;
   const [topTab, setTopTab] = useState<'playlist' | 'recent'>('playlist');
-
-  // Combine external refresh key with queue completion counter
-  const recentRefreshKey = completionCounter + refreshKey;
 
   // ── Section sizing ──
   // Heights are keyed by section name, not by index, so hiding one section does
@@ -204,7 +197,6 @@ export const ActivitySidebar: React.FC<ActivitySidebarProps> = ({
           ) : (
             <UnifiedRecentSongs
               showToast={showToast}
-              refreshKey={recentRefreshKey}
               compact={compact}
               source={source}
             />

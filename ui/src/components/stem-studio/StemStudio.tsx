@@ -1,3 +1,6 @@
+import { extractResultOptions } from '../../queries/studios/resources';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { modelsOptions } from '../../queries/studios/shared';
 // StemStudio.tsx — Main Stem Studio orchestrator
 //
 // Composes: SourceSelector, TrackSelector, StemMixer, RecentExtractions
@@ -12,9 +15,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, Info, Clock, ListOrdered } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { modelApi } from '../../services/api';
 import {
-  submitExtraction, submitSupersep, waitForExtraction, getExtractResult,
+  submitExtraction, submitSupersep, waitForExtraction,
   getStemUrl, getDownloadAllUrl, TRACK_CATEGORIES,
   type ExtractProgress, type ExtractJobResult,
 } from '../../services/stemStudioApi';
@@ -41,6 +43,23 @@ function getBaseModels(ditModels: string[]): string[] {
 
 export const StemStudio: React.FC = () => {
   const { t } = useTranslation();
+  const client = useQueryClient();
+  const selectedResult = React.useRef<string | null>(null);
+
+  // Narrow-screen (<1024px) pane switcher — which of the three columns is visible
+  const [narrowPane, setNarrowPane] = useState<'source' | 'tracks' | 'recent'>('tracks');
+
+  // Portrait-screen (>= 1024px, orientation portrait) — behaves like narrow
+  const [isPortrait, setIsPortrait] = useState(() =>
+    window.matchMedia('(orientation: portrait) and (min-width: 1024px)').matches
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(orientation: portrait) and (min-width: 1024px)');
+    const handler = (e: MediaQueryListEvent) => setIsPortrait(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+
   // Source audio (persisted across sessions for testing convenience)
   const [sourceAudioUrl, _setSourceAudioUrl] = useState(() => localStorage.getItem('hs-stem-sourceUrl') || '');
   const [sourceFileName, _setSourceFileName] = useState(() => localStorage.getItem('hs-stem-sourceFile') || '');
@@ -62,9 +81,10 @@ export const StemStudio: React.FC = () => {
   const [lyrics, setLyrics] = useState('');
 
   // Model selection — extract requires base/SFT model
-  const [baseModels, setBaseModels] = useState<string[]>([]);
+  const modelsQuery = useQuery(modelsOptions());
+  const baseModels = getBaseModels(modelsQuery.data?.models.dit || []);
   const [extractModel, setExtractModel] = useState<string>('');
-  const [modelsLoading, setModelsLoading] = useState(true);
+  const modelsLoading = modelsQuery.isPending;
 
   // Extraction state
   const [isExtracting, setIsExtracting] = useState(false);
@@ -84,18 +104,12 @@ export const StemStudio: React.FC = () => {
 
   // Fetch available base models on mount — restore persisted selection
   useEffect(() => {
-    modelApi.list()
-      .then(data => {
-        const base = getBaseModels(data.models.dit || []);
-        setBaseModels(base);
-        if (base.length > 0) {
-          const stored = localStorage.getItem('hs-stem-extractModel');
-          setExtractModel(stored && base.includes(stored) ? stored : base[0]);
-        }
-      })
-      .catch(err => console.error('[StemStudio] Failed to load models:', err))
-      .finally(() => setModelsLoading(false));
-  }, []);
+    const base = getBaseModels(modelsQuery.data?.models.dit || []);
+    if (base.length && !extractModel) {
+      const stored = localStorage.getItem('hs-stem-extractModel');
+      setExtractModel(stored && base.includes(stored) ? stored : base[0]);
+    }
+  }, [modelsQuery.data, extractModel]);
 
   // Persist extract model selection
   useEffect(() => {
@@ -221,12 +235,13 @@ export const StemStudio: React.FC = () => {
   const handleSelectPastJob = useCallback(async (jobId: string) => {
     try {
       setActiveJobId(jobId);
-      const result = await getExtractResult(jobId);
-      loadResultIntoMixer(jobId, result);
+      selectedResult.current = jobId;
+      const result = await client.query(extractResultOptions(jobId));
+      if (selectedResult.current === jobId) loadResultIntoMixer(jobId, result);
     } catch (err) {
       console.error('Failed to load past job:', err);
     }
-  }, [loadResultIntoMixer]);
+  }, [loadResultIntoMixer, client]);
 
   const handleDownloadStem = useCallback((stem: MixerStemInfo) => {
     if (!activeJobId) return;
@@ -267,12 +282,31 @@ export const StemStudio: React.FC = () => {
 
   return (
     <div className="flex flex-col w-full h-full overflow-hidden">
+      {(modelsQuery.error) && <div role="alert" className="text-sm text-red-500">{(modelsQuery.error)?.message}</div>}
+
+      {/* Narrow/portrait pane switcher — rendered below 1024px and on portrait >= 1024px */}
+      <div className="max-[1023px]:flex min-[1024px]:hidden portrait-wide:flex flex-shrink-0 border-b border-zinc-200 dark:border-white/5">
+        {(['source', 'tracks', 'recent'] as const).map(pane => (
+          <button
+            key={pane}
+            type="button"
+            onClick={() => setNarrowPane(pane)}
+            className={`flex-1 py-2 text-xs font-semibold transition-colors ${
+              narrowPane === pane
+                ? 'text-purple-400 border-b-2 border-purple-400'
+                : 'text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            {pane === 'source' ? 'Source' : pane === 'tracks' ? 'Tracks' : 'Recent'}
+          </button>
+        ))}
+      </div>
 
       {/* Main workspace */}
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden min-h-0">
 
         {/* Left — Source Audio + Optional Fields */}
-        <div className="flex flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-shrink-0" style={{ width: 300 }}>
+        <div className={`flex flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-shrink-0 ${!isPortrait ? 'min-[1024px]:w-[300px] min-[1024px]:flex' : ''} ${narrowPane === 'source' ? 'flex w-full min-w-0' : 'hidden'}`}>
           <SourceSelector
             sourceAudioUrl={sourceAudioUrl}
             sourceFileName={sourceFileName}
@@ -314,7 +348,7 @@ export const StemStudio: React.FC = () => {
         </div>
 
         {/* Center — Track Selection + Mixer */}
-        <div className="flex-1 flex flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5">
+        <div className={`flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-1 min-w-0 ${!isPortrait ? 'min-[1024px]:flex' : ''} ${narrowPane === 'tracks' ? 'flex' : 'hidden'}`}>
           {/* Model selector for Extract */}
           {mode === 'extract' && !modelsLoading && baseModels.length === 0 && (
             <div style={styles.noModelsWarning}>
@@ -395,16 +429,19 @@ export const StemStudio: React.FC = () => {
           )}
         </div>
 
-        {/* Resize handle */}
+        {/* Resize handle — hidden on narrow screens */}
         <div
-          className="flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-purple-500/20 active:bg-purple-500/30 transition-colors"
+          className={`${isPortrait ? 'hidden' : 'max-[1023px]:hidden'} flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-purple-500/20 active:bg-purple-500/30 transition-colors`}
           onMouseDown={handleSidebarResize}
         >
           <div className="w-0.5 h-8 rounded-full bg-zinc-600 group-hover:bg-purple-400 transition-colors" />
         </div>
 
         {/* Right — Recent Extractions + Queue */}
-        <div className="h-full flex-shrink-0 border-l border-zinc-200 dark:border-white/5 overflow-hidden flex flex-col" style={{ width: sidebarWidth }}>
+        <div
+          className={`h-full flex-shrink-0 border-l border-zinc-200 dark:border-white/5 overflow-hidden flex-col ${!isPortrait ? 'min-[1024px]:flex' : ''} max-[1023px]:!w-full ${narrowPane === 'recent' ? 'flex' : 'hidden'}`}
+          style={{ width: sidebarWidth }}
+        >
           <Section
             title={t('stem.recentExtractions')}
             icon={<Clock className="w-3 h-3" />}

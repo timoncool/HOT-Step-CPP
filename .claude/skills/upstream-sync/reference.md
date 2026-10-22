@@ -1,5 +1,9 @@
 # upstream-sync — reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Deep detail supporting [SKILL.md](SKILL.md). Everything here was verified against the working tree on 2026-07-02.
 
 ## 1. Linker sentinel — exact mechanism
@@ -41,7 +45,7 @@ Both samplers print a `[DiT] Solver:` line, so its mere presence proves nothing.
 | Upstream vanilla | `[DiT] Solver: <name> (<N> NFE/step, order <N>)` — no scheduler field | upstream `src/dit-sampler.h:397` |
 | Upstream vanilla | *(no Guidance line at all)* | — |
 
-So: **`[DiT] Guidance:` present = HOT-Step sampler is live.** Check the newest session folder: `logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log`.
+So: **`[DiT] Guidance:` present = HOT-Step sampler is live.** Check the newest session folder: `<data root>/logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log`.
 
 (NFE = number of function evaluations, i.e. DiT forward passes per solver step.)
 

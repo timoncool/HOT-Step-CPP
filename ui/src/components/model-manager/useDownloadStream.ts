@@ -1,3 +1,6 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { bridgeDownloads, downloadsKey } from '../../queries/global-models/downloads';
+import { subscribeEventSource } from '../../services/sharedEventSource';
 // useDownloadStream.ts — SSE hook for real-time download progress
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -10,45 +13,22 @@ interface UseDownloadStreamOptions {
 }
 
 export function useDownloadStream(opts?: UseDownloadStreamOptions) {
-  const [jobs, setJobs] = useState<DownloadJob[]>([]);
+  const { data: jobs = [] } = useQuery({
+    queryKey: downloadsKey(), queryFn: async (): Promise<DownloadJob[]> => [],
+    enabled: false, initialData: [] as DownloadJob[],
+  });
   const [isConnected, setIsConnected] = useState(false);
-  const completedRef = useRef(new Set<string>());
-  const eventSourceRef = useRef<EventSource | null>(null);
-
+  const client = useQueryClient();
+  const callback = useRef(opts?.onComplete);
+  callback.current = opts?.onComplete;
   useEffect(() => {
     const url = modelManagerApi.downloadsStreamUrl;
-    const es = new EventSource(url);
-    eventSourceRef.current = es;
-
-    es.onopen = () => setIsConnected(true);
-
-    es.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as { jobs: DownloadJob[] };
-        setJobs(data.jobs);
-
-        // Check for newly completed jobs
-        if (opts?.onComplete) {
-          for (const job of data.jobs) {
-            if (job.status === 'completed' && !completedRef.current.has(job.jobId)) {
-              completedRef.current.add(job.jobId);
-              opts.onComplete();
-            }
-          }
-        }
-      } catch { /* ignore parse errors */ }
-    };
-
-    es.onerror = () => {
-      setIsConnected(false);
-      // EventSource auto-reconnects
-    };
-
-    return () => {
-      es.close();
-      eventSourceRef.current = null;
-    };
-  }, [opts?.onComplete]);
+    const detachBridge = bridgeDownloads(client, url, () => callback.current?.());
+    const detachStatus = subscribeEventSource(url, {
+      open: () => setIsConnected(true), error: () => setIsConnected(false),
+    }, { reconnect: true });
+    return () => { detachBridge(); detachStatus(); };
+  }, [client]);
 
   const getJob = useCallback((jobId: string): DownloadJob | undefined => {
     return jobs.find(j => j.jobId === jobId);

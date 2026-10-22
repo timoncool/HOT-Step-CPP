@@ -12,8 +12,11 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import { QueryObserver } from '@tanstack/react-query';
 import type { Song } from '../types';
-import { runSongPostProcessing, getSongPostProcessingStatus, revertSongPostProcessing } from '../services/api';
+import { runSongPostProcessing, revertSongPostProcessing } from '../services/api';
+import { queryClient } from '../queries/client';
+import { postProcessStatusOptions } from '../queries/shell-queue/songs';
 import { useGlobalParamsStore } from './globalParamsStore';
 
 export interface PostProcessRun {
@@ -36,7 +39,8 @@ export interface PostProcessRun {
 let _runs: Record<string, PostProcessRun> = {};
 
 const _listeners = new Set<() => void>();
-const _pollers = new Map<string, ReturnType<typeof setInterval>>();
+/** Per song, the unsubscribe of the Query observer polling its run. */
+const _pollers = new Map<string, () => void>();
 
 function notify(): void {
   _listeners.forEach(cb => cb());
@@ -107,56 +111,57 @@ export function canPostProcess(song: Song | null | undefined): PpAvailability {
 
 // ── Runner ───────────────────────────────────────────────────────────────────
 
-const POLL_MS = 1500;
-
 /** How long a completed run stays on the dock before retiring itself. Long
  *  enough to notice the tick, short enough that a batch drains on its own. */
 const SUCCESS_LINGER_MS = 4000;
 
 function stopPolling(songId: string): void {
-  const timer = _pollers.get(songId);
-  if (timer) { clearInterval(timer); _pollers.delete(songId); }
+  const unsubscribe = _pollers.get(songId);
+  if (unsubscribe) { unsubscribe(); _pollers.delete(songId); }
 }
 
 function startPolling(songId: string, jobId: string): void {
   stopPolling(songId);
-  const timer = setInterval(async () => {
-    try {
-      const status = await getSongPostProcessingStatus(songId, jobId);
-      if (!status) return; // job aged out of the server's map — keep the last state
-      setRun(songId, {
-        status: status.status,
-        stage: status.stage,
-        error: status.error,
-        masteredAudioUrl: status.masteredAudioUrl,
-      });
-
-      if (status.status === 'succeeded') {
-        stopPolling(songId);
-        // Let every list holding this song swap to the processed file.
-        window.dispatchEvent(new CustomEvent('song-postprocessed', {
-          detail: { songId, masteredAudioUrl: status.masteredAudioUrl },
-        }));
-        // Show the tick briefly, then retire the run so the dock empties
-        // itself and disappears. Safe to do now that the dock exists: the run
-        // was visible for its whole duration, and the track itself carries the
-        // lasting evidence (a mastered version, and the M/O switch).
-        //
-        // FAILURES ARE NOT CLEARED HERE, deliberately. A success that
-        // disappears is tidy; an error that disappears is a bug you never find
-        // out about.
-        setTimeout(() => {
-          if (_runs[songId]?.status === 'succeeded') clearRun(songId);
-        }, SUCCESS_LINGER_MS);
-      } else if (status.status === 'failed') {
-        stopPolling(songId);
-      }
-    } catch (err: any) {
+  // Query owns the reads: one request at a time, at the active cadence, and
+  // the options stop polling once the run ends. Unsubscribing on the first
+  // terminal answer keeps the completion event to one.
+  const observer = new QueryObserver(queryClient, postProcessStatusOptions(songId, jobId));
+  _pollers.set(songId, observer.subscribe(result => {
+    if (result.status === 'error') {
       stopPolling(songId);
-      setRun(songId, { status: 'failed', stage: 'Failed', error: err.message });
+      setRun(songId, { status: 'failed', stage: 'Failed', error: result.error.message });
+      return;
     }
-  }, POLL_MS);
-  _pollers.set(songId, timer);
+    const status = result.data;
+    if (!status) return; // job aged out of the server's map — keep the last state
+    setRun(songId, {
+      status: status.status,
+      stage: status.stage,
+      error: status.error,
+      masteredAudioUrl: status.masteredAudioUrl,
+    });
+
+    if (status.status === 'succeeded') {
+      stopPolling(songId);
+      // Let every list holding this song swap to the processed file.
+      window.dispatchEvent(new CustomEvent('song-postprocessed', {
+        detail: { songId, masteredAudioUrl: status.masteredAudioUrl },
+      }));
+      // Show the tick briefly, then retire the run so the dock empties
+      // itself and disappears. Safe to do now that the dock exists: the run
+      // was visible for its whole duration, and the track itself carries the
+      // lasting evidence (a mastered version, and the M/O switch).
+      //
+      // FAILURES ARE NOT CLEARED HERE, deliberately. A success that
+      // disappears is tidy; an error that disappears is a bug you never find
+      // out about.
+      setTimeout(() => {
+        if (_runs[songId]?.status === 'succeeded') clearRun(songId);
+      }, SUCCESS_LINGER_MS);
+    } else if (status.status === 'failed') {
+      stopPolling(songId);
+    }
+  }));
 }
 
 /**

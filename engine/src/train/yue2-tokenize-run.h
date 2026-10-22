@@ -127,6 +127,8 @@ struct Yue2TokenizeArgs {
     std::string decode = "auto";    // auto | ffmpeg
     int         limit  = 0;         // --limit N, debug: first N matching sources
     bool        force  = false;     // --force, re-encode sources that already have codes
+    bool        dump_mert = false;  // --dump-mert, also write codes/<stem>.mert.f16: the head's
+                                    // instance-normed [T25, 1024] input, for head-training experiments
 };
 
 // ── Small helpers ──────────────────────────────────────────────────────────
@@ -571,6 +573,15 @@ static int yue2_tokenize_run(const Yue2TokenizeArgs & a) {
             }
             s.T25 = res.T25;
             total_encode_ms += res.total_ms;
+            if (a.dump_mert) {
+                std::string f16(res.feat.size() * sizeof(ggml_fp16_t), '\0');
+                ggml_fp32_to_fp16_row(res.feat.data(), (ggml_fp16_t *) f16.data(), (int64_t) res.feat.size());
+                const std::string fp = join_path(out_dir, "codes/" + s.stem + ".mert.f16");
+                if (!pm_write_atomic(fp, f16)) {
+                    fprintf(stderr, "[yue2-tokenize] %zu/%zu WARN %s: cannot write %s\n", pi + 1, picked.size(),
+                            s.name.c_str(), fp.c_str());
+                }
+            }
 
             // ── the alignment resize (see the header) ──
             const int64_t delta = s.T25 - s.frames;

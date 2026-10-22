@@ -14,6 +14,11 @@ enum class Status : int { success = 0, invalid_argument = 1, cuda_error = 2 };
 Status forward_chunk(const float *adapted, const float *base, const uint32_t *targets, float *gradient,
                      float *per_ce, float *per_kl, std::size_t position_offset, std::size_t position_count,
                      std::size_t total_positions, std::size_t vocab, float kl_weight, cudaStream_t stream);
+// The same with BF16 logits (BF16-rounded values) and a BF16 gradient, each
+// gradient element rounded to nearest even from the F32 value above.
+Status forward_chunk_bf16(const void *adapted, const void *base, const uint32_t *targets, void *gradient,
+                          float *per_ce, float *per_kl, std::size_t offset, std::size_t count,
+                          std::size_t total_positions, std::size_t vocab, float kl_weight, cudaStream_t stream);
 Status reduce(const float *per_ce, const float *per_kl, std::size_t total_positions,
               float *ce, float *kl, cudaStream_t stream);
 const char *status_string(Status status);

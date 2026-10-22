@@ -8,6 +8,8 @@ import type { Router, Request, Response } from 'express';
 import * as db from '../../db/lireekDb.js';
 import * as genius from '../../services/lireek/geniusService.js';
 import { exportGeneration } from '../../services/lireek/exportService.js';
+import { updateAdapterReferences } from '../../services/lireek/adapterReferences.js';
+import { config } from '../../config.js';
 
 /** Safely extract a route param as string (Express 5 types params as string | string[]) */
 function param(req: Request, name: string): string {
@@ -476,6 +478,14 @@ export function registerCrudRoutes(router: Router): void {
   });
 
   // ── Album Presets ───────────────────────────────────────────────────────────
+
+  router.post('/presets/update-adapter-references', (_req: Request, res: Response) => {
+    try {
+      res.json(updateAdapterReferences(db.getLireekDb(), config.aceServer.adapters));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
 
   router.get('/lyrics-sets/:id/preset', (req: Request, res: Response) => {
     try {

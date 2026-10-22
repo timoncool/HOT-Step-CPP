@@ -7,6 +7,16 @@
 
 import { create } from 'zustand';
 import * as trainingApi from '../services/trainingApi';
+import * as preparationApi from '../services/trainingPreparationApi';
+import type { Yue2PreparationPayload } from '../services/trainingPreparationApi';
+import { snapshotFor, type TrainingWorkerRef } from '../services/trainingOperations';
+import { queryClient } from '../queries/client';
+import { ACTIVE_POLL_MS } from '../queries/contract';
+import { resourceKey } from '../queries/keys';
+import { queryManager } from '../queries/invalidation';
+import { keysPlan, writeAndInvalidate } from '../queries/writes';
+import { cancelWorkerReads, TD, trainingQueries as tq, workerReads } from '../queries/training-data/queries';
+import { TRAINING_RECIPE_VERSION } from '../../../server/src/contracts/trainingRecipes';
 import { computeTrainingEta, type TrainingEta } from '../utils/trainingEta';
 import type {
   AuditionOptions,
@@ -23,6 +33,7 @@ import type {
   PreprocessOptions,
   PreprocessStatus,
   StartPipelineInput,
+  TrainingTarget,
   TrainDitEpoch,
   TrainDitOptions,
   TrainDitStatus,
@@ -42,19 +53,10 @@ import type {
  *  URL needs, and it lives on the event rather than on the preview. */
 export type TrainingPreviewRow = TrainingPreview & { run: string };
 
-/** The seven YuE2 stages, in the fixed order the chain runs them. Index + 1 is
- *  the stage NUMBER the UI shows and `yue2RunAllStage` carries. `sheet` sits
- *  between codes and stems: it is independent of both (SheetSage2 reads a
- *  source's own audio, not its codes or cursor spans) so its position here is
- *  ordering convenience, not a dependency. */
+/** Stage selection and display order for the server-owned YuE2 operation. */
 export const YUE2_STAGES = ['latents', 'codes', 'sheet', 'stems', 'align', 'nar', 'ar'] as const;
 export type Yue2StageKey = typeof YUE2_STAGES[number];
-/** Which stages a run is allowed to perform. A stage that is off is not
- *  merely skipped when already done — it is never started, even if its output
- *  is missing, which is what makes "just re-train the AR half" expressible.
- *  The chain does NOT reorder or infer dependencies: unticking a stage a later
- *  one needs is a real way to make that later stage fail, and the wizard says
- *  so rather than silently ticking it back on. */
+/** A stage that is off is never started, even if its output is missing. */
 export type Yue2StageSet = Record<Yue2StageKey, boolean>;
 export const YUE2_ALL_STAGES: Yue2StageSet =
   { latents: true, codes: true, sheet: true, stems: true, align: true, nar: true, ar: true };
@@ -117,6 +119,8 @@ let trainLmSeq = 0;
 // Same two devices for train-dit.
 let lastTrainDitQuery: { variantKey?: string; adapterName?: string } | undefined;
 let trainDitSeq = 0;
+// Bumped by every open and close: only the newest one may set the selection.
+let openSeq = 0;
 // The `vram` metric carries crop/layers exactly ONCE, before the first step, and
 // `trainDitLast` does not exist yet at that point — creating it there would put a
 // fabricated 0.0000 loss on the metric strip. Park them here instead and fold them
@@ -399,28 +403,12 @@ interface TrainingState {
    *  server's advisory warnings about a partial cache — the run has already
    *  started, so they are for the card to show, not to act on. */
   startYue2ArTrain(opts?: trainingApi.Yue2ArTrainRequest): Promise<string[]>;
-  /** YuE2 "Perform all stages": runs 1 latent cache, 2 codes, 3 lead sheets,
-   *  4 vocal stems, 5 lyric cursor spans, 6 NAR LoRA training, 7 AR LoRA
-   *  training in order, skipping any stage already complete. Stops the chain
-   *  the moment a stage ends in anything but 'done' — the failed job's own
-   *  error is left on `error`, there is no separate retry-from-here. Lives
-   *  here rather than in server/src/services/training/pipelineRunner.ts,
-   *  which is the ACE batch-import orchestrator hardcoded to a different
-   *  stage union: this chain survives SPA navigation (it is Zustand state)
-   *  but not a hard reload (nothing here is persisted). */
+  /** Start the durable Node-owned YuE2 stage chain and project its status. */
   runYue2AllStages(datasetId: string, trigger: string, stages?: Yue2StageSet): Promise<void>;
-  /** YuE2 Joint Training "Perform all stages": the same preparation chain as
-   *  the legacy stages 1-5 (latent cache, codes, lead sheets, plus vocal
-   *  stems and lyric alignment while lyric timing is enabled), skipping what
-   *  is already complete, then hands off to `startTraining` — the card's own
-   *  start, which builds the request from the form the user configured (the
-   *  form belongs to the card, not to this chain). A returned jobId is
-   *  adopted into `activeJob` and polled like every other stage. */
-  runYue2JointStages(
-    datasetId: string,
-    lyricTiming: boolean,
-    startTraining: (() => Promise<string | null>) | null,
-  ): Promise<void>;
+  /** Start durable joint preparation. With `jointOverrides` (the card's
+   *  captured form) the server chain ends in joint training from that
+   *  snapshot; without them it only prepares. */
+  runYue2JointStages(datasetId: string, lyricTiming: boolean, jointOverrides?: Record<string, unknown>): Promise<void>;
   loadTrainDitStatus(q?: { variantKey?: string; adapterName?: string }): Promise<void>;
   startTrainDit(opts: TrainDitOptions): Promise<void>;
   loadAuditions(): Promise<void>;
@@ -532,81 +520,68 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   setRefineNarJob: (refineNarJob) => set({ refineNarJob }),
   setStep: (step) => set({ step }),
 
-  closeDataset: () => set({
-    selectedDatasetId: null,
-    detail: null,
-    samplesById: {},
-    sampleOrder: [],
-    activeJob: null,
-    jobLog: [],
-    // Variant cards are per-dataset; keeping them would attribute one dataset's
-    // caches to the next one opened.
-    preprocessStatus: null,
-    preprocessLoading: false,
-    // Same reasoning: the adapter dir is keyed on the dataset slug, so B would
-    // otherwise render A's trained-adapter card.
-    trainLmStatus: null,
-    trainLmLoading: false,
-    trainLmEpochs: [],
-    trainLmLast: null,
-    mm3Live: null,
-    yue2Live: null,
-    yue2ArLive: null,
-    yue2ArEvalSeries: [],
-    trainEvalSeries: [],
-    trainLmSkippedLong: 0,
-    trainLmVram: null,
-    trainDitStatus: null,
-    trainDitLoading: false,
-    trainDitEpochs: [],
-    trainDitLast: null,
-    ...blankTrainSeries(),
-    // Previews are per-dataset (and their URLs point at that dataset's files),
-    // so carrying them over would attribute A's auditions to B.
-    auditions: [],
-    auditionRunning: false,
-    auditionError: null,
-    samplePreviews: {},
-    samplePreviewSources: {},
-    samplePreviewPending: {},
-    samplePreviewErrors: {},
-    selectedSampleIds: new Set<string>(),
-    openSampleId: null,
-    pendingEdits: {},
-    savingSampleIds: new Set<string>(),
-    saveError: null,
-    // Leaving a dataset must not carry its error back to the list, where
-    // TrainingStudio would read it as a fatal load failure.
-    error: null,
-    step: 'label',
-  }),
+  closeDataset: () => {
+    ++openSeq;
+    set({
+      selectedDatasetId: null,
+      detail: null,
+      samplesById: {},
+      sampleOrder: [],
+      activeJob: null,
+      jobLog: [],
+      // Variant cards, adapter cards and previews are per-dataset; keeping them
+      // would attribute one dataset's caches and runs to the next one opened.
+      ...blankDatasetRuns(),
+      selectedSampleIds: new Set<string>(),
+      openSampleId: null,
+      pendingEdits: {},
+      savingSampleIds: new Set<string>(),
+      saveError: null,
+      // Leaving a dataset must not carry its error back to the list, where
+      // TrainingStudio would read it as a fatal load failure.
+      error: null,
+      step: 'label',
+    });
+  },
 
   loadCapabilities: async () => {
+    const worker = get().trainingWorker;
     try {
-      const capabilities = await trainingApi.getCapabilities();
-      set({ capabilities });
+      // Cached for staleTime: every panel asks on mount, and they share one read.
+      const capabilities = await queryClient.query(tq.capabilities(worker));
+      if (get().trainingWorker === worker) set({ capabilities });
     } catch (err) {
       // Capabilities are advisory — a failure must never blank the studio.
+      if (get().trainingWorker !== worker) return;
       console.warn('[Training] capabilities failed:', errMessage(err));
       set({ capabilities: null });
     }
   },
 
   loadDatasets: async () => {
+    const worker = get().trainingWorker;
     set({ loading: true, error: null });
     try {
-      const datasets = await trainingApi.listDatasets();
-      set({ datasets, loading: false });
+      const datasets = await queryClient.query(tq.datasets(worker));
+      // A list read for the worker the studio just left belongs to that
+      // worker's cache entry, never to this one's store.
+      if (get().trainingWorker === worker) set({ datasets, loading: false });
     } catch (err) {
-      set({ error: errMessage(err), loading: false });
+      if (get().trainingWorker === worker) set({ error: errMessage(err), loading: false });
     }
   },
 
   openDataset: async (id) => {
+    const worker = get().trainingWorker;
+    const seq = ++openSeq;
+    // The newest open (or a close) owns the selection; an older read that
+    // answers late must not put its dataset back on screen.
+    const superseded = () => seq !== openSeq || get().trainingWorker !== worker;
     const isSwitch = get().selectedDatasetId !== id;
     set({ loading: true, error: null });
     try {
-      const detail = await trainingApi.getDataset(id);
+      const detail = await queryClient.query(tq.dataset(worker, id));
+      if (superseded()) return;
       const { byId, order } = indexSamples(detail.samples);
       set({
         detail,
@@ -620,52 +595,39 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
               selectedSampleIds: new Set<string>(),
               openSampleId: null,
               pendingEdits: {},
+              // A save still in flight belongs to the dataset being left.
+              savingSampleIds: new Set<string>(),
+              saveError: null,
               jobLog: [],
               // Per-dataset, exactly like closeDataset. The Preprocess panel's
               // own picker calls openDataset(), so without this A's variant
               // cards stay rendered under B — and Delete would then post B's id
               // with A's variantKey (identical keys across datasets, since the
               // key is just the DiT base name) and rm -rf the wrong cache.
-              preprocessStatus: null,
-              preprocessLoading: false,
-              trainLmStatus: null,
-              trainLmLoading: false,
-              trainLmEpochs: [],
-              trainLmLast: null,
-              mm3Live: null,
-              yue2Live: null,
-              yue2ArLive: null,
-              yue2ArEvalSeries: [],
-              trainEvalSeries: [],
-              trainLmSkippedLong: 0,
-              trainLmVram: null,
-              trainDitStatus: null,
-              trainDitLoading: false,
-              trainDitEpochs: [],
-              trainDitLast: null,
-              ...blankTrainSeries(),
-              auditions: [],
-              auditionRunning: false,
-              auditionError: null,
-              samplePreviews: {},
-              samplePreviewSources: {},
-              samplePreviewPending: {},
-              samplePreviewErrors: {},
+              ...blankDatasetRuns(),
             }
           : {}),
       });
       if (detail.activeJobId) {
-        try { set({ activeJob: await trainingApi.getJob(detail.activeJobId) }); } catch { /* job may have just ended */ }
+        try {
+          const job = await queryClient.query(tq.job(worker, detail.activeJobId));
+          if (!superseded()) set({ activeJob: job });
+        } catch { /* job may have just ended */ }
       } else if (isSwitch) {
         set({ activeJob: null });
       }
     } catch (err) {
-      set({ error: errMessage(err), loading: false });
+      if (!superseded()) set({ error: errMessage(err), loading: false });
     }
   },
 
   createDataset: async (input) => {
-    const detail = await trainingApi.createDataset(input);
+    const worker = get().trainingWorker;
+    const detail = await writeAndInvalidate(queryClient, () => trainingApi.createDataset(input, { worker }),
+      keysPlan(resourceKey(TD.datasets, { worker })));
+    queryClient.setQueryData(tq.dataset(worker, detail.id).queryKey, detail);
+    if (get().trainingWorker !== worker) return detail.id;
+    ++openSeq;
     const { byId, order } = indexSamples(detail.samples);
     set({
       detail,
@@ -684,36 +646,49 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   },
 
   patchDataset: async (patch) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) return;
     try {
-      const summary = await trainingApi.patchDataset(id, patch);
+      const summary = await writeAndInvalidate(queryClient, () => trainingApi.patchDataset(id, patch, { worker }),
+        keysPlan(resourceKey(TD.dataset, { worker }, id), resourceKey(TD.datasets, { worker })));
+      // The cache is updated for the scope the rename was made in, whatever
+      // is selected now; the store only while it still shows that worker.
+      queryClient.setQueryData(tq.dataset(worker, id).queryKey, d => d && { ...d, ...summary });
+      queryClient.setQueryData(tq.datasets(worker).queryKey, list => list?.map(d => (d.id === id ? { ...d, ...summary } : d)));
+      if (get().trainingWorker !== worker) return;
       const detail = get().detail;
       set({
-        detail: detail ? { ...detail, ...summary } : detail,
+        detail: detail && detail.id === id ? { ...detail, ...summary } : detail,
         datasets: get().datasets.map(d => (d.id === id ? { ...d, ...summary } : d)),
       });
     } catch (err) {
-      set({ error: errMessage(err) });
+      if (isCurrent(get, worker, id)) set({ error: errMessage(err) });
     }
   },
 
   deleteDataset: async (id) => {
-    await trainingApi.deleteDataset(id);
+    const worker = get().trainingWorker;
+    await writeAndInvalidate(queryClient, () => trainingApi.deleteDataset(id, { worker }),
+      keysPlan(resourceKey(TD.datasets, { worker })));
+    queryClient.removeQueries({ queryKey: resourceKey(TD.dataset, { worker }, id) });
+    if (get().trainingWorker !== worker) return;
     if (get().selectedDatasetId === id) get().closeDataset();
     await get().loadDatasets();
   },
 
   rescan: async () => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) return;
     set({ loading: true, error: null });
     try {
-      const detail = await trainingApi.rescanDataset(id);
+      const detail = await writeAndInvalidate(queryClient, () => trainingApi.rescanDataset(id, { worker }),
+        keysPlan(resourceKey(TD.datasets, { worker })));
+      queryClient.setQueryData(tq.dataset(worker, id).queryKey, detail);
+      if (!isCurrent(get, worker, id)) { set({ loading: false }); return; }
       const { byId, order } = indexSamples(detail.samples);
       set({ detail, samplesById: byId, sampleOrder: order, loading: false });
     } catch (err) {
-      set({ error: errMessage(err), loading: false });
+      set(isCurrent(get, worker, id) ? { error: errMessage(err), loading: false } : { loading: false });
     }
   },
 
@@ -741,7 +716,7 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   },
 
   toggleExcluded: async (sampleId, excluded) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     const sample = get().samplesById[sampleId];
     if (!id || !sample) return;
 
@@ -750,11 +725,14 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     // allows an exclude-only change on a missing file. Route it there.
     if (sample.fileMissing) {
       try {
-        const result = await trainingApi.bulkSetSamples(id, [sampleId], { excluded });
+        const result = await writeAndInvalidate(queryClient, () => trainingApi.bulkSetSamples(id, [sampleId], { excluded }, { worker }),
+          keysPlan(resourceKey(TD.dataset, { worker }, id)));
         if (result.failed.length > 0) throw new Error(result.failed[0].error);
+        cacheSample(worker, id, { ...sample, excluded });
+        if (!isCurrent(get, worker, id)) return;
         set({ samplesById: { ...get().samplesById, [sampleId]: { ...sample, excluded } }, saveError: null });
       } catch (err) {
-        set({ saveError: { sampleId, message: errMessage(err) } });
+        if (isCurrent(get, worker, id)) set({ saveError: { sampleId, message: errMessage(err) } });
       }
       return;
     }
@@ -786,14 +764,15 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   clearSaveError: () => set({ saveError: null }),
 
   bulkSet: async (bulk) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     const ids = Array.from(get().selectedSampleIds);
     if (!id || ids.length === 0) return;
     try {
-      await trainingApi.bulkSetSamples(id, ids, bulk);
-      await get().openDataset(id);
+      await writeAndInvalidate(queryClient, () => trainingApi.bulkSetSamples(id, ids, bulk, { worker }),
+        keysPlan(resourceKey(TD.dataset, { worker }, id)));
+      if (isCurrent(get, worker, id)) await get().openDataset(id);
     } catch (err) {
-      set({ saveError: { sampleId: '', message: errMessage(err) } });
+      if (isCurrent(get, worker, id)) set({ saveError: { sampleId: '', message: errMessage(err) } });
     }
   },
 
@@ -808,112 +787,49 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   clearSelection: () => set({ selectedSampleIds: new Set<string>() }),
   setOpenSampleId: (sampleId) => set({ openSampleId: sampleId }),
 
-  startLabel: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startLabel(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startGenius: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startGenius(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startCaption: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startCaption(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startYue2Caption: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Caption(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startBuild: async (outputPath) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startBuild(id, outputPath);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
+  startLabel: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startLabel(id, opts, t)); },
+  startGenius: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startGenius(id, opts, t)); },
+  startCaption: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startCaption(id, opts, t)); },
+  startYue2Caption: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Caption(id, opts, t)); },
+  startBuild: async (outputPath) => { await startJob(set, get, (id, t) => trainingApi.startBuild(id, outputPath, t)); },
 
   loadPreprocessStatus: async () => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) { set({ preprocessStatus: null }); return; }
     set({ preprocessLoading: true });
     try {
-      const preprocessStatus = await trainingApi.getPreprocessStatus(id);
+      const preprocessStatus = await queryClient.query(tq.preprocessStatus(worker, id));
       // A slow request must not overwrite a newer dataset's status — but it must
       // still clear the spinner, or a stale response landing last leaves it
       // spinning forever next to the "Tensor caches" heading.
-      if (get().selectedDatasetId !== id) { set({ preprocessLoading: false }); return; }
+      if (!isCurrent(get, worker, id)) { set({ preprocessLoading: false }); return; }
       set({ preprocessStatus, preprocessLoading: false });
     } catch (err) {
       // Advisory — a failed status read must never blank the panel's controls,
       // but it must not leave ANOTHER dataset's cards on screen either.
       console.warn('[Training] preprocess status failed:', errMessage(err));
-      if (get().selectedDatasetId === id) set({ preprocessStatus: null, preprocessLoading: false });
-      else set({ preprocessLoading: false });
+      set(isCurrent(get, worker, id) ? { preprocessStatus: null, preprocessLoading: false } : { preprocessLoading: false });
     }
   },
 
-  startPreprocess: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startPreprocess(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
+  startPreprocess: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startPreprocess(id, opts, t)); },
 
   deletePreprocessVariant: async (variantKey) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) return;
     try {
-      await trainingApi.deletePreprocessVariant(id, variantKey);
+      await writeAndInvalidate(queryClient, () => trainingApi.deletePreprocessVariant(id, variantKey, { worker }),
+        keysPlan(resourceKey(TD.preprocessStatus, { worker }, id)));
+      if (!isCurrent(get, worker, id)) return;
       set({ error: null });
       await get().loadPreprocessStatus();
     } catch (err) {
-      set({ error: errMessage(err) });
+      if (isCurrent(get, worker, id)) set({ error: errMessage(err) });
     }
   },
 
   loadTrainLmStatus: async (q) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) { set({ trainLmStatus: null }); return; }
     // No argument = "refresh whatever the panel last asked for" (see
     // lastTrainLmQuery), not "read the 0.6B/<slug> directory".
@@ -922,221 +838,100 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     const seq = ++trainLmSeq;
     set({ trainLmLoading: true });
     try {
-      const trainLmStatus = await trainingApi.getTrainLmStatus(id, query);
+      const trainLmStatus = await queryClient.query(tq.trainLmStatus(worker, id, query));
       // A superseded request must not win: a newer one is in flight and owns the
       // spinner. A slow request must not overwrite a newer dataset's status, but
       // it must still clear the spinner — same rule as loadPreprocessStatus.
       if (seq !== trainLmSeq) return;
-      if (get().selectedDatasetId !== id) { set({ trainLmLoading: false }); return; }
+      if (!isCurrent(get, worker, id)) { set({ trainLmLoading: false }); return; }
       set({ trainLmStatus, trainLmLoading: false });
     } catch (err) {
       // Advisory: a failed status read must never blank the panel's controls.
       console.warn('[Training] train-lm status failed:', errMessage(err));
       if (seq !== trainLmSeq) return;
-      if (get().selectedDatasetId === id) set({ trainLmStatus: null, trainLmLoading: false });
-      else set({ trainLmLoading: false });
+      set(isCurrent(get, worker, id) ? { trainLmStatus: null, trainLmLoading: false } : { trainLmLoading: false });
     }
   },
 
   startMm3Codes: async (opts?: { launder?: boolean }) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startMm3Codes(id, opts?.launder ? { launder: true } : {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+    await startJob(set, get, (id, t) => trainingApi.startMm3Codes(id, opts?.launder ? { launder: true } : {}, t));
   },
 
+  // MM3 reports STEPS, not epochs, so the epoch series stays empty and the
+  // chart draws the step layer alone. blankTrainSeries() clears whatever a
+  // previous ACE run left behind. The target line is drawn immediately rather
+  // than waiting for the engine's own announcement, which arrives a model
+  // load later.
   startMm3TrainLm: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startMm3TrainLm(id, opts);
-      // MM3 reports STEPS, not epochs, so the epoch series stays empty and the
-      // chart draws the step layer alone. blankTrainSeries() clears whatever a
-      // previous ACE run left behind.
-      set({ jobLog: [], error: null, ...blankTrainSeries(), trainMaxEpochs: 0,
-        // Drawn immediately rather than waiting for the engine's own
-        // announcement, which arrives a model load later.
-        trainTargetLoss: opts.stopMode === 'loss' ? (opts.targetLoss ?? 0) : 0 });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+    await startJob(set, get, (id, t) => trainingApi.startMm3TrainLm(id, opts, t), () => ({
+      ...blankTrainSeries(), trainMaxEpochs: 0,
+      trainTargetLoss: opts.stopMode === 'loss' ? (opts.targetLoss ?? 0) : 0 }));
   },
 
+  // The chart starts empty and refills from the resumed run's own step events,
+  // which carry on from where it left off — so the curve picks up at step N
+  // rather than redrawing the whole history.
   resumeMm3TrainLm: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.resumeMm3TrainLm(id, opts);
-      // The chart starts empty and refills from the resumed run's own step
-      // events, which carry on from where it left off — so the curve picks up
-      // at step N rather than redrawing the whole history.
-      set({ jobLog: [], error: null, ...blankTrainSeries(), trainMaxEpochs: 0,
-        trainTargetLoss: opts.stopMode === 'loss' ? (opts.targetLoss ?? 0) : 0 });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+    await startJob(set, get, (id, t) => trainingApi.resumeMm3TrainLm(id, opts, t), () => ({
+      ...blankTrainSeries(), trainMaxEpochs: 0,
+      trainTargetLoss: opts.stopMode === 'loss' ? (opts.targetLoss ?? 0) : 0 }));
   },
 
-  startYue2Preprocess: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Preprocess(id, opts ?? {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
+  startYue2Preprocess: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Preprocess(id, opts ?? {}, t)); },
 
+  // Steps, not epochs — same as MM3 — so the epoch series stays empty and the
+  // chart draws the step layer alone. There is no target-loss mode in the YuE2
+  // trainer, so no target line is seeded.
   startYue2Train: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Train(id, opts);
-      // Steps, not epochs — same as MM3 — so the epoch series stays empty and
-      // the chart draws the step layer alone. There is no target-loss mode in
-      // the YuE2 trainer, so no target line is seeded.
-      set({ jobLog: [], error: null, ...blankTrainSeries(), trainMaxEpochs: 0,
-        trainTargetLoss: 0, yue2Live: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+    await startJob(set, get, (id, t) => trainingApi.startYue2Train(id, opts, t), () => ({
+      ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0, yue2Live: null }));
   },
 
-  startYue2Tokenize: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Tokenize(id, opts ?? {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
+  startYue2Tokenize: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Tokenize(id, opts ?? {}, t)); },
+  startYue2Sheet: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Sheet(id, opts ?? {}, t)); },
+  startYue2Stems: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Stems(id, opts ?? {}, t)); },
+  startYue2Align: async (opts) => { await startJob(set, get, (id, t) => trainingApi.startYue2Align(id, opts ?? {}, t)); },
 
-  startYue2Sheet: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Sheet(id, opts ?? {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startYue2Stems: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Stems(id, opts ?? {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  startYue2Align: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startYue2Align(id, opts ?? {});
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
+  // Same chart reset as startYue2Train.
   startYue2ArTrain: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return [];
-    try {
-      const { jobId, warnings } = await trainingApi.startYue2ArTrain(id, opts ?? {});
-      // Steps, not epochs, so the epoch series stays empty and the chart draws
-      // the step layer alone. There is no target-loss mode in the YuE2 trainer,
-      // so no target line is seeded.
-      set({ jobLog: [], error: null, ...blankTrainSeries(), trainMaxEpochs: 0,
-        trainTargetLoss: 0, yue2ArLive: null, yue2ArEvalSeries: [] });
-      await adoptJob(set, get, jobId);
-      return warnings ?? [];
-    } catch (err) {
-      set({ error: errMessage(err) });
-      return [];
-    }
+    const res = await startJob(set, get, (id, t) => trainingApi.startYue2ArTrain(id, opts ?? {}, t), () => ({
+      ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0, yue2ArLive: null, yue2ArEvalSeries: [] }));
+    return res?.warnings ?? [];
   },
 
   runYue2AllStages: async (datasetId, trigger, stages) => {
-    if (get().yue2RunAllActive) return;
-    const running = get().activeJob;
-    if (running && (running.status === 'queued' || running.status === 'running')) {
-      set({ error: 'A job is already running for this dataset — wait for it to finish first.' });
-      return;
-    }
-    set({ yue2RunAllActive: true, yue2RunAllStage: null, error: null });
-    try {
-      const result = await runYue2StageChain(
-        set, get, datasetId, trigger, stages ?? YUE2_ALL_STAGES,
-        n => set({ yue2RunAllStage: n }),
-      );
-      if (!result.ok) set({ error: result.error });
-    } finally {
-      set({ yue2RunAllActive: false, yue2RunAllStage: null });
-    }
+    const enabled = stages ?? YUE2_ALL_STAGES;
+    const selected = YUE2_STAGES.filter(stage => enabled[stage]);
+    await runPreparation(set, get, datasetId, () => ({
+      mode: selected.some(s => s === 'nar' || s === 'ar') ? 'train-after-preparation' : 'prepare-only',
+      stages: selected, trigger, lyricTiming: true,
+      recipes: {
+        ...(enabled.nar ? { nar: { version: TRAINING_RECIPE_VERSION, overrides: {} } } : {}),
+        ...(enabled.ar ? { ar: { version: TRAINING_RECIPE_VERSION, overrides: {} } } : {}),
+      },
+    }), selected.length > 0);
   },
 
-  runYue2JointStages: async (datasetId, lyricTiming, startTraining) => {
-    if (get().yue2RunAllActive) return;
-    const running = get().activeJob;
-    if (running && (running.status === 'queued' || running.status === 'running')) {
-      set({ error: 'A job is already running for this dataset — wait for it to finish first.' });
-      return;
-    }
-    set({ yue2RunAllActive: true, yue2RunAllStage: null, error: null });
-    try {
-      const result = await runYue2JointChain(
-        set, get, datasetId, lyricTiming,
-        n => set({ yue2RunAllStage: n }),
-        startTraining,
-      );
-      if (!result.ok) set({ error: result.error });
-    } finally {
-      set({ yue2RunAllActive: false, yue2RunAllStage: null });
-    }
+  runYue2JointStages: async (datasetId, lyricTiming, jointOverrides) => {
+    const stages: Yue2PreparationPayload['stages'] = lyricTiming
+      ? ['latents', 'codes', 'sheet', 'stems', 'align'] : ['latents', 'codes', 'sheet'];
+    if (jointOverrides) stages.push('joint');
+    await runPreparation(set, get, datasetId, () => ({
+      mode: jointOverrides ? 'train-after-preparation' : 'prepare-only', stages, trigger: '', lyricTiming,
+      recipes: jointOverrides ? { joint: { version: TRAINING_RECIPE_VERSION, overrides: jointOverrides } } : {},
+    }));
   },
 
+  // Seeded from the options the run actually started with; the engine's own
+  // `epochs` field confirms the cap on the first epoch metric.
   startTrainLm: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startTrainLm(id, opts);
-      set({ jobLog: [], error: null, trainLmEpochs: [], trainLmLast: null, trainLmSkippedLong: 0,
-        trainLmVram: null,
-        // Seeded from the options the run actually started with; the engine's
-        // own `epochs` field confirms the cap on the first epoch metric.
-        ...blankTrainSeries(),
-        trainTargetLoss: opts.targetLoss ?? 0,
-        trainMaxEpochs: opts.epochs ?? 0 });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+    await startJob(set, get, (id, t) => trainingApi.startTrainLm(id, opts, t), () => ({
+      trainLmEpochs: [], trainLmLast: null, trainLmSkippedLong: 0, trainLmVram: null,
+      ...blankTrainSeries(), trainTargetLoss: opts.targetLoss ?? 0, trainMaxEpochs: opts.epochs ?? 0 }));
   },
 
   loadTrainDitStatus: async (q) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) { set({ trainDitStatus: null }); return; }
     // No argument = "refresh whatever the panel last asked for", not "read the
     // <slug> directory" — same rule as loadTrainLmStatus.
@@ -1145,85 +940,71 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     const seq = ++trainDitSeq;
     set({ trainDitLoading: true });
     try {
-      const trainDitStatus = await trainingApi.getTrainDitStatus(id, query);
+      const trainDitStatus = await queryClient.query(tq.trainDitStatus(worker, id, query));
       if (seq !== trainDitSeq) return;
-      if (get().selectedDatasetId !== id) { set({ trainDitLoading: false }); return; }
+      if (!isCurrent(get, worker, id)) { set({ trainDitLoading: false }); return; }
       set({ trainDitStatus, trainDitLoading: false });
     } catch (err) {
       // Advisory: a failed status read must never blank the panel's controls.
       console.warn('[Training] train-dit status failed:', errMessage(err));
       if (seq !== trainDitSeq) return;
-      if (get().selectedDatasetId === id) set({ trainDitStatus: null, trainDitLoading: false });
-      else set({ trainDitLoading: false });
+      set(isCurrent(get, worker, id) ? { trainDitStatus: null, trainDitLoading: false } : { trainDitLoading: false });
     }
   },
 
   startTrainDit: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
-    try {
-      const { jobId } = await trainingApi.startTrainDit(id, opts);
+    await startJob(set, get, (id, t) => trainingApi.startTrainDit(id, opts, t), () => {
       ditVram = { crop: 0, layers: 0 };
-      set({ jobLog: [], error: null, trainDitEpochs: [], trainDitLast: null,
-        ...blankTrainSeries(),
-        trainTargetLoss: opts.targetLoss ?? 0,
-        trainMaxEpochs: opts.epochs ?? 0 });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
+      return { trainDitEpochs: [], trainDitLast: null, ...blankTrainSeries(),
+        trainTargetLoss: opts.targetLoss ?? 0, trainMaxEpochs: opts.epochs ?? 0 };
+    });
   },
 
   loadAuditions: async () => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) { set({ auditions: [] }); return; }
     try {
-      const res = await trainingApi.getAuditions(id);
+      const res = await queryClient.query(tq.auditions(worker, id));
       // A slow read must not attribute one dataset's previews to the next.
-      if (get().selectedDatasetId !== id) return;
+      if (!isCurrent(get, worker, id)) return;
       set({ auditions: res.previews });
     } catch (err) {
       // Advisory — the history list is not worth blanking the card for. The
       // route does not exist until the server workstream lands, and a 404 here
       // must leave the Run button perfectly usable.
       console.warn('[Training] audition list failed:', errMessage(err));
-      if (get().selectedDatasetId === id) set({ auditions: [] });
+      if (isCurrent(get, worker, id)) set({ auditions: [] });
     }
   },
 
+  // The audition's own errors belong on the audition card — `error` is the
+  // panel-wide banner and would outlive the card the user is looking at.
   startAudition: async (opts) => {
-    const id = get().selectedDatasetId;
-    if (!id) return;
+    if (!get().selectedDatasetId) return;
     set({ auditionRunning: true, auditionError: null });
     try {
-      const { jobId } = await trainingApi.startAudition(id, opts);
-      set({ jobLog: [], error: null });
-      await adoptJob(set, get, jobId);
-    } catch (err) {
-      // The audition's own errors belong on the audition card — `error` is the
-      // panel-wide banner and would outlive the card the user is looking at.
-      set({ auditionError: errMessage(err) });
+      await startJob(set, get, (id, t) => trainingApi.startAudition(id, opts, t), undefined, 'auditionError');
     } finally {
       set({ auditionRunning: false });
     }
   },
 
   auditionSample: async (sampleId) => {
-    const id = get().selectedDatasetId;
+    const { trainingWorker: worker, selectedDatasetId: id } = get();
     if (!id) return;
     set({
       samplePreviewPending: { ...get().samplePreviewPending, [sampleId]: true },
       samplePreviewErrors: { ...get().samplePreviewErrors, [sampleId]: '' },
     });
     try {
-      const res = await trainingApi.auditionSample(id, sampleId);
-      if (get().selectedDatasetId !== id) return;
+      const res = await trainingApi.auditionSample(id, sampleId, undefined, { worker });
+      if (!isCurrent(get, worker, id)) return;
       set({
         samplePreviews: { ...get().samplePreviews, [sampleId]: res.preview },
         samplePreviewSources: { ...get().samplePreviewSources, [sampleId]: res.source },
       });
     } catch (err) {
-      if (get().selectedDatasetId !== id) return;
+      if (!isCurrent(get, worker, id)) return;
       set({ samplePreviewErrors: { ...get().samplePreviewErrors, [sampleId]: errMessage(err) } });
     } finally {
       const pending = { ...get().samplePreviewPending };
@@ -1233,24 +1014,33 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   },
 
   cancelJob: async () => {
-    const job = get().activeJob;
+    const { trainingWorker: worker, activeJob: job } = get();
     if (!job) return;
     try {
-      await trainingApi.cancelJob(job.id);
+      await writeAndInvalidate(queryClient, () => trainingApi.cancelJob(job.id, { worker }),
+        keysPlan(resourceKey(TD.job, { worker }, job.id)));
+      if (get().trainingWorker !== worker || get().activeJob?.id !== job.id) return;
       set({ activeJob: { ...job, status: 'cancelled' } });
       // That status change unmounts the EventSource, so the server's terminal
       // `status` frame may never arrive — run the authoritative refresh here.
       refreshAfterJob(get, job.id);
     } catch (err) {
-      set({ error: errMessage(err) });
+      if (get().trainingWorker === worker) set({ error: errMessage(err) });
     }
   },
 
   loadPipelines: async () => {
+    const worker = get().trainingWorker;
     set({ pipelinesLoading: true });
     try {
-      const pipelines = await trainingApi.listPipelines();
-      set({ pipelines, pipelinesLoading: false });
+      // Read by the Monitor's own interval poll: fresh for one poll period
+      // only, so a mount and a tick share a read but the poll never stalls.
+      const pipelines = await queryClient.query({ ...tq.pipelines(worker), staleTime: ACTIVE_POLL_MS });
+      // A stage that moved changed some dataset on this worker. Structural
+      // sharing keeps an unchanged list the same object. Not a write — the
+      // read itself detected the drift, so it goes straight to the manager.
+      if (pipelines !== get().pipelines) void queryManager.keys(queryClient, resourceKey(TD.datasets, { worker }));
+      set(get().trainingWorker === worker ? { pipelines, pipelinesLoading: false } : { pipelinesLoading: false });
     } catch (err) {
       // Advisory — a failed poll must never blank the monitor panel mid-run.
       console.warn('[Training] pipelines failed:', errMessage(err));
@@ -1261,67 +1051,54 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   setYue2BatchDraft: (ids) => set({ yue2BatchDraft: ids && ids.length ? ids : null }),
   setYue2BatchFollow: (follow) => set({ yue2BatchFollow: follow }),
   setTrainingWorker: async (name) => {
+    const old = get().trainingWorker;
     trainingApi.setTrainingWorker(name);
+    // Whatever the old worker still owes us would be dropped on arrival, so
+    // stop waiting for it. Its finished cache entries stay for a switch back.
+    if (old !== name) void cancelWorkerReads(queryClient, old);
     get().closeDataset();
-    set({ trainingWorker: name, phase: 'dataset', datasets: [], yue2Batches: [], yue2BatchDraft: null, error: null });
+    set({ trainingWorker: name, phase: 'dataset', datasets: [], capabilities: null, pipelines: [],
+      yue2Batches: [], yue2BatchDraft: null, error: null, loading: false });
     await Promise.all([get().loadCapabilities(), get().loadDatasets(), get().loadYue2Batches()]);
   },
   loadYue2Batches: async () => {
-    try { set({ yue2Batches: await trainingApi.listYue2Batches() }); }
-    catch (err) { console.warn('[Training] yue2 batches failed:', errMessage(err)); }
+    const worker = get().trainingWorker;
+    try {
+      // Polled by the batch panel every 3 s; same rule as loadPipelines.
+      const yue2Batches = await queryClient.query({ ...tq.yue2Batches(worker), staleTime: ACTIVE_POLL_MS });
+      if (get().trainingWorker === worker) set({ yue2Batches });
+    } catch (err) { console.warn('[Training] yue2 batches failed:', errMessage(err)); }
   },
   startYue2Batch: async (input) => {
-    const batch = await trainingApi.startYue2Batch(input);
-    set({ yue2BatchDraft: null });
-    await get().loadYue2Batches();
+    const worker = get().trainingWorker;
+    const batch = await writeAndInvalidate(queryClient, () => trainingApi.startYue2Batch(input, { worker }),
+      keysPlan(resourceKey(TD.yue2Batches, { worker })));
+    if (get().trainingWorker === worker) {
+      set({ yue2BatchDraft: null });
+      await get().loadYue2Batches();
+    }
     return batch;
   },
-  pauseYue2Batch: async (id) => {
-    try { await trainingApi.pauseYue2Batch(id); await get().loadYue2Batches(); } catch (err) { set({ error: errMessage(err) }); }
-  },
-  resumeYue2Batch: async (id) => {
-    try { await trainingApi.resumeYue2Batch(id); await get().loadYue2Batches(); } catch (err) { set({ error: errMessage(err) }); }
-  },
+  pauseYue2Batch: (id) => workerCommand(set, get, t => trainingApi.pauseYue2Batch(id, t), 'loadYue2Batches'),
+  resumeYue2Batch: (id) => workerCommand(set, get, t => trainingApi.resumeYue2Batch(id, t), 'loadYue2Batches'),
   addToYue2Batch: async (id, datasetIds) => {
-    await trainingApi.addToYue2Batch(id, datasetIds);
-    await get().loadYue2Batches();
+    const worker = get().trainingWorker;
+    await writeAndInvalidate(queryClient, () => trainingApi.addToYue2Batch(id, datasetIds, { worker }),
+      keysPlan(resourceKey(TD.yue2Batches, { worker })));
+    if (get().trainingWorker === worker) await get().loadYue2Batches();
   },
-  cancelYue2Batch: async (id) => {
-    try { await trainingApi.cancelYue2Batch(id); await get().loadYue2Batches(); } catch (err) { set({ error: errMessage(err) }); }
-  },
+  cancelYue2Batch: (id) => workerCommand(set, get, t => trainingApi.cancelYue2Batch(id, t), 'loadYue2Batches'),
 
   startPipeline: async (input) => {
-    const pipeline = await trainingApi.startPipeline(input);
-    await get().loadPipelines();
+    const worker = get().trainingWorker;
+    const pipeline = await writeAndInvalidate(queryClient, () => trainingApi.startPipeline(input, { worker }),
+      keysPlan(resourceKey(TD.pipelines, { worker })));
+    if (get().trainingWorker === worker) await get().loadPipelines();
     return pipeline;
   },
-
-  cancelPipeline: async (id) => {
-    try {
-      await trainingApi.cancelPipeline(id);
-      await get().loadPipelines();
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  pausePipeline: async (id) => {
-    try {
-      await trainingApi.pausePipeline(id);
-      await get().loadPipelines();
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
-
-  resumePipeline: async (id) => {
-    try {
-      await trainingApi.resumePipeline(id);
-      await get().loadPipelines();
-    } catch (err) {
-      set({ error: errMessage(err) });
-    }
-  },
+  cancelPipeline: (id) => workerCommand(set, get, t => trainingApi.cancelPipeline(id, t), 'loadPipelines'),
+  pausePipeline: (id) => workerCommand(set, get, t => trainingApi.pausePipeline(id, t), 'loadPipelines'),
+  resumePipeline: (id) => workerCommand(set, get, t => trainingApi.resumePipeline(id, t), 'loadPipelines'),
 
   applyStreamEvent: (ev) => {
     switch (ev.type) {
@@ -1384,6 +1161,8 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
           sampleOrder: order,
           pendingEdits: edits,
         });
+        const { trainingWorker, selectedDatasetId } = get();
+        if (selectedDatasetId) cacheSample(trainingWorker, selectedDatasetId, merged);
         break;
       }
 
@@ -1693,17 +1472,108 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
   },
 }));
 
+type SetState = (partial: Partial<TrainingState>) => void;
+type GetState = () => TrainingState;
+
+/** Replace one sample row in the cached detail of the scope it belongs to. */
+function cacheSample(worker: string | null, datasetId: string, sample: TrainingSample): void {
+  queryClient.setQueryData(tq.dataset(worker, datasetId).queryKey, d => {
+    if (!d) return d;
+    const known = d.samples.some(s => s.sampleId === sample.sampleId);
+    return { ...d, samples: known ? d.samples.map(s => (s.sampleId === sample.sampleId ? sample : s)) : [...d.samples, sample] };
+  });
+}
+
+/** The run-scoped slices of one dataset, blanked. Shared by close and by an
+ *  open that switches datasets. */
+function blankDatasetRuns() {
+  return {
+    preprocessStatus: null, preprocessLoading: false,
+    // The adapter dir is keyed on the dataset slug, so B would otherwise render
+    // A's trained-adapter card.
+    trainLmStatus: null, trainLmLoading: false, trainLmEpochs: [], trainLmLast: null,
+    mm3Live: null, yue2Live: null, yue2ArLive: null, yue2ArEvalSeries: [], trainEvalSeries: [],
+    trainLmSkippedLong: 0, trainLmVram: null,
+    trainDitStatus: null, trainDitLoading: false, trainDitEpochs: [], trainDitLast: null,
+    ...blankTrainSeries(),
+    // Previews are per-dataset (and their URLs point at that dataset's files).
+    auditions: [], auditionRunning: false, auditionError: null,
+    samplePreviews: {}, samplePreviewSources: {}, samplePreviewPending: {}, samplePreviewErrors: {},
+  } satisfies Partial<TrainingState>;
+}
+
+/** The worker and dataset a request was made for are still the ones on
+ *  screen. Every async write-back checks this: "Train on" or the open dataset
+ *  can change while a request is in flight, and its answer then belongs to
+ *  the old scope's cache entry only. */
+function isCurrent(get: GetState, worker: string | null, datasetId: string): boolean {
+  const s = get();
+  return s.trainingWorker === worker && s.selectedDatasetId === datasetId;
+}
+
+const workerRef = (worker: string | null): TrainingWorkerRef =>
+  worker ? { kind: 'remote', name: worker } : { kind: 'local' };
+
+/** Start a job on the open dataset of the captured worker and adopt it. The
+ *  job runs regardless; it is only adopted while its dataset is still open.
+ *  `reset` runs after the server accepted the job, never before. */
+async function startJob<R extends { jobId: string }>(
+  set: SetState, get: GetState,
+  call: (datasetId: string, target: TrainingTarget) => Promise<R>,
+  reset?: () => Partial<TrainingState>,
+  errorField: 'error' | 'auditionError' = 'error',
+): Promise<R | undefined> {
+  const { trainingWorker: worker, selectedDatasetId: id } = get();
+  if (!id) return undefined;
+  try {
+    // The write dirties the open dataset (it now has an active job) and the
+    // list (its row may show one).
+    const res = await writeAndInvalidate(queryClient, () => call(id, { worker }),
+      keysPlan(resourceKey(TD.dataset, { worker }, id), resourceKey(TD.datasets, { worker })));
+    if (!isCurrent(get, worker, id)) return res;
+    set({ jobLog: [], error: null, ...reset?.() });
+    await adoptJob(set, get, worker, id, res.jobId);
+    return res;
+  } catch (err) {
+    if (isCurrent(get, worker, id)) set({ [errorField]: errMessage(err) });
+    return undefined;
+  }
+}
+
+/** A pipeline or batch command on the captured worker, then a list refresh. */
+async function workerCommand(
+  set: SetState, get: GetState,
+  call: (target: TrainingTarget) => Promise<unknown>,
+  reload: 'loadPipelines' | 'loadYue2Batches',
+): Promise<void> {
+  const worker = get().trainingWorker;
+  try {
+    await writeAndInvalidate(queryClient, () => call({ worker }),
+      keysPlan(resourceKey(reload === 'loadPipelines' ? TD.pipelines : TD.yue2Batches, { worker })));
+    if (get().trainingWorker === worker) await get()[reload]();
+  } catch (err) {
+    if (get().trainingWorker === worker) set({ error: errMessage(err) });
+  }
+}
+
 /** Re-read the dataset once a job reaches a terminal state. Guarded: the SSE
  *  buffer is replayed on reconnect and cancel calls this too. */
-function refreshAfterJob(get: () => TrainingState, jobId: string): void {
+function refreshAfterJob(get: GetState, jobId: string): void {
   const id = get().selectedDatasetId;
   if (!id || refreshedJobs.has(jobId)) return;
   refreshedJobs.add(jobId);
+  // Everything a job can change on this worker is stale now: mounted readers
+  // refetch, the rest refetch when next asked.
+  void queryManager.filter(queryClient, workerReads(get().trainingWorker));
   void get().openDataset(id);
   void get().loadDatasets();
   // A finished train-lm job wrote (or failed to write) the adapter dir — the
   // done-state card reads that from disk, so re-read it here.
-  if (get().activeJob?.kind === 'train-lm') void get().loadTrainLmStatus();
+  if (get().activeJob?.kind === 'train-lm') {
+    void get().loadTrainLmStatus();
+    // ...and the adapter pickers list what is under adapters/lm.
+    void queryManager.keys(queryClient, resourceKey(TD.lmAdapters));
+  }
   // Same for the DiT adapter dir — the per-epoch export means even a cancelled
   // run usually leaves one on disk, so this refresh matters on every terminal
   // status, not just 'done'.
@@ -1719,318 +1589,84 @@ function refreshAfterJob(get: () => TrainingState, jobId: string): void {
  * immediate failure) can finish before this GET resolves — the stream is then
  * never opened, so the terminal refresh has to happen here instead.
  */
-async function adoptJob(
-  set: (partial: Partial<TrainingState>) => void,
-  get: () => TrainingState,
-  jobId: string,
-): Promise<void> {
-  const job = await trainingApi.getJob(jobId);
+async function adoptJob(set: SetState, get: GetState, worker: string | null, datasetId: string, jobId: string): Promise<void> {
+  const job = await queryClient.query(tq.job(worker, jobId));
+  if (!isCurrent(get, worker, datasetId)) return;
   set({ activeJob: job });
   if (job.status !== 'queued' && job.status !== 'running') refreshAfterJob(get, job.id);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => window.setTimeout(resolve, ms));
+/** Start the server-owned YuE2 preparation chain for a dataset on the
+ *  captured worker and follow it. One chain per studio at a time. */
+async function runPreparation(
+  set: SetState, get: GetState, datasetId: string,
+  payload: () => Yue2PreparationPayload, enabled = true,
+): Promise<void> {
+  if (get().yue2RunAllActive) return;
+  const running = get().activeJob;
+  if (running && (running.status === 'queued' || running.status === 'running')) {
+    set({ error: 'A job is already running for this dataset — wait for it to finish first.' });
+    return;
+  }
+  if (!enabled) return;
+  const worker = get().trainingWorker;
+  set({ yue2RunAllActive: true, yue2RunAllStage: null, error: null });
+  try {
+    const context = await preparationApi.getYue2PreparationContext(datasetId);
+    const pipeline = await preparationApi.startYue2Preparation(snapshotFor({
+      kind: 'yue2-preparation', idempotencyKey: crypto.randomUUID(), worker: workerRef(worker),
+      dataset: context.dataset, sources: [context.source], payload: payload(),
+    }));
+    await followYue2Preparation(set, get, pipeline.id, worker, datasetId);
+  } catch (err) {
+    if (get().trainingWorker === worker) set({ error: errMessage(err) });
+  } finally {
+    set({ yue2RunAllActive: false, yue2RunAllStage: null });
+  }
 }
 
-/** Start one YuE2 job and poll it to a terminal state, the same 1500 ms cadence
- *  server/src/services/training/pipelineRunner.ts uses for the ACE batch
- *  pipeline. `activeJob` is updated on every poll, so JobProgress and the SSE
- *  stream mounted off it (DatasetDetail.tsx, keyed on `activeJob`) follow the
- *  run live exactly as they do for a single Start button.
- *
- *  Deliberately NOT a mode on `adoptJob`: the five single-stage startYue2*
- *  actions above must keep resolving the instant the job is ADOPTED (their
- *  callers' busy spinners depend on that timing), so "run one job all the way
- *  to done" is this separate helper, used only by runYue2AllStages. */
-async function startYue2JobAndAwait(
-  set: (partial: Partial<TrainingState>) => void,
-  get: () => TrainingState,
-  seed: Partial<TrainingState>,
-  start: () => Promise<{ jobId: string }>,
-): Promise<TrainingJobSummary> {
-  set({ jobLog: [], error: null, ...seed });
-  const { jobId } = await start();
+/** Read a captured server chain; this poll is a projection, not its executor.
+ *  Its reads go through the shared preparation keys, so a Monitor panel
+ *  showing the same chain joins them rather than asking again.
+ *  The chain carries on on the server whatever the studio shows, so the
+ *  follow stops once "Train on" moves elsewhere, and only projects the
+ *  chain's job while its dataset is the open one. */
+async function followYue2Preparation(
+  set: SetState, get: GetState, id: string, worker: string | null, datasetId: string,
+): Promise<boolean> {
+  let lastJobId: string | null = null;
   for (;;) {
-    const job = await trainingApi.getJob(jobId);
-    set({ activeJob: job });
-    if (job.status !== 'queued' && job.status !== 'running') {
-      refreshAfterJob(get, job.id);
-      return job;
+    const pipeline = await queryClient.query(tq.preparation(id));
+    if (get().trainingWorker !== worker) return false;
+    const running = pipeline.stages.findIndex(s => s.status === 'running');
+    set({ yue2RunAllStage: running < 0 ? null : running + 1 });
+    const job = await queryClient.query(tq.preparationJob(id));
+    if (get().trainingWorker !== worker) return false;
+    if (job && isCurrent(get, worker, datasetId)) {
+      if (job.id !== lastJobId) {
+        lastJobId = job.id;
+        const stage = pipeline.stages.find(s => s.jobId === job.id)?.stage;
+        set({ jobLog: [], error: null,
+          ...(stage === 'nar' || stage === 'ar' || stage === 'joint'
+            ? { ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0,
+                ...(stage === 'nar' ? { yue2Live: null } : {}),
+                ...(stage === 'ar' ? { yue2ArLive: null, yue2ArEvalSeries: [] } : {}) }
+            : {}) });
+      }
+      set({ activeJob: job });
+      if (job.status !== 'queued' && job.status !== 'running') refreshAfterJob(get, job.id);
+    }
+    if (pipeline.status === 'done') return true;
+    if (pipeline.status === 'failed' || pipeline.status === 'cancelled' || pipeline.status === 'interrupted') {
+      set({ error: pipeline.error || `Preparation ${pipeline.status}` });
+      return false;
     }
     await sleep(1500);
   }
 }
 
-/** One line for the run-all chain to surface when a stage doesn't end in
- *  'done' — the job's own error if it has one, otherwise just its status. */
-function yue2StageFailure(label: string, job: TrainingJobSummary): string {
-  const what = job.status === 'cancelled' ? 'was cancelled' : 'failed';
-  return `${label} ${what}${job.error ? `: ${job.error}` : '.'}`;
-}
-
-/**
- * The YuE2 seven-stage chain for ONE dataset: 1 latent cache, 2 codes, 3 lead
- * sheets, 4 vocal stems, 5 lyric cursor spans, 6 NAR LoRA training, 7 AR LoRA
- * training, in that order, skipping anything already complete and anything
- * `stages` turns off. Stops at the first stage that doesn't end in 'done'.
- *
- * Module-level rather than a store action because BOTH callers need it and
- * they report differently: `runYue2AllStages` puts the failure on the store's
- * one `error` banner. So this returns the outcome instead of writing it
- * anywhere, and takes `onStage` instead of touching `yue2RunAllStage` itself.
- * (The browser-side bulk queue that was its second caller is gone: bulk
- * training is the server-owned batch in yue2BatchRunner.ts.)
- *
- * `datasetId` is threaded through every call — nothing here reads
- * `selectedDatasetId`, which is what lets the queue train datasets the user
- * never opened.
- */
-async function runYue2StageChain(
-  set: (partial: Partial<TrainingState>) => void,
-  get: () => TrainingState,
-  datasetId: string,
-  trigger: string,
-  stages: Yue2StageSet,
-  onStage: (stage: number | null) => void,
-): Promise<{ ok: boolean; error?: string }> {
-  try {
-    // Stage 1: latent cache.
-    //
-    // captionMode 'yue2', not the server default of 'none'. The default is
-    // right for a NAR-only run — the clip carries no caption and the style is
-    // the trigger alone — but this chain goes on to train the AR half, and
-    // there the caption IS the prefix and the aligner reads the manifest's
-    // lyrics. A cache built with 'none' carries neither, so cursor spans skip
-    // every source for having no lyrics and AR training exports something
-    // generic with nothing saying why. 'yue2' is 'ace' plus the .yue2.txt
-    // planner sentence where one exists (2026-09-25: this chain still sent
-    // 'ace', so every run-all cut trained on the ACE captions).
-    //
-    // And re-encode when an EXISTING cache was built the wrong way, rather
-    // than skipping the stage because latents are present: a cache the later
-    // stages cannot read, or one that ignores the planner captions, is not a
-    // stage that is done.
-    if (stages.latents) {
-      onStage(1);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.preprocess.done || arStatus.stages.preprocess.captionModeOk === false || arStatus.stages.preprocess.captionsStale) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Preprocess(datasetId, { captionMode: 'yue2' }));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Latent cache', job) };
-      }
-    }
-
-    // Stage 2: codes.
-    if (stages.codes) {
-      onStage(2);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.tokenize.done) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Tokenize(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Codes', job) };
-      }
-    }
-
-    // Stage 3: lead sheets. Independent of codes/stems/align — SheetSage2
-    // reads a source's own audio — so it can run here without waiting on
-    // anything above; it sits at this position for pacing, not a dependency.
-    // "Already complete" requires EVERY source to carry abc OR abc_error, not
-    // just "some do": a source with neither silently trains cot=off forever.
-    if (stages.sheet) {
-      onStage(3);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.sheet.done) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Sheet(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Lead sheets', job) };
-      }
-    }
-
-    // Stage 4: vocal stems.
-    //
-    // Not one of the stages anyone asks for, and the reason it is here is
-    // that the aligner does NOT produce its own input: it reads
-    // <source>/vocals.wav per song and SKIPS a source whose stem is missing,
-    // silently, exiting 0 having aligned nothing. With no stems at all,
-    // cursor spans is not merely blocked, it is a stage that would report
-    // success and leave the corpus untouched.
-    if (stages.stems) {
-      onStage(4);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (arStatus.stages.align.stemsReady <= 0) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Stems(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Vocal stems', job) };
-      }
-    }
-
-    // Stage 5: lyric cursor spans.
-    if (stages.align) {
-      onStage(5);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.align.done) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Align(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Lyric cursor spans', job) };
-      }
-    }
-
-    // Stage 6: NAR LoRA training. "Already complete" means the NEWEST run for
-    // this dataset finished cleanly — an owner decision, not a technical one:
-    // a halted or failed run does not count, and this never resumes one, it
-    // starts fresh exactly like the button does.
-    if (stages.nar) {
-      onStage(6);
-      const narRuns = await trainingApi.listYue2Runs(datasetId);
-      if (narRuns.runs[0]?.outcome !== 'completed') {
-        const body: trainingApi.Yue2TrainRequest = trigger.trim()
-          ? { trigger: trigger.trim() } : { allowNoTrigger: true };
-        const job = await startYue2JobAndAwait(
-          set, get,
-          { ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0, yue2Live: null },
-          () => trainingApi.startYue2Train(datasetId, body),
-        );
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('NAR LoRA training', job) };
-      }
-    }
-
-    // Stage 7: AR LoRA training. Same "newest run completed" rule as stage 6.
-    if (stages.ar) {
-      onStage(7);
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      const arRuns = await trainingApi.listYue2ArRuns(datasetId);
-      if (arRuns.runs[0]?.outcome !== 'completed') {
-        const body: trainingApi.Yue2ArTrainRequest = {
-          ...(trigger.trim() ? { trigger: trigger.trim() } : { allowNoTrigger: true }),
-          ...(arStatus.minted.present ? {} : { allowNoMinted: true }),
-        };
-        const job = await startYue2JobAndAwait(
-          set, get,
-          { ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0, yue2ArLive: null, yue2ArEvalSeries: [] },
-          () => trainingApi.startYue2ArTrain(datasetId, body),
-        );
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('AR LoRA training', job) };
-      }
-    }
-
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: errMessage(err) };
-  } finally {
-    onStage(null);
-  }
-}
-
-/**
- * The YuE2 Joint Training "perform all stages" chain for ONE dataset:
- * 1 latent cache, 2 codes, 3 lead sheets, and — while the lyric-timing
- * objective is on — 4 vocal stems, 5 lyric alignment. The preparation
- * predicates are the legacy chain's own (same caches, same re-encode rule),
- * because the joint trainer consumes the same prepared corpus. The final
- * stage is not a job this function starts: `startTraining` is the card's own
- * start, so the run always trains with the form the user actually sees
- * (steps, optimizer, rank/alpha, target), and the chain only guarantees the
- * order. A returned jobId is adopted and polled like any other stage; the
- * card's local poller follows the same job in parallel.
- */
-async function runYue2JointChain(
-  set: (partial: Partial<TrainingState>) => void,
-  get: () => TrainingState,
-  datasetId: string,
-  lyricTiming: boolean,
-  onStage: (stage: number | null) => void,
-  startTraining: (() => Promise<string | null>) | null,
-): Promise<{ ok: boolean; error?: string }> {
-  try {
-    // Stage 1: latent cache — same captionMode 'yue2' rule as the legacy
-    // chain: the aligner reads the manifest's lyrics, so a 'none' cache must
-    // be rebuilt, not skipped, and an 'ace' cut that ignores the .yue2.txt
-    // planner captions is rebuilt too.
-    onStage(1);
-    {
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.preprocess.done || arStatus.stages.preprocess.captionModeOk === false || arStatus.stages.preprocess.captionsStale) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Preprocess(datasetId, { captionMode: 'yue2' }));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Latent cache', job) };
-      }
-    }
-
-    // Stage 2: codes.
-    onStage(2);
-    {
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.tokenize.done) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Tokenize(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Codes', job) };
-      }
-    }
-
-    // Stage 3: lead sheets.
-    onStage(3);
-    {
-      const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-      if (!arStatus.stages.sheet.done) {
-        const job = await startYue2JobAndAwait(set, get, {},
-          () => trainingApi.startYue2Sheet(datasetId, {}));
-        if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Lead sheets', job) };
-      }
-    }
-
-    // Stages 4-5: vocal stems, then lyric alignment — only while the
-    // timing objective is enabled; the joint trainer trains without a cursor
-    // head when it is off.
-    let nextStage = 4;
-    if (lyricTiming) {
-      onStage(4);
-      {
-        const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-        if (arStatus.stages.align.stemsReady <= 0) {
-          const job = await startYue2JobAndAwait(set, get, {},
-            () => trainingApi.startYue2Stems(datasetId, {}));
-          if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Vocal stems', job) };
-        }
-      }
-      onStage(5);
-      {
-        const arStatus = await trainingApi.getYue2ArStatus(datasetId);
-        if (!arStatus.stages.align.done) {
-          const job = await startYue2JobAndAwait(set, get, {},
-            () => trainingApi.startYue2Align(datasetId, {}));
-          if (job.status !== 'done') return { ok: false, error: yue2StageFailure('Lyric alignment', job) };
-        }
-      }
-      nextStage = 6;
-    }
-
-    // Prepare page: preparation only, no training stage.
-    if (!startTraining) return { ok: true };
-    // Final stage: hand off to the card's own start and follow the job it
-    // returns to a terminal state.
-    onStage(nextStage);
-    const jobId = await startTraining();
-    if (!jobId) {
-      return { ok: false, error: 'Joint training did not start.' };
-    }
-    set({ jobLog: [], error: null });
-    for (;;) {
-      const job = await trainingApi.getJob(jobId);
-      set({ activeJob: job });
-      if (job.status !== 'queued' && job.status !== 'running') {
-        refreshAfterJob(get, job.id);
-        return job.status === 'done'
-          ? { ok: true }
-          : { ok: false, error: yue2StageFailure('Joint training', job) };
-      }
-      await sleep(1500);
-    }
-  } catch (err) {
-    return { ok: false, error: errMessage(err) };
-  } finally {
-    onStage(null);
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
 /**
@@ -2038,14 +1674,9 @@ async function runYue2JointChain(
  * `pendingEdits` until the server confirms; on failure they are reverted so
  * the cell snaps back to the on-disk value.
  */
-async function flushFields(
-  set: (partial: Partial<TrainingState>) => void,
-  get: () => TrainingState,
-  sampleId: string,
-  fields: EditableField[],
-): Promise<void> {
+async function flushFields(set: SetState, get: GetState, sampleId: string, fields: EditableField[]): Promise<void> {
   const state = get();
-  const datasetId = state.selectedDatasetId;
+  const { trainingWorker: worker, selectedDatasetId: datasetId } = state;
   const pending = state.pendingEdits[sampleId];
   if (!datasetId || !pending) return;
 
@@ -2077,21 +1708,29 @@ async function flushFields(
     return edits;
   };
 
-  try {
-    const sample = await trainingApi.patchSample(datasetId, sampleId, patch);
+  // Completion writes only into the scope the save was made in. Switching
+  // worker or dataset reset the pending and saving state, so a late answer
+  // must not touch the new scope's rows, even one with the same sample id.
+  const finished = () => {
     const done = new Set(get().savingSampleIds);
     done.delete(sampleId);
+    return done;
+  };
+  try {
+    const sample = await writeAndInvalidate(queryClient, () => trainingApi.patchSample(datasetId, sampleId, patch, { worker }),
+      keysPlan(resourceKey(TD.dataset, { worker }, datasetId)));
+    cacheSample(worker, datasetId, sample);
+    if (!isCurrent(get, worker, datasetId)) return;
     set({
       samplesById: { ...get().samplesById, [sampleId]: sample },
       pendingEdits: dropFields(),
-      savingSampleIds: done,
+      savingSampleIds: finished(),
     });
   } catch (err) {
-    const done = new Set(get().savingSampleIds);
-    done.delete(sampleId);
+    if (!isCurrent(get, worker, datasetId)) return;
     set({
       pendingEdits: dropFields(),      // revert the optimistic value
-      savingSampleIds: done,
+      savingSampleIds: finished(),
       saveError: { sampleId, message: errMessage(err) },
     });
   }

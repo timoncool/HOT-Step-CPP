@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'crypto';
 import { isCancelled, emitProgress, type TrainingJob } from './labelingQueue.js';
 import { log } from './yue2TrainRunner.js';
 import { refreshYue2ManifestCaptions, runYue2AitkPrepareJob, type ResolvedYue2AitkPrepareOptions } from './yue2AitkPrepareRunner.js';
+import { FIXED_RECIPE_CAPTION_GRAMMAR } from './fixedRecipeCaption.js';
 
 function stamp(file: string): unknown {
   const st = fs.statSync(file);
@@ -28,15 +29,22 @@ export function preparationFingerprint(o: ResolvedYue2AitkPrepareOptions): strin
   // version 4 (2026-09-27): the importer emits the condition-dropout prefix
   // variants the base-matched method trains on.
   return createHash('sha256').update(JSON.stringify({ version: 4, text, timing: o.lyricTiming !== false, trigger: o.trigger || '',
-    files: [...new Set(files)].sort().map(stamp) })).digest('hex');
+    files: [...new Set(files)].sort().map(stamp), ...(o.captionGrammar ? { captionGrammar: FIXED_RECIPE_CAPTION_GRAMMAR } : {}) })).digest('hex');
 }
 
-function outputFingerprint(manifest: string): string {
+function outputFingerprint(manifest: string, captionGrammar?: 'fixed-recipe'): string {
   if (fs.statSync(manifest).size > 16 * 1024 * 1024) throw new Error('Prepared manifest exceeds 16 MiB');
   const text = fs.readFileSync(manifest, 'utf8');
   const data = JSON.parse(text);
   if (data.schema_version !== 1 || data.recipe_version !== 'aitk-yue2-2026-09-16' || !Array.isArray(data.items) || !data.items.length) {
     throw new Error('Invalid prepared dataset');
+  }
+  if (captionGrammar === 'fixed-recipe' && data.caption_grammar !== FIXED_RECIPE_CAPTION_GRAMMAR) {
+    throw new Error('Prepared dataset has no Fixed recipe caption marker');
+  }
+  // Prepared before 2026-10-15: exports from it would not record the trigger.
+  if (captionGrammar === 'fixed-recipe' && data.style_template !== 'bare') {
+    throw new Error('Prepared dataset does not record its trigger');
   }
   // Prepared before 2026-09-20: no trigger-only prefixes, so caption dropout
   // (a card default) is refused by the engine. Stale, so it re-prepares.
@@ -63,10 +71,11 @@ export async function ensureYue2PreparedDataset(job: TrainingJob, options: Resol
   // what must invalidate a prepared dataset built from the stale captions.
   await refreshYue2ManifestCaptions(job, options.legacyManifest);
   const fingerprint = preparationFingerprint(options);
-  const index = path.join(path.dirname(options.legacyManifest), 'aitk-auto-prepare-v1.json');
+  const index = path.join(path.dirname(options.legacyManifest), options.captionGrammar === 'fixed-recipe'
+    ? 'aitk-auto-prepare-fixed-recipe-v1.json' : 'aitk-auto-prepare-v1.json');
   try {
     const cached = JSON.parse(fs.readFileSync(index, 'utf8'));
-    if (cached.fingerprint === fingerprint && cached.outputFingerprint === outputFingerprint(cached.manifest)) {
+    if (cached.fingerprint === fingerprint && cached.outputFingerprint === outputFingerprint(cached.manifest, options.captionGrammar)) {
       log(job, 'info', 'Reusing prepared YuE2 dataset; source caches and settings are unchanged.');
       return cached.manifest;
     }
@@ -77,7 +86,7 @@ export async function ensureYue2PreparedDataset(job: TrainingJob, options: Resol
   if (isCancelled(job) || ['failed'].includes(job.status)) return;
   if (preparationFingerprint(options) !== fingerprint) throw new Error('Dataset changed during preparation; start training again.');
   const manifest = path.join(output, 'dataset.json');
-  const record = { fingerprint, manifest, outputFingerprint: outputFingerprint(manifest) };
+  const record = { fingerprint, manifest, outputFingerprint: outputFingerprint(manifest, options.captionGrammar) };
   const temp = `${index}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(record));
   fs.renameSync(temp, index);

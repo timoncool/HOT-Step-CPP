@@ -12,7 +12,6 @@ import * as prompts from './prompts.js';
 // shared with the in-app pipeline; appended HERE (not in the LLM prompt) so it
 // is deterministic.
 import { withModelSuffix } from '../../../server/src/services/lireek/modelName.js';
-import { recalculateProfileStats } from '../../../server/src/services/lireek/profilerService.js';
 import { registerCollaborationTools } from './collaboration.js';
 import { channelServerOptions } from './discussion-wake.js';
 
@@ -815,6 +814,8 @@ server.tool(
     // and computed from the lyrics — never agent-derived. Without this, MCP-built
     // profiles render "Average verse length: undefined lines" and carry no
     // excerpts or structural vocabulary into generation prompts.
+    // The profiler imports app startup; load it only after database startup guards pass.
+    const { recalculateProfileStats } = await import('../../../server/src/services/lireek/profilerService.js');
     parsed = recalculateProfileStats(lyricsSet.songs, parsed);
 
     // The provider/model were hardcoded to 'antigravity'/'claude-opus-4' here, so

@@ -5,6 +5,10 @@ description: Explains where HOT-Step generation time goes (LM/DiT/VAE), how the 
 
 # Engine Performance & TensorRT
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 The C++ engine ([engine/](../../../engine/)) generates music in three phases: **LM** (a Qwen3 language model produces audio-code tokens from caption+lyrics), **DiT** (a Diffusion Transformer denoises latents over N steps — this is the main compute loop), and **VAE** (decodes latents to 48 kHz stereo audio). Two inference backends coexist: **GGML** (quantized GGUF files, the default) and **TensorRT** ("TRT" — NVIDIA's compiled-engine runtime, fed by ONNX model exports). This skill maps the performance landscape, the TRT integration, and how to measure things.
 
 Detailed line-references, the full DONE/PLANNED ledger, and the on-disk model layout live in [reference.md](reference.md).
@@ -55,18 +59,18 @@ Triggers:
 - **DiT:** selected DiT model path ends in (or its directory contains) `.onnx` → `dit_ends_with_onnx` gate at `engine/src/pipeline-synth-ops.cpp:1225` → `dit-trt.h`. Engine file = same name with `.engine`; **built on first use if missing (5–30 min), else loaded from cache**.
 - **LM:** if `<model_path>/lm_full.onnx` exists → raw TRT LM (`lm-trt.h`), engine `lm_full.engine` built if missing (`engine/src/pipeline-lm.cpp:1159`). A TRT-LLM engine dir (`trtllm-engine-*`) is checked first but TRT-LLM is compile-time **disabled** (see ledger).
 - **VAE decode:** GGML only. The ONNX Runtime VAE decoder and the `use_ort_vae` request flag are gone; the registry takes the first non-ONNX VAE (`registry_find_non_onnx`, `engine/tools/hot-step-server.cpp:1311`). There is no `useOrtVae` in `translateParams.ts` any more.
-- **Text/cond encoders + PP-VAE:** auto-discovered ONNX files alongside the DiT / in `models/onnx/pp-vae/` — no user action.
+- **Text/cond encoders + PP-VAE:** auto-discovered ONNX files alongside the DiT / in `<data root>/models/onnx/pp-vae/` — no user action.
 - **Streaming** (`stream_mode` request): requires an ONNX DiT (`pipeline-synth-ops.cpp:2098`); ring-buffer batched generation, previews currently hard-disabled (`:2251` sets `preview_interval = 0` — partially-denoised latents through the VAE = scrambled audio).
 
 Build requirement: the vendored TRT SDK at `engine/deps/tensorrt/` (present: `include/NvInfer.h`, libs `*_10` = TRT 10.x) defines `HOT_STEP_TRT` at compile time (`engine/CMakeLists.txt:302`). Without it, all TRT code compiles out and the build is GGML-only. ONNX export tooling: `tools/onnx-export/` (`export_dit.py`, `export_lm.py`, `export_vae.py`, etc.) — runs in a separate Python venv (hot-step-9000 repo), not in this repo's toolchain.
 
 ## Procedure: benchmark / profile a generation
 
-There is **no dedicated bench tool** — instrumentation is log-based. Logs land in `logs\YYYY-MM-DD_HH-MM-SS\` per session (name-sorted = time-sorted).
+There is **no dedicated bench tool** — instrumentation is log-based. Logs land in `<data root>/logs\YYYY-MM-DD_HH-MM-SS\` per session (name-sorted = time-sorted).
 
 1. Run a generation normally, through the UI at `http://localhost:3000` (app started detached with `dev.bat`).
-2. Read the **server-side timing table** — best single overview. It is in `logs\<newest>\generations\gen_<uuid>_<task>.log` as a `[Timing] ── Pipeline Breakdown ──` block (rendered by `server/src/routes/generate.ts:1257`) with per-stage seconds/percent bars: LM Phase, model loads, FSQ Detokenize, Adapter Refit/Merge, DiT Denoising, VAE Decode, Text Encoding, plus gap rows (HTTP→Engine, DiT Model Load, etc.).
-3. Cross-check against **engine-side ground truth** in `logs\<newest>\ace_engine.log` (see Golden rule 6). Key markers:
+2. Read the **server-side timing table** — best single overview. It is in `<data root>/logs\<newest>\generations\gen_<uuid>_<task>.log` as a `[Timing] ── Pipeline Breakdown ──` block (rendered by `server/src/routes/generate.ts:1257`) with per-stage seconds/percent bars: LM Phase, model loads, FSQ Detokenize, Adapter Refit/Merge, DiT Denoising, VAE Decode, Text Encoding, plus gap rows (HTTP→Engine, DiT Model Load, etc.).
+3. Cross-check against **engine-side ground truth** in `<data root>/logs\<newest>\ace_engine.log` (see Golden rule 6). Key markers:
    - `[DiT-Generate] TRT Total: X ms (Y ms/sample)` (`pipeline-synth-ops.cpp:1384`) or the GGML equivalent `[DiT-Generate] Total: ...`
    - `[DiT-TRT] Step k/N ... (first step: N ms)` — first-step latency including warmup (`hot-step-sampler-trt.h:700`)
    - `[Adapter-TRT] Applied in N ms` / `Batched GPU merge: N ms`
@@ -74,7 +78,7 @@ There is **no dedicated bench tool** — instrumentation is log-based. Logs land
    - `[VAE-Decode ...] Decode: N ms (ORT|GGML)`
 4. Quick pull of the newest session (PowerShell):
    ```powershell
-   $s = Get-ChildItem D:\Ace-Step-Latest\hot-step-cpp\logs | Sort-Object Name -Descending | Select-Object -First 1
+   $s = Get-ChildItem <data root>/logs | Sort-Object Name -Descending | Select-Object -First 1
    Select-String -Path "$($s.FullName)\ace_engine.log" -Pattern 'TRT Total|Applied in|Decode:|Load complete|first step'
    Select-String -Path "$($s.FullName)\generations\*.log" -Pattern '\[Timing\]'
    ```
@@ -89,7 +93,7 @@ There is **no dedicated bench tool** — instrumentation is log-based. Logs land
 | **LM CFG Cutoff** (`lm_cfg_cutoff_ratio`) | `request.h`, `pipeline-lm.cpp` | Same idea for LM token generation; ~0.7 ≈ 15% LM speedup. |
 | **Step Cache** (`cache_ratio`, default 0.0, UI max 0.7) | `hot-step-params.h:176`; GGML `hot-step-sampler.h`; TRT `hot-step-sampler-trt.h:484` | Skips middle-step forward passes, reusing last velocity; first/last steps protected. Try 0.3–0.5. Stacks with CFG cutoff. |
 | **Steps / model tier** | `num_steps`; turbo (8) vs base/SFT (50) | Linear cost. Biggest single lever. |
-| **Quantization** | GGUF variants in `models\` (Q4_K_M → Q8_0 → BF16, plus NVFP4/MXFP4) | VRAM vs dequant overhead vs quality. |
+| **Quantization** | GGUF variants in `<data root>/models\` (Q4_K_M → Q8_0 → BF16, plus NVFP4/MXFP4) | VRAM vs dequant overhead vs quality. |
 | **Co-resident models** (`coResident` → engine `EVICT_NEVER`) | `generate.ts:302/584`; `pipeline-synth-ops.cpp:1390` | Keeps DiT (including multi-GB TRT engine) + VAE in VRAM between jobs — saves ~7.5s reload per back-to-back run, costs GBs of VRAM. Default `EVICT_STRICT` frees after every generation. |
 | **Batched CFG** (`use_batch_cfg`) | request | One 2N-batch forward vs two N passes; faster but doubles activation VRAM. |
 | **Flash attention** (`use_fa`) | request | GGML paths. |
@@ -146,10 +150,10 @@ There is **no dedicated bench tool** — instrumentation is log-based. Logs land
 - **VALIDATED — the "16.56s adapter apply" was two bugs in one:** part log-timestamp skew (Node table vs reality), part real CUDA driver overhead: per-module LoKr Kronecker merges caused ~359 separate cudaMalloc/free cycles ≈ 14s. Fix: micro-batches of 32 modules per GGML graph → ~1.8s (`adapter-trt.h`, log `[Adapter-TRT] Applied in 1777 ms`).
 - **VALIDATED — skipping GGML per-step constant re-uploads breaks output** (blank audio). The scheduler aliases input buffers as scratch. A local plan doc claims this optimization landed; it was effectively reverted. Code comment at `hot-step-sampler.h:593` is authoritative.
 - **VALIDATED — native TRT (Approach A) beat ORT+TRT-EP (Approach B) for the DiT** solely because adapter refit needs `IRefitter`, which ORT does not expose. ORT+TRT-EP remains correct for refit-free models (VAE, encoders).
-- **VALIDATED — TRT-LLM on native Windows is a dead end** (engine-version mismatch Docker 10.14 vs Windows SDK 10.16; ONNX-rebuilt engines lack TRT-LLM tensor bindings like `kv_cache_block_offsets`). A built `trtllm-engine-RTX5090/` still sits in `models/onnx/lm-4B/` — it is inert.
+- **VALIDATED — TRT-LLM on native Windows is a dead end** (engine-version mismatch Docker 10.14 vs Windows SDK 10.16; ONNX-rebuilt engines lack TRT-LLM tensor bindings like `kv_cache_block_offsets`). A built `trtllm-engine-RTX5090/` still sits in `<data root>/models/onnx/lm-4B/` — it is inert.
 - **VALIDATED — LM-TRT teardown ordering** (Golden rule 5) prevents cross-runtime CUDA corruption.
 - **UNVERIFIED — current TRT-vs-GGUF end-to-end totals.** The 77.6s-vs-50.5s table predates the adapter fix and dedicated streams; no fresher benchmark exists in the repo. Re-measure before making "TRT is slower overall" claims.
-- **UNVERIFIED — whether the FP8 DiT native-TRT path is in active use.** `models/onnx/dit-fp8/` has no `dit_fp8.engine` on disk (checked 2026-07-02) — first native-TRT use would trigger a full rebuild; the dir may mainly serve as the home for the ONNX text/cond encoders.
+- **UNVERIFIED — whether the FP8 DiT native-TRT path is in active use.** `<data root>/models/onnx/dit-fp8/` has no `dit_fp8.engine` on disk (checked 2026-07-02) — first native-TRT use would trigger a full rebuild; the dir may mainly serve as the home for the ONNX text/cond encoders.
 - **HYPOTHESIS — the 2026-05-30 design's 30–50% DiT speedup claim.** Measured reality was ~25%. Remaining headroom (cross-attn KV cache, CUDA graphs) is unimplemented and unproven here.
 
 ## Deeper reading

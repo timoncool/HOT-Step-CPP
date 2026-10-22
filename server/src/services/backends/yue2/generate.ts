@@ -31,6 +31,7 @@ import fs from 'fs';
 import path from 'path';
 import { performance } from 'perf_hooks';
 import { v4 as uuidv4 } from 'uuid';
+import { clampYue2SemanticSampling } from './semanticGuard.js';
 
 import { config } from '../../../config.js';
 import { getDb } from '../../../db/database.js';
@@ -46,12 +47,13 @@ import { readSafetensorsMeta } from '../../training/yue2Runs.js';
 import { jointRunForAdapter } from '../../training/yue2AitkRuns.js';
 import { yue2AdapterTrigger } from './jointAdapterContext.js';
 import type { Yue2AdapterScales, Yue2FinalDetail } from './client.js';
-import { yue2Align, yue2Synth, yue2FinalDetail, yue2Props, yue2PropsCached, splitMultipartMixed, yue2AdapterWire, type Yue2SynthRequest, type Yue2TrackDetail } from './client.js';
+import { yue2Align, yue2Synth, yue2FinalDetail, yue2Props, yue2PropsCached, splitMultipartMixed, yue2AdapterWire, type Yue2SynthRequest, type Yue2TrackDetail, type Yue2Seed, yue2Seed, yue2SeedPlus } from './client.js';
 import { yue2LyricsJson } from './align.js';
+import { applyYue2DurationCap, YUE2_TRIM_FADE_SEC } from './durationCap.js';
 import { buildYue2LyricSchedule } from './lyricSchedule.js';
 import { classifyYue2Score, type Yue2ScoreHealth, yue2PlanUsable, yue2PickPlan, yue2PlanDraws, readYue2StyleNorms, type Yue2StyleNorms } from './scoreHealth.js';
 import {
-  yue2PickFromModels, yue2ResolvePick, yue2StackFrom, yue2CoverFromSubmission,
+  yue2PickFromModels, yue2ResolvePick, yue2StackFrom, yue2PlanStackFrom, yue2PlanScaleDiffers, yue2CoverFromSubmission,
   type Yue2PersistedSelection, type Yue2CoverSubmission,
 } from './index.js';
 
@@ -75,8 +77,11 @@ export function jobCover(job: GenerationJob): { cover: Yue2CoverSubmission; abc:
   return { cover, abc };
 }
 import { applyYue2StyleTemplate, splitYue2Tail, type Yue2StyleTemplate } from './style.js';
+import { instrumentalScore, instrumentalStyle } from './instrumentalScore.js';
 import type { GenerationJob, StageTiming } from '../../generation/jobTypes.js';
+import type { PollWatchdogOptions } from '../../generation/pollUntilDone.js';
 import type { GenerationAttempt } from '../types.js';
+import { buildSessionRender, TRIM_FADE_S, trimWavStart } from '../../yue2Takes.js';
 
 /** Injected so this module never imports back into routes/generate.ts at
  *  runtime, matching MinimaxGenerationDeps' own shape exactly. */
@@ -84,7 +89,7 @@ export interface Yue2GenerationDeps {
   attempt: GenerationAttempt;
   signal: AbortSignal;
   pollUntilDone(
-    aceJobId: string, job: GenerationJob, signal: AbortSignal, timeoutMinutes?: number,
+    aceJobId: string, job: GenerationJob, signal: AbortSignal, timeoutMinutes?: number, options?: PollWatchdogOptions,
   ): Promise<void>;
   /** YuE2 jobs still waiting behind this one, oldest first, for coalescing.
    *  Absent = never coalesce. */
@@ -109,6 +114,8 @@ const YUE2_COALESCE_WAIT_MS = 750;
 
 export interface Yue2ParamMapping {
   req: Yue2SynthRequest;
+  /** Score supplied before app planning can add ABC to the request. */
+  abcSupplied: boolean;
   notes: string[];
   /** What the user typed, before the adapter's style template wrapped it.
    *  req.style is the prompt the MODEL needs; this is the one a human wrote,
@@ -145,6 +152,11 @@ function yue2StyleForAdapter(
   caption: string, params: any, picked: Yue2PersistedSelection['adapters'],
 ): { style: string; notes: string[]; halves: Yue2StyleHalves; trainedCot: string } {
   const notes: string[] = [];
+  // "Include BPM/key in caption" off (#286): adapters trained without the
+  // tail never saw it. Peel the caption's own tail and compose no Song Info
+  // values; absent or true is today's behaviour.
+  const noTail = params.yue2CaptionBpmKey === false;
+  if (noTail) caption = splitYue2Tail(caption).caption;
   const halfOf = (slot: { path: string; scales: Yue2AdapterScales }) => ({
     path: slot.path,
     trigger: yue2AdapterTrigger(slot.path).trigger,
@@ -210,8 +222,8 @@ function yue2StyleForAdapter(
   //
   // Only when actually set: tail() drops blanks, so a render that leaves BPM
   // at 0 and Key on Auto composes the identical string it did before.
-  const userBpm = Number(params.bpm) > 0 ? String(Math.round(Number(params.bpm))) : '';
-  const userKey = String(params.keyScale || '').trim();
+  const userBpm = !noTail && Number(params.bpm) > 0 ? String(Math.round(Number(params.bpm))) : '';
+  const userKey = noTail ? '' : String(params.keyScale || '').trim();
 
   // A caption from the dataset ("automatic" caption source) usually ENDS with
   // a tail of its own, because the labeller wrote it in the trained format.
@@ -255,6 +267,43 @@ function yue2StyleForAdapter(
   return { style, notes, halves, trainedCot };
 }
 
+/** An instrumental render's score: the Vocal melody moved onto Ins
+ *  (instrumentalScore.ts), with what happened written to `notes`. */
+function yue2InstrumentalAbc(abc: string, notes: string[]): string {
+  const moved = instrumentalScore(abc);
+  notes.push(moved.movedBars
+    ? `Instrumental: moved ${moved.movedBars} sung bar(s) from Vocal to Ins`
+      + (moved.replacedInsBars ? `; Vocal cut overlapping Ins notes in ${moved.replacedInsBars} bar(s)` : '')
+    : 'Instrumental: the score has no sung Vocal bars to move to Ins');
+  return moved.abc;
+}
+
+/** The LM tab's planner and composer sampler fields, as wire fields. Only
+ *  what the UI actually sent travels (an untouched control is absent), so the
+ *  engine keeps its checkpoint value otherwise. Shared with training previews,
+ *  so the unlimited Top-K temperature clamp lives here, not in the callers. */
+export function yue2LmOverrides(params: Record<string, unknown>, notes: string[] = []): Record<string, number> {
+  const lmFields: Array<[string, keyof Yue2SynthRequest]> = [
+    ['yue2PlanTemperature', 'plan_temperature'], ['yue2PlanTopP', 'plan_top_p'], ['yue2PlanTopK', 'plan_top_k'],
+    ['yue2PlanRepPenalty', 'plan_repetition_penalty'], ['yue2PlanRepWindow', 'plan_penalty_window'],
+    ['yue2PlanMaxTokens', 'plan_max_tokens'],
+    ['yue2SemTemperature', 'semantic_temperature'], ['yue2SemTopP', 'semantic_top_p'], ['yue2SemTopK', 'semantic_top_k'],
+    ['yue2SemRepPenalty', 'semantic_repetition_penalty'], ['yue2SemRepWindow', 'semantic_penalty_window'],
+    ['yue2SemMinTokens', 'semantic_min_tokens'], ['yue2SemMaxTokens', 'semantic_max_tokens'],
+    ['yue2EndThreshold', 'end_threshold'], ['yue2EndBias', 'end_bias'],
+    ['yue2EndBiasFrom', 'end_bias_from_sec'], ['yue2EndBiasRamp', 'end_bias_ramp_sec'],
+  ];
+  const lmOverrides: Record<string, number> = {};
+  for (const [uiKey, wireKey] of lmFields) {
+    if (params[uiKey] === undefined || params[uiKey] === null || params[uiKey] === '') continue;
+    const v = Number(params[uiKey]);
+    if (Number.isFinite(v)) lmOverrides[wireKey] = v;
+    else notes.push(`Invalid ${uiKey} — using the checkpoint default`);
+  }
+  clampYue2SemanticSampling(lmOverrides, notes, yue2PropsCached()?.sampling?.semantic?.temperature);
+  return lmOverrides;
+}
+
 /**
  * UI params -> /yue2/synth request.
  *
@@ -274,11 +323,14 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   // (docs/plans/yue2/06-engine-port-plan.md §2 — NFC before pre-tokenization).
   const caption = rawCaption.normalize('NFC');
   const styled = yue2StyleForAdapter(caption, params, pick.adapters);
-  const style = styled.style;
   notes.push(...styled.notes);
 
   const lyricsRaw: string = params.instrumental ? '' : (params.lyrics || '');
   const lyrics = lyricsRaw.normalize('NFC');
+  // Instrumental: upstream's wording on the base model. An adapter's style is
+  // the template it trained on, so it is left as composed.
+  const adapted = !!(styled.halves.ar.path || styled.halves.nar.path);
+  const style = !lyrics && !adapted ? instrumentalStyle(styled.style) : styled.style;
 
   const cotRaw = typeof params.yue2Cot === 'string' ? params.yue2Cot : 'full';
   const cot: Yue2SynthRequest['cot'] =
@@ -309,8 +361,16 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   const odeRaw = Number(params.yue2OdeSteps);
   const ode_steps = Number.isFinite(odeRaw) && odeRaw > 0 ? Math.round(odeRaw) : 32;
 
-  const narSolver = params.yue2NarSolver === 'wasserstein' ? 'md_wasserstein_yue2' : undefined;
-  const narScheduler = params.yue2NarScheduler === 'ht_v3' ? 'md_ht_scheduler V3' : undefined;
+  const narSolver = params.yue2NarSolver === 'wasserstein' ? 'md_wasserstein_yue2'
+    : params.yue2NarSolver === 'ancestral' ? 'md_ancestral_yue2'
+    : params.yue2NarSolver === 'latent_eq' ? 'md_latent_eq_yue2'
+    : params.yue2NarSolver === 'tlie' ? 'md_tlie_yue2'
+    : undefined;
+  const narScheduler = params.yue2NarScheduler === 'ht_v3' ? 'md_ht_scheduler V3'
+    : params.yue2NarScheduler === 'plan_aware' ? 'md_plan_aware_yue2'
+    : params.yue2NarScheduler === 'plan_loose' ? 'md_plan_loose_yue2'
+    : params.yue2NarScheduler === 'plan_overdrive' ? 'md_plan_overdrive_yue2'
+    : undefined;
   const plugin_params: NonNullable<Yue2SynthRequest['plugin_params']> = {};
   const copyNumbers = (plugin: string, fields: Record<string, string>) => {
     for (const [field, key] of Object.entries(fields)) {
@@ -320,6 +380,32 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
       else notes.push(`Invalid ${field} — using the plugin default`);
     }
   };
+  // Text and select plugin params: strings only, capped so a pasted wall of
+  // text never reaches the Lua parser; a select must name a listed option.
+  const copyStrings = (plugin: string, fields: Record<string, string>, options: Record<string, string[]> = {}) => {
+    for (const [field, key] of Object.entries(fields)) {
+      const value = params[field];
+      if (value === undefined) continue;
+      if (typeof value === 'string' && value.length <= 200 && (!options[field] || options[field].includes(value))) {
+        plugin_params[`${plugin}:${key}`] = value;
+      } else {
+        notes.push(`Invalid ${field} — using the plugin default`);
+      }
+    }
+  };
+  if (narSolver === 'md_latent_eq_yue2') {
+    copyNumbers(narSolver, { yue2EqGroup: 'group', yue2EqGain: 'gain', yue2EqT1: 'eq_t1', yue2EqT2: 'eq_t2' });
+    copyStrings(narSolver, { yue2EqGains: 'gains', yue2EqSection: 'section_only' });
+  }
+  if (narSolver === 'md_tlie_yue2') {
+    copyNumbers(narSolver, { yue2LieAmount: 'lie', yue2LieT1: 'lie_t1', yue2LieT2: 'lie_t2' });
+    copyStrings(narSolver, { yue2LieCurve: 'lie_curve', yue2LieSections: 'section_lies' },
+      { yue2LieCurve: ['constant', 'early', 'late', 'sections'] });
+  }
+  if (narScheduler === 'md_plan_overdrive_yue2') {
+    copyNumbers(narScheduler, { yue2OdDrive: 'drive', yue2OdBase: 'base', yue2OdPeriod: 'pulse_period' });
+    copyStrings(narScheduler, { yue2OdShape: 'shape' }, { yue2OdShape: ['flat', 'late', 'early', 'pulse'] });
+  }
   if (narSolver) {
     copyNumbers(narSolver, {
       yue2WassTau: 'tau', yue2WassSpectral: 'spectral_weight',
@@ -344,12 +430,75 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
       plugin_params[`${narScheduler}:snr_space`] = params.yue2HtSnr;
     }
   }
+  // CADS conditioning noise on the NAR plan conditioning (engine-side, works
+  // with any solver/scheduler). Strength 0 sends nothing: bit-identical output.
+  const cadsStrength = Number(params.yue2CadsStrength);
+  if (Number.isFinite(cadsStrength) && cadsStrength > 0) {
+    plugin_params['yue2:cads_strength'] = Math.min(1, cadsStrength);
+    copyNumbers('yue2', { yue2CadsT1: 'cads_t1', yue2CadsT2: 'cads_t2' });
+    if (typeof params.yue2CadsRescale === 'boolean') {
+      plugin_params['yue2:cads_rescale'] = params.yue2CadsRescale;
+    }
+  }
+  // Plan-strength curve w(step) on the NAR plan conditioning. w = 1 at both
+  // ends sends nothing: bit-identical output.
+  const wStart = Number(params.yue2PlanWStart), wEnd = Number(params.yue2PlanWEnd);
+  const wS = Number.isFinite(wStart) ? wStart : 1, wE = Number.isFinite(wEnd) ? wEnd : 1;
+  if (wS !== 1 || wE !== 1) {
+    plugin_params['yue2:plan_w_start'] = Math.min(2, Math.max(0, wS));
+    plugin_params['yue2:plan_w_end'] = Math.min(2, Math.max(0, wE));
+    if (params.yue2PlanWCurve === 'cosine') plugin_params['yue2:plan_w_curve'] = 'cosine';
+  }
+  // Plan CFG: 1 = off (nothing sent, identical output, no extra pass).
+  const planCfg = Number(params.yue2PlanCfg);
+  if (Number.isFinite(planCfg) && planCfg > 1) {
+    plugin_params['yue2:plan_cfg'] = Math.min(8, planCfg);
+    copyNumbers('yue2', { yue2PlanCfgT1: 'plan_cfg_t1', yue2PlanCfgT2: 'plan_cfg_t2', yue2PlanCfgRescale: 'plan_cfg_rescale' });
+    if (typeof params.yue2PlanCfgLevelMatch === 'boolean') {
+      plugin_params['yue2:plan_cfg_level_match'] = params.yue2PlanCfgLevelMatch;
+    }
+  }
   if (params.yue2NarSolver && params.yue2NarSolver !== 'stock' && !narSolver) {
     notes.push(`Unknown YuE2 NAR solver "${params.yue2NarSolver}" — using midpoint`);
   }
   if (params.yue2NarScheduler && params.yue2NarScheduler !== 'stock' && !narScheduler) {
     notes.push(`Unknown YuE2 NAR scheduler "${params.yue2NarScheduler}" — using uniform steps`);
   }
+  // Generic plugin params passthrough (e.g. NAR solver/scheduler params sent
+  // as "pluginName:key" entries -- same convention the explicit mappings above
+  // use). Keys already set by the explicit solver/scheduler mapping above are
+  // left untouched so that the explicit mapping always wins over a generic
+  // override.
+  //
+  // The global ACE postprocess plugin (params.postprocessPlugin, e.g.
+  // "md_audio_tiled V2") is NOT forwarded here. YuE2 has no postprocess picker
+  // in its UI, so inheriting the ACE global would silently attach a tile-decode
+  // pass to every YuE2 render -- the 156 s seam issue. The engine hook in
+  // yue2-pipeline.h stays intact for future use; wire it up when a
+  // yue2PostprocessPlugin UI field exists. Until then, drop any pluginParams
+  // key whose prefix matches the global postprocess plugin name (they are
+  // postprocess-specific and meaningless to the NAR/VAE path here).
+  const globalPpPlugin = typeof params.postprocessPlugin === 'string'
+    ? params.postprocessPlugin.trim() : '';
+  if (params.pluginParams && typeof params.pluginParams === 'object') {
+    for (const [k, v] of Object.entries(params.pluginParams as Record<string, unknown>)) {
+      if (k in plugin_params) continue; // explicit mapping takes precedence
+      // Drop postprocess-plugin params that leaked from the global ACE setting.
+      if (globalPpPlugin && k.startsWith(globalPpPlugin + ':')) continue;
+      if (v === null || v === undefined || v === '') continue;
+      if (typeof v === 'boolean') { plugin_params[k] = v; continue; }
+      if (typeof v === 'number') { if (Number.isFinite(v)) plugin_params[k] = v; continue; }
+      if (typeof v === 'string') {
+        const n = Number(v);
+        plugin_params[k] = Number.isFinite(n) ? n : v;
+      }
+    }
+  }
+  // Postprocess plugin: YuE2 has no UI picker for postprocess, so the global
+  // ACE setting (params.postprocessPlugin) is intentionally NOT forwarded.
+  // The yue2-pipeline.h hook exists for future use; a yue2PostprocessPlugin
+  // field can re-enable it when that UI is added.
+  const postprocess_plugin: string | undefined = undefined;
   // Step-level velocity caching for the NAR midpoint solver (see
   // yue2-nar-graph.h). 0/unset = off, every step computed for real -- the
   // UI slider (index.ts's yue2NarCacheRatio extension) clamps to [0, 0.9],
@@ -366,9 +515,10 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   const chunkRaw = Number(params.yue2NarChunkSeconds);
   const nar_chunk_frames = Number.isFinite(chunkRaw) && chunkRaw > 0 ? Math.round(Math.min(chunkRaw, 600) * 25) : undefined;
 
-  // From the job's pick (#204), which already folded in the per-request
-  // yue2VaeVariant select at submit. '' (never chosen) renders standard.
-  const vae_variant: Yue2SynthRequest['vae_variant'] = pick.vae_variant === 'legacy' ? 'legacy' : 'standard';
+  // From the job's pick (#204): the model picker's VAE, captured at submit.
+  // '' (never chosen) renders standard.
+  const vae_variant: Yue2SynthRequest['vae_variant'] =
+    pick.vae_variant === 'legacy' || pick.vae_variant === 'dec2x' ? pick.vae_variant : 'standard';
 
   // ── Duration: model-ended, same story as MM3 ──────────────────────────────
   // core.duration.auto = true / editable = false: the AR plan/semantic stages
@@ -378,36 +528,39 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   const requestedDuration = Number(params.duration);
   if (requestedDuration > 0) {
     notes.push(
-      `duration: model-ended — the requested ${Math.round(requestedDuration)}s was ignored `
-      + `(YuE2 has no length field on the wire; the plan/semantic stages end on their own `
-      + `terminator, capped at roughly ${YUE2_MAX_DURATION_SEC}s).`,
+      `duration: model-ended, the requested ${Math.round(requestedDuration)}s is applied as a ceiling `
+      + `(YuE2 has no length field on the wire; a longer render is trimmed to length with a `
+      + `short fade-out after decode, capped at roughly ${YUE2_MAX_DURATION_SEC}s).`,
     );
   }
 
-  // -1 tells the engine to draw one; it echoes the resolved value back so the
-  // render stays reproducible — same convention mapMinimaxParams uses.
-  const seed: number = params.randomSeed
-    ? -1
-    : (typeof params.seed === 'number' && params.seed >= 0 ? params.seed : -1);
+  // Draw it here, not in the engine: the engine's random seed is a full uint64,
+  // which JSON.parse rounds past 2^53, so the take would record (and replay) a
+  // different seed. 32 bits leaves the engine's derived seeds (seed + song,
+  // + 1000003 per retry) far below 2^53, so they stay exact too. A pinned seed
+  // may be a decimal string (a replayed uint64) and rides through unrounded.
+  const seed: Yue2Seed = (params.randomSeed ? undefined : yue2Seed(params.seed)) ?? Math.floor(Math.random() * 2 ** 32);
 
   // A previewed-and-approved lead sheet (score preview flow): the engine
   // renders this score instead of planning one. Meaningless under cot=off,
   // which has no plan stage — dropped with a note rather than sent.
   const abcRaw = typeof params.yue2Abc === 'string' ? params.yue2Abc.trim() : '';
-  const abc = abcRaw && cot !== 'off' ? abcRaw : undefined;
-  if (abcRaw && !abc) notes.push('A previewed score was supplied but Chain of Thought is "off" — the score was ignored.');
+  const abcUsed = abcRaw && cot !== 'off' ? abcRaw : undefined;
+  if (abcRaw && !abcUsed) notes.push('A previewed score was supplied but Chain of Thought is "off" — the score was ignored.');
+  const abc = abcUsed && !lyrics ? yue2InstrumentalAbc(abcUsed, notes) : abcUsed;
 
   // C6 lyric schedule: ties each sung lyric block to its score section's
-  // timing. Soft (bias, -4) is the default for a render with an approved
-  // score — an ear test went from 2/11 on-time sections to 11/11 with it
-  // (RESEARCH/YUE2_ALIGNMENT_GATE_SET.md:1064). Hard (mask) stays selectable
-  // but is never the default. An explicit 'off' (current or saved) always
-  // wins. A schedule that cannot be built (no tempo, unlabelled sections, no
-  // matching timed lyric block, ...) must never fail the render — it logs
-  // why and falls back to the unscheduled baseline instead.
-  const scheduleMode = params.yue2LyricSchedule === 'off' ? undefined
-    : params.yue2LyricSchedule === 'mask' ? 'mask'
-    : params.yue2LyricSchedule === 'bias' || params.yue2LyricSchedule === undefined ? 'bias'
+  // timing. Off by default (2026-10-12: condition strength 1 with the old
+  // soft-by-default ruined lyric adherence) — soft (bias, -4) and hard (mask)
+  // both stay selectable, and an explicit choice (current or saved) always
+  // wins. An ear test went from 2/11 on-time sections to 11/11 with soft on
+  // (RESEARCH/YUE2_ALIGNMENT_GATE_SET.md:1064), so it is worth turning on by
+  // hand for a render where lyric timing matters more than adherence. A
+  // schedule that cannot be built (no tempo, unlabelled sections, no matching
+  // timed lyric block, ...) must never fail the render — it logs why and
+  // falls back to the unscheduled baseline instead.
+  const scheduleMode = params.yue2LyricSchedule === 'mask' ? 'mask'
+    : params.yue2LyricSchedule === 'bias' ? 'bias'
     : undefined;
   // The engine only schedules the no-guidance set (yue2-pipeline.h: "needs
   // cfg_scale 1 (no rule for the guidance set)"); cot is never 'off' here
@@ -456,28 +609,10 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   const synth_batch_size = Math.min(askedVars, maxVars);
   if (askedSongs > maxSongs) notes.push(`batchSize ${askedSongs} requested — this engine renders at most ${maxSongs} song(s) per job`);
   if (askedVars > maxVars) notes.push(`yue2Variations ${askedVars} requested — this engine renders at most ${maxVars} variation(s) per song`);
-  const noiseSeedRaw = Number(params.yue2NoiseSeed);
-  const noise_seed = Number.isFinite(noiseSeedRaw) && noiseSeedRaw >= 0 ? Math.floor(noiseSeedRaw) : undefined;
+  const noiseSeedRaw = params.yue2NoiseSeed;
+  const noise_seed = yue2Seed(typeof noiseSeedRaw === 'number' ? Math.floor(noiseSeedRaw) : noiseSeedRaw);
 
-  // LM tab: forward only what the UI actually sent (an untouched control is
-  // absent), so the engine keeps its checkpoint value otherwise.
-  const lmFields: Array<[string, keyof Yue2SynthRequest]> = [
-    ['yue2PlanTemperature', 'plan_temperature'], ['yue2PlanTopP', 'plan_top_p'], ['yue2PlanTopK', 'plan_top_k'],
-    ['yue2PlanRepPenalty', 'plan_repetition_penalty'], ['yue2PlanRepWindow', 'plan_penalty_window'],
-    ['yue2PlanMaxTokens', 'plan_max_tokens'],
-    ['yue2SemTemperature', 'semantic_temperature'], ['yue2SemTopP', 'semantic_top_p'], ['yue2SemTopK', 'semantic_top_k'],
-    ['yue2SemRepPenalty', 'semantic_repetition_penalty'], ['yue2SemRepWindow', 'semantic_penalty_window'],
-    ['yue2SemMinTokens', 'semantic_min_tokens'], ['yue2SemMaxTokens', 'semantic_max_tokens'],
-    ['yue2EndThreshold', 'end_threshold'], ['yue2EndBias', 'end_bias'],
-    ['yue2EndBiasFrom', 'end_bias_from_sec'], ['yue2EndBiasRamp', 'end_bias_ramp_sec'],
-  ];
-  const lmOverrides: Record<string, number> = {};
-  for (const [uiKey, wireKey] of lmFields) {
-    if (params[uiKey] === undefined || params[uiKey] === null || params[uiKey] === '') continue;
-    const v = Number(params[uiKey]);
-    if (Number.isFinite(v)) lmOverrides[wireKey] = v;
-    else notes.push(`Invalid ${uiKey} — using the checkpoint default`);
-  }
+  const lmOverrides = yue2LmOverrides(params, notes);
   if (Object.keys(lmOverrides).length) notes.push(`LM overrides: ${Object.entries(lmOverrides).map(([k, v]) => `${k}=${v}`).join(', ')}`);
 
   const req: Yue2SynthRequest = {
@@ -503,11 +638,12 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
     ...(narSolver ? { infer_method: narSolver } : {}),
     ...(narScheduler ? { scheduler: narScheduler } : {}),
     ...(Object.keys(plugin_params).length ? { plugin_params } : {}),
+    ...(postprocess_plugin ? { postprocess_plugin } : {}),
     vae_variant,
-    ...(seed >= 0 ? { seed } : {}),
+    seed,
   };
 
-  return { req, notes, caption, halves: styled.halves };
+  return { req, abcSupplied: !!abc, notes, caption, halves: styled.halves };
 }
 
 /** First non-empty line of the caption, for StableStep's own SA3 prompt —
@@ -560,7 +696,7 @@ function yue2StageText(phase: string | undefined, step: number, total: number): 
 
 
 type Yue2Log = (level: 'INFO' | 'DEBUG' | 'WARNING' | 'ERROR', msg: string) => void;
-type Yue2AutoReplan = { attempts: Array<{ seed: number; verdict: string; reason: string; flags?: string[] }>; accepted: boolean;
+type Yue2AutoReplan = { attempts: Array<{ seed: Yue2Seed; verdict: string; reason: string; flags?: string[] }>; accepted: boolean;
   /** The rendered plan passed the judge with no legibility flags (only set
    *  when flag re-plans are on). false = the least-flagged was rendered. */
   clean?: boolean };
@@ -568,9 +704,12 @@ type Yue2AutoReplan = { attempts: Array<{ seed: number; verdict: string; reason:
 /** A job mapped, logged and (when on) auto-replanned: everything that happens
  *  before its request goes to the engine. Several of these can share one
  *  engine call (see runYue2Generation). */
-interface Yue2PreparedJob {
+export interface Yue2PreparedJob {
   job: GenerationJob;
   req: Yue2SynthRequest;
+  abcSupplied: boolean;
+  /** The app planned the score itself and handed the engine a finished one. */
+  abcPlanned?: boolean;
   caption: string;
   halves: Yue2StyleHalves;
   autoReplan?: Yue2AutoReplan;
@@ -583,6 +722,21 @@ interface Yue2PreparedJob {
   /** Cover provenance captured into the envelope at submit, undefined for an
    *  ordinary job. */
   cover?: Yue2CoverSubmission;
+  /** Seconds a built song's saved audio starts late, faded in (yue2Takes setBuildTrim). */
+  trimStart?: number;
+}
+
+/** A job's params with a cover's captured score and CFG applied, as the
+ *  render reads them. */
+function yue2JobParams(job: GenerationJob): any {
+  const captured = jobCover(job);
+  return captured ? { ...job.params, yue2Abc: captured.abc,
+    ...(captured.cover.cfgScale !== undefined ? { yue2CfgScale: captured.cover.cfgScale } : {}) } : job.params;
+}
+
+/** The /yue2/synth request a job would send, without sending it. */
+export function yue2RequestForJob(job: GenerationJob): Yue2SynthRequest {
+  return mapYue2Params(yue2JobParams(job), jobPick(job)).req;
 }
 
 async function prepareYue2Job(job: GenerationJob, attempt?: GenerationAttempt): Promise<Yue2PreparedJob> {
@@ -594,13 +748,28 @@ async function prepareYue2Job(job: GenerationJob, attempt?: GenerationAttempt): 
   // submit, never from job.params (the raw request body) — index.ts's
   // resolveRequest already validated it there.
   const captured = jobCover(job);
-  const params = captured ? { ...job.params, yue2Abc: captured.abc,
-    ...(captured.cover.cfgScale !== undefined ? { yue2CfgScale: captured.cover.cfgScale } : {}) } : job.params;
-  const { req, notes, caption, halves } = mapYue2Params(params, jobPick(job));
+  const { req, abcSupplied, notes, caption, halves } = mapYue2Params(yue2JobParams(job), jobPick(job));
 
   startGenerationLog(job.id, 'yue2-text2music');
   logGenerationParams(job.id, req as unknown as Record<string, unknown>);
   for (const n of notes) log('WARNING', `[YuE2] ${n}`);
+  // A song built section by section: the kept codec stream is rendered as it
+  // is (prefilled, not sampled), so the job only runs the audio stages, under
+  // the score and lyrics in the build's arranged order (the job params hold
+  // them in source order). Set after the request is logged, which would
+  // otherwise list every code.
+  const build = job.params?.yue2Build as { session?: unknown } | undefined;
+  let trimStart: number | undefined;
+  if (build?.session !== undefined) {
+    const render = buildSessionRender(String(build.session), job.userId);
+    trimStart = render.trimStart;
+    for (const key of ['codec_ids', 'abc', 'lyrics', 'lyric_schedule'] as const) {
+      if (render[key] === undefined) delete req[key];
+      else (req as unknown as Record<string, unknown>)[key] = render[key];
+    }
+    delete req.semantic_retries;
+    log('INFO', `[YuE2] Rendering ${render.codec_ids!.length} kept codec frames from build session ${String(build.session)}`);
+  }
 
   console.log(`[Generate] Job ${job.id} — backend=yue2, cot=${req.cot}, seed=${req.seed ?? -1}, `
     + `caption=${req.style.length} chars, lyrics=${req.lyrics ? `${req.lyrics.length} chars` : '(instrumental)'}`);
@@ -625,7 +794,7 @@ async function prepareYue2Job(job: GenerationJob, attempt?: GenerationAttempt): 
     throw new Error('YuE2 needs a caption — the Style Description field is empty');
   }
 
-  return { job, req, caption, halves, timing, pipelineStart, log, attempt, cover: captured?.cover };
+  return { job, req, abcSupplied, caption, halves, timing, pipelineStart, log, attempt, cover: captured?.cover, trimStart };
 }
 
 // ── Auto-replan ──
@@ -656,25 +825,50 @@ function activeStyleNorms(pick: Yue2PersistedSelection): Yue2StyleNorms | null {
   return readYue2StyleNorms(jointRunForAdapter(adapter)?.output);
 }
 
-async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
+/** Whether a job plans its score before rendering. 'replan': auto-replan,
+ *  redrawing bad plans. 'once': re-planning is off, but an instrumental still
+ *  needs its score in hand so the melody can move off Vocal (instrumentalScore.ts);
+ *  the one plan renders whatever it is; also when the planner strength
+ *  differs from the composer's, since the two strengths need two loads.
+ *  null: the engine plans and renders in one call, or there is nothing to
+ *  plan (a supplied score, which mapYue2Params has already moved, or Chain of
+ *  Thought off). */
+export function yue2PlanMode(params: any, req: Pick<Yue2SynthRequest, 'cot' | 'abc' | 'lyrics'>, splitPlan = false): 'replan' | 'once' | null {
+  if (req.cot === 'off' || req.abc) return null;
+  if (params.yue2AutoReplan !== false) return 'replan';
+  return params.instrumental === true || !req.lyrics || splitPlan ? 'once' : null;
+}
+
+/** Plan attempt k's seed (k from 1): the base itself, then fixed steps from it
+ *  (the engine's compose retries step the same way), within uint32. */
+export function yue2ReplanSeed(base: Yue2Seed, k: number): Yue2Seed {
+  const b = BigInt(base), next = b + 1000003n * BigInt(k - 1);
+  // A uint32 base keeps the uint32 walk; a wider pinned seed steps within uint64, exactly.
+  return yue2Seed((b < 4294967296n ? next % 4294967296n : next % 18446744073709551616n).toString())!;
+}
+
+/** @internal exported for tests */
+export async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
   type Pending = {
     m: Yue2PreparedJob; maxAttempts: number; replanFlags: boolean; instrumental: boolean;
-    sheets: string[]; done: boolean;
+    once: boolean; sheets: string[]; done: boolean; seedBase?: Yue2Seed;
   };
   const pending: Pending[] = [];
   for (const m of members) {
     const { job, req } = m;
-    if (job.params.yue2AutoReplan === false || req.cot === 'off' || req.abc) continue;
+    const mode = yue2PlanMode(job.params, req, yue2PlanScaleDiffers(jobPick(job).adapters));
+    if (!mode) continue;
     m.autoReplan = { attempts: [], accepted: false };
     // UI slider (index.ts's yue2ReplanAttempts extension) clamps to [1, 10].
     const attemptsRaw = Number(job.params.yue2ReplanAttempts);
-    const maxAttempts = Number.isInteger(attemptsRaw) && attemptsRaw >= 1 && attemptsRaw <= 10 ? attemptsRaw : 3;
+    const maxAttempts = mode === 'once' ? 1
+      : Number.isInteger(attemptsRaw) && attemptsRaw >= 1 && attemptsRaw <= 10 ? attemptsRaw : 3;
     // Plan flags (2026-09-27): a plan the judge passes can still be
     // illegible (one chord for the whole song, a looped riff, a melody on two
     // pitches). On by default like the runaway re-plans; the same tries.
-    const replanFlags = job.params.yue2ReplanFlags !== false;
+    const replanFlags = mode === 'replan' && job.params.yue2ReplanFlags !== false;
     const instrumental = job.params.instrumental === true || !req.lyrics;
-    pending.push({ m, maxAttempts, replanFlags, instrumental, sheets: [], done: false });
+    pending.push({ m, maxAttempts, replanFlags, instrumental, once: mode === 'once', sheets: [], done: false });
   }
   if (!pending.length) return;
 
@@ -692,10 +886,16 @@ async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
     // 4096-token cap (12.3 ms/step at 8 wide, 5.8 at 1: ~50 s vs ~24 s), so
     // round one draws a single plan per song (yue2PlanDraws).
     const order = yue2PlanDraws(live.map(p => ({ used: p.m.autoReplan!.attempts.length, max: p.maxAttempts })), slots, round === 1);
-    // A pinned seed is the first attempt's (round one's); every re-plan draws its own.
+    // Attempt k plans with yue2ReplanSeed(base, k): attempt 1 is the job's own
+    // seed, later ones step from it, so a pinned seed replays the same re-plans
+    // (and the same winner) on every run. An unpinned job draws its base once.
+    const nextAttempt = new Map<Pending, number>();
     const draws = order.map(i => {
       const p = live[i];
-      return { p, seed: round === 1 && typeof p.m.req.seed === 'number' ? p.m.req.seed : randomSeed() };
+      const k = nextAttempt.get(p) ?? p.m.autoReplan!.attempts.length + 1;
+      nextAttempt.set(p, k + 1);
+      p.seedBase ??= yue2Seed(p.m.req.seed) ?? randomSeed();
+      return { p, seed: yue2ReplanSeed(p.seedBase, k) };
     });
     for (const p of live) {
       const n = draws.filter(d => d.p === p).length;
@@ -712,7 +912,7 @@ async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
 
     let plans: Array<{ abc: string; end_reason: string }>;
     try {
-      plans = await runYue2PlanBatch(live[0].m.req, draws.map(d => ({
+      plans = await runYue2PlanBatch(live[0].m.req, jobPick(live[0].m.job), draws.map(d => ({
         style: d.p.m.req.style, ...(d.p.m.req.lyrics ? { lyrics: d.p.m.req.lyrics } : {}), seed: d.seed,
       })));
     } catch (err: any) {
@@ -745,8 +945,17 @@ async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
     const seed = picked.pick.seed;
     autoReplan.accepted = yue2PlanUsable(picked.pick.verdict, p.instrumental);
     if (p.replanFlags) autoReplan.clean = picked.clean;
-    m.req.abc = p.sheets[picked.index];
+    const notes: string[] = [];
+    m.req.abc = m.req.lyrics ? p.sheets[picked.index] : yue2InstrumentalAbc(p.sheets[picked.index], notes);
+    m.abcPlanned = true;
+    for (const n of notes) m.log('INFO', `[YuE2] ${n}`);
     m.req.seed = seed;
+    if (p.once) {
+      // Re-planning is off: this was a plan-first pass for the instrumental move, not a re-plan.
+      m.autoReplan = undefined;
+      m.log('INFO', `[YuE2] Re-planning is off; planned the score once (seed ${seed}, ${picked.pick.verdict}) so the melody could move to Ins`);
+      continue;
+    }
     if (!autoReplan.accepted) m.log('WARNING', `[YuE2] Every plan attempt was a runaway, had no vocal line or ran to its cap; rendering the last one (seed ${seed})`);
     else if (p.replanFlags && !picked.clean) m.log('WARNING', `[YuE2] No clean plan in ${autoReplan.attempts.length} attempts: every one carried plan flags. Rendering the least-flagged (seed ${seed}: ${(picked.pick.flags ?? []).join('; ')}). This adapter/checkpoint is not writing good plans.`);
     else if (picked.index > 0) m.log('INFO', `[YuE2] Bad plan replaced: rendering attempt ${picked.index + 1} of ${autoReplan.attempts.length}`);
@@ -775,8 +984,8 @@ function yue2SongEntries(p: Yue2PreparedJob): NonNullable<Yue2SynthRequest['song
     style: p.req.style,
     ...(p.req.lyrics ? { lyrics: p.req.lyrics } : {}),
     ...(p.req.abc ? { abc: p.req.abc } : {}),
-    ...(typeof p.req.seed === 'number' ? { seed: p.req.seed + i } : {}),
-    ...(typeof p.req.noise_seed === 'number' ? { noise_seed: p.req.noise_seed + i } : {}),
+    ...(p.req.seed !== undefined ? { seed: yue2SeedPlus(p.req.seed, i) } : {}),
+    ...(p.req.noise_seed !== undefined ? { noise_seed: yue2SeedPlus(p.req.noise_seed, i) } : {}),
   }));
 }
 
@@ -971,7 +1180,7 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
     // /yue2/synth answers with the job id and nothing else (#177). The seed and
     // the instrumental flag come from what we sent; a random seed (-1) is only
     // known once the job reports its tracks, and is recorded then.
-    const reqSeed = lead.req.seed ?? -1;
+    const reqSeed: Yue2Seed = lead.req.seed ?? -1;
     job.aceJobId = sub.job_id;   // standard /job id — /cancel/:id reaches it unchanged
     if (members.length > 1) {
       const entry = { engineJobId: sub.job_id, members: members.map((m, i) => ({ job: m.job, bits: songBits[i] })) };
@@ -980,14 +1189,30 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
       const early = entry.members.filter(e => (e.job.status as string) === 'cancelled').reduce((a, e) => a | e.bits, 0);
       if (early && !allCancelled()) await aceClient.dropSongs(sub.job_id, early).catch(() => {});
     }
-    if (reqSeed >= 0) {
+    // The seed the user typed, before re-plans and the per-song +i offset
+    // replace job.params.seed with the rendered one. Reuse-seed reads this so
+    // a reused variation does not shift the base (and the wildcard expansion).
+    // Seeds may arrive as exact decimal strings above 2^53 (ae21a09e).
+    if (job.params.baseSeed === undefined && !job.params.randomSeed
+        && (typeof job.params.seed === 'number' || typeof job.params.seed === 'string')
+        && Number(job.params.seed) >= 0) {
+      job.params.baseSeed = job.params.seed;
+    }
+    for (const m of members.slice(1)) {
+      if (m.job.params.baseSeed === undefined && !m.job.params.randomSeed
+          && (typeof m.job.params.seed === 'number' || typeof m.job.params.seed === 'string')
+          && Number(m.job.params.seed) >= 0) {
+        m.job.params.baseSeed = m.job.params.seed;
+      }
+    }
+    if (Number(reqSeed) >= 0) {
       deps.attempt.effective.seed = reqSeed;
       job.params.seed = reqSeed;
       job.params.randomSeed = false;
     }
     log('INFO', `[YuE2] Job ${sub.job_id} submitted — cot=${req.cot}, ode_steps=${req.ode_steps}, `
       + `cfg=${req.cfg_scale ?? '(default)'}, vae=${req.vae_variant}, `
-      + `seed ${reqSeed >= 0 ? reqSeed : 'random'}${lead.req.lyrics ? '' : ', instrumental'}`);
+      + `seed ${Number(reqSeed) >= 0 ? reqSeed : 'random'}${lead.req.lyrics ? '' : ', instrumental'}`);
 
     // ── Progress ticker ──
     // No /yue2/job route exists (docs/plans/yue2/06-engine-port-plan.md §7
@@ -1034,7 +1259,10 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
     }, DETAIL_POLL_MS);
     detailTimer.unref?.();
 
-    await deps.pollUntilDone(sub.job_id, pollView, deps.signal, timeoutMinutes);
+    await deps.pollUntilDone(sub.job_id, pollView, deps.signal, timeoutMinutes, {
+      // No chunk cap means the engine can render the full 360 s song at 25 fps.
+      narChunkFrames: req.nar_chunk_frames || 9000,
+    });
     clearInterval(detailTimer);
     detailTimer = undefined;
     const generateMs = Math.round(performance.now() - submitStart);
@@ -1161,7 +1389,7 @@ async function finishYue2Job(
       if (eosStages.length) log('INFO', `[YuE2] Stages reaching their own terminator: ${eosStages.join(', ')}`);
     }
     const resolvedSeed = trackDetails[0]?.seed;
-    if (typeof resolvedSeed === 'number' && resolvedSeed >= 0) {
+    if (resolvedSeed !== undefined && Number(resolvedSeed) >= 0) {
       if (p.attempt) p.attempt.effective.seed = resolvedSeed;
       job.params.seed = resolvedSeed;
       job.params.randomSeed = false;
@@ -1174,6 +1402,10 @@ async function finishYue2Job(
     const audioUrls: string[] = [];
     const filepaths: string[] = [];
     const durations: number[] = [];
+    if (p.trimStart) {
+      log('INFO', `[YuE2] Starting the built song ${p.trimStart.toFixed(2)} s in, faded in over ${TRIM_FADE_S} s`);
+      parts = parts.map(part => trimWavStart(part, p.trimStart!, TRIM_FADE_S));
+    }
     for (let i = 0; i < parts.length; i++) {
       const filename = `${uuidv4()}.wav`;
       const filepath = path.join(config.data.audioDir, filename);
@@ -1182,6 +1414,19 @@ async function finishYue2Job(
       filepaths.push(filepath);
       const td = trackDetails[i];
 
+      // 48 kHz native (yue2vae.sample_rate) — read from the WAV header rather
+      // than assumed, same as every other backend.
+      // A requested duration is a ceiling: YuE2 cannot bound its own length on
+      // the wire, so trim the render here (durationCap.ts). Never fatal.
+      const fullSec = wavDurationSec(filepath);
+      let measured = fullSec;
+      try {
+        const cap = applyYue2DurationCap(filepath, job.params);
+        if (cap.trimmed) log('INFO', `[YuE2] Trimmed ${filename} from ${Math.round(measured)}s to requested ${Math.round(cap.durationSec)}s (${YUE2_TRIM_FADE_SEC}s fade-out)`);
+        measured = cap.durationSec;
+      } catch (e: any) {
+        log('WARNING', `[YuE2] Duration trim failed (non-fatal, kept full length): ${e?.message ?? e}`);
+      }
       // Artifacts: score.abc (decoded ABC text) and semantic ids, saved beside
       // the WAV as sidecars when the engine returned them. Never fatal.
       const abcText = td.abc ?? (parts.length === 1 ? finalDetail.abc : undefined);
@@ -1192,20 +1437,28 @@ async function finishYue2Job(
           log('WARNING', `[YuE2] Failed to save score.abc sidecar (non-fatal): ${e?.message ?? e}`);
         }
       }
-      if (parts.length === 1 && finalDetail.semantic_ids?.length) {
+      // The codec stream and the request that made it, so a later request
+      // can resume it from a section boundary (codec_ids +
+      // continue_codec_ids) with the same prompt and score.
+      const semanticIds = td?.semantic_ids ?? (parts.length === 1 ? finalDetail.semantic_ids : undefined);
+      if (semanticIds?.length) {
+        // ponytail: codec ids are a constant frame rate, so a trim keeps the
+        // same fraction of ids; exact only if the trimmed tail is uniform.
+        const kept = measured < fullSec ? semanticIds.slice(0, Math.ceil(semanticIds.length * measured / fullSec)) : semanticIds;
         try {
           fs.writeFileSync(
             path.join(config.data.audioDir, filename.replace(/\.[^.]+$/, '.semantic.json')),
-            JSON.stringify(finalDetail.semantic_ids),
+            JSON.stringify(kept),
+          );
+          fs.writeFileSync(
+            path.join(config.data.audioDir, filename.replace(/\.[^.]+$/, '.yue2-request.json')),
+            JSON.stringify({ request: req, seed: td?.seed, noise_seed: td?.noise_seed }),
           );
         } catch (e: any) {
           log('WARNING', `[YuE2] Failed to save semantic-ids sidecar (non-fatal): ${e?.message ?? e}`);
         }
       }
 
-      // 48 kHz native (yue2vae.sample_rate) — read from the WAV header rather
-      // than assumed, same as every other backend.
-      const measured = wavDurationSec(filepath);
       durations.push(measured);
       log('INFO', `[YuE2] Saved ${filename} (${(parts[i].length / 1024).toFixed(0)} KB, ${Math.round(measured)}s)`
         + (parts.length > 1 ? ` — song ${td.song + 1}, variation ${td.variation + 1}, seed ${td.seed}, noise ${td.noise_seed}` : ''));
@@ -1355,7 +1608,8 @@ async function finishYue2Job(
           end_reason: td.end_reason ?? finalDetail.end_reason,
           stage_end_reasons: td.stage_end_reasons ?? finalDetail.stage_end_reasons,
           duration_s: measured > 0 ? Math.round(measured * 10) / 10 : undefined,
-          abc_supplied: !!req.abc,
+          abc_supplied: p.abcSupplied,
+          ...(p.abcPlanned ? { abc_planned: true } : {}),
           ...(parts.length > 1 ? { song: td.song, variation: td.variation, noise_seed: td.noise_seed } : {}),
           ...(scoreHealth ? { score_health: scoreHealth } : {}),
           ...(autoReplan ? { auto_replan: autoReplan } : {}),
@@ -1452,7 +1706,7 @@ async function finishYue2Job(
 
 export interface Yue2PlanPreview {
   abc: string;
-  seed: number;
+  seed: Yue2Seed;
   end_reason: string;
   stage_end_reasons?: Yue2FinalDetail['stage_end_reasons'];
   health: Yue2ScoreHealth;
@@ -1469,7 +1723,10 @@ export async function runYue2PlanPreview(params: any, signal?: AbortSignal): Pro
   // params.semantic: run the semantic stage too and return its codec ids
   // (about a minute) instead of stopping at the lead sheet (seconds).
   const semantic = params?.semantic === true;
-  const planReq: Yue2SynthRequest = semantic ? { ...req, semantic_only: true } : { ...req, plan_only: true };
+  // A score-only preview plans at the planner strength; the semantic preview
+  // runs both stages in one load, so it keeps the composer's.
+  const planReq: Yue2SynthRequest = semantic ? { ...req, semantic_only: true }
+    : { ...req, plan_only: true, lm_adapter: yue2AdapterWire(yue2PlanStackFrom(pick.adapters)) };
   delete planReq.abc;
 
   const sub = await yue2Synth(planReq);
@@ -1513,8 +1770,9 @@ async function waitYue2PlanJob(jobId: string, signal?: AbortSignal): Promise<voi
 /** One plan_only pass over several songs (up to props.max_plan_batch), each
  *  with its own prompt and seed, sharing `req`'s settings. Scores come back
  *  in entry order. */
-async function runYue2PlanBatch(req: Yue2SynthRequest, songs: NonNullable<Yue2SynthRequest['songs']>): Promise<Array<{ abc: string; end_reason: string }>> {
-  const planReq: Yue2SynthRequest = { ...req, plan_only: true, songs };
+async function runYue2PlanBatch(req: Yue2SynthRequest, pick: Yue2PersistedSelection, songs: NonNullable<Yue2SynthRequest['songs']>): Promise<Array<{ abc: string; end_reason: string }>> {
+  // Planner strength: the score is written under its own adapter load.
+  const planReq: Yue2SynthRequest = { ...req, plan_only: true, songs, lm_adapter: yue2AdapterWire(yue2PlanStackFrom(pick.adapters)) };
   for (const k of ['lyrics', 'abc', 'seed', 'noise_seed', 'lm_batch_size', 'synth_batch_size'] as const) delete planReq[k];
   const sub = await yue2Synth(planReq);
   await waitYue2PlanJob(sub.job_id);

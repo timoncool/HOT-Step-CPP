@@ -13,7 +13,11 @@
 -- GNU General Public License for more details: https://www.gnu.org/licenses/
 -- ============================================================================
 
--- MD Causal Scheduler v2.1 — LINA Time Warping + Multi-Mode Base Curves
+-- MD Causal Scheduler v2.2 — LINA Time Warping + Multi-Mode Base Curves
+-- MDMAchine | A&E Concepts © 2026
+--
+-- v2.2: Schema/code default sync — mode fallback "karras" -> "polynomial",
+--       lina_shift fallback 1.0 -> 1.2 (matching UI schema defaults).
 -- MDMAchine | A&E Concepts © 2026
 --
 -- Port of md_causal_scheduler_core.py to HOT-Step-CPP Lua.
@@ -45,7 +49,7 @@
 scheduler = {
     name        = "md_causal",
     display     = "MD Causal (LINA + 14 Modes)",
-    description = "14 base schedule modes with LINA time-axis warp. Karras, smoothstep, beta, AYS, bong, DDIM, SGM, blended, variance-preserving, KL-optimal and more. Port of md_causal_scheduler_core v2.1.",
+    description = "14 base schedule modes with LINA time-axis warp. Karras, smoothstep, beta, AYS, bong, DDIM, SGM, blended, variance-preserving, KL-optimal and more. Port of md_causal_scheduler_core v2.2.",
     params      = {
         {
             key     = "mode",
@@ -389,8 +393,8 @@ end
 -- ── Required schedule() function ─────────────────────────────────────────────
 
 function schedule(output, num_steps, shift)
-    local mode        = (params and params.mode)         or "karras"
-    local lina_shift  = (params and params.lina_shift)   or 1.0
+    local mode        = (params and params.mode)         or "polynomial"
+    local lina_shift  = (params and params.lina_shift)   or 1.2
     local rho         = (params and params.rho)          or 7.0
     local power       = (params and params.power)        or 2.0
     local ba          = (params and params.beta_alpha)   or 0.6

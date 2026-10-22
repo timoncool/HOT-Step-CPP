@@ -56,7 +56,7 @@ export const SectionMatchReview: React.FC<Props> = ({ before, match, stale, savi
         The lyrics changed after matching. Match again before applying.
       </p>}
       <div className="flex flex-wrap gap-2">
-        {!match.unchanged && <button type="button" onClick={onApply} disabled={stale}
+        {!match.unchanged && !match.datasetSong && <button type="button" onClick={onApply} disabled={stale}
           className="disabled:opacity-40 rounded bg-cyan-600 px-2 py-1 text-xs font-semibold text-white">Apply</button>}
         {match.datasetSong && <button type="button" onClick={onSave} disabled={saving || stale}
           className="rounded bg-emerald-600 px-2 py-1 text-xs font-semibold text-white disabled:opacity-40">

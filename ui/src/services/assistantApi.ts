@@ -1,3 +1,4 @@
+import { apiClient, type ReadOptions } from './httpClient';
 // assistantApi.ts — Frontend API client for the AI Assistant
 //
 // Provides streaming chat via SSE (fetch + ReadableStream) and
@@ -201,8 +202,6 @@ export function extractThinkingAndResponse(text: string): { thinking: string | n
 /**
  * Fetch available LLM providers for the assistant.
  */
-export async function getProviders(): Promise<AssistantProvider[]> {
-  const res = await fetch('/api/assistant/providers');
-  if (!res.ok) throw new Error(`Failed to fetch providers: ${res.statusText}`);
-  return res.json();
+export async function getProviders(opts?: ReadOptions): Promise<AssistantProvider[]> {
+  return apiClient.get<AssistantProvider[]>('/assistant/providers', opts);
 }

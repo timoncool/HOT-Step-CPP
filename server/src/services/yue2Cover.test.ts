@@ -12,6 +12,7 @@ import { createYue2CoverService } from './yue2Cover.js';
 import { createYue2CoverRouter } from '../routes/yue2Cover.js';
 import { readSidecar, writeSidecar } from './training/sidecarIO.js';
 import { sidecarPathFor } from './training/paths.js';
+import { abcSidecarPath, writeAbcSidecar } from './training/abcSidecar.js';
 
 function fixture(missing = false, defer = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yue2-cover-api-'));
@@ -26,8 +27,10 @@ function fixture(missing = false, defer = false) {
   let started = 0;
   let cancelled = 0;
   let runnerCalls = 0;
+  let ranOn = '';
   let duration = 120;
   let datasetAudio: string | null = null;
+  let failAbc = false;
   let pending: (() => Promise<void>) | undefined;
   let alignTimes: Array<[string, number]> = [];
   const fakeQueue = {
@@ -67,23 +70,30 @@ function fixture(missing = false, defer = false) {
       const file = sidecarPathFor(audioPath);
       await writeSidecar(file, { ...readSidecar(file), ...fields }, { keepBackups: true });
     },
+    saveAbc: ({ audioPath }: { audioPath: string }, abc: string) => {
+      if (failAbc) throw new Error('disk full');
+      return writeAbcSidecar(audioPath, abc, { keepBackups: true });
+    },
+    toMp3: async (file: string) => { const out = path.join(root, 'cover-mp3', path.basename(file) + '.mp3'); fs.mkdirSync(path.dirname(out), { recursive: true }); fs.writeFileSync(out, 'mp3'); return out; },
     datasetMatch: () => datasetAudio ? { datasetId: 'dataset-1', sampleId: 'sample-1', audioPath: datasetAudio } : null,
     song: (id, userId) => id === 'song-1' && userId === 'owner' ? { audio_url: '/audio/library.wav', title: 'Library track' } : undefined,
-    run: async (job, _audioPath, dir) => {
+    run: async (job, audioPath, dir) => {
       runnerCalls++;
+      ranOn = audioPath;
       job.status = 'running';
       job.phase = 'transcribing';
       await new Promise<void>(resolve => { job.controller.signal.addEventListener('abort', () => resolve(), { once: true }); setTimeout(resolve, 15); });
       if (job.controller.signal.aborted) return '';
-      fs.writeFileSync(path.join(dir, 'cover-sheet.json'), JSON.stringify({ sources: [{ name: upload, abc: 'X:1\nK:C\nC' }] }));
+      fs.writeFileSync(path.join(dir, 'cover-sheet.json'), JSON.stringify({ sources: [{ name: path.basename(audioPath), abc: 'X:1\nK:C\nC' }] }));
       job.status = 'done';
       return 'X:1\nK:C\nC';
     },
   });
   return { root, referenceDir, libraryDir, upload, service, setDuration: (n: number) => { duration = n; },
     setDatasetAudio: (audio: string | null) => { datasetAudio = audio; },
+    failAbcWrites: (fail: boolean) => { failAbc = fail; },
     setAlign: (times: Array<[string, number]>) => { alignTimes = times; },
-    counts: () => ({ started, cancelled, runnerCalls }), drain: async () => { await pending?.(); },
+    counts: () => ({ started, cancelled, runnerCalls }), ranOn: () => ranOn, drain: async () => { await pending?.(); },
     close: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -126,6 +136,17 @@ test('instrumental metadata and missing or malformed sidecars preserve fallback'
     if (!instrumental.matched || !instrumental.metadataAvailable) throw new Error('Expected dataset metadata');
     assert.equal(instrumental.isInstrumental, true);
     assert.equal(instrumental.lyrics, '');
+    // A blank flag is read from the lyrics.
+    fs.writeFileSync(sidecar, 'bpm: 123\nkey: C# Minor\nis_instrumental:\nlyrics:\n[Intro]\nSung line\n');
+    const blank = await f.service.lookup(input, 'owner');
+    if (!blank.matched || !blank.metadataAvailable) throw new Error('Expected dataset metadata');
+    assert.equal(blank.isInstrumental, false);
+    assert.equal(blank.lyrics, '[Intro]\nSung line');
+    fs.writeFileSync(sidecar, 'bpm: 123\nkey: C# Minor\nis_instrumental:\nlyrics:');
+    const blankEmpty = await f.service.lookup(input, 'owner');
+    assert.equal(blankEmpty.matched && blankEmpty.metadataAvailable && blankEmpty.isInstrumental, true);
+    fs.writeFileSync(sidecar, 'bpm: 123\nkey: C# Minor\nis_instrumental: maybe\nlyrics: line');
+    assert.deepEqual(await f.service.lookup(input, 'owner'), { matched: false });
   } finally { f.close(); }
 });
 
@@ -158,9 +179,24 @@ test('invalid, oversized, and unreadable sources are refused before enqueue', as
     f.setDuration(601);
     await assert.rejects(f.service.start({ sourceAudioUrl: `/references/${f.upload}` }, 'owner'), /10 minutes/);
     f.setDuration(120);
-    fs.truncateSync(path.join(f.referenceDir, f.upload), 100 * 1024 * 1024 + 1);
-    await assert.rejects(f.service.start({ sourceAudioUrl: `/references/${f.upload}` }, 'owner'), /100 MB/);
+    fs.truncateSync(path.join(f.referenceDir, f.upload), 0);
+    await assert.rejects(f.service.start({ sourceAudioUrl: `/references/${f.upload}` }, 'owner'), /empty/);
     assert.equal(f.counts().started, 0);
+  } finally { f.close(); }
+});
+
+test('an oversized source runs on a cached MP3 copy, leaving the original alone', async () => {
+  const f = fixture();
+  try {
+    const original = path.join(f.referenceDir, f.upload);
+    fs.truncateSync(original, 100 * 1024 * 1024 + 1);
+    const result = await f.service.start({ sourceAudioUrl: `/references/${f.upload}` }, 'owner');
+    assert.equal(result.status, 'queued');
+    await new Promise(resolve => setTimeout(resolve, 40));
+    assert.equal(f.ranOn(), path.join(f.root, 'cover-mp3', f.upload + '.mp3'));
+    assert.equal(fs.statSync(original).size, 100 * 1024 * 1024 + 1);
+    assert.deepEqual(fs.readdirSync(f.referenceDir), [f.upload]);
+    assert.equal(f.service.find(result.jobId!, 'owner').abc, 'X:1\nK:C\nC');
   } finally { f.close(); }
 });
 
@@ -300,11 +336,11 @@ test('drift route authenticates, aligns once, and persists the cached result', a
     assert.equal(first.status, 200);
     const body = await first.json() as { meanAbsoluteOffsetBars: number; metricVersion: number; inputHash: string };
     assert.equal(body.meanAbsoluteOffsetBars, 0);
-    assert.equal(body.metricVersion, 4);
+    assert.equal(body.metricVersion, 5);
     assert.equal((await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer owner' } })).status, 200);
     assert.equal(alignCalls, 1);
     row.generation_params = JSON.stringify({ ...JSON.parse(row.generation_params),
-      yue2CoverDrift: { ...body, metricVersion: 3, meanAbsoluteOffsetBars: 99 } });
+      yue2CoverDrift: { ...body, metricVersion: 4, meanAbsoluteOffsetBars: 99 } });
     const refreshed = await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer owner' } });
     assert.equal((await refreshed.json() as { meanAbsoluteOffsetBars: number }).meanAbsoluteOffsetBars, 0);
     assert.equal(alignCalls, 2);
@@ -326,11 +362,19 @@ test('match sections retags from aligned times; save writes the dataset sidecar 
     const matched = await f.service.matchSections({ ...input, abc, lyrics }, 'owner');
     assert.equal(matched.lyrics, '[verse]\nfirst line\n\n[chorus]\nsecond line');
     assert.equal(matched.datasetSong, false);
+    // The other direction returns the score's new sections; nothing is written.
+    const plan = await f.service.planScoreSections({ ...input, abc, lyrics }, 'owner');
+    // The lyrics win, so the score takes the lyric's own kind ([Hook] → hook).
+    assert.deepEqual(plan.sections.map(s => `${s.label}@${s.bar}`), ['verse@1', 'hook@3']);
+    assert.equal(plan.lyrics, matched.lyrics.replace('[chorus]', '[hook]'));
     await assert.rejects(f.service.saveDatasetDetails({ ...input, lyrics: matched.lyrics }, 'owner'), /not a dataset song/);
     f.setDatasetAudio(path.join(f.referenceDir, f.upload));
     const sidecar = path.join(f.referenceDir, path.parse(f.upload).name + '.txt');
     fs.writeFileSync(sidecar, `caption: test\nbpm: 120\nkey: E Major\nlyrics:\n${lyrics}\n`);
-    const saved = await f.service.saveDatasetDetails({ ...input, lyrics: matched.lyrics }, 'owner');
+    const onDataset = await f.service.matchSections({ ...input, abc, lyrics }, 'owner');
+    assert.equal(onDataset.datasetSong, true);
+    await assert.rejects(f.service.saveDatasetDetails({ ...input, lyrics: matched.lyrics }, 'owner'), /changed since matching/);
+    const saved = await f.service.saveDatasetDetails({ ...input, lyrics: matched.lyrics, revision: onDataset.revision }, 'owner');
     assert.equal(saved.saved, true);
     assert.equal(readSidecar(sidecar).lyrics, matched.lyrics);
     assert.equal(readSidecar(sidecar).caption, 'test');
@@ -361,4 +405,92 @@ test('saving with keepBackups never replaces an existing .bak', async () => {
     assert.equal(stamped.length, 1);
     assert.equal(readSidecar(path.join(dir, stamped[0])).lyrics, 'current words');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an accepted score plan saves lyrics and the revised score with backups, and a reload reuses them', async () => {
+  const f = fixture();
+  try {
+    const input = { sourceAudioUrl: `/references/${f.upload}` };
+    const abc = ['X:1', 'M:3/4', 'L:1/8', 'Q:1/8=120', 'K:C', '% verse', 'V: Vocal', 'C6|D6|',
+      '% chorus', 'V: Vocal', 'E6|F6|', ''].join('\n');
+    const revised = abc.replace('% chorus', '% hook');
+    const lyrics = '[Verse 1]\nfirst line\n[Hook]\nsecond line';
+    f.setAlign([['first', 0.2], ['second', 6.1]]);
+    f.setDatasetAudio(path.join(f.referenceDir, f.upload));
+    const sidecar = path.join(f.referenceDir, path.parse(f.upload).name + '.txt');
+    const abcFile = abcSidecarPath(path.join(f.referenceDir, f.upload));
+    fs.writeFileSync(sidecar, `caption: test\nbpm: 120\nkey: E Major\nis_instrumental: false\nlyrics:\n${lyrics}\n`);
+    fs.writeFileSync(abcFile, `${abc}\n`);
+    const plan = await f.service.planScoreSections({ ...input, abc, lyrics }, 'owner');
+    assert.equal(plan.datasetSong, true);
+
+    // Nothing is written by planning, and a score with no vocal is refused before any write.
+    assert.equal(readSidecar(sidecar).lyrics, lyrics);
+    await assert.rejects(f.service.saveDatasetDetails({ ...input, lyrics: plan.lyrics, abc: 'X:1\nK:C\n', revision: plan.revision }, 'owner'), /sounding vocal/);
+    assert.equal(readSidecar(sidecar).lyrics, lyrics);
+    // A song edited since matching is refused whole.
+    fs.appendFileSync(sidecar, 'extra\n');
+    await assert.rejects(f.service.saveDatasetDetails({ ...input, lyrics: plan.lyrics, abc: revised, revision: plan.revision }, 'owner'), /changed since matching/);
+    const fresh = await f.service.planScoreSections({ ...input, abc, lyrics }, 'owner');
+    assert.notEqual(fresh.revision, plan.revision);
+
+    // An .abc failure after the .txt is written is reported, not hidden.
+    f.failAbcWrites(true);
+    const partial = await f.service.saveDatasetDetails({ ...input, lyrics: fresh.lyrics, abc: revised, revision: fresh.revision }, 'owner') as { saved: boolean; abcSaved?: boolean; abcError?: string };
+    assert.equal(partial.saved, true);
+    assert.equal(partial.abcSaved, false);
+    assert.match(partial.abcError || '', /disk full/);
+    assert.equal(readSidecar(sidecar).lyrics, fresh.lyrics);
+    assert.equal(fs.readFileSync(abcFile, 'utf8').trim(), abc.trim());
+    f.failAbcWrites(false);
+
+    const again = await f.service.planScoreSections({ ...input, abc, lyrics }, 'owner');
+    const done = await f.service.saveDatasetDetails({ ...input, lyrics: again.lyrics, abc: revised, revision: again.revision }, 'owner') as { abcSaved?: boolean };
+    assert.equal(done.abcSaved, true);
+    assert.equal(fs.readFileSync(abcFile, 'utf8').trim(), revised.trim());
+    assert.equal(readSidecar(sidecar).caption, 'test');
+    assert.equal(fs.readFileSync(`${abcFile}.bak`, 'utf8').trim(), abc.trim());
+    assert.equal(readSidecar(`${sidecar}.bak`).lyrics, lyrics + '\nextra');
+
+    // Reload: the dataset supplies the saved score and lyrics, with no job.
+    const looked = await f.service.lookup(input, 'owner');
+    assert.equal(looked.matched && looked.metadataAvailable && looked.lyrics, again.lyrics);
+    const started = await f.service.start(input, 'owner');
+    assert.equal(started.status, 'done');
+    assert.equal(started.abc, revised.trim());
+    assert.equal(f.counts().started, 0);
+  } finally { f.close(); }
+});
+
+test('suggestions stamp what they were made for, stay instant unless asked, and fall back when the recording fails', async () => {
+  const f = fixture();
+  try {
+    const abc = ['X:1', 'M:3/4', 'L:1/8', 'Q:1/8=120', 'K:C', '% verse', 'V: Vocal', 'C6|D6|',
+      '% chorus', 'V: Vocal', 'E6|F6|', '% chorus', 'V: Vocal', 'E6|F6|', ''].join('\n');
+    const prepare = {
+      version: 2, sourceKey: 'src-1', abc, sectionIds: ['s1', 's2', 's3'], paste: '', excluded: [], flagged: [], nextId: 4,
+      lyricRevision: 7, assignments: {}, confirmed: { structure: null, lyrics: null },
+      blocks: [{ id: 'b1', text: 'first line', tag: 'Verse' }, { id: 'b2', text: 'second line', tag: 'Chorus' }],
+    };
+    const input = { sourceAudioUrl: `/references/${f.upload}`, prepare };
+    const instant = await f.service.suggestAssignments(input, 'owner');
+    assert.deepEqual([instant.sourceKey, instant.lyricRevision, instant.structureHash.startsWith('v1:')], ['src-1', 7, true]);
+    assert.deepEqual(instant.assignments, { s1: ['b1'], s2: ['b2'] });
+    assert.deepEqual(instant.reuse, [{ sectionId: 's3', blockId: 'b2' }]);
+    assert.equal(instant.recording, false);
+    // Opt in, and the recording places the blocks.
+    f.setAlign([['first', 0.2], ['second', 6.1]]);
+    const aligned = await f.service.suggestAssignments({ ...input, useRecording: true }, 'owner');
+    assert.equal(aligned.recording, true);
+    assert.deepEqual(aligned.assignments, { s1: ['b1'], s2: ['b2'] });
+    // A source that cannot be read falls back to the instant proposals, with the reason.
+    const fallback = await f.service.suggestAssignments({ ...input, sourceAudioUrl: '/references/missing.wav', useRecording: true }, 'owner');
+    assert.equal(fallback.recording, false);
+    assert.deepEqual(fallback.assignments, instant.assignments);
+    assert.equal(typeof fallback.recordingError, 'string');
+    // A malformed document is a 400; replacement score or lyrics in the body are ignored.
+    await assert.rejects(f.service.suggestAssignments({ ...input, prepare: { ...prepare, version: 1 } }, 'owner'), /version/);
+    const sneaky = await f.service.suggestAssignments({ ...input, abc: 'X:1\nK:C\nC', lyrics: 'nope' } as never, 'owner');
+    assert.equal(sneaky.structureHash, instant.structureHash);
+  } finally { f.close(); }
 });

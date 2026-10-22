@@ -1,3 +1,6 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { midiNotesOptions, midiJobsOptions } from '../../queries/studios/midi';
+import { queryManager } from '../../queries/invalidation';
 // MidiPlayer.tsx — live piano roll + synced playback for MIDI Studio
 //
 // Plays the ORIGINAL track (audio element) and the transcribed MIDI (WebAudio
@@ -10,7 +13,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Pause, Play, Radio } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
-  getMidiNotes, getMidiStreamUrl, channelLabel,
+  getMidiStreamUrl, channelLabel,
 } from '../../services/midiStudioApi';
 import { MidiSynth, type PlayNote } from './midiSynth';
 
@@ -33,6 +36,8 @@ interface Props {
 
 export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => {
   const { t } = useTranslation();
+  const client = useQueryClient();
+  const notesQuery = useQuery({ ...midiNotesOptions(jobId), enabled: !live });
 
   // NOTE: parent must mount this component with a key unique per (job, mode)
   // — notes accumulate for the component's lifetime, no in-place reset.
@@ -117,6 +122,8 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
             setChunks({ done: ev.completed, total: ev.total });
             setFrontier(ev.completed * 5.0);
           } else if (ev.type === 'status') {
+            void queryManager.keys(client, midiJobsOptions().queryKey);
+            void queryManager.keys(client, midiNotesOptions(jobId).queryKey);
             flush();
             setLiveDone(true);
             setFrontier(null);
@@ -124,24 +131,28 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
           }
         } catch { /* ignore malformed */ }
       };
-      es.onerror = () => { /* server restarts end the stream; job list will reconcile */ };
+      es.onopen = () => { void queryManager.keys(client, midiJobsOptions().queryKey); };
+      es.onerror = () => { void queryManager.keys(client, midiJobsOptions().queryKey); };
       return () => { window.clearInterval(flushTimer); es.close(); };
-    } else {
-      getMidiNotes(jobId).then(parsed => {
-        const label = new Map<number, string>();
-        for (const ch of parsed.channels) label.set(ch.channel, channelLabel(ch));
-        addNotes(parsed.notes.map(n => ({
-          pitch: n.pitch, start: n.start, duration: n.duration,
-          family: label.get(n.channel) || `ch${n.channel}`,
-        })));
-        setDuration(d => Math.max(d, parsed.durationSec));
-      }).catch(() => {});
-      return undefined;
     }
+    return undefined;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, live]);
 
   // ── audio element wiring (original track = master clock) ──
+  useEffect(() => {
+    const parsed = notesQuery.data;
+    if (live || !parsed) return;
+    const label = new Map(parsed.channels.map(ch => [ch.channel, channelLabel(ch)]));
+    const notes = parsed.notes.map(n => ({ pitch: n.pitch, start: n.start, duration: n.duration,
+      family: label.get(n.channel) || `ch${n.channel}` }));
+    notesRef.current = [];
+    synthRef.current?.setAllNotes([]);
+    setFamilies([]);
+    addNotes(notes);
+    setDuration(d => Math.max(d, parsed.durationSec));
+  }, [notesQuery.data, live, addNotes]);
+
   useEffect(() => {
     const el = audioRef.current;
     if (!el || !sourceAudioUrl) return;
@@ -210,14 +221,29 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
     ctx.clearRect(0, 0, w, h);
 
     const rowH = h / (PITCH_MAX - PITCH_MIN + 1);
-    // 10 s gridlines
-    ctx.strokeStyle = dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
     ctx.fillStyle = dark ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)';
     ctx.font = '9px sans-serif';
-    for (let s = 0; s * PPS < w; s += 10) {
-      const x = s * PPS;
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-      ctx.fillText(`${s}s`, x + 3, 10);
+    const grid = notesQuery.data?.grid;
+    if (grid) {
+      // the MIDI's own beats and bar lines, numbered as a DAW shows them
+      ctx.strokeStyle = dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)';
+      for (const b of grid.beats) {
+        ctx.beginPath(); ctx.moveTo(b * PPS, 0); ctx.lineTo(b * PPS, h); ctx.stroke();
+      }
+      ctx.strokeStyle = dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.14)';
+      const firstBar = grid.bars.findIndex(b => b >= grid.audioShift - 1e-3);
+      grid.bars.forEach((b, i) => {
+        ctx.beginPath(); ctx.moveTo(b * PPS, 0); ctx.lineTo(b * PPS, h); ctx.stroke();
+        if (firstBar >= 0 && i >= firstBar) ctx.fillText(String(i - firstBar + 1), b * PPS + 3, 10);
+      });
+    } else {
+      // 10 s gridlines
+      ctx.strokeStyle = dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
+      for (let s = 0; s * PPS < w; s += 10) {
+        const x = s * PPS;
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+        ctx.fillText(`${s}s`, x + 3, 10);
+      }
     }
 
     for (const n of notesRef.current) {
@@ -238,7 +264,7 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
     ctx.strokeStyle = 'rgba(236,72,153,0.9)';
     ctx.lineWidth = 1.5;
     ctx.beginPath(); ctx.moveTo(t * PPS, 0); ctx.lineTo(t * PPS, h); ctx.stroke();
-  }, [frontier, duration, curTime]);
+  }, [frontier, duration, curTime, notesQuery.data]);
 
   // resize canvas to content and redraw on data changes
   useEffect(() => {
@@ -274,7 +300,7 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
       {sourceAudioUrl && <audio ref={audioRef} src={sourceAudioUrl} preload="metadata" />}
 
       {/* transport */}
-      <div className="flex items-center gap-3 flex-wrap mb-2">
+      <div className="flex items-center gap-3 gap-y-2 flex-wrap mb-2">
         <button
           onClick={togglePlay}
           disabled={!sourceAudioUrl}

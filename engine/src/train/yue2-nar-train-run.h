@@ -88,6 +88,7 @@
 #include "train/lm-optim.h"
 #include "train/preprocess-io.h"  // pm_mkdir_p, pm_js_*, pm_file_exists
 #include "train/st-write.h"       // the exporter
+#include "train/yue2-nar-audio-loss.h"  // --audio-loss
 #include "train/yue2-nar-train-graph.h"
 #include "train/yue2-sidecar.h"  // yue2_style_string: the style template shared with yue2-ar-train
 
@@ -130,6 +131,13 @@ struct Yue2NarTrainArgs : Yue2OptimConfig {
     // schema in 08 §5) and the directory that takes the checkpoints, the
     // snapshots and the final adapter.
     std::string manifest;
+    // A repeated --manifest appends here: every listed cache trains as one set
+    // (same latent_dim and clip length required). `manifest` stays the first.
+    std::vector<std::string> extra_manifests;
+    // --companion: merge the tokenizer's companion decoder adapter
+    // (nar_lora_joint_v9) under the NAR before training, exactly as the server
+    // does under every render, so the adapter learns on the decoder it ships on.
+    bool        companion = false;
     std::string out_dir;
     std::string name = "yue2_nar_lora";  // export stem: <out>/<name>.safetensors
 
@@ -197,6 +205,16 @@ struct Yue2NarTrainArgs : Yue2OptimConfig {
     int    fd_check  = 0;
     double fd_eps    = 1e-2;  // a FLOOR on the step, not the step (contract §10)
     int    nar_layers = 2;    // F32 isolation depth; 0 = no isolation (report only)
+
+    // --audio-loss <w>: add w * the audio-domain loss (yue2-nar-audio-loss.h)
+    // on micro-steps whose t <= --audio-tmax. 0 = off, the flow loss alone.
+    // The decode covers --audio-frames scored frames plus --audio-margin of
+    // context each side; joint_v6's defaults.
+    float       audio_loss   = 0.0f;
+    float       audio_tmax   = 0.4f;
+    int64_t     audio_frames = 150;
+    int64_t     audio_margin = 25;
+    std::string ffmpeg       = "ffmpeg";  // decodes the non-WAV/MP3 references, as yue2-preprocess did
 
     // --dump-cond <name> <off|full> <out.json>: G8. Dumps the NAR
     // conditioning ids this trainer would build for ONE manifest source under
@@ -414,10 +432,19 @@ static bool yue2_nt_open_model(Yue2Model * m, const Yue2NarTrainArgs & a, const 
         fprintf(stderr, "[%s] --vae-dir is accepted and IGNORED: latents reach this trainer through the "
                         "preprocess manifest, never by encoding audio here\n", tag);
     }
-    if (!yue2_load_parts(m, /*want_lm=*/true, /*want_vae=*/false, YUE2_VAE_STANDARD, /*want_encoder=*/false,
-                         err)) {
+    m->companion_enabled = a.companion;
+    // The VAE comes along only for --audio-loss, which decodes through it.
+    if (!yue2_load_parts(m, /*want_lm=*/true, /*want_vae=*/a.audio_loss > 0.0f, YUE2_VAE_STANDARD,
+                         /*want_encoder=*/false, err)) {
         *err = "load: " + *err;
         return false;
+    }
+    if (a.companion && !m->companion_applied) {
+        *err = "--companion was given but the companion was not merged (see the [YuE2-Companion] line above)";
+        return false;
+    }
+    if (a.companion) {
+        fprintf(stderr, "[%s] training on top of the companion: %s\n", tag, m->companion_path.c_str());
     }
     if (std::fabs((double) m->lm_cfg.timestep_shift - 1.0) > 1e-6) {
         fprintf(stderr,
@@ -552,6 +579,26 @@ static bool yue2_nt_train_ctx_init(const Yue2Model & m, int n_layers, int64_t ra
 }
 
 // ── One micro-step ─────────────────────────────────────────────────────────
+
+// --audio-loss for one micro-step: decode x0_hat = x_t - t*v_pred over
+// columns [s0, s0 + A->win()) and score it against `ref` ([samples, 2]).
+// `flow` false drops the flow term (the gate measures the audio term alone).
+struct Yue2NtAudioStep {
+    const Yue2AudioLoss *      A      = nullptr;
+    const std::vector<float> * ref    = nullptr;
+    float                      t      = 0.0f;
+    float                      weight = 1.0f;
+    int64_t                    s0     = 0;
+    bool                       flow   = true;
+    float                      aux_out  = 0.0f;  // the unweighted audio term
+    float                      flow_out = 0.0f;  // the flow term
+    std::vector<float> *       audio_out = nullptr;  // non-null: the decoded scored span, [samples, 2]
+    // The gate's decoder-input probe: `dx` ([LD, win], frame-major) is added
+    // to the x0_hat window, and with backward the window's gradient lands in
+    // `win_grad` — dL/dx0_hat through the decoder and the spectral loss only.
+    const std::vector<float> * dx       = nullptr;
+    std::vector<float> *       win_grad = nullptr;
+};
 //
 // Builds forward -> loss, optionally the backward, computes, and returns both
 // the in-graph loss and the predicted velocity (the numeric arm re-aggregates
@@ -564,7 +611,8 @@ static bool yue2_nt_train_ctx_init(const Yue2Model & m, int n_layers, int64_t ra
 static bool yue2_nt_micro(const Yue2Model & m, ggml_backend_sched_t sched, const Yue2TrainAdapters & ad,
                           const Yue2NarTrainKv & kv, LmOptim * opt, int n_layers,
                           const Yue2NarTrainHostInputs & hin, const std::vector<float> & vtarget_h,
-                          bool backward, float * loss_out, std::vector<float> * pred_out, std::string * err) {
+                          bool backward, float * loss_out, std::vector<float> * pred_out, std::string * err,
+                          Yue2NtAudioStep * al = nullptr) {
     const Yue2LmConfig & c     = m.lm_cfg;
     const int64_t        LD    = (int64_t) c.latent_dim;
     const int64_t        N_nar = kv.n_nar;
@@ -613,7 +661,39 @@ static bool yue2_nt_micro(const Yue2Model & m, ggml_backend_sched_t sched, const
     ggml_set_input(in.vtarget);
 
     ggml_tensor * pred = yue2_nt_build_forward(ctx, m, ad, kv, in, n_layers);
-    ggml_tensor * loss = yue2_nt_loss(ctx, pred, in.vtarget);
+    ggml_tensor * flow = yue2_nt_loss(ctx, pred, in.vtarget);
+    ggml_tensor * loss = flow;
+    ggml_tensor * aux   = nullptr;
+    ggml_tensor * ref   = nullptr;
+    ggml_tensor * audio = nullptr;
+    ggml_tensor * dx_in = nullptr;
+    ggml_tensor * win_t = nullptr;
+    ggml_tensor * win_g = nullptr;
+    if (al) {
+        const Yue2AudioLoss & A = *al->A;
+        GGML_ASSERT(al->s0 >= 0 && al->s0 + A.win() <= T);
+        ref = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, A.samples(), 2);
+        ggml_set_name(ref, "yue2_al_ref");
+        ggml_set_input(ref);
+        // x0_hat = x_t - t * v_pred over the content rows (x_nar rows 1..T),
+        // already [LD, T] = the decoder twin's [C, T].
+        ggml_tensor * xt  = ggml_view_2d(ctx, in.x_nar, LD, T, in.x_nar->nb[1], in.x_nar->nb[1]);
+        ggml_tensor * x0  = ggml_sub(ctx, xt, ggml_scale(ctx, pred, al->t));
+        ggml_tensor * win = ggml_view_2d(ctx, x0, LD, A.win(), x0->nb[1], (size_t) al->s0 * x0->nb[1]);
+        if (al->dx) {
+            dx_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, LD, A.win());
+            ggml_set_input(dx_in);
+            win = ggml_add(ctx, win, dx_in);
+        }
+        win_t             = win;
+        audio             = yue2_al_decode_scored(ctx, A, win);
+        aux               = yue2_al_spec_loss(ctx, A, audio, ref).total;
+        ggml_set_output(aux);
+        ggml_set_output(audio);
+        ggml_set_output(flow);
+        ggml_tensor * wa = ggml_scale(ctx, aux, al->weight);
+        loss             = al->flow ? ggml_add(ctx, flow, wa) : wa;
+    }
     ggml_set_output(pred);
     if (backward) {
         ggml_set_loss(loss);
@@ -630,10 +710,19 @@ static bool yue2_nt_micro(const Yue2Model & m, ggml_backend_sched_t sched, const
     }
     ggml_build_forward_expand(gf, loss);
     ggml_build_forward_expand(gf, pred);
+    ggml_build_forward_expand(gf, flow);  // still read back when the gate drops it from `loss`
     if (backward) {
         std::vector<ggml_tensor *> gacc;
         lm_optim_fill_gacc(opt, gf, &gacc);
         ggml_build_backward_expand(ctx, gf, gacc.data());
+        if (al && al->win_grad && win_t) {
+            win_g = ggml_graph_get_grad(gf, win_t);
+            // The grad is usually a RESHAPE view of a CONT; the allocator only
+            // keeps the view's source alive if the source itself is an output.
+            for (ggml_tensor * t = win_g; t; t = t->view_src) {
+                ggml_set_output(t);
+            }
+        }
     }
 
     ggml_backend_sched_reset(sched);
@@ -650,6 +739,14 @@ static bool yue2_nt_micro(const Yue2Model & m, ggml_backend_sched_t sched, const
     ggml_backend_tensor_set(in.local_idx, hin.local_idx.data(), 0, hin.local_idx.size() * sizeof(int32_t));
     ggml_backend_tensor_set(in.rope_pos, hin.rope_pos.data(), 0, hin.rope_pos.size() * sizeof(int32_t));
     ggml_backend_tensor_set(in.vtarget, vtarget_h.data(), 0, vtarget_h.size() * sizeof(float));
+    if (ref) {
+        GGML_ASSERT(al->ref && al->ref->size() == (size_t) ggml_nelements(ref));
+        ggml_backend_tensor_set(ref, al->ref->data(), 0, ggml_nbytes(ref));
+    }
+    if (dx_in) {
+        GGML_ASSERT(al->dx->size() == (size_t) ggml_nelements(dx_in));
+        ggml_backend_tensor_set(dx_in, al->dx->data(), 0, ggml_nbytes(dx_in));
+    }
 
     const bool ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
     if (ok) {
@@ -660,11 +757,247 @@ static bool yue2_nt_micro(const Yue2Model & m, ggml_backend_sched_t sched, const
             pred_out->assign((size_t) (LD * T), 0.0f);
             ggml_backend_tensor_get(pred, pred_out->data(), 0, pred_out->size() * sizeof(float));
         }
+        if (aux) {
+            ggml_backend_tensor_get(aux, &al->aux_out, 0, sizeof(float));
+            ggml_backend_tensor_get(flow, &al->flow_out, 0, sizeof(float));
+            if (al->audio_out) {
+                al->audio_out->resize((size_t) ggml_nelements(audio));
+                ggml_backend_tensor_get(audio, al->audio_out->data(), 0, ggml_nbytes(audio));
+            }
+            if (al->win_grad) {
+                al->win_grad->clear();
+                if (win_g) {
+                    al->win_grad->resize((size_t) ggml_nelements(win_g));
+                    ggml_backend_tensor_get(win_g, al->win_grad->data(), 0, ggml_nbytes(win_g));
+                }
+            }
+        }
     } else if (err) {
         *err = "graph compute failed";
     }
     ggml_free(ctx);
     return ok;
+}
+
+// Decode a [W, LD] frame-major latent window through the decoder twin, no
+// backward: `out` gets [S_dec, 2] (channel 0, then channel 1). The gate's
+// parity check and the loop's alignment check both read this.
+static bool yue2_nt_al_decode_host(const Yue2Model & m, ggml_backend_sched_t sched, const Yue2AudioLoss & A,
+                                   const float * lat, int64_t W, std::vector<float> * out, int64_t * S_out,
+                                   std::string * err) {
+    const size_t     MAX_NODES = 16384;
+    ggml_init_params ip = { ggml_tensor_overhead() * MAX_NODES * 2 + ggml_graph_overhead_custom(MAX_NODES, false),
+                            nullptr, true };
+    ggml_context *   ctx = ggml_init(ip);
+    ggml_tensor *    x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, A.latent_dim, W);
+    ggml_set_input(x);
+    ggml_tensor * y = yue2_al_decode(ctx, A, x);
+    ggml_set_output(y);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, false);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_sched_reset(sched);
+    bool ok = ggml_backend_sched_alloc_graph(sched, gf);
+    if (ok) {
+        ggml_backend_tensor_set(x, lat, 0, ggml_nbytes(x));
+        ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        out->resize((size_t) ggml_nelements(y));
+        ggml_backend_tensor_get(y, out->data(), 0, ggml_nbytes(y));
+        *S_out = y->ne[0];
+    } else {
+        *err = "audio-loss decode graph failed";
+    }
+    (void) m;
+    ggml_free(ctx);
+    return ok;
+}
+
+// --audio-loss, once per run: decode the first scored clip's CLEAN latents
+// and line them up against the reference it will be scored against. A lag
+// other than 0, or a low correlation, means the reference is the wrong audio
+// or is offset from the latents, and every audio-loss step would be teaching
+// the network to match that. Reports; does not stop the run.
+static void yue2_nt_al_alignment(const Yue2Model & m, ggml_backend_sched_t sched, const Yue2AudioLoss & A,
+                                 const std::vector<float> & z, int64_t LD, int64_t s0,
+                                 const std::vector<float> & track, int64_t win_start) {
+    std::vector<float> dec;
+    int64_t            S = 0;
+    std::string        err;
+    if (!yue2_nt_al_decode_host(m, sched, A, z.data() + s0 * LD, A.win(), &dec, &S, &err)) {
+        fprintf(stderr, "[yue2-audio] alignment check skipped: %s\n", err.c_str());
+        return;
+    }
+    const int64_t TS = (int64_t) track.size() / 2, a0 = A.margin * A.ratio, n = A.samples(), L = 480;
+    auto          corr = [&](int64_t lag, double * snr) {
+        double xy = 0, xx = 0, yy = 0, e = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const int64_t j = win_start + a0 + i + lag;
+            if (j < 0 || j >= TS) {
+                continue;
+            }
+            for (int ch = 0; ch < 2; ch++) {
+                const double x = dec[(size_t) (ch * S + a0 + i)], y = track[(size_t) (ch * TS + j)];
+                xy += x * y;
+                xx += x * x;
+                yy += y * y;
+                e += (x - y) * (x - y);
+            }
+        }
+        if (snr) {
+            *snr = 10.0 * std::log10(yy / std::max(1e-30, e));
+        }
+        return xy / std::sqrt(std::max(1e-30, xx * yy));
+    };
+    double  snr0 = 0, c0 = corr(0, &snr0), best = c0;
+    int64_t best_lag = 0;
+    for (int64_t lag = -L; lag <= L; lag++) {
+        const double cv = corr(lag, nullptr);
+        if (cv > best) {
+            best     = cv;
+            best_lag = lag;
+        }
+    }
+    fprintf(stderr, "[yue2-audio] alignment: VAE decode of the clean latents vs the reference: corr %.4f at lag 0 "
+                    "(recon SNR %.1f dB), best %.4f at lag %lld samples%s\n",
+            c0, snr0, best, (long long) best_lag,
+            (best_lag != 0 || c0 < 0.5) ? "  <- WARNING: reference and latents do not line up" : "");
+}
+
+// --fd-check --audio-loss --manifest: the manifest's first long-enough clip,
+// its latents into `z` and its source audio (gain applied) into `track`, with
+// `start` the track sample of the clip's frame 0. Defined after the manifest
+// reader, which it needs.
+static bool yue2_nt_al_gate_clip(const Yue2NarTrainArgs & a, int64_t T, int64_t LD, std::vector<float> * z,
+                                 std::vector<float> * track, int64_t * start, std::string * err);
+
+// The audio term's two backwards, each on its own: the decoder twin through
+// L = sum(decode(x) * R) with a fixed random R (linear in the decoder output,
+// so only the decoder's own curvature enters), and the spectral loss with the
+// audio itself as the variable. Each is a central difference along the
+// analytic gradient, swept over the step. Returns the worse best-rel.
+static double yue2_nt_al_selftest(const Yue2Model & m, ggml_backend_sched_t sched, const Yue2AudioLoss & A,
+                                  const float * lat, const std::vector<float> & ref) {
+    const int64_t LD = A.latent_dim, W = A.win(), S = A.samples();
+    double        worst = 0.0;
+    for (int mode = 0; mode < 2; mode++) {
+        const int64_t      n0 = mode == 0 ? LD : S, n1 = mode == 0 ? W : 2;
+        std::vector<float> x0((size_t) (n0 * n1)), R;
+        if (mode == 0) {
+            std::copy(lat, lat + n0 * n1, x0.begin());
+            R.resize((size_t) S * 2);
+            yue2_nt_fill_normal(&R, 0x5151ull);
+        } else {
+            // the reference plus a little noise, so the loss is not at its minimum
+            std::vector<float> nz(x0.size());
+            yue2_nt_fill_normal(&nz, 0x5252ull);
+            for (size_t i = 0; i < x0.size(); i++) {
+                x0[i] = ref[i] + 0.05f * nz[i];
+            }
+        }
+        auto run = [&](const std::vector<float> & xv, bool backward, std::vector<float> * g, double * L) -> bool {
+            const size_t     MAX_NODES = 32768;
+            ggml_init_params ip = { ggml_tensor_overhead() * MAX_NODES * 3 + ggml_graph_overhead_custom(MAX_NODES, true),
+                                    nullptr, true };
+            ggml_context *   ctx = ggml_init(ip);
+            ggml_tensor *    x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1);
+            ggml_set_input(x);
+            if (backward) {
+                ggml_set_param(x);
+            }
+            ggml_tensor * rt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, 2);
+            ggml_set_input(rt);
+            ggml_tensor * loss = nullptr;
+            ggml_tensor * outa = nullptr;
+            if (mode == 0) {
+                outa = yue2_al_decode_scored(ctx, A, x);
+                loss = ggml_sum(ctx, ggml_mul(ctx, outa, rt));
+            } else {
+                outa = x;
+                loss = yue2_al_spec_loss(ctx, A, x, rt).total;
+            }
+            ggml_set_output(outa);
+            ggml_set_output(loss);
+            if (backward) {
+                ggml_set_loss(loss);
+            }
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, MAX_NODES, backward);
+            ggml_build_forward_expand(gf, loss);
+            ggml_build_forward_expand(gf, outa);
+            ggml_tensor * gx = nullptr;
+            if (backward) {
+                ggml_build_backward_expand(ctx, gf, nullptr);
+                gx = ggml_graph_get_grad(gf, x);
+                for (ggml_tensor * t = gx; t; t = t->view_src) {
+                    ggml_set_output(t);
+                }
+            }
+            ggml_backend_sched_reset(sched);
+            bool ok = ggml_backend_sched_alloc_graph(sched, gf);
+            if (ok) {
+                ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+                ggml_backend_tensor_set(rt, mode == 0 ? R.data() : ref.data(), 0, ggml_nbytes(rt));
+                if (backward) {
+                    ggml_graph_reset(gf);  // seeds dL/dloss = 1, zeroes the rest
+                }
+                ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+            }
+            if (ok) {
+                std::vector<float> a((size_t) ggml_nelements(outa));
+                ggml_backend_tensor_get(outa, a.data(), 0, ggml_nbytes(outa));
+                if (mode == 0) {
+                    double s = 0.0;
+                    for (size_t i = 0; i < a.size(); i++) {
+                        s += (double) a[i] * R[i];
+                    }
+                    *L = s;
+                } else {
+                    *L = yue2_al_spec_loss_host(a, ref);
+                }
+                if (g && gx) {
+                    g->resize((size_t) ggml_nelements(gx));
+                    ggml_backend_tensor_get(gx, g->data(), 0, ggml_nbytes(gx));
+                }
+            }
+            ggml_free(ctx);
+            return ok && (!g || gx);
+        };
+        std::vector<float> g;
+        double             L0 = 0.0;
+        if (!run(x0, true, &g, &L0)) {
+            fprintf(stderr, "[yue2-fd] audio self-test %d: graph failed\n", mode);
+            return 1e30;
+        }
+        double gn2 = 0.0, xn2 = 0.0;
+        for (size_t i = 0; i < g.size(); i++) {
+            gn2 += (double) g[i] * g[i];
+            xn2 += (double) x0[i] * x0[i];
+        }
+        const double gn = std::sqrt(gn2), xn = std::sqrt(xn2);
+        double       best = 1e30;
+        fprintf(stderr, "[yue2-fd] audio self-test: %s, L %.6e, ||g|| %.6e, ||x|| %.4e\n",
+                mode == 0 ? "decoder twin (L = sum(decode(x) * R))" : "spectral loss (x = audio)", L0, gn, xn);
+        for (double hr : { 1e-2, 1e-3, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6 }) {
+            const double       h = hr * xn;
+            std::vector<float> xp(x0.size());
+            double             lp[2] = { 0, 0 };
+            for (int sg = 0; sg < 2; sg++) {
+                for (size_t i = 0; i < xp.size(); i++) {
+                    xp[i] = (float) ((double) x0[i] + (sg ? -h : h) * (double) g[i] / gn);
+                }
+                if (!run(xp, false, nullptr, &lp[sg])) {
+                    return 1e30;
+                }
+            }
+            const double num = (lp[0] - lp[1]) / (2.0 * h);
+            const double rel = std::fabs(num - gn) / std::max(1e-30, gn);
+            best             = std::min(best, rel);
+            fprintf(stderr, "[yue2-fd]   h/||x|| %-6g numeric %.6e rel %.5f\n", hr, num, rel);
+        }
+        worst = std::max(worst, best);
+    }
+    (void) m;
+    return worst;
 }
 
 // ── The gate ───────────────────────────────────────────────────────────────
@@ -685,7 +1018,8 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
         return 1;
     }
     fprintf(stderr, "[yue2-fd] the gate uses z ~ N(0,1) as a stand-in latent; it tests the GRAPH, not the "
-                    "data, so no manifest is read here\n");
+                    "data, so no manifest is read here%s\n",
+            a.audio_loss > 0.0f && !a.manifest.empty() ? " (except --audio-loss's real gate clip, below)" : "");
     const Yue2LmConfig & c  = m.lm_cfg;
     const int64_t        LD = (int64_t) c.latent_dim;
     const int64_t        T  = a.frames;
@@ -807,6 +1141,18 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
     std::vector<float> z((size_t) (T * LD)), noise((size_t) (T * LD)), x_t, vtarget;
     yue2_nt_fill_normal(&z, a.seed ^ 0x11ull);
     yue2_nt_fill_normal(&noise, a.seed ^ 0x22ull);
+    // --audio-loss with --manifest: the first clip's REAL latents and audio
+    // instead. A N(0,1) latent drives the VAE's SnakeBeta far outside its
+    // range, where the decoder is so rough that a central difference only
+    // becomes linear at steps of ~1e-6 of the input.
+    std::vector<float> gate_track;
+    int64_t            gate_start = -1;  // sample of the clip's frame 0 in gate_track
+    if (a.audio_loss > 0.0f && !a.manifest.empty()) {
+        if (!yue2_nt_al_gate_clip(a, T, LD, &z, &gate_track, &gate_start, &err)) {
+            fprintf(stderr, "[yue2-fd] --manifest clip: %s\n", err.c_str());
+            return 1;
+        }
+    }
 
     double raw_t = 0.0;
     if (a.t_sampling == "uniform") {
@@ -834,16 +1180,149 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
     fprintf(stderr, "[yue2-fd] t sampling %s: raw_t %.6f -> t %.6f (shift %.3f)\n", a.t_sampling.c_str(),
             raw_t, (double) t_val, (double) c.timestep_shift);
 
+    // ── --audio-loss: the decoder twin against the inference decoder, then the
+    // gate runs on the audio term ALONE (flow dropped), so a fault in the
+    // decoder or spectral backward cannot hide under the flow gradient ──
+    Yue2AudioLoss      AL;
+    Yue2NtAudioStep    als;
+    std::vector<float> al_ref, al_audio, al_dx;
+    Yue2NtAudioStep *  alp       = nullptr;
+    double             al_x0_rel   = 0.0;  // the decoder-input probe's best rel
+    double             al_self_rel = 0.0;  // the decoder / spectral self-tests' worse best rel
+    if (a.audio_loss > 0.0f) {
+        if (!yue2_al_init(m, a.audio_frames, a.audio_margin, &AL, &err)) {
+            fprintf(stderr, "[yue2-fd] audio loss: %s\n", err.c_str());
+            return 1;
+        }
+        const int64_t W = AL.win();
+        if (W > T) {
+            fprintf(stderr, "[yue2-fd] --audio-frames + 2*--audio-margin = %lld exceeds --frames %lld\n",
+                    (long long) W, (long long) T);
+            return 1;
+        }
+        const int64_t      s0 = (T - W) / 2;
+        std::vector<float> mine, theirs, ct((size_t) (LD * W));
+        int64_t            Sm = 0, Si = 0;
+        for (int64_t t = 0; t < W; t++) {
+            for (int64_t ch = 0; ch < LD; ch++) {
+                ct[(size_t) (ch * W + t)] = z[(size_t) ((s0 + t) * LD + ch)];
+            }
+        }
+        if (!yue2_nt_al_decode_host(m, sched, AL, z.data() + s0 * LD, W, &mine, &Sm, &err) ||
+            !yue2_vae_decode(m, ct.data(), W, &theirs, &Si, &err)) {
+            fprintf(stderr, "[yue2-fd] audio loss parity decode: %s\n", err.c_str());
+            return 1;
+        }
+        double d2 = 0.0, r2 = 0.0, dmax = 0.0;
+        for (size_t i = 0; i < std::min(mine.size(), theirs.size()); i++) {
+            const double d = (double) mine[i] - (double) theirs[i];
+            d2 += d * d;
+            r2 += (double) theirs[i] * theirs[i];
+            dmax = std::max(dmax, std::fabs(d));
+        }
+        const double prel = std::sqrt(d2 / std::max(1e-30, r2));
+        const bool   pok  = Sm == Si && prel < 1e-4;
+        fprintf(stderr, "[yue2-fd] decoder twin vs yue2_vae_decode, %lld frames: %lld vs %lld samples/ch, rel rms "
+                        "%.3e, max |d| %.3e -> %s\n",
+                (long long) W, (long long) Sm, (long long) Si, prel, dmax, pok ? "MATCH" : "MISMATCH");
+        if (!pok) {
+            return 1;
+        }
+        if (gate_start >= 0) {
+            // The real recording, exactly as the loop would slice it.
+            if (!yue2_al_ref_slice(gate_track, gate_start + (s0 + AL.margin) * AL.ratio, AL.samples(), &al_ref)) {
+                fprintf(stderr, "[yue2-fd] the gate clip's audio is shorter than its latents\n");
+                return 1;
+            }
+            yue2_nt_al_alignment(m, sched, AL, z, LD, s0, gate_track, gate_start + s0 * AL.ratio);
+        } else {
+            // Stand-in reference: the scored span of decode(z), i.e. what
+            // x0_hat would decode to if v_pred were exact.
+            al_ref.resize((size_t) AL.samples() * 2);
+            for (int64_t ch = 0; ch < 2; ch++) {
+                std::copy(mine.begin() + ch * Sm + AL.margin * AL.ratio,
+                          mine.begin() + ch * Sm + AL.margin * AL.ratio + AL.samples(),
+                          al_ref.begin() + ch * AL.samples());
+            }
+        }
+        als.A      = &AL;
+        als.ref    = &al_ref;
+        als.t      = t_val;
+        als.weight = 1.0f;
+        als.s0     = s0;
+        als.flow   = false;
+        als.audio_out = &al_audio;
+        alp        = &als;
+
+        al_self_rel = yue2_nt_al_selftest(m, sched, AL, z.data() + s0 * LD, al_ref);
+        fprintf(stderr, "[yue2-fd] audio self-test %s: worst best-rel %.5f (bar 2e-02)\n",
+                al_self_rel < 2e-2 ? "PASS" : "FAIL", al_self_rel);
+
+        // ── decoder-input probe: d(audio term)/d(x0_hat window) ──
+        //
+        // Every LoRA probe below reaches the audio term through this one
+        // gradient, so this is where a decoder or spectral-loss backward fault
+        // would show, undiluted by the NAR's own f32 noise. Swept over the step
+        // because central differences trade O(h^2) truncation against O(1/h)
+        // rounding; the best row is the measurement.
+        al_dx.assign((size_t) (LD * W), 0.0f);
+        std::vector<float> gx;
+        als.dx       = &al_dx;
+        als.win_grad = &gx;
+        float lgx    = 0.0f;
+        if (!yue2_nt_micro(m, sched, ad, kv, &opt, n_layers, hin, vtarget, /*backward=*/true, &lgx, nullptr, &err,
+                           alp) ||
+            gx.size() != al_dx.size()) {
+            fprintf(stderr, "[yue2-fd] decoder-input probe: %s\n", err.empty() ? "no gradient for the window" : err.c_str());
+            return 1;
+        }
+        als.win_grad = nullptr;
+        double gn2 = 0.0;
+        for (float g : gx) {
+            gn2 += (double) g * g;
+        }
+        const double gnx = std::sqrt(gn2);
+        double       best_rel = 1e30;
+        fprintf(stderr, "[yue2-fd] decoder-input probe, ||dL/dx0|| %.6e over %zu values:\n", gnx, gx.size());
+        for (double h : { 1e-1, 1e-2, 1e-3, 3e-4, 1e-4, 3e-5 }) {
+            std::vector<float> dxp(al_dx.size());
+            double             lpm[2] = { 0, 0 };
+            for (int sgn = 0; sgn < 2; sgn++) {
+                for (size_t i = 0; i < dxp.size(); i++) {
+                    dxp[i] = (float) ((sgn ? -h : h) * (double) gx[i] / gnx);
+                }
+                als.dx = &dxp;
+                float f = 0.0f;
+                if (!yue2_nt_micro(m, sched, ad, kv, &opt, n_layers, hin, vtarget, false, &f, nullptr, &err, alp)) {
+                    fprintf(stderr, "[yue2-fd] decoder-input probe forward: %s\n", err.c_str());
+                    return 1;
+                }
+                lpm[sgn] = yue2_al_spec_loss_host(al_audio, al_ref);
+            }
+            const double num = (lpm[0] - lpm[1]) / (2.0 * h);
+            const double rel = std::fabs(num - gnx) / std::max(1e-12, gnx);
+            best_rel         = std::min(best_rel, rel);
+            fprintf(stderr, "[yue2-fd]   h %-6g  numeric %.6e  rel %.5f\n", h, num, rel);
+        }
+        als.dx = &al_dx;
+        al_x0_rel = best_rel;
+        fprintf(stderr, "[yue2-fd] decoder-input probe %s: best rel %.5f (bar 2e-02)\n",
+                best_rel < 2e-2 ? "PASS" : "FAIL", best_rel);
+        fprintf(stderr, "[yue2-fd] --audio-loss: probing the AUDIO term alone (window %lld..%lld, t %.3f); the "
+                        "numeric arm recomputes it in double from the decoded audio\n",
+                (long long) s0, (long long) (s0 + W), (double) t_val);
+    }
+
     // ── numeric arm: forward only, loss re-aggregated on the host in double ──
     std::vector<float> pred_host;
     auto forward_loss = [&]() -> double {
         float f = 0.0f;
         if (!yue2_nt_micro(m, sched, ad, kv, &opt, n_layers, hin, vtarget, /*backward=*/false, &f, &pred_host,
-                           &err)) {
+                           &err, alp)) {
             fprintf(stderr, "[yue2-fd] forward failed: %s\n", err.c_str());
             return std::nan("");
         }
-        return yue2_nt_loss_host(pred_host, vtarget);
+        return alp ? yue2_al_spec_loss_host(*als.audio_out, al_ref) : yue2_nt_loss_host(pred_host, vtarget);
     };
 
     const double l0 = forward_loss();
@@ -860,7 +1339,7 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
     ggml_backend_buffer_clear(opt.buf_grad, 0);
     float loss_graph = 0.0f;
     if (!yue2_nt_micro(m, sched, ad, kv, &opt, n_layers, hin, vtarget, /*backward=*/true, &loss_graph, nullptr,
-                       &err)) {
+                       &err, alp)) {
         fprintf(stderr, "[yue2-fd] backward failed: %s\n", err.c_str());
         return 1;
     }
@@ -918,7 +1397,10 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
     // gradient direction is exactly 2*h*||g||; a fixed eps measures every probe
     // at a different signal-to-noise ratio, in direct proportion to ||g||.
     // mm3-lm-train-run.h:1459-1500 has the measured sweep behind this rule.
-    const double dl_min = std::max(1e-4, 1e-3 * std::fabs(l0));
+    // YUE2_FD_DLREL overrides the relative floor (default 1e-3) for a step sweep.
+    const char * dlr    = std::getenv("YUE2_FD_DLREL");
+    const double dl_rel = (dlr && dlr[0]) ? atof(dlr) : 1e-3;
+    const double dl_min = std::max(dl_rel * 0.1, dl_rel * std::fabs(l0));
     fprintf(stderr,
             "[yue2-fd] step floor: dL >= %.2e; a probe whose 2*eps*||g|| clears it keeps eps %.3g, and a "
             "raised step is capped at 0.05*||w||\n",
@@ -1030,7 +1512,13 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
             n_bad++;
         }
     }
-    const int n_checked = (int) fd_rel.size() - n_inconclusive;
+    int n_checked = (int) fd_rel.size() - n_inconclusive;
+    // The decoder-input probe and the self-tests count as two more probes:
+    // they are the gradient every audio-term probe goes through.
+    if (alp) {
+        n_checked += 2;
+        n_bad += !(al_x0_rel < 2e-2) + !(al_self_rel < 2e-2);
+    }
 
     if (n_inconclusive) {
         fprintf(stderr,
@@ -1067,6 +1555,7 @@ static int yue2_nar_fdcheck_main(const Yue2NarTrainArgs & a) {
     }
 
     yue2_nt_train_ctx_free(&C);
+    yue2_al_free(&AL);
     yue2_nt_kv_free(&kv);
     yue2_nt_f32_free(&iso);
     // No measurable probe is not a pass: exit non-zero so a script cannot read
@@ -1156,6 +1645,12 @@ struct Yue2TrainClip {
     // yue2-preprocess-run.h:826-853).
     std::string abc_text;      // the source's `abc`, verbatim; empty = no sheet
     bool        has_abc = false;
+
+    // --audio-loss: the source's `loudness_gain_db`, joined the same way. The
+    // reference audio is the source decoded and scaled by it, which is the
+    // audio the latents were encoded from.
+    double gain_db  = 0.0;
+    bool   has_gain = false;
 };
 
 struct Yue2TrainSet {
@@ -1366,13 +1861,24 @@ static bool yue2_nt_load_manifest(const std::string & path, bool no_abc, Yue2Tra
     // sources[] at all — an older or hand-written manifest) leaves the map
     // empty, which is exactly "no source carries a sheet".
     std::map<std::string, std::string> abc_by_latents;
-    if (!no_abc) {
+    std::map<std::string, double>      gain_by_latents;
+    {
         yyjson_val * sarr = yue2_nt_jsv(root, { "sources", "songs" });
         if (sarr && yyjson_is_arr(sarr)) {
             size_t       si = 0, sn = 0;
             yyjson_val * sit = nullptr;
             yyjson_arr_foreach(sarr, si, sn, sit) {
                 if (!yyjson_is_obj(sit)) {
+                    continue;
+                }
+                const std::string slat0 = yue2_nt_jstr(sit, { "latents" });
+                yyjson_val *      gv    = yyjson_obj_get(sit, "loudness_gain_db");
+                if (!slat0.empty() && gv && yyjson_is_num(gv)) {
+                    gain_by_latents[yue2_nt_is_abs(slat0) ? slat0
+                                                          : yue2_nt_join(lat_dir.empty() ? out->dir : lat_dir, slat0)] =
+                        yyjson_get_num(gv);
+                }
+                if (no_abc) {
                     continue;
                 }
                 const std::string abc = yue2_nt_jstr(sit, { "abc" });
@@ -1424,6 +1930,11 @@ static bool yue2_nt_load_manifest(const std::string & path, bool no_abc, Yue2Tra
             if (ait != abc_by_latents.end()) {
                 cl.abc_text = ait->second;
                 cl.has_abc  = true;
+            }
+            auto git = gain_by_latents.find(cl.latents);
+            if (git != gain_by_latents.end()) {
+                cl.gain_db  = git->second;
+                cl.has_gain = true;
             }
         }
         bool got_frames = false;
@@ -1568,6 +2079,37 @@ static bool yue2_nt_read_clip(const Yue2TrainClip & cl, int64_t LD, int64_t T, s
     return true;
 }
 
+static bool yue2_nt_al_gate_clip(const Yue2NarTrainArgs & a, int64_t T, int64_t LD, std::vector<float> * z,
+                                 std::vector<float> * track, int64_t * start, std::string * err) {
+    Yue2TrainSet ds;
+    if (!yue2_nt_load_manifest(a.manifest, true, &ds, err)) {
+        return false;
+    }
+    for (const Yue2TrainClip & cl : ds.clips) {
+        if (cl.frames < T || !cl.has_gain) {
+            continue;
+        }
+        if (!yue2_nt_read_clip(cl, LD, T, z, err)) {
+            return false;
+        }
+        Yue2AlRefCache rc;
+        rc.ffmpeg  = a.ffmpeg;
+        rc.tmp_wav = ds.dir + "/yue2_audio_gate.tmp.wav";
+        const std::vector<float> * tr = yue2_al_ref_track(&rc, cl.source, cl.gain_db, err);
+        hs_remove(rc.tmp_wav);
+        if (!tr) {
+            return false;
+        }
+        *track = *tr;
+        *start = cl.offset * 1920;  // 48 kHz / 25 fps, the manifest's own rate
+        fprintf(stderr, "[yue2-fd] gate clip: %s (real latents and audio, gain %+.2f dB)\n", cl.id.c_str(),
+                cl.gain_db);
+        return true;
+    }
+    *err = "no clip of at least " + std::to_string((long long) T) + " frames with a loudness_gain_db";
+    return false;
+}
+
 // ── The AR-prefix K/V cache ────────────────────────────────────────────────
 //
 // OUR ADVANTAGE OVER UPSTREAM, and the contract says so (09 §1): upstream
@@ -1704,6 +2246,7 @@ enum {
     YUE2_NT_TAG_NOISE   = 4,
     YUE2_NT_TAG_BLOCK   = 5,
     YUE2_NT_TAG_ABCD    = 6,  // --abc-dropout: cot=full (sheet spliced in), or cot=off
+    YUE2_NT_TAG_AUDIO   = 7,  // --audio-loss: where in the clip the decode window sits
 };
 
 // ── Which clip a micro-step trains on ──────────────────────────────────────
@@ -1910,6 +2453,14 @@ static uint64_t yue2_nt_cond_hash(const Yue2NarTrainArgs & a) {
     // change would silently continue on a different conditioning.
     mix_bytes(&a.abc_dropout, sizeof(a.abc_dropout));
     mix_bytes(&a.no_abc, sizeof(a.no_abc));
+    // --audio-loss changes the objective. Mixed in only when on, so a
+    // flow-only run's checkpoint keeps the hash it always had.
+    if (a.audio_loss > 0.0f) {
+        mix_bytes(&a.audio_loss, sizeof(a.audio_loss));
+        mix_bytes(&a.audio_tmax, sizeof(a.audio_tmax));
+        mix_bytes(&a.audio_frames, sizeof(a.audio_frames));
+        mix_bytes(&a.audio_margin, sizeof(a.audio_margin));
+    }
     // NOT --style. It reaches the FD gate only (yue2_nar_fdcheck_main builds
     // its prefix from it); the loop builds style from --trigger + the clip's
     // own caption and never reads a.style. Fingerprinting it would refuse a
@@ -2264,6 +2815,9 @@ static bool yue2_nt_export(const Yue2TrainAdapters & ad, const Yue2NarTrainArgs 
     // loader only prints it (yue2-adapter.h:504-508), so a breadcrumb is
     // exactly what it is for — and an invented hash would be worse than none.
     md.emplace_back("base_sha", base_id);
+    // Which decoder this adapter was trained on: it belongs on top of the
+    // companion only if it was trained on top of it.
+    md.emplace_back("companion", a.companion ? "nar_lora_joint_v9" : "none");
     // doc 19 decision 4 / contract §19, exactly the AR trainer's own
     // convention (yue2-ar-train-run.h): "off,full" iff this run could ever
     // draw "full" (a clip carried a sheet and --abc-dropout < 1), else the
@@ -2328,6 +2882,26 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
     if (!yue2_nt_load_manifest(a.manifest, a.no_abc, &ds, &err)) {
         fprintf(stderr, "[yue2-train] %s\n", err.c_str());
         return 1;
+    }
+    for (const std::string & extra : a.extra_manifests) {
+        Yue2TrainSet more;
+        if (!yue2_nt_load_manifest(extra, a.no_abc, &more, &err)) {
+            fprintf(stderr, "[yue2-train] %s\n", err.c_str());
+            return 1;
+        }
+        if (more.latent_dim != ds.latent_dim || more.clip_frames != ds.clip_frames) {
+            fprintf(stderr, "[yue2-train] %s: latent_dim %lld / clip_frames %lld differ from the first manifest's "
+                            "%lld / %lld\n", extra.c_str(), (long long) more.latent_dim, (long long) more.clip_frames,
+                    (long long) ds.latent_dim, (long long) ds.clip_frames);
+            return 1;
+        }
+        ds.codec_ids_present = ds.codec_ids_present && more.codec_ids_present;
+        ds.clips.insert(ds.clips.end(), std::make_move_iterator(more.clips.begin()),
+                        std::make_move_iterator(more.clips.end()));
+    }
+    if (!a.extra_manifests.empty()) {
+        fprintf(stderr, "[yue2-train] %zu manifests, %zu clips in total\n", a.extra_manifests.size() + 1,
+                ds.clips.size());
     }
 
     static Yue2Model m;
@@ -2451,6 +3025,35 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
     C.opt.lr_floor     = 1.0f;
     C.opt.total_steps  = 1;
     C.opt.warmup_steps = 0;
+
+    // ── --audio-loss ──
+    Yue2AudioLoss  AL;
+    Yue2AlRefCache refc;
+    const bool     audio_on = a.audio_loss > 0.0f;
+    if (audio_on) {
+        for (const Yue2TrainClip * cl : clips) {
+            if (!cl->has_gain) {
+                fprintf(stderr, "[yue2-train] --audio-loss: clip \"%s\" has no source loudness_gain_db in the "
+                                "manifest, so its reference audio cannot be matched to its latents. Re-run "
+                                "yue2-preprocess.\n", cl->id.c_str());
+                return 1;
+            }
+        }
+        if (!yue2_al_init(m, a.audio_frames, a.audio_margin, &AL, &err)) {
+            fprintf(stderr, "[yue2-train] audio loss: %s\n", err.c_str());
+            return 1;
+        }
+        if (AL.win() > T) {
+            fprintf(stderr, "[yue2-train] --audio-frames + 2*--audio-margin = %lld exceeds the %lld-frame clip\n",
+                    (long long) AL.win(), (long long) T);
+            return 1;
+        }
+        refc.ffmpeg  = a.ffmpeg;
+        refc.tmp_wav = a.out_dir + "/yue2_audio_ref.tmp.wav";
+        fprintf(stderr, "[yue2-train] --audio-loss %.3g on t <= %.2f: %lld frames scored (+%lld margin each side) "
+                        "against the source audio\n",
+                (double) a.audio_loss, (double) a.audio_tmax, (long long) a.audio_frames, (long long) a.audio_margin);
+    }
 
     // ── resume ──
     Yue2NtCkptState want;
@@ -2590,6 +3193,11 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
     int64_t                window_n   = 0;
     const int64_t          t0_ms      = ggml_time_ms();
     bool                   said_ctx   = false;
+    std::vector<float>     al_ref;
+    bool                   al_checked = false;
+    int64_t                al_short   = 0;  // windows past the end of their track (flow only)
+    double                 aux_win    = 0.0;
+    int64_t                aux_win_n  = 0, aux_run_n = 0;
 
     // ── the working set (see yue2_nt_block_set) ──
     //
@@ -2725,14 +3333,51 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
                 return 1;
             }
 
+            // --audio-loss on low-noise draws only (joint_v6's AUX_TMAX): at
+            // high t, x0_hat is mostly the network's guess and its decode says
+            // little about this recording.
+            Yue2NtAudioStep    als;
+            Yue2NtAudioStep *  alp = nullptr;
+            if (audio_on && t_val <= (double) a.audio_tmax) {
+                Yue2NtRng     r_a(yue2_nt_seed_mix(a.seed, k, YUE2_NT_TAG_AUDIO));
+                const int64_t span = T - AL.win();
+                const int64_t s0   = std::min(span, (int64_t) (r_a.u01() * (double) (span + 1)));
+                std::string   rerr;
+                const std::vector<float> * track = yue2_al_ref_track(&refc, cl.source, cl.gain_db, &rerr);
+                if (!track) {
+                    fprintf(stderr, "[yue2-train] --audio-loss: cannot decode %s: %s\n", cl.source.c_str(),
+                            rerr.c_str());
+                    return 1;
+                }
+                if (yue2_al_ref_slice(*track, (cl.offset + s0 + AL.margin) * AL.ratio, AL.samples(), &al_ref)) {
+                    als.A      = &AL;
+                    als.ref    = &al_ref;
+                    als.t      = (float) t_val;
+                    als.weight = a.audio_loss;
+                    als.s0     = s0;
+                    alp        = &als;
+                    if (!al_checked) {
+                        al_checked = true;
+                        yue2_nt_al_alignment(m, C.sched, AL, z, LD, s0, *track, (cl.offset + s0) * AL.ratio);
+                    }
+                } else {
+                    al_short++;
+                }
+            }
+
             float lv = 0.0f;
             if (!yue2_nt_micro(m, C.sched, C.ad, *kv, &C.opt, n_layers, hin, vtarget, /*backward=*/true, &lv,
-                               nullptr, &err)) {
+                               nullptr, &err, alp)) {
                 fprintf(stderr, "[yue2-train] step %lld: %s\n", (long long) step, err.c_str());
                 return 1;
             }
-            step_loss += (double) lv;
-            loss_sum += (double) lv;
+            if (alp) {
+                aux_win += (double) als.aux_out;
+                aux_win_n++;
+                aux_run_n++;
+            }
+            step_loss += (double) (alp ? als.flow_out : lv);
+            loss_sum += (double) (alp ? als.flow_out : lv);
             n_micro++;
         }
 
@@ -2755,6 +3400,14 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
                     n_micro ? loss_sum / (double) n_micro : 0.0, (double) st.grad_norm, (double) st.lr,
                     last_t, elapsed / (double) std::max<int64_t>(1, step - step0), gm.used_mb(),
                     gm.total_mb(), gm.source(), last_mode, last_id);
+            if (audio_on) {
+                fprintf(stderr, "[yue2-train]   audio %.4f over %lld micro-step(s) since the last line (%lld in all, "
+                                "%lld past a track end, %lld reference decode(s))\n",
+                        aux_win_n ? aux_win / (double) aux_win_n : 0.0, (long long) aux_win_n, (long long) aux_run_n,
+                        (long long) al_short, (long long) refc.loads);
+                aux_win   = 0.0;
+                aux_win_n = 0;
+            }
             window_sum = 0.0;
             window_n   = 0;
         }
@@ -2804,6 +3457,10 @@ static int yue2_nar_train_loop(const Yue2NarTrainArgs & a) {
     // would let a later `--resume` in the same directory come back from a run
     // that has already finished and exported.
     hs_remove(ckpt_path);
+    if (audio_on) {
+        hs_remove(refc.tmp_wav);
+    }
+    yue2_al_free(&AL);
     yue2_nt_kvcache_free(&kvc);
     yue2_nt_train_ctx_free(&C);
     return 0;

@@ -13,6 +13,8 @@
 // gradient by the KL weight again.
 
 #include "yue2-aitk-model.h"
+#include "yue2-aitk-graph.h"
+#include "yue2-aitk-bf16-storage.h"
 #include "../../ggml/include/ggml-alloc.h"
 #if YUE2_AITK_CUDA_RUNTIME
 #include "joint_loss_cuda.h"
@@ -57,6 +59,13 @@ struct Request {
     uint16_t * adapted_hidden_grad_bf16 = nullptr; // host [positions, hidden]
     float * ce_sum = nullptr; // raw sum over target positions
     float * kl_sum = nullptr; // raw sum over target positions
+    // Device mode (adapted_rows set): the rows are already on the backend as
+    // [hidden, positions] F32 (Yue2AitkArHeadRows), the raw F32 hidden gradient
+    // is copied into adapted_grad_rows, and the three host hidden pointers above
+    // are unused. A nonfinite input then shows up as a nonfinite CE or KL sum.
+    const ggml_tensor * adapted_rows = nullptr;
+    const ggml_tensor * base_rows = nullptr;
+    ggml_tensor * adapted_grad_rows = nullptr;
 };
 
 inline const char * status_string(Status status) {
@@ -137,9 +146,17 @@ struct CudaDeviceGuard {
 struct CudaDeviceGuard { explicit CudaDeviceGuard(ggml_backend_t) {} bool valid = false; };
 #endif
 
+// With no KL weight and no teacher (base rows are the adapted rows) the KL term does not exist:
+// the gradient is (1+0) p - onehot, and ar_kl is reported 0. Skip q, log_q and the base logits then
+// (YUE2_AITK_HEAD_SKIPKL=0 restores the full graph). Portable (non-CUDA) loss only.
+inline bool want_skip_kl(const Request & r) {
+    static const bool off = [] { const char * e = std::getenv("YUE2_AITK_HEAD_SKIPKL"); return e && *e == '0'; }();
+    return !off && !yue2_aitk_is_cuda(r.backend) && r.adapted_rows && r.base_rows == r.adapted_rows && r.kl_weight == 0.0f;
+}
 // One graph/context/buffer per chunk shape. Full chunks are reused for every
 // 128-position batch; a second cache is created only when a tail exists.
 struct ChunkWorkspace {
+    bool skip_kl = false;
     Temporary tmp;
     std::size_t count = 0;
     ggml_tensor * adapted = nullptr;
@@ -157,10 +174,12 @@ struct ChunkWorkspace {
     ggml_tensor * chunk_kl = nullptr;    // [1, count]
     ggml_cgraph * forward = nullptr;
     ggml_cgraph * backward = nullptr;
+    bool bf16 = false;
 
     Status init(const Request & request, std::size_t requested_count, std::string * error) {
         if (tmp.ctx) return Status::success;
         count = requested_count;
+        skip_kl = want_skip_kl(request);
         ggml_init_params params{};
         params.mem_size = 2 * ggml_graph_overhead_custom(64, false) +
                           ggml_tensor_overhead() * 64 + 4096;
@@ -170,20 +189,23 @@ struct ChunkWorkspace {
         adapted = ggml_new_tensor_2d(tmp.ctx, GGML_TYPE_F32, request.hidden, count);
         base = ggml_new_tensor_2d(tmp.ctx, GGML_TYPE_F32, request.hidden, count);
         targets = ggml_new_tensor_1d(tmp.ctx, GGML_TYPE_I32, count);
-        logit_grad = ggml_new_tensor_2d(tmp.ctx, GGML_TYPE_F32, kVocab, count);
+        // CUDA with BF16 activation storage (not strict F32, the reference):
+        // the logits are stored as BF16
+        // (their values are BF16-rounded anyway) and the loss kernel writes
+        // the gradient as BF16, the round the backward applied to it.
+        bf16 = !request.head->parts.empty() && yue2_aitk_is_cuda(request.backend) && yue2_aitk_bf16_storage::enabled() &&
+            !yue2_aitk_graph::strict_f32();
+        logit_grad = ggml_new_tensor_2d(tmp.ctx, bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32, kVocab, count);
         if (!request.head->parts.empty()) {
             // GGUF head: ConvRot's BF16 boundaries (rounded input, output and
             // incoming gradient) over a plain mul_mat; the backward reads the
             // BF16 transpose load_gguf built, since W^T g is not a mul_mat of W.
             auto logits = [&](ggml_tensor * h) {
-                ggml_tensor * y = ggml_mul_mat(tmp.ctx, request.head->parts[0], ggml_bf16_round(tmp.ctx, h));
-                ggml_mul_mat_set_prec(y, GGML_PREC_F32);
-                return ggml_bf16_round(tmp.ctx, y);
+                return ggml_bf16_round(tmp.ctx, yue2_aitk_graph::mm(tmp.ctx, request.head->parts[0], ggml_bf16_round(tmp.ctx, h)));
             };
             adapted_logits = logits(adapted);
             base_logits = logits(base);
-            hidden_grad = ggml_mul_mat(tmp.ctx, request.head->dense_t, ggml_bf16_round(tmp.ctx, logit_grad));
-            ggml_mul_mat_set_prec(hidden_grad, GGML_PREC_F32);
+            hidden_grad = yue2_aitk_graph::mm(tmp.ctx, request.head->dense_t, bf16 ? logit_grad : ggml_bf16_round(tmp.ctx, logit_grad));
         } else {
             adapted_logits = ggml_convrot8(tmp.ctx, request.head->weight_i8, adapted,
                 request.head->scales_f32, nullptr, request.head->rotation, true);
@@ -209,9 +231,10 @@ struct ChunkWorkspace {
             const float w = request.kl_weight, inv = 1.0f / float(request.positions);
             const int64_t V = int64_t(kVocab), n = int64_t(count);
             ggml_tensor * p = ggml_soft_max(tmp.ctx, adapted_logits);
-            ggml_tensor * q = ggml_soft_max(tmp.ctx, base_logits);
+            ggml_tensor * q = skip_kl ? nullptr : ggml_soft_max(tmp.ctx, base_logits);
             flat_index = ggml_new_tensor_1d(tmp.ctx, GGML_TYPE_I32, n);
-            ggml_tensor * g = ggml_add(tmp.ctx, ggml_scale(tmp.ctx, p, (1.0f + w) * inv), ggml_scale(tmp.ctx, q, -w * inv));
+            ggml_tensor * g = skip_kl ? ggml_scale(tmp.ctx, p, (1.0f + w) * inv)
+                : ggml_add(tmp.ctx, ggml_scale(tmp.ctx, p, (1.0f + w) * inv), ggml_scale(tmp.ctx, q, -w * inv));
             ggml_tensor * g_flat = ggml_reshape_2d(tmp.ctx, g, 1, V * n);
             ggml_tensor * at_target = ggml_scale_bias(tmp.ctx, ggml_get_rows(tmp.ctx, g_flat, flat_index), 1.0f, -inv);
             ggml_tensor * g_done = ggml_reshape_2d(tmp.ctx, ggml_set_rows(tmp.ctx, g_flat, at_target, flat_index), V, n);
@@ -219,15 +242,18 @@ struct ChunkWorkspace {
             // CE = -log p[target]; KL = sum q (log q - log p). Clamped logs: a
             // probability below 1e-30 contributes nothing measurable to either.
             ggml_tensor * log_p = ggml_log(tmp.ctx, ggml_clamp(tmp.ctx, p, 1e-30f, 1.0f));
-            ggml_tensor * log_q = ggml_log(tmp.ctx, ggml_clamp(tmp.ctx, q, 1e-30f, 1.0f));
+            ggml_tensor * log_q = skip_kl ? nullptr : ggml_log(tmp.ctx, ggml_clamp(tmp.ctx, q, 1e-30f, 1.0f));
             chunk_ce = ggml_scale(tmp.ctx, ggml_get_rows(tmp.ctx, ggml_reshape_2d(tmp.ctx, log_p, 1, V * n), flat_index), -1.0f);
-            chunk_kl = ggml_sum_rows(tmp.ctx, ggml_mul(tmp.ctx, q, ggml_sub(tmp.ctx, log_q, log_p)));
             ggml_build_forward_expand(forward, chunk_ce);
-            ggml_build_forward_expand(forward, chunk_kl);
+            if (!skip_kl) {
+                chunk_kl = ggml_sum_rows(tmp.ctx, ggml_mul(tmp.ctx, q, ggml_sub(tmp.ctx, log_q, log_p)));
+                ggml_build_forward_expand(forward, chunk_kl);
+            }
         }
         ggml_build_forward_expand(forward, adapted_logits);
-        ggml_build_forward_expand(forward, base_logits);
+        if (!skip_kl) ggml_build_forward_expand(forward, base_logits);
         ggml_build_forward_expand(backward, hidden_grad);
+        if (bf16) yue2_aitk_bf16_storage::apply(forward, {});
         if (!validate_nodes(request.backend, forward, error) || !validate_nodes(request.backend, backward, error))
             return fail(Status::graph_failure, error, "head-loss graph contains a node this backend does not support");
         tmp.buffer = ggml_backend_alloc_ctx_tensors(tmp.ctx, request.backend);
@@ -236,9 +262,17 @@ struct ChunkWorkspace {
     }
 };
 
+inline bool rows_match(const ggml_tensor * t, const Request & request) {
+    return t && t->data && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_n_dims(t) <= 2 &&
+           t->ne[0] == static_cast<int64_t>(request.hidden) && t->ne[1] == static_cast<int64_t>(request.positions);
+}
+
 inline Status compute(const Request & request, std::string * error = nullptr) {
-    if (!request.backend || !request.head || !request.adapted_hidden || !request.base_hidden ||
-        !request.targets || !request.adapted_hidden_grad_bf16 || !request.ce_sum || !request.kl_sum ||
+    const bool device = request.adapted_rows != nullptr;
+    if (!request.backend || !request.head || !request.targets || !request.ce_sum || !request.kl_sum ||
+        (device ? !rows_match(request.adapted_rows, request) || !rows_match(request.base_rows, request) ||
+                  !rows_match(request.adapted_grad_rows, request)
+                : !request.adapted_hidden || !request.base_hidden || !request.adapted_hidden_grad_bf16) ||
         !request.positions || !request.hidden || request.hidden > std::numeric_limits<int64_t>::max() ||
         request.positions > std::numeric_limits<int>::max() || !std::isfinite(request.kl_weight) ||
         request.kl_weight < 0.0f || request.head->rows != static_cast<int64_t>(kVocab) ||
@@ -260,7 +294,7 @@ inline Status compute(const Request & request, std::string * error = nullptr) {
         return fail(Status::invalid_argument, error, "head-loss request size overflows");
     for (std::size_t i = 0; i < request.positions; ++i) {
         if (request.targets[i] >= kVocab) return fail(Status::invalid_argument, error, "head-loss target is outside vocabulary");
-        for (std::size_t j = 0; j < request.hidden; ++j) {
+        for (std::size_t j = 0; !device && j < request.hidden; ++j) {
             if (!std::isfinite(request.adapted_hidden[i * request.hidden + j]) ||
                 !std::isfinite(request.base_hidden[i * request.hidden + j]))
                 return fail(Status::invalid_argument, error, "head-loss hidden input is nonfinite");
@@ -270,7 +304,22 @@ inline Status compute(const Request & request, std::string * error = nullptr) {
     if (cuda && !device_guard.valid)
         return fail(Status::unsupported_backend, error, "unable to select the GGML CUDA backend device");
 
-    std::vector<float> chunk_grad(kArChunk * request.hidden);
+    std::vector<float> chunk_grad(device ? 0 : kArChunk * request.hidden);
+    // Chunk-sized views of the device rows, for the copies in and out.
+    Temporary views;
+    if (device) {
+        ggml_init_params params{};
+        params.mem_size = ggml_tensor_overhead() * 4; // reset every chunk
+        params.no_alloc = true;
+        views.ctx = ggml_init(params);
+        if (!views.ctx) return fail(Status::allocation_failure, error, "head-loss view context allocation failed");
+    }
+    auto rows_view = [&](const ggml_tensor * rows, std::size_t offset, std::size_t count) {
+        ggml_tensor * t = const_cast<ggml_tensor *>(rows);
+        ggml_tensor * v = ggml_view_2d(views.ctx, t, t->ne[0], int64_t(count), t->nb[1], offset * t->nb[1]);
+        ggml_backend_view_init(v); // the copies need the view's buffer, not just its data
+        return v;
+    };
     std::vector<float> per_ce(request.positions), per_kl(request.positions);
     ChunkWorkspace full_workspace;
     ChunkWorkspace tail_workspace;
@@ -296,8 +345,14 @@ inline Status compute(const Request & request, std::string * error = nullptr) {
         ggml_tensor * per_kl_t = workspace.per_kl_t;
         ggml_cgraph * forward = workspace.forward;
         ggml_cgraph * backward = workspace.backward;
-        ggml_backend_tensor_set(adapted, request.adapted_hidden + offset * request.hidden, 0, ggml_nbytes(adapted));
-        ggml_backend_tensor_set(base, request.base_hidden + offset * request.hidden, 0, ggml_nbytes(base));
+        if (device) {
+            ggml_reset(views.ctx);
+            ggml_backend_tensor_copy(rows_view(request.adapted_rows, offset, count), adapted);
+            if (!workspace.skip_kl) ggml_backend_tensor_copy(rows_view(request.base_rows, offset, count), base);
+        } else {
+            ggml_backend_tensor_set(adapted, request.adapted_hidden + offset * request.hidden, 0, ggml_nbytes(adapted));
+            ggml_backend_tensor_set(base, request.base_hidden + offset * request.hidden, 0, ggml_nbytes(base));
+        }
         ggml_backend_tensor_set(targets, request.targets + offset, 0, ggml_nbytes(targets));
         if (!cuda) {
             std::vector<int32_t> flat(count);
@@ -311,21 +366,29 @@ inline Status compute(const Request & request, std::string * error = nullptr) {
 
         if (!cuda) {
             ggml_backend_tensor_get(workspace.chunk_ce, per_ce.data() + offset, 0, count * sizeof(float));
-            ggml_backend_tensor_get(workspace.chunk_kl, per_kl.data() + offset, 0, count * sizeof(float));
+            if (workspace.chunk_kl) ggml_backend_tensor_get(workspace.chunk_kl, per_kl.data() + offset, 0, count * sizeof(float));
         }
 #if YUE2_AITK_CUDA_RUNTIME
         if (cuda) {
-        auto * adapted_ptr = static_cast<const float *>(adapted_logits->data);
-        auto * base_ptr = static_cast<const float *>(base_logits->data);
+        auto * adapted_ptr = adapted_logits->data;
+        auto * base_ptr = base_logits->data;
         auto * target_ptr = static_cast<const uint32_t *>(targets->data);
-        auto * gradient_ptr = static_cast<float *>(logit_grad->data);
+        auto * gradient_ptr = logit_grad->data;
         auto * ce_ptr = static_cast<float *>(per_ce_t->data);
         auto * kl_ptr = static_cast<float *>(per_kl_t->data);
         if (!adapted_ptr || !base_ptr || !target_ptr || !gradient_ptr || !ce_ptr || !kl_ptr)
             return fail(Status::graph_failure, error, "head-loss CUDA tensor data is unavailable");
-        const auto loss_status = yue2_joint_loss_cuda::forward_chunk(
-            adapted_ptr, base_ptr, target_ptr, gradient_ptr, ce_ptr, kl_ptr,
-            offset, count, request.positions, kVocab, request.kl_weight, nullptr);
+        const bool bf16 = workspace.bf16;
+        if (bf16 && (adapted_logits->type != GGML_TYPE_BF16 || base_logits->type != GGML_TYPE_BF16))
+            return fail(Status::graph_failure, error, "head-loss BF16 logits were not stored as BF16");
+        const auto loss_status = bf16 ?
+            yue2_joint_loss_cuda::forward_chunk_bf16(
+                adapted_ptr, base_ptr, target_ptr, gradient_ptr, ce_ptr, kl_ptr,
+                offset, count, request.positions, kVocab, request.kl_weight, nullptr) :
+            yue2_joint_loss_cuda::forward_chunk(
+                static_cast<const float *>(adapted_ptr), static_cast<const float *>(base_ptr), target_ptr,
+                static_cast<float *>(gradient_ptr), ce_ptr, kl_ptr,
+                offset, count, request.positions, kVocab, request.kl_weight, nullptr);
         if (loss_status != yue2_joint_loss_cuda::Status::success)
             return fail(Status::cuda_failure, error, yue2_joint_loss_cuda::status_string(loss_status));
         if (cudaStreamSynchronize(nullptr) != cudaSuccess)
@@ -342,10 +405,16 @@ inline Status compute(const Request & request, std::string * error = nullptr) {
             return fail(Status::graph_failure, error, "head-loss backward graph failed");
         }
         ggml_backend_synchronize(request.backend);
+        if (device) {
+            ggml_backend_tensor_copy(hidden_grad, rows_view(request.adapted_grad_rows, offset, count));
+            continue;
+        }
         ggml_backend_tensor_get(hidden_grad, chunk_grad.data(), 0, count * request.hidden * sizeof(float));
         for (std::size_t i = 0; i < count * request.hidden; ++i)
             request.adapted_hidden_grad_bf16[offset * request.hidden + i] = f32_to_bf16(chunk_grad[i]);
     }
+    if (device && (!std::isfinite(*request.ce_sum) || !std::isfinite(*request.kl_sum)))
+        return fail(Status::invalid_argument, error, "head-loss hidden input is nonfinite");
     return Status::success;
 }
 

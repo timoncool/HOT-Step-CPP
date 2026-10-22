@@ -42,6 +42,7 @@ it to snap that one field back. The reset persists like any other change — it 
 | Include latent file | Also downloads the `.hslat` latent file alongside each track, which can be reused for covers and remixing. |
 | Use filename as trigger word | Auto-injects the adapter's filename (minus the `.safetensors` extension) into the style description at generation time. |
 | Trigger word placement | Only shown when the trigger toggle above is on. Prepend, Append, or Replace, controlling where the trigger word lands relative to your style description. |
+| Update adapter references | Checks Lyric Studio album presets and clears references to deleted adapter weights. Lists each changed preset and removed adapter. Existing adapters, scales, and reference tracks are kept. Runs only when clicked. |
 
 ### Environment tab
 
@@ -59,6 +60,7 @@ This tab is a structured editor for `.env`. Fields marked "Restart" in the UI ne
 | Training workers / Training worker token | Other PCs this one can train YuE2 batches on, as `Name=http://address:3001`, comma-separated, and the token sent to them. Applies live. See [training on another PC](../training/yue2.md#training-on-another-pc). |
 | Worker token (this PC as a worker) | Set only on a PC that trains for another. API calls from other machines must then carry this token; the PC itself and a browser on it are not affected. Applies live. |
 | Dataset labeling throughput (Essentia / Genius / caption concurrency and intervals) | Rate limits for the background dataset-labeling queue used by Training Studio. Applies live, no restart. |
+| Download folder | Absolute folder that downloaded tracks are saved into, with a toast showing where each one went. Empty (the default) keeps normal browser downloads, which also stay the route for the library's zip export. The folder is checked when you save, and an existing file is never overwritten (the new one becomes `name (2).ext`). Applies live. |
 | Lyrics export directory | Where Lyric Studio exports lyric files. Applies live. |
 | MuScriptor models directory | Where MIDI Studio's transcription models live. Restart required. |
 
@@ -72,6 +74,8 @@ This tab is a structured editor for `.env`. Fields marked "Restart" in the UI ne
 | Provider model overrides | One text field per provider (Gemini, OpenAI, Anthropic, Ollama, LM Studio, Unsloth, llama.cpp, OpenAI-compatible) naming which model to request. Leave blank to use the provider's built-in default. |
 | Provider endpoints and credentials | For the self-hosted providers (Ollama, LM Studio, Unsloth, llama.cpp) and the generic OpenAI-compatible slot: a base URL, plus an API key, username/password, or display name where that provider needs one. Ollama and llama.cpp need only a URL; LM Studio and the OpenAI-compatible slot also take an API key; Unsloth takes a username and password. |
 
+With an Anthropic API key set, Claude model choices come from Anthropic's current model list. If that list cannot be reached, the picker shows a built-in list. The default Claude model is Haiku 4.5 unless you set `ANTHROPIC_MODEL`.
+
 ### Performance tab
 
 | Control | What it does |
@@ -84,6 +88,38 @@ This tab is a structured editor for `.env`. Fields marked "Restart" in the UI ne
 | Generation Timeout | Longest the app waits for a single generation before marking it timed out, from 10 minutes up to 6 hours. This budget is per track, not per batch: a 9-track batch spends it nine times over, once per track as the engine picks each one up. Increase it for high step counts or slower hardware. |
 
 ### Storage & Data tab
+
+The **Data folder** panel shows the release app's active root and any external path
+overrides. Development checkouts keep their existing paths and show this panel as
+read-only. A process `HOT_STEP_DATA_ROOT` override must be cleared before changing
+the saved location.
+
+Choose an action, enter an absolute folder path, and click **Preview change**:
+
+- **Move current data** transfers managed data to an empty destination. Across
+  drives, the copy is verified before the source is removed.
+- **Use existing folder** switches to a compatible data folder without copying,
+  deleting or merging libraries.
+- **Create empty data folder** starts a new library and leaves the current data
+  in place.
+- **Import previous install** copies data from an older app folder into the current
+  empty library, preserving the previous install. Enter the old app folder rather
+  than its data subfolder.
+
+The preview shows source and destination paths, transfer size, and free-space needs
+for a transfer across drives. External locations remain in place. Running or queued
+generation, training and other work, or active downloads, prevent scheduling.
+**Confirm and restart** saves the pending operation outside the app folder and
+requests a graceful restart. Transfers run at startup before the library opens;
+progress appears in the console. The saved location is reused by a fresh unzip.
+
+If the restart request fails, the pending change stays saved. The panel offers
+**Restart to apply** and **Cancel scheduled change**. Cancellation is only possible
+before the transfer starts. An interrupted transfer resumes on restart; a failed
+transfer shows an explanatory page. If only the saved folder is missing or inaccessible,
+startup warns in the launch console and uses `HOT-Step-Data` beside the app, or the
+original checkout folders in dev. This may show an empty library. The saved location
+is kept; reconnect the drive and restart to use it again.
 
 | Control | What it does |
 |---|---|
@@ -127,3 +163,5 @@ Saving the Environment or AI Services tab only writes keys you changed; unmodifi
 - [Troubleshooting](../troubleshooting.md)
 - [Configuration](../../dev/config.md)
 - [Lyric Studio](lyric-studio.md)
+
+For upgrade, layout and recovery instructions, see [Data folder and upgrades](../data-folder.md).

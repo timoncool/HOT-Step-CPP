@@ -1,4 +1,5 @@
 import { yue2OptimRequest } from '../services/training/yue2Optim.js';
+import { selectYue2Audio, YUE2_AUDIO_EXTS, yue2SeparationAudioDir } from '../services/training/yue2AudioStaging.js';
 // training.ts — Dataset Studio HTTP surface (Training Studio phase 1)
 //
 // Import audio → local label (/understand + Essentia) → optional cloud enhance
@@ -90,6 +91,7 @@ import {
 import { AUDIO_EXTENSIONS, datasetDir, isInside, sampleIdFor, trainingBaseDir } from '../services/training/paths.js';
 import { resolveMossPaths } from '../services/training/mossCaption.js';
 import { samplesMissingYue2Caption } from '../services/training/yue2CaptionJob.js';
+import { datasetTrackCaption, yue2DatasetCaptions } from '../services/training/yue2DatasetCaptions.js';
 import { bestScoredRung } from '../services/training/yue2BestRung.js';
 import { deleteLabel, deleteLabels, patchLabel, readLabel } from '../services/training/labelStore.js';
 import { listDatasetsWithAssets } from '../services/training/datasetAssets.js';
@@ -114,7 +116,7 @@ import {
   applyYue2Preset, availableYue2Bases, estimateYue2PreprocessMb, estimateYue2RunMs,
   isYue2CaptionMode, isYue2Target, isYue2VaeVariant, missingYue2TrainModels,
   readYue2PreprocessSummary, resolveYue2TrainModels,
-  YUE2_DEFAULT_PRESET, YUE2_NAR_DEFAULTS, YUE2_PRESETS,
+  YUE2_CACHE_LUFS, YUE2_DEFAULT_PRESET, YUE2_NAR_DEFAULTS, YUE2_PRESETS,
   YUE2_TARGET_TENSORS, YUE2_VRAM_MODEL, yue2AdapterRunDir, yue2LatentsDir,
   yue2ModelDir, yue2PreprocessManifest, yue2RunName,
 } from '../services/training/yue2Train.js';
@@ -142,12 +144,13 @@ import {
 } from '../services/training/yue2ArRuns.js';
 import { YUE2_LICENSE_NOTICE } from '../services/backends/yue2/index.js';
 import { yue2StyleString } from '../services/backends/yue2/style.js';
-import { jointRunForAdapter, listYue2AitkRuns, yue2JointOutputDirectory, yue2ReviewComplete, setYue2ReviewComplete, yue2RunFinished } from '../services/training/yue2AitkRuns.js';
+import { isCheckpointLadder, jointRunForAdapter, listYue2AitkRuns, yue2JointOutputDirectory, yue2ReviewComplete, setYue2ReviewComplete, yue2RunFinished } from '../services/training/yue2AitkRuns.js';
 import { deleteYue2Run } from '../services/training/yue2Mirror.js';
 import { clearPreparedCaches, listPreparedCaches, YUE2_CORE_CACHE } from '../services/training/preparedDataReset.js';
 import { jointCaptionTracks } from '../services/training/yue2AitkCaptions.js';
 import { listYue2JointPreviews, resolveYue2JointPreview, parseYue2JointPreviewOptions, renderYue2JointPreview, yue2JointPreviewMp3 } from '../services/training/yue2JointPreview.js';
 import { runOnGpuLane } from '../services/generation/gpuLane.js';
+import { evictOtherFamilies } from '../services/generation/residency.js';
 import { listYue2RungScores, scoreYue2Rung, yue2RungScoresCsv, getYue2AlbumScore, scoreYue2Album } from '../services/training/yue2RungScores.js';
 import { calibrateYue2Length, ensureDatasetProfile, noteYue2TrainLog, type Yue2Calibration } from '../services/training/datasetProfile.js';
 import { optimisationPath, readOptimisation } from '../services/training/yue2Optimise.js';
@@ -155,7 +158,7 @@ import { planYue2Cleanup, runYue2Cleanup } from '../services/training/yue2Cleanu
 import { listMm3LmAdapters } from '../services/backends/minimax/lmAdapter.js';
 import { listMm3PreviewCandidates } from '../services/training/mm3Preview.js';
 import { writeSidecar } from '../services/training/sidecarIO.js';
-import { essentiaAvailable } from '../services/training/essentiaClient.js';
+import { essentiaAvailable, essentiaTempoProfile } from '../services/training/essentiaClient.js';
 import { engineQueueDepth, engineUnderstandReady, pickBestLm } from '../services/training/understandClient.js';
 import { buildGpuEnv } from '../services/gpuDevices.js';
 import * as queue from '../services/training/labelingQueue.js';
@@ -165,7 +168,9 @@ import {
   type ResolvedYue2AitkPrepareOptions,
 } from '../services/training/yue2AitkPrepareRunner.js';
 import { isEngineSuspended } from '../services/aceEngineProcess.js';
-import { parseYue2JointStopMode, applyBaseMatchedRecipe, resolveYue2JointBase, yue2JointBases, defaultYue2JointBase, defaultYue2JointDevice, yue2ConvRotCheckpoint } from '../services/training/yue2JointTrainRunner.js';
+import { FIXED_RECIPE_CAPTION_GRAMMAR, fixedRecipeTrigger } from '../services/training/fixedRecipeCaption.js';
+import { legacyYue2DoraError, parseYue2JointStopMode, applyBaseMatchedRecipe, applyFixedRecipe, resolveYue2JointBase, yue2JointBases, defaultYue2JointBase, defaultYue2JointDevice, yue2ConvRotCheckpoint } from '../services/training/yue2JointTrainRunner.js';
+import { jointAdmissionError, takeJointAdmission } from '../services/training/yue2JointAdmission.js';
 import { appendToBatch as appendToYue2Batch, finishScoredLadders, cancelBatch as cancelYue2Batch, getBatch as getYue2Batch, listBatches as listYue2Batches, pauseBatch as pauseYue2Batch, resumeBatch as resumeYue2Batch, startBatch as startYue2Batch } from '../services/training/yue2BatchRunner.js';
 import {
   aceTrainExe, engineGpuBackend, engineSupportsFlashAttnTraining,
@@ -197,6 +202,11 @@ import {
 } from '../services/training/lyricStudioExport.js';
 import { datasetLanguage } from '../services/languageCodes.js';
 import { getGenerations, getLyricsSet } from '../db/lireekDb.js';
+import { trainingOperationsRouter } from '../services/training/operations.js';
+// Training operation domains register themselves at import (operations.ts).
+import '../services/training/recipes/operations.js';
+import '../services/training/review/operations.js';
+import '../services/training/yue2PreparationOperations.js';
 import type {
   AuditionListResponse, AuditionOptions, AuditionSideSpec,
   BulkSetInput, CaptionOptions, CreateDatasetInput, FieldSource, GeniusOptions, LabelOptions, LmSize,
@@ -209,6 +219,10 @@ import type {
 } from '../services/training/types.js';
 
 const router = Router();
+
+// Node-owned training operations (recipes, preparation, review): each domain
+// registers its handlers in services/training/operations.ts, not here.
+router.use('/ops', trainingOperationsRouter);
 
 const MIME_BY_EXT: Record<string, string> = {
   '.wav': 'audio/wav',
@@ -836,7 +850,7 @@ router.get('/datasets/:id', async (req: Request, res: Response) => {
       return;
     }
     const detail = await detailFor(ds);
-    syncCounters(ds, detail.samples);
+    detail.updatedAt = syncCounters(ds, detail.samples);
     res.json(detail);
   } catch (err: any) {
     if (err instanceof ScanLimitError) {
@@ -934,7 +948,7 @@ router.post('/datasets/:id/rescan', async (req: Request, res: Response) => {
     }
     if (pruned) detail = await detailFor(ds);
 
-    syncCounters(ds, detail.samples);
+    detail.updatedAt = syncCounters(ds, detail.samples);
     res.json(detail);
   } catch (err: any) {
     if (err instanceof ScanLimitError) {
@@ -1312,6 +1326,8 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
       return;
     }
     const body = (req.body || {}) as LabelOptions;
+    try { essentiaTempoProfile(body.essentiaTempo); }
+    catch (err) { res.status(400).json({ error: err instanceof Error ? err.message : String(err) }); return; }
     {
       const needsEngine = body.useUnderstand === true
         || (body.useCaption !== false && body.caption?.provider === 'moss');
@@ -2186,6 +2202,17 @@ router.post('/datasets/:id/mm3-codes', (req: Request, res: Response) => {
  *  place. This route has no such UI in front of it (a raw API call can set
  *  every boolean at once), so the illegal state needs an explicit refusal
  *  rather than a precedence order nobody asked for. Returns '' when fine. */
+/** The MM3 crop is validated, never clamped: an out-of-range value used to be swapped for the default
+ *  and the trainer ran with a crop the user never chose. Absent/null means "use the default". */
+export const MM3_MAX_FRAMES_RANGE = { min: 64, max: 9000 } as const;
+export function mm3MaxFramesError(raw: unknown): string {
+  if (raw === undefined || raw === null) return '';
+  const v = Number(raw);
+  const { min, max } = MM3_MAX_FRAMES_RANGE;
+  return Number.isFinite(v) && v >= min && v <= max
+    ? '' : `maxFrames must be a number between ${min} and ${max} (got ${String(raw)}).`;
+}
+
 function mm3MethodConflict(b: Record<string, unknown>, adapterType: 'lora' | 'lokr'): string {
   const on = (['dora', 'hira', 'loha', 'pissa', 'hra'] as const).filter(k => b[k] === true);
   if (!on.length) return '';
@@ -2498,6 +2525,12 @@ router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) =>
       }
     }
 
+    const maxFramesError = mm3MaxFramesError(b.maxFrames);
+    if (maxFramesError) {
+      res.status(400).json({ error: maxFramesError });
+      return;
+    }
+
     const adapterType: 'lora' | 'lokr' = b.adapterType === 'lora' || b.adapterType === 'lokr'
       ? b.adapterType : D.adapterType;
     const methodConflict = mm3MethodConflict(b, adapterType);
@@ -2632,6 +2665,7 @@ router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) =>
       scoreLast:    num('scoreLast', 0, 0, 9000),
       scoreLastEndOnly: b.scoreLastEndOnly === true,
       keepResumeState: bool('keepResumeState', D.keepResumeState),
+      updateLinkedPresets: bool('updateLinkedPresets', D.updateLinkedPresets),
       longTracks: longTracksResolved,
       verifyExport: b.verifyExport === true,
       lyricsDropout: num('lyricsDropout', 0, 0, 1),
@@ -2984,11 +3018,9 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
 // The MM3 routes above are untouched. Three things differ here and all three
 // are engine-CLI facts, not choices (survey: docs/plans/yue2/11-training-studio-notes.md):
 //
-//   * `yue2-preprocess` takes --audio <folder> and scans it FLAT. The
-//     dataset's `recursive` flag and its excluded rows cannot reach it, so the
-//     status endpoint reports the flat audio count BESIDE the dataset's own
-//     count and the preprocess route warns when they disagree. Hiding that
-//     would mean a user training on tracks they excluded and never knowing.
+//   * `yue2-preprocess` takes --audio <folder> and scans it flat. The runner
+//     stages included dataset rows into persistent <output>/_staged_audio,
+//     keeping sidecars paired and nested files reachable by later stages.
 //   * There is no `--captions <dir>`. `--caption-mode txt` would read the ACE
 //     Option-A sidecar raw, field syntax and lyrics included, so the default
 //     is `none` (style = the trigger word alone) and `txt` is refused unless
@@ -3004,8 +3036,8 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
  *  Deliberately NOT mm3Preflight: MM3 requires a BUILT dataset because
  *  `mm3-lm-train --manifest` reads `dataset.json`. Neither YuE2 tool reads it,
  *  so demanding a build would refuse a run that would have worked. The build
- *  state is reported by the status route instead, because the count it gives
- *  is the only cross-check on the flat scan. */
+ *  state is reported by the status route instead. Preprocess selection comes
+ *  from the current dataset scan and labels, without requiring a build. */
 function yue2Preflight(req: Request, res: Response): TrainingDatasetRow | null {
   const ds = repo.getDataset(req.params.id as string);
   if (!ds) {
@@ -3023,14 +3055,12 @@ function yue2Preflight(req: Request, res: Response): TrainingDatasetRow | null {
   return ds;
 }
 
-/** Audio files `yue2-preprocess` will actually see: a FLAT, non-recursive scan
+/** Legacy status-card source count: a flat, non-recursive scan
  *  of the source folder filtered to the five extensions the engine accepts
  *  (yue2-preprocess-run.h's list — note .opus and .aac are NOT among them,
  *  though the dataset scanner accepts both).
  *
- *  This is the number the tool works from, and it is reported so the card can
- *  set it against `sampleCount`. Never throws. */
-const YUE2_AUDIO_EXTS = new Set(['.wav', '.flac', '.mp3', '.ogg', '.m4a']);
+ *  Preparation itself uses selectYue2Audio instead. Never throws. */
 function countYue2ScannableAudio(dir: string): { files: number; unsupported: number; needFfmpeg: number } {
   let files = 0, unsupported = 0, needFfmpeg = 0;
   try {
@@ -3062,18 +3092,19 @@ function countYue2ScannableAudio(dir: string): { files: number; unsupported: num
  *  reports zeroes, which reads as "no sidecars" and keeps the old default.
  */
 const SIDECAR_HEAD_BYTES = 4096;
-function countYue2Sidecars(dir: string): { withCaption: number; withLyrics: number; withYue2: number } {
+function countYue2Sidecars(dir: string, audioPaths?: string[]): { withCaption: number; withLyrics: number; withYue2: number } {
   let withCaption = 0, withLyrics = 0, withYue2 = 0;
   try {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (!e.isFile()) continue;
-      if (!YUE2_AUDIO_EXTS.has(path.extname(e.name).toLowerCase())) continue;
-      const stem = path.parse(e.name).name;
+    const files = audioPaths ?? fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isFile() && YUE2_AUDIO_EXTS.has(path.extname(e.name).toLowerCase()))
+      .map(e => path.join(dir, e.name));
+    for (const audio of files) {
+      const stem = audio.slice(0, -path.extname(audio).length);
       // The planner caption is its own file and is what `--caption-mode yue2`
       // reads. Counted separately so the card can say a cache cut in another
       // mode is ignoring N of them.
-      if (fs.existsSync(path.join(dir, `${stem}.yue2.txt`))) withYue2++;
-      const sidecar = path.join(dir, `${stem}.txt`);
+      if (fs.existsSync(`${stem}.yue2.txt`)) withYue2++;
+      const sidecar = `${stem}.txt`;
       let head = '';
       try {
         const fd = fs.openSync(sidecar, 'r');
@@ -3186,7 +3217,7 @@ router.get('/datasets/:id/yue2', async (req: Request, res: Response) => {
 });
 
 /** POST /datasets/:id/yue2-preprocess */
-router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
+router.post('/datasets/:id/yue2-preprocess', async (req: Request, res: Response) => {
   try {
     const ds = yue2Preflight(req, res);
     if (!ds) return;
@@ -3209,11 +3240,16 @@ router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
       return;
     }
 
-    const scan = countYue2ScannableAudio(ds.sourceDir);
+    const selected = selectYue2Audio(await buildSamples(ds));
+    // buildSamples yields; another request can enqueue while it is reading.
+    if (queue.activeJobForDataset(ds.id)) {
+      res.status(409).json({ error: 'A job is already running for this dataset' });
+      return;
+    }
+    const scan = { ...selected, files: selected.files.length };
     if (scan.files === 0) {
       res.status(400).json({
-        error: `No .wav/.flac/.mp3/.ogg/.m4a files directly in ${ds.sourceDir}. yue2-preprocess scans that `
-             + 'folder flat — it does not search subfolders, whatever the dataset\'s recursive setting says.',
+        error: 'Dataset has no included .wav/.flac/.mp3/.ogg/.m4a files. Check excluded rows and the recursive setting.',
       });
       return;
     }
@@ -3247,7 +3283,8 @@ router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
     // form's defaults above — a corpus that ships captions or lyrics reads
     // them. Falling back to `none` here built a cache with neither, and the
     // align stage then skipped every source of a bulk run.
-    const sidecarsForMode = isYue2CaptionMode(b.captionMode) ? undefined : countYue2Sidecars(ds.sourceDir);
+    const sidecarsForMode = isYue2CaptionMode(b.captionMode) ? undefined
+      : countYue2Sidecars(ds.sourceDir, selected.files.map(s => s.audioPath));
     const captionMode = isYue2CaptionMode(b.captionMode) ? b.captionMode
       : sidecarsForMode && (sidecarsForMode.withLyrics > 0 || sidecarsForMode.withCaption > 0) ? 'yue2' : D.captionMode;
     const defaultCaption = typeof b.defaultCaption === 'string' ? b.defaultCaption.trim() : '';
@@ -3270,9 +3307,10 @@ router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
       return;
     }
 
-    // Loudness target: absent = the engine's -14 LUFS; 0 = off. It is part of
-    // the cache key, so a change re-encodes and drops codes/sheet/alignment.
-    let loudnessLufs: number | undefined;
+    // Loudness target: -14 LUFS for every method unless the body names
+    // another; 0 = off. It is part of the cache key, so a change re-encodes
+    // and drops codes/sheet/alignment.
+    let loudnessLufs = YUE2_CACHE_LUFS;
     if (b.loudnessLufs !== undefined && b.loudnessLufs !== null && b.loudnessLufs !== '') {
       const v = Number(b.loudnessLufs);
       if (!Number.isFinite(v) || v > 0 || v < -40) { res.status(400).json({ error: 'loudnessLufs must be 0 (off) or a target from -40 to 0 LUFS.' }); return; }
@@ -3284,7 +3322,7 @@ router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
       outDir,
       manifestPath: yue2PreprocessManifest(ds.slug),
       vaeVariant,
-      ...(loudnessLufs !== undefined ? { loudnessLufs } : {}),
+      loudnessLufs,
       clipSeconds: num('clipSeconds', D.clipSeconds, 1, 60),
       captionMode,
       defaultCaption,
@@ -3298,8 +3336,7 @@ router.post('/datasets/:id/yue2-preprocess', (req: Request, res: Response) => {
     });
     res.json({
       jobId: job.id, kind: job.kind, outDir,
-      // Echoed so the card can show the mismatch the engine cannot see. Not a
-      // warning string: the card decides how loudly to say it.
+      // Eligible dataset rows, before the optional --only/--limit filters.
       scannableFiles: scan.files,
       datasetSamples: ds.sampleCount,
       datasetExcluded: ds.excludedCount,
@@ -3316,6 +3353,8 @@ router.post('/datasets/:id/yue2-train', (req: Request, res: Response) => {
     const ds = yue2Preflight(req, res);
     if (!ds) return;
     const b = (req.body || {}) as Record<string, unknown>;
+    const doraError = legacyYue2DoraError(b);
+    if (doraError) { res.status(400).json({ error: doraError }); return; }
     const num = (k: string, d: number, lo: number, hi: number): number => {
       if (b[k] === undefined || b[k] === null) return d;
       const v = Number(b[k]);
@@ -3435,6 +3474,13 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
     const ds = yue2Preflight(req, res);
     if (!ds) return;
     let b = (req.body || {}) as Record<string, unknown>;
+    // A continuation decided by a Node operation (yue2JointAdmission.ts):
+    // its guard re-checks that decision just before the job is queued.
+    const admissionGuard = b.admission === undefined ? undefined : takeJointAdmission(b.admission);
+    if (b.admission !== undefined && !admissionGuard) {
+      res.status(409).json({ error: 'This continuation was not admitted, or was already used.' });
+      return;
+    }
     if (b.trainingMethod !== 'aitk') {
       res.status(400).json({ error: 'Joint training requires trainingMethod="aitk"; Legacy is never selected implicitly.' });
       return;
@@ -3501,11 +3547,11 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
     }
     // Base-matched method: the fixed parts of the recipe replace whatever the
     // body says (they define the method); its knobs fill in where blank.
-    if (b.method !== undefined && b.method !== 'tuned' && b.method !== 'base-matched') {
-      res.status(400).json({ error: 'method must be tuned or base-matched.' });
+    if (b.method !== undefined && b.method !== 'tuned' && b.method !== 'base-matched' && b.method !== 'fixed-recipe') {
+      res.status(400).json({ error: 'method must be tuned, base-matched or fixed-recipe.' });
       return;
     }
-    const method: 'tuned' | 'base-matched' = b.method === 'base-matched' ? 'base-matched' : 'tuned';
+    const method = b.method === 'base-matched' || b.method === 'fixed-recipe' ? b.method : 'tuned';
     // Dataset-Calibrated Training (opt-in): a fresh base-matched run that asks
     // for it gets steps and saveEvery sized to the album before the recipe
     // fills in warmup from the step count. Without calibrated: true, nothing here runs.
@@ -3526,6 +3572,7 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       b = { ...b, steps: calibration.steps, saveEvery: calibration.saveEvery };
     }
     if (method === 'base-matched') b = applyBaseMatchedRecipe(b);
+    if (method === 'fixed-recipe') b = applyFixedRecipe(b);
     const str = (key: string): string => typeof b[key] === 'string' ? (b[key] as string).trim() : '';
     const automatic = b.autoPrepare === true && !str('resume');
     const prepDefaults = automatic ? yue2AitkPrepareDefaults(ds).options : undefined;
@@ -3572,7 +3619,8 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       preparation = { ...prepDefaults, checkpoint, models,
         legacyManifest: prepString('legacyManifest', prepDefaults.legacyManifest),
         tokenizer: prepString('tokenizer', prepDefaults.tokenizer),
-        trigger: ds.customTag || ds.slug,
+        trigger: method === 'fixed-recipe' ? fixedRecipeTrigger(ds.customTag, ds.slug) : ds.customTag || ds.slug,
+        ...(method === 'fixed-recipe' ? { captionGrammar: 'fixed-recipe' as const } : {}),
         lyricTiming: b.lyricTiming === undefined ? b.alignmentEnabled !== false : b.lyricTiming === true };
       const prepError = foreignYue2Manifest(ds, preparation.legacyManifest) || validateYue2AitkPrepareOptions(preparation);
       if (prepError) { res.status(400).json({ error: prepError }); return; }
@@ -3594,12 +3642,14 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
         return;
       }
       const trigger = ds.customTag || ds.slug;
-      if (manifest.trigger !== trigger || manifest.style_template !== 'upstream'
-        || !manifest.items.every((item: unknown) => {
+      if (method === 'fixed-recipe' ? manifest.caption_grammar !== FIXED_RECIPE_CAPTION_GRAMMAR
+        : manifest.style_template !== 'upstream' || manifest.trigger !== trigger || !manifest.items.every((item: unknown) => {
           const style = item && typeof item === 'object' ? (item as Record<string, unknown>).style : undefined;
           return typeof style === 'string' && (style === trigger || style.startsWith(`${trigger}, in the style of ${trigger}. `));
         })) {
-        res.status(400).json({ error: 'Prepared dataset does not contain this dataset trigger in its training styles. Reprepare with the current joint trainer.' });
+        res.status(400).json({ error: method === 'fixed-recipe'
+          ? 'Prepared dataset needs fixed-recipe caption grammar. Reprepare with Fixed recipe selected.'
+          : 'Prepared dataset does not contain this dataset trigger in its training styles. Reprepare with the current joint trainer.' });
         return;
       }
     } catch {
@@ -3661,9 +3711,9 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
     // LoKr sites (kron factors) instead of LoRA pairs. Only forwarded when
     // asked for, so a request without it trains exactly as before.
     const adapterType = b.adapterType === undefined || b.adapterType === 'lora' ? 'lora'
-      : b.adapterType === 'lokr' ? 'lokr' : null;
+      : b.adapterType === 'lokr' || b.adapterType === 'dora' ? b.adapterType : null;
     if (adapterType === null) {
-      res.status(400).json({ error: 'adapterType must be lora or lokr.' });
+      res.status(400).json({ error: 'adapterType must be lora, lokr or dora.' });
       return;
     }
     const lokrDim = b.lokrDim === undefined ? undefined : integer('lokrDim', 0);
@@ -3768,8 +3818,9 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       arCropFrames = v;
     }
     // Base-matched knobs (any method may set them; absent = engine default).
-    const baseMatched: { method?: 'base-matched'; warmup?: number; arLossWeight?: number; beta1?: number; beta2?: number; arTargets?: 'base'; gradAccum?: number; textDropout?: number; lyricDropout?: number; bothDropout?: number } = {};
+    const baseMatched: { method?: 'base-matched' | 'fixed-recipe'; warmup?: number; arLossWeight?: number; beta1?: number; beta2?: number; arTargets?: 'base'; gradAccum?: number; textDropout?: number; lyricDropout?: number; bothDropout?: number } = {};
     if (method === 'base-matched') baseMatched.method = 'base-matched';
+    if (method === 'fixed-recipe') baseMatched.method = 'fixed-recipe';
     for (const [key, lo, hi, int, zeroOk] of [['warmup', 0, 0x7fffffff, true, true], ['arLossWeight', 0, 10, false, false], ['beta1', 0, 0.999999, false, true], ['beta2', 0, 0.999999, false, true],
       ['gradAccum', 1, 256, true, true], ['textDropout', 0, 1, false, true], ['lyricDropout', 0, 1, false, true], ['bothDropout', 0, 1, false, true]] as const) {
       if (b[key] === undefined || b[key] === null || b[key] === '') continue;
@@ -3822,6 +3873,9 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
     const cursorWeight = Number.isFinite(rawCursor) && rawCursor >= 0 && rawCursor <= 10
       ? rawCursor : (alignmentEnabled ? 0.08 : 0);
     const alignment: Yue2AlignmentOptions = { enabled: alignmentEnabled && cursorWeight > 0, cursorWeight };
+    // Synchronous with the enqueue below: nothing can change the run between.
+    const refused = admissionGuard ? jointAdmissionError(admissionGuard) : null;
+    if (refused) { res.status(409).json({ error: refused }); return; }
     const job = queue.startYue2JointTrainJob(ds.id, {
       checkpoint, dataset, outDir, steps, saveEvery, seed, device,
       ...(gpuUuid ? { gpuUuid } : {}),
@@ -3831,6 +3885,7 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       preview: preview.enabled && (preview.everySteps > 0 || b.refinePlanner === true || preview.parallel) ? preview : { ...preview, enabled: false },
       alignment,
       rank, alpha: alphaRaw,
+      ...(adapterType === 'dora' ? { adapterType } : {}),
       ...(adapterType === 'lokr' ? { adapterType, ...(lokrDim !== undefined ? { lokrDim } : {}), ...(lokrFactor !== undefined ? { lokrFactor } : {}) } : {}),
       ...(optimizer !== 'adamw' ? { optimizer } : {}),
       ...(cautious ? { cautious } : {}),
@@ -3992,14 +4047,17 @@ router.post('/datasets/:id/yue2-joint-prepare', (req: Request, res: Response) =>
       res.status(400).json({ error: 'models must provide exactly vae=FILE, semantic=FILE, and sheetsage=FILE (repeat model fields are accepted)' });
       return;
     }
+    const fixedBase = b.captionGrammar === 'fixed-recipe' ? resolveYue2JointBase(str('base') || 'bf16') : undefined;
+    if (fixedBase && 'error' in fixedBase) { res.status(400).json({ error: fixedBase.error }); return; }
     const options: ResolvedYue2AitkPrepareOptions = {
       legacyManifest: str('legacyManifest') || str('manifest') || defaults.options.legacyManifest,
-      checkpoint: str('checkpoint') || defaults.options.checkpoint,
+      checkpoint: fixedBase && 'checkpoint' in fixedBase ? fixedBase.checkpoint : str('checkpoint') || defaults.options.checkpoint,
       tokenizer: str('tokenizer') || defaults.options.tokenizer,
       output: str('output') || defaults.options.output,
       models,
-      trigger: ds.customTag || ds.slug,
-      lyricTiming: b.lyricTiming !== false,
+      trigger: b.captionGrammar === 'fixed-recipe' ? fixedRecipeTrigger(ds.customTag, ds.slug) : ds.customTag || ds.slug,
+      ...(b.captionGrammar === 'fixed-recipe' ? { captionGrammar: 'fixed-recipe' as const } : {}),
+      lyricTiming: b.captionGrammar === 'fixed-recipe' ? false : b.lyricTiming !== false,
     };
     const error = foreignYue2Manifest(ds, options.legacyManifest) || validateYue2AitkPrepareOptions(options);
     if (error) { res.status(400).json({ error }); return; }
@@ -4178,7 +4236,7 @@ router.get('/yue2-review', (_req: Request, res: Response) => {
           live, rungs: rungs.length, previews: previews.length, scored: scored.size,
           unscored: rungs.filter(r => !scored.has(r.step)).length, reviewed: yue2ReviewComplete(run.output), best: best ? { step: best.step, overall: best.overall, blindLabel: run.blindLabels?.[best.step] ?? '' } : null,
           decoderOnly: (run.options as Record<string, unknown>)?.freezePlannerNow === true, klMin: kls.length ? Math.min(...kls) : null, klMax: kls.length ? Math.max(...kls) : null,
-          baseMatched: (run.options as Record<string, unknown>)?.method === 'base-matched', finished: yue2RunFinished(run.output) });
+          baseMatched: isCheckpointLadder(run.options), finished: yue2RunFinished(run.output) });
       }
     }
     rows.sort((a, b) => (b.createdAt as number) - (a.createdAt as number));
@@ -4323,14 +4381,19 @@ router.post('/datasets/:id/yue2-joint-previews/render', async (req: Request, res
     const dataset = typeof run.options.dataset === 'string' ? run.options.dataset : undefined;
     const odeSteps = Number.isInteger(Number(b.odeSteps)) && Number(b.odeSteps) > 0 ? Math.min(64, Number(b.odeSteps)) : undefined;
     const narCacheRatio = typeof b.narCacheRatio === 'number' && b.narCacheRatio >= 0 && b.narCacheRatio <= 0.9 ? b.narCacheRatio : undefined;
-    const options = { enabled: true, everySteps: 0, takes, fixedTakes: hasFixed ? 0 : 1, seconds, seed, previewMaxFrames: seconds * 25, baseline: false, control: false,
+    const runPreview = run.options.preview as { arScale?: number; sampler?: unknown } | undefined;
+    const { arScale, sampler } = parseYue2JointPreviewOptions({ arScale: b.arScale ?? runPreview?.arScale, sampler: b.sampler ?? runPreview?.sampler }, 0);
+    const options = { enabled: true, everySteps: 0, takes, arScale, ...(sampler ? { sampler } : {}), fixedTakes: hasFixed ? 0 : 1, seconds, seed, previewMaxFrames: seconds * 25, baseline: false, control: false,
       ...(b.baselineOnly === true ? { baselineOnly: true } : {}),
       ...(odeSteps ? { odeSteps } : {}), ...(narCacheRatio !== undefined ? { narCacheRatio } : {}),
       // Without an override, a rung sings what the run's earlier previews sang
       // (a Lyric Studio generation or the dataset's lyrics), so the ladder compares like with like.
       ...(typeof b.caption === 'string' && b.caption.trim() ? { caption: b.caption.trim() } : prior?.caption ? { caption: prior.caption } : {}),
       ...(typeof b.lyrics === 'string' && b.lyrics.trim() ? { lyrics: b.lyrics.trim() } : prior?.lyrics ? { lyrics: prior.lyrics } : {}) };
-    const last = await runOnGpuLane(() => renderYue2JointPreview({ output: run.output, step, options, arAdapter: ckpt.arPath!, narAdapter: ckpt.narPath!, dataset }), { label: 'yue2 refine preview', family: 'yue2' });
+    const last = await runOnGpuLane(async () => {
+      await evictOtherFamilies('yue2');
+      return renderYue2JointPreview({ output: run.output, step, options, arAdapter: ckpt.arPath!, narAdapter: ckpt.narPath!, dataset });
+    }, { label: 'yue2 refine preview', family: 'yue2' });
     res.json({ run: run.jobId, step, previews: [last] });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
@@ -4437,7 +4500,7 @@ router.get('/datasets/:id/yue2-ar', (req: Request, res: Response) => {
           done: !!cache && cache.clips > 0 && cache.loudnessLufs !== null,
           cache: cache ?? null,
           // The level the cache was cut at (0 = off); the batch chain re-cuts
-          // when a method wants another (yue2LoudnessForMethod).
+          // anything but YUE2_CACHE_LUFS.
           loudnessLufs: cache?.loudnessLufs ?? null,
           missing: missingYue2TrainModels('preprocess', { vaeVariant: 'standard' }),
           // A cache built for the NAR (or before `ace` existed) carries no
@@ -4696,7 +4759,7 @@ router.post('/datasets/:id/yue2-stems', (req: Request, res: Response) => {
     if (!ds) return;
     const b = (req.body || {}) as Record<string, unknown>;
 
-    const audioDir = ds.sourceDir;
+    const audioDir = yue2SeparationAudioDir(yue2PreprocessManifest(ds.slug), ds.sourceDir);
     if (!audioDir || !fs.existsSync(audioDir)) {
       res.status(400).json({ error: `This dataset has no audio folder on disk (${audioDir || 'unset'})` });
       return;
@@ -4818,6 +4881,8 @@ router.post('/datasets/:id/yue2-ar-train', (req: Request, res: Response) => {
     const ds = yue2Preflight(req, res);
     if (!ds) return;
     const b = (req.body || {}) as Record<string, unknown>;
+    const doraError = legacyYue2DoraError(b);
+    if (doraError) { res.status(400).json({ error: doraError }); return; }
     const num = (k: string, d: number, lo: number, hi: number): number => {
       if (b[k] === undefined || b[k] === null) return d;
       const v = Number(b[k]);
@@ -5016,32 +5081,6 @@ router.get('/datasets/:id/yue2-ar-runs', (req: Request, res: Response) => {
   }
 });
 
-/** The caption a dataset track contributes, newest source first: the YuE2
- *  planner sentence beside the audio, then whatever the cache baked in (the ACE
- *  caption), then the MM3 structured caption flattened to one line.
- *
- *  Sidecar FIRST, not manifest first. A cache is cut once and then outlives
- *  several rounds of captioning, so the manifest is a snapshot of what the
- *  labels said on the day — reading it in preference to the file on disk is how
- *  an album with eleven `.yue2.txt` beside its audio rendered from its ACE
- *  captions for weeks without anything saying so.
- *
- *  Note the consequence: a caption served here may be one the adapter never
- *  trained on, if the cache was cut in `ace` mode. That is the user's call —
- *  re-cut and retrain to make the two agree. */
-function datasetTrackCaption(audioPath: string, baked: string): string {
-  const read = (file: string): string => {
-    try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; }
-  };
-  if (!audioPath) return baked.trim();
-  const stem = audioPath.slice(0, audioPath.length - path.extname(audioPath).length);
-  // The MM3 caption is a multi-line structured block; as a YuE2 style it is a
-  // last resort and it goes in as one line, never as its own field layout.
-  return read(`${stem}.yue2.txt`)
-    || baked.trim()
-    || read(`${stem}.mm3.txt`).replace(/\s+/g, ' ').trim();
-}
-
 /** GET /yue2-dataset-captions?dataset=<id> | ?lyricsSet=<id> | ?adapter=<path>
  *
  *  The caption-source picker's list, keyed by the training DATASET rather than
@@ -5055,38 +5094,9 @@ function datasetTrackCaption(audioPath: string, baked: string): string {
  *  sidecar fields the prepare step used; the trigger opener is added at
  *  generate time, as before. Every failure answers with an empty list. */
 router.get('/yue2-dataset-captions', async (req: Request, res: Response) => {
-  const empty = { datasetId: '', datasetSlug: '', datasetName: '', tracks: [] as unknown[] };
-  try {
-    const q = (key: string): string => typeof req.query[key] === 'string' ? (req.query[key] as string).trim() : '';
-    let ds: TrainingDatasetRow | null = null;
-    if (q('dataset')) ds = repo.getDataset(q('dataset'));
-    else if (q('lyricsSet')) {
-      const id = Number(q('lyricsSet'));
-      ds = Number.isFinite(id) ? repo.listDatasets().find(d => Number(d.lyricsSetId) === id) ?? null : null;
-    } else if (q('adapter')) {
-      const run = jointRunForAdapter(q('adapter'));
-      ds = run ? repo.getDataset(run.datasetId) ?? repo.listDatasets().find(d => d.slug === run.datasetSlug) ?? null : null;
-    }
-    if (!ds) { res.json(empty); return; }
-    const samples = await buildSamples(ds);
-    // Parity with the prepared style: a `.yue2.txt` caption is the whole
-    // trained sentence (it carries its own BPM), so it gets no tail; an ACE
-    // caption gets the trainer's "<genre>, <bpm> BPM, key of <key>." tail.
-    const yue2Sidecar = (audioPath: string): string => {
-      try { return fs.readFileSync(audioPath.slice(0, audioPath.length - path.extname(audioPath).length) + '.yue2.txt', 'utf8').replace(/\s+/g, ' ').trim(); }
-      catch { return ''; }
-    };
-    const tracks = samples
-      .filter(s => !s.excluded && !s.fileMissing)
-      .map(s => ({ name: s.filename, caption: datasetTrackCaption(s.audioPath, s.caption || ''), yue2: yue2Sidecar(s.audioPath),
-        genre: s.genre || '', bpm: s.bpm === null || s.bpm === undefined ? '' : String(s.bpm), key: s.key || '' }))
-      .filter(t => t.caption)
-      .map(({ yue2, ...t }) => ({ ...t, styled: yue2 || yue2StyleString(t) }));
-    res.json({ datasetId: ds.id, datasetSlug: ds.slug, datasetName: ds.albumName || ds.name || ds.slug, tracks });
-  } catch (err: any) {
-    console.warn(`[Training] yue2-dataset-captions failed: ${err?.message || err}`);
-    res.json(empty);
-  }
+  const q = (key: string): string => typeof req.query[key] === 'string' ? (req.query[key] as string).trim() : '';
+  const lyricsSet = q('lyricsSet') ? Number(q('lyricsSet')) : undefined;
+  res.json(await yue2DatasetCaptions({ dataset: q('dataset') || undefined, lyricsSet, adapter: q('adapter') || undefined }));
 });
 
 /** GET /yue2-adapter-captions?adapter=<path> — the captions the dataset behind

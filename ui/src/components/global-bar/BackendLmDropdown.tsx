@@ -20,6 +20,7 @@
 // Nothing here is MM3-specific — it renders declared schema.
 
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { useBackendStore } from '../../stores/backendStore';
 import {
   BackendExtensionControls,
@@ -27,11 +28,34 @@ import {
   useBackendExtensionSummary,
 } from './BackendExtensionControls';
 import { ParamLabel } from '../shared/ParamLabel';
+import { useGlobalParamsStore } from '../../stores/globalParamsStore';
+
+/** YuE2: unlimited composer top-k with temperature above 1.0 breaks the song.
+ *  The server clamps temperature to 1.0 then; this tells the user up front. */
+const Yue2SemanticWarning: React.FC = () => {
+  const { t } = useTranslation();
+  const bp = useGlobalParamsStore((s: any) => s.backendParams as Record<string, unknown>) ?? {};
+  // Checkpoint's own composer temperature (the control's declared default),
+  // which is what the engine uses when the slider is untouched.
+  const ckptDefault = useBackendExtensions('lm').find(p => p.key === 'yue2SemTemperature')?.default;
+  const set = (v: unknown) => v !== undefined && v !== null && v !== '';
+  // The engine truncates top_k to int, so 0.5 is unlimited too.
+  if (!set(bp.yue2SemTopK) || Math.trunc(Number(bp.yue2SemTopK)) !== 0) return null;
+  const temp = set(bp.yue2SemTemperature) ? Number(bp.yue2SemTemperature)
+    : (typeof ckptDefault === 'number' && Number.isFinite(ckptDefault) ? ckptDefault : 1.0);
+  if (typeof temp !== 'number' || !Number.isFinite(temp) || !(temp > 1.0)) return null;
+  return (
+    <p className="text-[11px] text-amber-400 leading-relaxed border border-amber-500/40 rounded px-2 py-1">
+      {t('globalBar.yue2SemanticWarning', { temp: temp.toFixed(2) })}
+    </p>
+  );
+};
 
 export const BackendLmDropdown: React.FC = () => {
   const displayName = useBackendStore(s =>
     s.backends.find(b => b.id === s.activeBackendId)?.displayName);
   const params = useBackendExtensions('lm');
+  const activeBackendId = useBackendStore(s => s.activeBackendId);
 
   if (params.length === 0) {
     return (
@@ -51,6 +75,7 @@ export const BackendLmDropdown: React.FC = () => {
         info={`${displayName ?? 'This backend'} plans the whole song as a token stream before a `
           + `single sample is rendered — these are that planner's controls. It always runs; `
           + `there is no render without it.`} />}
+      {activeBackendId === 'yue2' && <Yue2SemanticWarning />}
       <BackendExtensionControls group="lm" accentColor="purple" />
     </div>
   );

@@ -35,6 +35,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { runOnGpuLane } from '../generation/gpuLane.js';
+import { evictOtherFamilies } from '../generation/residency.js';
 import { saveDatasetCoverAbc } from '../coverDatasetSource.js';
 import { YUE2_LICENSE_NOTICE } from '../backends/yue2/index.js';
 import { EMPTY_COVER_SCORE_ERROR, hasSoundingVocalBar } from '../backends/yue2/scoreHealth.js';
@@ -732,6 +733,7 @@ export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, 
     if ((loadFailed || forceFallback) && !isCancelled(job)) {
       log(job, 'info', 'The transcriber could not load beside the engine; waiting for active renders to finish.');
       await runOnGpuLane(async () => {
+        await evictOtherFamilies('yue2');
         log(job, 'info', 'Freeing the engine for transcription and restarting it afterward.');
         const retryState: SheetState = { fatalMessage: '', doneSeen: false, lastStep: 0, totalSteps: 0 };
         await deps.run(job, 'yue2-sheet', buildYue2SheetArgs({ ...opts, force: forceFallback }),

@@ -26,7 +26,10 @@
 
 #include "audio-io.h"
 #include "backend.h"
+#include "beat-this.h"
 #include "ggml.h"
+#include "midi-abc.h"
+#include "midi-grid.h"
 #include "safetensors.h"
 
 // ---------------------------------------------------------------------------
@@ -952,18 +955,34 @@ static void sort_midi_events(std::vector<MidiEvent> & evs) {
     });
 }
 
-// Serialize notes to a type-1 SMF (480 tpb, 120 bpm, velocity 100), matching
+// Grid timing for write_midi (upstream notes_to_midi): note times are beats
+// from tick 0, not seconds.
+struct MidiTiming {
+    std::vector<std::pair<int, int>> tempo;          // (tick, microseconds per beat)
+    int                              beats_per_bar = 0;  // 0: no time signature
+    double                           offset_s      = 0;  // where the recording's 0 s plays
+};
+
+// Serialize notes to a type-1 SMF (480 tpb, velocity 100), matching
 // note_event2midi: per-program named tracks, channels 0-8,10-15 by first
-// appearance (overflow shares 15), drums on 9 with +0.01 s synthetic offs.
-static std::vector<uint8_t> write_midi(std::vector<MidiNote> notes) {
+// appearance (overflow shares 15), drums on 9 with synthetic offs.
+// Without timing: seconds at 120 bpm, drum offs +0.01 s, tempo only in the
+// meta track (the byte-exact v0.2 layout --validate-midi checks). With it:
+// beats, the tempo map in every track (MuseScore ignores a note-less
+// conductor track), a time signature, drum offs +1/32 beat.
+static std::vector<uint8_t> write_midi(std::vector<MidiNote> notes, const MidiTiming * tm = nullptr) {
     const int    TPB = 480;
     const int    TEMPO = 500000;
     const int    VEL = 100;
+    const double drum_len = tm ? 1.0 / 32 : 0.01;
+    const std::vector<std::pair<int, int>> tempo = tm ? tm->tempo : std::vector<std::pair<int, int>>{ { 0, TEMPO } };
 
-    validate_notes_fix(notes);
-    notes = trim_overlapping(notes);
+    if (!tm) {  // the grid path cleans the notes in seconds, before converting them
+        validate_notes_fix(notes);
+        notes = trim_overlapping(notes);
+    }
 
-    // note2note_event + drum offsets (writer adds them at time+0.01)
+    // note2note_event + drum offsets (writer adds them at time + drum_len)
     std::vector<MidiEvent> evs;
     for (auto & n : notes) {
         evs.push_back({ n.onset, n.is_drum, n.is_drum ? DRUM_PROGRAM : n.program, 1, n.pitch });
@@ -973,14 +992,14 @@ static std::vector<uint8_t> write_midi(std::vector<MidiNote> notes) {
     {
         std::vector<MidiEvent> drum_offs;
         for (auto & e : evs) {
-            if (e.is_drum) drum_offs.push_back({ e.time + 0.01, true, DRUM_PROGRAM, 0, e.pitch });
+            if (e.is_drum) drum_offs.push_back({ e.time + drum_len, true, DRUM_PROGRAM, 0, e.pitch });
         }
         for (auto & d : drum_offs) evs.push_back(d);
         sort_midi_events(evs);
     }
 
     // per-program tracks
-    struct Track { std::vector<uint8_t> bytes; int last_tick = 0; int channel = 0; };
+    struct Track { std::vector<uint8_t> bytes; int last_tick = 0; int channel = 0; size_t tempo_i = 0; };
     std::vector<int>   track_order;               // program keys, first appearance
     std::vector<Track> tracks;
     std::vector<int>   avail_channels;
@@ -1030,16 +1049,28 @@ static std::vector<uint8_t> write_midi(std::vector<MidiNote> notes) {
         return t;
     };
 
+    // set_tempo at an absolute tick; on a shared tick it precedes the notes
+    auto put_tempo = [&](std::vector<uint8_t> & b, int & last_tick, std::pair<int, int> tc) {
+        put_varlen(b, (uint32_t) (tc.first - last_tick));
+        last_tick = tc.first;
+        b.push_back(0xff); b.push_back(0x51); b.push_back(0x03);
+        b.push_back((uint8_t) (tc.second >> 16)); b.push_back((uint8_t) (tc.second >> 8)); b.push_back((uint8_t) tc.second);
+    };
+
     for (auto & e : evs) {
         // mido second2tick + round (banker's) — nearbyint matches
-        int tick = (int) nearbyint(e.time * 1e6 / TEMPO * TPB);
+        int tick = (int) nearbyint(tm ? e.time * TPB : e.time * 1e6 / TEMPO * TPB);
         Track & t = track_for(e);
+        while (tm && t.tempo_i < tempo.size() && tempo[t.tempo_i].first <= tick) put_tempo(t.bytes, t.last_tick, tempo[t.tempo_i++]);
         int delta = tick - t.last_tick;
         t.last_tick = tick;
         put_varlen(t.bytes, (uint32_t) (delta < 0 ? 0 : delta));
         t.bytes.push_back((uint8_t) ((e.velocity > 0 ? 0x90 : 0x80) | t.channel));
         t.bytes.push_back((uint8_t) e.pitch);
         t.bytes.push_back((uint8_t) (e.velocity > 0 ? VEL : 0));
+    }
+    for (auto & t : tracks) {
+        while (tm && t.tempo_i < tempo.size()) put_tempo(t.bytes, t.last_tick, tempo[t.tempo_i++]);
     }
 
     // assemble file: meta track (set_tempo) + program tracks, each + end_of_track
@@ -1059,13 +1090,103 @@ static std::vector<uint8_t> write_midi(std::vector<MidiNote> notes) {
     };
     {
         std::vector<uint8_t> meta;
-        put_varlen(meta, 0);
-        meta.push_back(0xff); meta.push_back(0x51); meta.push_back(0x03);
-        meta.push_back((uint8_t) (TEMPO >> 16)); meta.push_back((uint8_t) (TEMPO >> 8)); meta.push_back((uint8_t) TEMPO);
+        if (tm && tm->beats_per_bar > 0) {  // n/4, mido's defaults for the click fields
+            put_varlen(meta, 0);
+            meta.insert(meta.end(), { 0xff, 0x58, 0x04, (uint8_t) tm->beats_per_bar, 0x02, 0x18, 0x08 });
+        }
+        if (tm && tm->offset_s != 0.0) {  // upstream's marker: how far the bars delayed the music
+            char text[64];
+            int  n = snprintf(text, sizeof(text), "muscriptor:bar_offset=%.4f", tm->offset_s);
+            put_varlen(meta, 0);
+            meta.push_back(0xff); meta.push_back(0x06);
+            put_varlen(meta, (uint32_t) n);
+            meta.insert(meta.end(), text, text + n);
+        }
+        int last = 0;
+        for (auto & tc : tempo) put_tempo(meta, last, tc);
         emit_track(meta);
     }
     for (auto & t : tracks) emit_track(t.bytes);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Grid-aware export (upstream utils/midi.py notes_to_midi): onset-delay shift,
+// tempo map / bar alignment, optional quantize, gap fill, leading-bar trim.
+// ---------------------------------------------------------------------------
+
+struct GridOut {
+    BeatGrid grid;
+    Timeline timeline;
+    double   offset_s;   // MIDI seconds before the recording's 0 s
+};
+
+// onto a step-beat grid, `strength` of the way; a note that rounds to nothing
+// keeps one step
+static std::vector<MidiNote> quantized_notes(std::vector<MidiNote> notes, double step, double strength) {
+    auto snap = [&](double t) { return nearbyint(t / step) * step; };
+    for (auto & n : notes) {
+        double on = snap(n.onset), off = std::max(snap(n.offset), on + step);
+        n.onset  += strength * (on - n.onset);
+        n.offset += strength * (off - n.offset);
+    }
+    return trim_overlapping(notes);
+}
+
+// per instrument, hold a note to the next onset when the gap is <= max_gap beats
+static void gaps_filled(std::vector<MidiNote> & notes, double max_gap) {
+    const double eps = 1e-6;
+    std::vector<std::vector<double>> onsets(130);  // sorted onsets per program (vocab 0-129)
+    for (auto & n : notes) if (!n.is_drum) onsets[n.program].push_back(n.onset);
+    for (auto & v : onsets) std::sort(v.begin(), v.end());
+    for (auto & n : notes) {
+        if (n.is_drum) continue;
+        const auto & v  = onsets[n.program];
+        auto         it = std::upper_bound(v.begin(), v.end(), n.onset + eps);
+        if (it != v.end() && *it - n.offset > 0 && *it - n.offset <= max_gap + eps) n.offset = *it;
+    }
+}
+
+static std::vector<uint8_t> write_midi_grid(std::vector<MidiNote> notes, const BeatGrid * detected,
+                                            const GridExport & o, GridOut * out) {
+    validate_notes_fix(notes);
+    notes = trim_overlapping(notes);
+    std::vector<double> onsets;
+    for (auto & n : notes) onsets.push_back(n.onset);
+
+    BeatGrid     g     = grid_resolve(detected, o, onsets);
+    const double delay = g.onset_delay;
+    double       earliest = -delay;
+    for (auto & n : notes) {
+        n.onset -= delay;
+        n.offset -= delay;
+        earliest = std::min(earliest, n.onset);
+    }
+    Timeline tl = grid_timeline(g, earliest);
+    for (auto & n : notes) {
+        n.onset  = tl.beats_at(n.onset);
+        n.offset = tl.beats_at(n.offset);
+    }
+    if (o.quantize) {
+        if (g.subdivision) notes = quantized_notes(notes, 1.0 / g.subdivision, o.strength);
+        else fprintf(stderr, "[ace-midi] not quantizing: no beat subdivision to snap the notes to\n");
+    }
+    if (o.fill_gaps > 0) gaps_filled(notes, o.fill_gaps);
+    if (o.trim_leading && !notes.empty()) {
+        const int bar = g.beats_per_bar ? g.beats_per_bar : 1;
+        double first = INFINITY;
+        for (auto & n : notes) first = std::min(first, n.onset);
+        const double empty = std::max(0.0, floor((first + 1e-6) / bar)) * bar;
+        tl.shift(-empty);
+        for (auto & n : notes) { n.onset -= empty; n.offset -= empty; }
+    }
+
+    MidiTiming tm;
+    tm.tempo         = tl.tempo_changes(480);
+    tm.beats_per_bar = g.beats_per_bar;
+    tm.offset_s      = -tl.seconds_at(0.0);
+    if (out) *out = { g, tl, tm.offset_s };
+    return write_midi(notes, &tm);
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,11 +1567,11 @@ static int run_dump_logits(MidiModel * m, const std::string & vdir, const std::s
     return 0;
 }
 
-// Load WAV/MP3 (any rate, mono/stereo) as mono float32 @ 16 kHz —
-// matches the Python pipeline (channel mean + resample).
-static std::vector<float> load_audio_16k_mono(const std::string & path) {
-    int T = 0, sr = 0;
-    float * planar = audio_read(path.c_str(), &T, &sr);  // [L: T][R: T]
+// Load WAV/MP3 (any rate, mono/stereo) as mono float32 at its own rate
+// (channel mean, as the Python pipeline).
+static std::vector<float> load_audio_mono(const std::string & path, int * sr) {
+    int T = 0;
+    float * planar = audio_read(path.c_str(), &T, sr);  // [L: T][R: T]
     if (!planar || T <= 0) {
         fprintf(stderr, "[ace-midi] cannot read audio: %s\n", path.c_str());
         exit(1);
@@ -1458,9 +1579,14 @@ static std::vector<float> load_audio_16k_mono(const std::string & path) {
     std::vector<float> mono((size_t) T);
     for (int i = 0; i < T; i++) mono[i] = 0.5f * (planar[i] + planar[(size_t) T + i]);
     free(planar);
+    return mono;
+}
+
+static std::vector<float> resample_16k(std::vector<float> mono, int sr) {
+    const size_t n_in = mono.size();
     if (sr != MIDI_SAMPLE_RATE) {
         int n_out = 0;
-        float * r = audio_resample(mono.data(), T, sr, MIDI_SAMPLE_RATE, 1, &n_out);
+        float * r = audio_resample(mono.data(), (int) n_in, sr, MIDI_SAMPLE_RATE, 1, &n_out);
         if (!r || n_out <= 0) {
             fprintf(stderr, "[ace-midi] resample %d -> %d failed\n", sr, MIDI_SAMPLE_RATE);
             exit(1);
@@ -1469,28 +1595,230 @@ static std::vector<float> load_audio_16k_mono(const std::string & path) {
         free(r);
     }
     fprintf(stderr, "[ace-midi] audio: %.1f s @ %d Hz -> %zu samples @ 16 kHz\n",
-            (double) T / sr, sr, mono.size());
+            (double) n_in / sr, sr, mono.size());
     return mono;
 }
 
-// Transcribe an audio file (WAV/MP3, or raw f32 mono 16 kHz with is_raw)
-static int run_transcribe(MidiModel * m, const std::string & audio_path,
-                          const std::string & out_path, bool jsonl, bool is_raw) {
-    std::vector<float> wav = is_raw ? read_f32_file(audio_path) : load_audio_16k_mono(audio_path);
-    TranscribeResult   res = transcribe_wav(m, wav.data(), (int) wav.size(), jsonl);
-    std::vector<uint8_t> mid = write_midi(res.notes);
-    FILE * f = fopen(out_path.c_str(), "wb");
+static bool write_file(const std::string & path, const void * data, size_t n) {
+    FILE * f = fopen(path.c_str(), "wb");
     if (!f) {
-        fprintf(stderr, "[ace-midi] cannot write %s\n", out_path.c_str());
-        return 1;
+        fprintf(stderr, "[ace-midi] cannot write %s\n", path.c_str());
+        return false;
     }
-    fwrite(mid.data(), 1, mid.size(), f);
+    fwrite(data, 1, n, f);
     fclose(f);
+    return true;
+}
+
+// beats.json: the tracked beats (re-export reruns the grid from them) and the
+// written grid's beats and bar lines in seconds of the audio, for the piano
+// roll. audio_shift_s maps MIDI seconds (from tick 0) back to the audio.
+static bool write_beats_json(const std::string & path, const BeatTrack & tr, double duration, const GridOut & go) {
+    std::string j = "{\"tracked_beats\":[";
+    char        buf[64];
+    auto num = [&](double v, bool comma) { snprintf(buf, sizeof(buf), comma ? ",%.6f" : "%.6f", v); j += buf; };
+    for (size_t i = 0; i < tr.beats.size(); i++) num(tr.beats[i], i > 0);
+    j += "],\"tracked_downbeats\":[";
+    for (size_t i = 0; i < tr.downbeats.size(); i++) num(tr.downbeats[i], i > 0);
+    const BeatGrid & g = go.grid;
+    const double delay = g.onset_delay;
+    snprintf(buf, sizeof(buf), "],\"duration\":%.6f,\"grid\":{", duration);
+    j += buf;
+    snprintf(buf, sizeof(buf), "\"bpm\":%.4f,", g.bpm); j += buf;
+    snprintf(buf, sizeof(buf), "\"beats_per_bar\":%d,", g.beats_per_bar); j += buf;
+    snprintf(buf, sizeof(buf), "\"steady\":%s,", g.steady ? "true" : "false"); j += buf;
+    snprintf(buf, sizeof(buf), "\"onset_delay\":%.6f,", delay); j += buf;
+    snprintf(buf, sizeof(buf), "\"subdivision\":%d,", g.subdivision); j += buf;
+    snprintf(buf, sizeof(buf), "\"offset_s\":%.6f,", go.offset_s); j += buf;
+    snprintf(buf, sizeof(buf), "\"audio_shift_s\":%.6f,", delay - go.offset_s); j += buf;
+    // notes were moved by -delay before the timeline, so audio = seconds_at(p) + delay
+    std::string beats = "\"beats\":[", bars = "\"bars\":[";
+    const int   p0 = (int) ceil(go.timeline.beats_at(-delay)), p1 = (int) floor(go.timeline.beats_at(duration - delay));
+    for (int p = p0; p <= p1; p++) {
+        snprintf(buf, sizeof(buf), "%.4f", go.timeline.seconds_at(p) + delay);
+        beats += (p > p0 ? "," : "") + std::string(buf);
+        if (g.beats_per_bar && grid_pymod(p, g.beats_per_bar) == 0) bars += (bars.back() == '[' ? "" : ",") + std::string(buf);
+    }
+    j += beats + "]," + bars + "]}}\n";
+    return write_file(path, j.data(), j.size());
+}
+
+static bool run_beats(const std::string & model_dir, const std::vector<float> & mono, int sr, BeatTrack * tr) {
+    BeatThis bt;
+    if (!bt_load(&bt, model_dir + "/model.safetensors")) {
+        fprintf(stderr, "[ace-midi] cannot load the beat model from %s\n", model_dir.c_str());
+        return false;
+    }
+    int64_t t0 = ggml_time_ms();
+    *tr = bt_track(&bt, mono.data(), (int) mono.size(), sr);
+    bt_free(&bt);
+    fprintf(stderr, "[ace-midi] beats: %zu beats, %zu downbeats (%lld ms)\n", tr->beats.size(), tr->downbeats.size(),
+            (long long) (ggml_time_ms() - t0));
+    return true;
+}
+
+struct AbcOpts {
+    std::string out;               // YuE2 ABC lead sheet path; empty = none
+    int         ins_program = -1;  // the Ins voice's instrument; -1 = busiest melodic one
+    bool        melody_only = false;
+};
+
+// The transcription as a YuE2 lead sheet on the same grid as the MIDI (midi-abc.h)
+static void write_abc(const std::vector<MidiNote> & notes, const GridOut & go, double duration, const AbcOpts & ao) {
+    std::vector<AbcNote> an;
+    for (auto & n : notes) an.push_back({ n.onset, n.offset, n.pitch, n.program, n.is_drum });
+    AbcResult r = midi_to_yue2_abc(an, go.grid, duration, ao.ins_program, ao.melody_only);
+    if (r.ok) write_file(ao.out, r.abc.data(), r.abc.size());
+    fprintf(stderr, "[ace-midi] abc: %s (vocal %d notes, ins %s %d notes, key %s, %d chords%s%s)\n",
+            r.ok ? "ok" : r.error.c_str(), r.vocal_notes, r.ins_program < 0 ? "none" : instrument_name(r.ins_program).c_str(), r.ins_notes,
+            r.key.c_str(), r.chords, r.repaired.empty() ? "" : ", repaired: ", r.repaired.c_str());
+    std::string err;
+    for (char c : r.error) err += (c == '"' || c == '\\') ? std::string("\\") + c : (c == '\n' ? std::string(" ") : std::string(1, c));
+    printf("{\"type\":\"abc\",\"ok\":%s,\"vocal_notes\":%d,\"ins_notes\":%d,\"ins\":\"%s\",\"key\":\"%s\",\"chords\":%d,\"error\":\"%s\"}\n",
+           r.ok ? "true" : "false", r.vocal_notes, r.ins_notes, r.ins_program < 0 ? "none" : instrument_name(r.ins_program).c_str(), r.key.c_str(),
+           r.chords, err.c_str());
+    fflush(stdout);
+}
+
+// Notes -> MIDI on the detected grid, plus beats.json (and the ABC lead
+// sheet). A failed detection writes the placeholder grid (120 BPM, no
+// meter), as upstream's best-effort.
+static std::vector<uint8_t> grid_midi(const std::vector<MidiNote> & notes, const BeatTrack & tr, double duration,
+                                      const GridExport & opts, const std::string & beats_out,
+                                      const AbcOpts & ao = {}) {
+    BeatGrid g;
+    bool     ok = grid_detect(tr.beats, tr.downbeats, &g);
+    if (!ok) fprintf(stderr, "[ace-midi] only %zu beats detected, need %d; writing 120 BPM\n", tr.beats.size(), GRID_MIN_BEATS);
+    GridOut go;
+    std::vector<uint8_t> mid = write_midi_grid(notes, ok ? &g : nullptr, opts, &go);
+    if (!beats_out.empty()) write_beats_json(beats_out, tr, duration, go);
+    if (!ao.out.empty()) write_abc(notes, go, duration, ao);
+    return mid;
+}
+
+// Transcribe an audio file (WAV/MP3, or raw f32 mono 16 kHz with is_raw).
+// With a beat model the MIDI gets tempo, meter and bar lines.
+static int run_transcribe(MidiModel * m, const std::string & audio_path, const std::string & out_path, bool jsonl,
+                          bool is_raw, const std::string & beat_model, const GridExport & opts,
+                          const std::string & beats_out, const AbcOpts & ao) {
+    std::vector<float> wav;
+    BeatTrack          tr;
+    if (is_raw) {
+        wav = read_f32_file(audio_path);
+        if (!beat_model.empty() && !run_beats(beat_model, wav, MIDI_SAMPLE_RATE, &tr)) return 1;
+    } else {
+        int                sr   = 0;
+        std::vector<float> mono = load_audio_mono(audio_path, &sr);
+        if (!beat_model.empty() && !run_beats(beat_model, mono, sr, &tr)) return 1;
+        wav = resample_16k(std::move(mono), sr);
+    }
+    TranscribeResult     res = transcribe_wav(m, wav.data(), (int) wav.size(), jsonl);
+    std::vector<uint8_t> mid = beat_model.empty()
+        ? write_midi(res.notes)
+        : grid_midi(res.notes, tr, (double) wav.size() / MIDI_SAMPLE_RATE, opts, beats_out, ao);
+    if (!write_file(out_path, mid.data(), mid.size())) return 1;
     if (jsonl) {
         printf("{\"type\":\"done\",\"notes\":%zu,\"midi_bytes\":%zu}\n", res.notes.size(), mid.size());
         fflush(stdout);
     }
     fprintf(stderr, "[ace-midi] wrote %s (%zu notes, %zu bytes)\n", out_path.c_str(), res.notes.size(), mid.size());
+    return 0;
+}
+
+// The numbers in a JSON array `"key":[...]` (our own beats.json only)
+static std::vector<double> json_numbers(const std::string & j, const char * key) {
+    std::vector<double> v;
+    size_t p = j.find(std::string("\"") + key + "\":[");
+    if (p == std::string::npos) return v;
+    const char * s = j.c_str() + p + strlen(key) + 4;
+    while (*s && *s != ']') {
+        char * end;
+        double x = strtod(s, &end);
+        if (end == s) { s++; continue; }
+        v.push_back(x);
+        s = end;
+    }
+    return v;
+}
+
+static std::string read_text(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return "";
+    std::string s;
+    char        buf[65536];
+    size_t      n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) s.append(buf, n);
+    fclose(f);
+    return s;
+}
+
+// Re-export: the streamed note events (--jsonl output) + beats.json -> MIDI
+// with new export options. No transcription model needed.
+static int run_export(const std::string & events_path, const std::string & beats_in, const std::string & out_path,
+                      const GridExport & opts, const std::string & beats_out, const AbcOpts & ao) {
+    std::string ev = read_text(events_path), bj = read_text(beats_in);
+    if (ev.empty() || bj.empty()) {
+        fprintf(stderr, "[ace-midi] cannot read %s or %s\n", events_path.c_str(), beats_in.c_str());
+        return 1;
+    }
+    auto field = [](const std::string & line, const char * key, std::string * str) -> double {
+        size_t p = line.find(std::string("\"") + key + "\":");
+        if (p == std::string::npos) return -1;
+        const char * s = line.c_str() + p + strlen(key) + 3;
+        if (str) {
+            const char * q = strchr(s + 1, '"');
+            *str = q ? std::string(s + 1, q) : "";
+            return 0;
+        }
+        return atof(s);
+    };
+    auto program_for = [](const std::string & name, bool * drum) {
+        *drum = name == "drums";
+        if (*drum) return DRUM_PROGRAM;
+        for (int p = 0; p < DRUM_PROGRAM; p++) {
+            const char * n = instrument_for_program(p);
+            if (n && name == n) return p;
+        }
+        return name.rfind("program_", 0) == 0 ? atoi(name.c_str() + 8) : 0;
+    };
+
+    // pair note_start / note_end by index, as transcribe_wav assembles notes
+    std::vector<MidiNote> notes;
+    std::vector<std::pair<int, MidiNote>> open;
+    size_t pos = 0;
+    while (pos < ev.size()) {
+        size_t      nl   = ev.find('\n', pos);
+        std::string line = ev.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos              = nl == std::string::npos ? ev.size() : nl + 1;
+        std::string type, inst;
+        field(line, "type", &type);
+        const int index = (int) field(line, "index", nullptr);
+        if (type == "note_start") {
+            field(line, "instrument", &inst);
+            MidiNote n;
+            n.program = program_for(inst, &n.is_drum);
+            n.pitch   = (int) field(line, "pitch", nullptr);
+            n.onset = n.offset = field(line, "time", nullptr);
+            open.push_back({ index, n });
+        } else if (type == "note_end") {
+            for (size_t i = 0; i < open.size(); i++) {
+                if (open[i].first != index) continue;
+                open[i].second.offset = field(line, "time", nullptr);
+                notes.push_back(open[i].second);
+                open.erase(open.begin() + (long) i);
+                break;
+            }
+        }
+    }
+    BeatTrack tr;
+    tr.beats     = json_numbers(bj, "tracked_beats");
+    tr.downbeats = json_numbers(bj, "tracked_downbeats");
+    const size_t dp       = bj.find("\"duration\":");
+    const double duration = dp == std::string::npos ? 0.0 : atof(bj.c_str() + dp + 11);
+
+    std::vector<uint8_t> mid = grid_midi(notes, tr, duration, opts, beats_out, ao);
+    if (!write_file(out_path, mid.data(), mid.size())) return 1;
+    fprintf(stderr, "[ace-midi] exported %s (%zu notes, %zu bytes)\n", out_path.c_str(), notes.size(), mid.size());
     return 0;
 }
 
@@ -1523,11 +1851,34 @@ int main(int argc, char ** argv) {
     std::string audio_path, out_path = "out.mid";
     std::string dump_dir;
     std::string device = "auto";
+    std::string beat_model, beats_out, export_events, beats_in, track_path;
+    GridExport  opts;
+    AbcOpts     abc;
     bool   jsonl  = false;
     bool   is_raw = false;
     double tol    = 1e-3;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
+        if (!strcmp(argv[i], "--self-test-grid")) return grid_self_test();
+        else if (!strcmp(argv[i], "--beat-model") && i + 1 < argc) beat_model = argv[++i];
+        else if (!strcmp(argv[i], "--beats-out") && i + 1 < argc) beats_out = argv[++i];
+        else if (!strcmp(argv[i], "--export") && i + 1 < argc) export_events = argv[++i];
+        else if (!strcmp(argv[i], "--beats-in") && i + 1 < argc) beats_in = argv[++i];
+        else if (!strcmp(argv[i], "--track") && i + 1 < argc) track_path = argv[++i];
+        else if (!strcmp(argv[i], "--abc-out") && i + 1 < argc) abc.out = argv[++i];
+        else if (!strcmp(argv[i], "--abc-ins") && i + 1 < argc) abc.ins_program = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--abc-melody-only")) abc.melody_only = true;
+        else if (!strcmp(argv[i], "--bpm") && i + 1 < argc) opts.bpm = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--beats-per-bar") && i + 1 < argc) opts.beats_per_bar = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--first-downbeat") && i + 1 < argc) { opts.has_downbeat = true; opts.first_downbeat = atof(argv[++i]); }
+        else if (!strcmp(argv[i], "--tempo-map")) opts.tempo_map = 1;
+        else if (!strcmp(argv[i], "--fixed-tempo")) opts.tempo_map = 0;
+        else if (!strcmp(argv[i], "--beat-scale") && i + 1 < argc) opts.beat_scale = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--quantize")) opts.quantize = true;
+        else if (!strcmp(argv[i], "--grid") && i + 1 < argc) opts.subdivision = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--quantize-strength") && i + 1 < argc) opts.strength = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--fill-gaps") && i + 1 < argc) opts.fill_gaps = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--trim-leading-bars")) opts.trim_leading = true;
+        else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
         else if (!strcmp(argv[i], "--validate") && i + 1 < argc) validate_dir = argv[++i];
         else if (!strcmp(argv[i], "--validate-decode") && i + 1 < argc) validate_decode_dir = argv[++i];
         else if (!strcmp(argv[i], "--validate-midi") && i + 1 < argc) validate_midi_dir = argv[++i];
@@ -1539,9 +1890,36 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atof(argv[++i]);
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
     }
+    {
+        const double l2 = opts.beat_scale > 0 ? log2(opts.beat_scale) : 0.5;
+        if (l2 != floor(l2)) {
+            fprintf(stderr, "[ace-midi] --beat-scale must be a power of two, not %g\n", opts.beat_scale);
+            return 2;
+        }
+    }
+    if (!track_path.empty()) {  // beats only: no transcription model
+        if (beat_model.empty() || beats_out.empty()) {
+            fprintf(stderr, "[ace-midi] --track needs --beat-model <dir> and --beats-out <beats.json>\n");
+            return 2;
+        }
+        ggml_time_init();
+        int                sr   = 0;
+        std::vector<float> mono = load_audio_mono(track_path, &sr);
+        BeatTrack          tr;
+        if (!run_beats(beat_model, mono, sr, &tr)) return 1;
+        grid_midi({}, tr, (double) mono.size() / sr, opts, beats_out);
+        return 0;
+    }
+    if (!export_events.empty()) {
+        if (beats_in.empty()) {
+            fprintf(stderr, "[ace-midi] --export needs --beats-in <beats.json>\n");
+            return 2;
+        }
+        return run_export(export_events, beats_in, out_path, opts, beats_out, abc);
+    }
     if (model_dir.empty()) {
         fprintf(stderr,
-                "ace-midi (Phase 3) — MuScriptor GGML port\n"
+                "ace-midi — MuScriptor GGML port, with Beat This! tempo and bars\n"
                 "usage: ace-midi --model <dir> <mode>\n"
                 "  modes:\n"
                 "    --transcribe <audio.wav|mp3> [--out out.mid] [--jsonl]  audio -> MIDI\n"
@@ -1550,7 +1928,26 @@ int main(int argc, char ** argv) {
                 "    --validate-decode <dir>   mel + greedy token parity vs oracle\n"
                 "    --validate-midi <dir>     multi-chunk events + MIDI bytes vs oracle\n"
                 "  --device auto|cpu|<name>  backend (default auto = best available;\n"
-                "                            cpu is the byte-exact oracle-parity path)\n");
+                "                            cpu is the byte-exact oracle-parity path)\n"
+                "  tempo and bars (MuScriptor v0.4 export options):\n"
+                "    --beat-model <dir>        Beat This! weights (model.safetensors): detect\n"
+                "                              tempo, meter and downbeats, write them into the MIDI\n"
+                "    --beats-out <beats.json>  tracked beats + the written grid in audio seconds\n"
+                "    --bpm <x> | --beats-per-bar <n> | --first-downbeat <s>   override the grid\n"
+                "    --tempo-map | --fixed-tempo   follow the beats / one tempo (default: follow\n"
+                "                              when the beats don't fit one tempo)\n"
+                "    --beat-scale <2|0.5|...>  beats per detected beat\n"
+                "    --quantize [--grid <steps per beat>] [--quantize-strength <0..1>]\n"
+                "    --fill-gaps <beats>       hold notes over short rests\n"
+                "    --trim-leading-bars       drop empty bars before the first note\n"
+                "    --abc-out <score.abc> [--abc-ins <program>] [--abc-melody-only]\n"
+                "                              YuE2 lead sheet: voice -> Vocal, one instrument -> Ins,\n"
+                "                              estimated key and chords, on the same grid\n"
+                "  ace-midi --track <audio> --beat-model <dir> --beats-out <beats.json>\n"
+                "                              beats and grid only, no transcription model\n"
+                "  ace-midi --export <events.jsonl> --beats-in <beats.json> [options] --out x.mid\n"
+                "                              re-export a transcription, no model needed\n"
+                "  ace-midi --self-test-grid   grid maths on synthetic beats\n");
         return 2;
     }
 
@@ -1581,7 +1978,7 @@ int main(int argc, char ** argv) {
     else if (!validate_decode_dir.empty()) rc = run_validate_decode(&m, validate_decode_dir);
     else if (!validate_midi_dir.empty())   rc = run_validate_midi(&m, validate_midi_dir);
     else if (!dump_dir.empty())            rc = run_dump_logits(&m, dump_dir, out_path);
-    else if (!audio_path.empty())          rc = run_transcribe(&m, audio_path, out_path, jsonl, is_raw);
+    else if (!audio_path.empty())          rc = run_transcribe(&m, audio_path, out_path, jsonl, is_raw, beat_model, opts, beats_out, abc);
     else fprintf(stderr, "[ace-midi] no mode given\n");
 
     free_model(&m);

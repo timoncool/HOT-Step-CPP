@@ -8,6 +8,7 @@ import type { Artist, AlbumPreset } from '../../services/lireekApi';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
+import { CoverArtistGrid } from './CoverArtistGrid';
 
 interface ArtistSettingsPanelProps {
   artists: Artist[];
@@ -42,6 +43,8 @@ interface ArtistSettingsPanelProps {
   genProgress: number;
   genStage: string;
   onGenerate: () => void;
+  /** Under the Generate button (the Drafts fold). */
+  footer?: React.ReactNode;
   onCancel: () => void;
   isGeneratingCaption: boolean;
   onRegenerateCaption: () => void;
@@ -82,41 +85,13 @@ export const ArtistSettingsPanel: React.FC<ArtistSettingsPanelProps> = (props) =
             </button>
           )}
         </div>
-        {isLoadingArtists ? (
-          <div className="flex items-center justify-center py-8">
-            <Loader2 className="w-5 h-5 text-zinc-500 animate-spin" />
-          </div>
-        ) : artists.length === 0 ? (
+        {artists.length === 0 && !isLoadingArtists ? (
           <div className="text-center py-4">
             <p className="text-xs text-zinc-500">{t('cover.noArtistsAvailable')}</p>
             <p className="text-[10px] text-zinc-600 dark:text-zinc-400 mt-1">Describe the target style below, or add artists in Lyric Studio for adapter-powered covers.</p>
           </div>
         ) : (
-          <div className="grid grid-cols-5 gap-2 max-h-[240px] overflow-y-auto scrollbar-hide">
-            {artists.map(artist => (
-              <button
-                key={artist.id}
-                onClick={() => onSelectArtist(artist)}
-                className={`
-                  flex flex-col items-center gap-1.5 p-2 rounded-xl transition-all duration-200
-                  ${selectedArtistId === artist.id
-                    ? 'bg-cyan-500/20 ring-2 ring-cyan-400 shadow-lg shadow-cyan-500/10'
-                    : 'bg-black/5 dark:bg-white/5 hover:bg-cyan-500/10 hover:ring-1 hover:ring-cyan-400/50'}
-                `}
-              >
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-cyan-500 to-teal-600 flex items-center justify-center overflow-hidden flex-shrink-0">
-                  {artist.image_url ? (
-                    <img src={artist.image_url} alt={artist.name} className="w-full h-full object-cover" />
-                  ) : (
-                    <span className="text-white text-sm font-bold">{artist.name.charAt(0)}</span>
-                  )}
-                </div>
-                <span className="text-[10px] font-medium text-zinc-700 dark:text-zinc-300 truncate w-full text-center">
-                  {artist.name}
-                </span>
-              </button>
-            ))}
-          </div>
+          <CoverArtistGrid artists={artists} loading={isLoadingArtists} selectedArtistId={selectedArtistId} onSelectArtist={onSelectArtist} />
         )}
 
         {/* Album selector */}
@@ -308,6 +283,7 @@ export const ArtistSettingsPanel: React.FC<ArtistSettingsPanelProps> = (props) =
           <Disc3 className="w-4 h-4" />
           {isGenerating ? t('cover.addToQueue', 'Add to Queue') : t('cover.generateCover')}
         </button>
+        {props.footer}
       </div>
     </div>
   );

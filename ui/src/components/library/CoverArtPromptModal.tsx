@@ -4,17 +4,26 @@
 // this modal instead of firing immediately. It pre-fills the textarea with the
 // exact prompt the engine would auto-build (fetched from /prompt-preview), lets
 // the user edit it freely, then POSTs the verbatim prompt to /cover-art/generate
-// and polls to completion — dispatching `cover-art-updated` so App.tsx refreshes
-// the song. Auto-generate-after-creation is unaffected (it never opens this).
+// and follows the job with a Query poll — dispatching `cover-art-updated` so
+// App.tsx refreshes the song. Auto-generate-after-creation is unaffected (it never opens this).
 //
 // Mounted once at the SongList root; driven by the `open-cover-art-prompt`
 // window CustomEvent dispatched from the context-menu items.
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import ReactDOM from 'react-dom';
+import { QueryObserver, useQueryClient } from '@tanstack/react-query';
 import { X, Image as ImageIcon, Loader2, Sparkles, RotateCcw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { Song } from '../../types';
+import { apiClient } from '../../services/httpClient';
+import { pollWhile } from '../../queries/contract';
+import { serverKey } from '../../queries/keys';
+
+interface CoverArtJob { status: string; error?: string; result?: { coverUrl?: string } }
+const coverArtEnded = (job: CoverArtJob | undefined) => job?.status === 'succeeded' || job?.status === 'failed';
+/** Give up following a job after this long; the server keeps working. */
+const COVER_ART_FOLLOW_MS = 300_000;
 
 /** Detail payload for the `open-cover-art-prompt` window event. */
 export interface OpenCoverArtPromptDetail {
@@ -47,10 +56,12 @@ export const CoverArtPromptModal: React.FC = () => {
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The generation being followed. Clearing it stops the poll.
+  const [jobId, setJobId] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
   const close = useCallback(() => {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    setJobId(null);
     setSong(null);
     setPrompt('');
     setDefaultPrompt('');
@@ -83,8 +94,35 @@ export const CoverArtPromptModal: React.FC = () => {
     return () => window.removeEventListener('open-cover-art-prompt', onOpen);
   }, []);
 
-  // Cleanup poll on unmount
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  // Follow the job: Query polls it, one request at a time, and stops at a
+  // terminal status. Errors and non-OK replies keep polling (with backoff)
+  // until the job ends or the safety stop fires. Unsubscribing on the first
+  // terminal answer acts on it once.
+  useEffect(() => {
+    if (!jobId || !song) return;
+    const observer = new QueryObserver(queryClient, {
+      queryKey: serverKey('shell-queue/cover-art-job', { id: jobId }),
+      queryFn: ({ signal }) => apiClient.get<CoverArtJob>(`/cover-art/generate/${encodeURIComponent(jobId)}`, { signal }),
+      staleTime: 0,
+      refetchInterval: pollWhile<CoverArtJob>(j => !coverArtEnded(j), 2000),
+    });
+    const timer = setTimeout(() => { setJobId(null); setGenerating(false); }, COVER_ART_FOLLOW_MS);
+    const unsubscribe = observer.subscribe(({ data }) => {
+      if (!coverArtEnded(data)) return;
+      unsubscribe();
+      if (data!.status === 'succeeded') {
+        window.dispatchEvent(new CustomEvent('cover-art-updated', {
+          detail: { songId: song.id, coverUrl: data!.result?.coverUrl },
+        }));
+        close();
+      } else {
+        setJobId(null);
+        setError(data!.error || 'Generation failed');
+        setGenerating(false);
+      }
+    });
+    return () => { unsubscribe(); clearTimeout(timer); };
+  }, [jobId, song, queryClient, close]);
 
   const generate = useCallback(() => {
     if (!song || !prompt.trim()) return;
@@ -117,30 +155,10 @@ export const CoverArtPromptModal: React.FC = () => {
           }
           throw new Error(d.error || 'Failed to start generation');
         }
-        const { jobId } = await r.json();
-        pollRef.current = setInterval(async () => {
-          try {
-            const jr = await fetch(`/api/cover-art/generate/${jobId}`);
-            if (!jr.ok) return;
-            const job = await jr.json();
-            if (job.status === 'succeeded') {
-              if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-              window.dispatchEvent(new CustomEvent('cover-art-updated', {
-                detail: { songId: song.id, coverUrl: job.result?.coverUrl },
-              }));
-              close();
-            } else if (job.status === 'failed') {
-              if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
-              setError(job.error || 'Generation failed');
-              setGenerating(false);
-            }
-          } catch { /* network blip — keep polling */ }
-        }, 2000);
-        // Safety stop after 5 minutes
-        setTimeout(() => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; setGenerating(false); } }, 300_000);
+        setJobId((await r.json()).jobId);
       })
       .catch(err => { setError(err.message); setGenerating(false); });
-  }, [song, prompt, close]);
+  }, [song, prompt]);
 
   if (!song) return null;
 

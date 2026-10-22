@@ -36,7 +36,7 @@ run. Everything else runs to completion so one report shows every failure.
 | Tier | What it proves | Blocks |
 |---|---|---|
 | 0 | `tsc` on server and ui, `verify-hooks.ps1`, the `server/src` unit tests, `check-release-prereqs.mjs` | yes |
-| 1 | Health with `engine.ready`; ace, minimax-m3 and yue2 registered; DiT, VAE and LM catalogued; every `.lua` under `engine/plugins/` appears in the registry; thirty read-only endpoints answer 200 | yes |
+| 1 | Health with `engine.ready`; ace, minimax-m3 and yue2 registered; DiT, VAE and LM catalogued; declared solver, scheduler and guidance names under `engine/plugins/` appear in the registry, excluding helper modules; read-only endpoints answer 200, with the log SSE stream checked by status and content type then cancelled | yes |
 | 2 | ACE text2music with the LM and lyrics, the skip-LM path, then cover, repaint, extract, lego and complete from that render; the generation log ends with `GENERATION COMPLETED` | yes |
 | 3 | Same seed twice reproduces; a non-default solver, scheduler and guidance mode each change the output; a DiT adapter changes the output; an LM adapter loads | yes |
 | 4 | MM3 text2music, MM3 with a planner adapter, YuE2 text2music. Each skips when its models are not installed. | yes |

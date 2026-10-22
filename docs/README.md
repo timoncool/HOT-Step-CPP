@@ -6,9 +6,13 @@ link to the page that explains it.
 
 ## For users
 
+RunPod deployment: [Pod template](dev/runpod.md), including the public HTTP proxy and access warning.
+
 | Page | What it covers |
 |---|---|
 | [Getting started](user/getting-started.md) | Download, first launch, first model pack, first song, where files live |
+| [Data folder and upgrades](user/data-folder.md) | Shared data across versions, move, repoint, import and recovery |
+| [Running on Google Colab](user/colab.md) | The Colab notebook: install, models, Drive persistence, opening the UI |
 | [Backends](user/backends.md) | ACE-Step 1.5, MiniMax-Music3 and YuE2: what each is for, how to switch, capability matrix |
 | [Generation](user/generation.md) | The global parameter bar: models, steps, seeds, guidance, post-processing chain, queue, task modes |
 | [Getting higher quality output](user/quality.md) | Model precision, prompts, steps and solvers, post-processing, per-backend cheat sheet |
@@ -59,11 +63,20 @@ In sidebar order.
 | [Engine](dev/engine.md) | Binaries, per-backend pipeline, hook files, plugin host, adapters, TensorRT, training, the ggml fork |
 | [Engine request and CLI reference](../engine/docs/ARCHITECTURE.md) | Request JSON fields, generation modes, binary flags, engine endpoints |
 | [HTTP API index](dev/api.md) | Every Node route, generated |
+| [Generation API contracts](dev/api-contracts.md) | Generate request, errors, auth, jobs, media, capability manifest |
+| [Building a replacement frontend](dev/build-a-frontend.md) | Entry point for a client built on the HTTP contracts alone: origin/auth/media, discovery, errors/versioning, job polling and resume, Create's queue ownership, and the full workflow catalogue |
+| [Create's control dictionary](dev/frontend-create-controls.md) | The generation parameter dictionary for a frontend client: submission shapes, task modes, defaults |
+| [Studio workflows for frontend clients](dev/frontend-studios.md) | Insta-Gen, Cover, Repaint, Lego layer, Lyric Studio batch and stem separation wire contracts |
+| [Training for frontend clients](dev/frontend-training.md) | ACE/MM3/YuE2 recipes, starting a run, following a job, restarts, review |
+| [Library, playlist, drafts and Song Builder](dev/frontend-library.md) | Song, playlist, studio draft and Song Builder wire contracts |
+| [Preference presets](dev/frontend-presets.md) | Preference families, import, YuE2 joint preset resolution |
+| [Media for frontend clients](dev/frontend-media.md) | Import, export and the two live audio streams |
 | [Plugin authoring](dev/plugins-authoring.md) | Writing a Lua solver, scheduler, guidance or postprocess plugin |
 | [Training internals](dev/training-internals.md) | Trainer architecture, measured numbers, open decisions |
 | [Releasing](dev/releasing.md) | Cutting and publishing a release, CI caching, gotchas |
 | [Writing and maintaining the docs](dev/docs-contributing.md) | Layout, page template, generated tables, the checker |
 | [Writing style](dev/writing-style.md) | Rules for prose a human reads |
 | [UI design rules](dev/ui-design.md) | The shared controls every screen uses (dropdown, toggle, hover explanation), accent colours, and the check that enforces them |
+| [TanStack Query audit and migration](dev/tanstack-query.md) | Every TanStack integration audited: deprecated fetchQuery sweep, useQuery/useMutation gaps, hook folder conventions, phased migration plan |
 | [Skill library](../.claude/skills/README.md) | Procedures per maintenance domain for coding agents |
-| [AGENTS.md](../AGENTS.md) | Project rules for agents, including the documentation ownership table |
+| `AGENTS.md` (local only) | Project rules for agents, including the documentation ownership table |

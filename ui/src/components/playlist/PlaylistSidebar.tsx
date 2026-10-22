@@ -12,8 +12,9 @@ import {
   Music, ListPlus, ListMusic, Square, DownloadCloud, Loader2,
 } from 'lucide-react';
 import { usePlaylist, type PlaylistItem } from '../lyric-studio/playlistStore';
-import { playFromList, playlistItemToTrack, usePlaybackSelector } from '../../stores/playbackStore';
+import { playFromList, togglePlay, playlistItemToTrack, usePlaybackSelector } from '../../stores/playbackStore';
 import { downloadTrack, downloadAll } from '../../utils/downloadTrack';
+import { useAuth } from '../../context/AuthContext';
 import type { Song } from '../../types';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { SongActionsMenu, songFromPlaylistItem } from '../shared/SongActionsMenu';
@@ -32,6 +33,7 @@ export const PlaylistSidebar: React.FC<PlaylistSidebarProps> = ({ onClose, embed
   const currentSongId = usePlaybackSelector(s => s.currentTrack?.id ?? null);
   const { disguiseArtist, disguiseTitle } = useDisguiseMode();
   const [downloading, setDownloading] = useState(false);
+  const { token } = useAuth();
 
   /** Convert a PlaylistItem to a Song shape for the download utility. */
   const playlistItemToSong = useCallback((item: PlaylistItem): Song => ({
@@ -49,20 +51,30 @@ export const PlaylistSidebar: React.FC<PlaylistSidebarProps> = ({ onClose, embed
   }), []);
 
   const handleDownloadAll = useCallback(async () => {
-    if (downloading || playlist.items.length === 0) return;
+    if (downloading || playlist.items.length === 0 || !token) return;
     setDownloading(true);
     try {
       const songs = playlist.items.map(playlistItemToSong);
-      await downloadAll(songs);
+      const failures = await downloadAll(songs);
+      if (failures.length) window.alert(`Some downloads failed:\n${failures.join('\n')}`);
+    } catch (err) {
+      window.alert(`Download failed: ${(err as Error).message}`);
     } finally {
       setDownloading(false);
     }
-  }, [playlist.items, downloading, playlistItemToSong]);
+  }, [playlist.items, downloading, playlistItemToSong, token]);
 
   const handlePlay = useCallback((item: PlaylistItem) => {
     const allTracks = playlist.items.map(playlistItemToTrack);
     const clickedTrack = playlistItemToTrack(item);
+    // The current track pauses/resumes in place; reloading it would restart it.
+    if (clickedTrack.id === currentSongId) { togglePlay(); return; }
     playFromList(clickedTrack, allTracks, 'playlist');
+  }, [playlist.items, currentSongId]);
+
+  // Play All always (re)installs the playlist as the queue and starts at the top.
+  const handlePlayAll = useCallback(() => {
+    playFromList(playlistItemToTrack(playlist.items[0]), playlist.items.map(playlistItemToTrack), 'playlist');
   }, [playlist.items]);
 
   const totalDuration = useMemo(() => {
@@ -112,6 +124,22 @@ export const PlaylistSidebar: React.FC<PlaylistSidebarProps> = ({ onClose, embed
         </div>
       </div>
       )}
+
+      {playlist.needsImport && (
+        <div className="px-3 py-2 border-b border-zinc-200 dark:border-white/10 text-xs text-zinc-600 dark:text-zinc-300">
+          <p>Browser playlist found. Import it to save the ordered list on this installation.</p>
+          <button className="mt-1 text-pink-500 hover:text-pink-400 underline" onClick={() => void playlist.importBrowserPlaylist()}>
+            {playlist.replacingServer ? 'Import and replace saved playlist' : 'Import browser playlist'}{playlist.saveError ? ' (retry)' : ''}
+          </button>
+        </div>
+      )}
+      {playlist.saveError && (
+        <div className="px-3 py-2 border-b border-red-300 dark:border-red-900 text-xs text-red-600 dark:text-red-300" role="alert">
+          <p>Playlist save failed: {playlist.saveError}. Your local edit is still visible.</p>
+          {!playlist.needsImport && <button className="mt-1 underline" onClick={() => void playlist.retryPlaylistSave()}>Reload and reapply</button>}
+        </div>
+      )}
+      {playlist.saving && <div className="px-3 py-1 text-xs text-zinc-500" role="status">Saving playlist…</div>}
 
       {/* Track list */}
       <div className="flex-1 min-h-0 overflow-y-auto scrollbar-hide">
@@ -207,7 +235,7 @@ export const PlaylistSidebar: React.FC<PlaylistSidebarProps> = ({ onClose, embed
       {/* Footer */}
       {playlist.items.length > 0 && (
         <div className="flex items-center justify-between px-4 py-2 border-t border-zinc-200 dark:border-white/5 flex-shrink-0">
-          <button onClick={() => handlePlay(playlist.items[0])}
+          <button onClick={handlePlayAll}
             className="flex items-center gap-1.5 text-[10px] font-semibold text-pink-400 hover:text-pink-300 transition-colors">
             <Play className="w-3 h-3" /> {t('playlist.playAll')}
           </button>

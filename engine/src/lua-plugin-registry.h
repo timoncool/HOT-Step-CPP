@@ -1,7 +1,8 @@
 #pragma once
 // lua-plugin-registry.h: Runtime plugin registry replacing static C++ registries
 //
-// Scans engine/plugins/ and project-root/plugins/ for .lua files.
+// Scans engine/plugins/, project-root/plugins/ and an optional user plugin
+// root (ace-server --user-plugins) for .lua files.
 // Provides lookup functions matching the old solver-registry.h / scheduler-registry.h
 // / guidance-registry.h interfaces, plus JSON serialization for the API.
 
@@ -32,7 +33,11 @@ public:
     }
 
     // Scan directories and load all plugins. Call once at startup.
-    void init(const std::string & engine_dir, const std::string & project_dir) {
+    // user_plugins_dir is a plugins root itself (holds solvers/, schedulers/...).
+    // It is scanned last, and a user plugin replaces a shipped plugin of the
+    // same name. Shipped-vs-shipped (and user-vs-user) clashes keep the first.
+    void init(const std::string & engine_dir, const std::string & project_dir,
+              const std::string & user_plugins_dir = "") {
         fprintf(stderr, "[Plugins] Initializing plugin system...\n");
 
         // Scan engine/plugins/{solvers,schedulers,guidance,postprocess}/
@@ -47,6 +52,14 @@ public:
             scan_dir(project_dir + "/plugins/schedulers",   PluginType::Scheduler);
             scan_dir(project_dir + "/plugins/guidance",     PluginType::Guidance);
             scan_dir(project_dir + "/plugins/postprocess",  PluginType::Postprocess);
+        }
+
+        if (!user_plugins_dir.empty()) {
+            fprintf(stderr, "[Plugins] User plugins: %s\n",user_plugins_dir.c_str());
+            scan_dir(user_plugins_dir + "/solvers",      PluginType::Solver, true);
+            scan_dir(user_plugins_dir + "/schedulers",   PluginType::Scheduler, true);
+            scan_dir(user_plugins_dir + "/guidance",     PluginType::Guidance, true);
+            scan_dir(user_plugins_dir + "/postprocess",  PluginType::Postprocess, true);
         }
 
         fprintf(stderr, "[Plugins] Loaded %d solvers, %d schedulers, %d guidance, %d postprocess\n",
@@ -154,7 +167,9 @@ private:
     std::unordered_map<std::string, LuaPlugin> guidance_;
     std::unordered_map<std::string, LuaPlugin> postprocess_;
 
-    void scan_dir(const std::string & dir_path, PluginType expected_type) {
+    // Runs once from init(), before any lookup hands out a LuaPlugin pointer,
+    // so erasing a shipped entry leaves nothing dangling.
+    void scan_dir(const std::string & dir_path, PluginType expected_type, bool user_root = false) {
         if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) return;
 
         // Collect and sort files for deterministic load order
@@ -192,6 +207,11 @@ private:
         }
         std::sort(files.begin(), files.end());
 
+        // Names this call loaded from the user root, so a second user file of
+        // the same name keeps the first instead of replacing the first override.
+        // Per call, so it is per category like the maps.
+        std::set<std::string> user_names;
+
         for (auto & fpath : files) {
             LuaPlugin plugin;
             std::string path_str = fpath.string();
@@ -208,11 +228,18 @@ private:
                            : (expected_type == PluginType::Guidance)     ? guidance_
                            :                                               postprocess_;
 
-                if (map.count(plugin.name)) {
-                    fprintf(stderr, "[Plugins] WARNING: duplicate plugin '%s' from %s (keeping first)\n",
-                            plugin.name.c_str(), path_str.c_str());
-                    continue;
+                auto existing = map.find(plugin.name);
+                if (existing != map.end()) {
+                    if (!user_root || user_names.count(plugin.name)) {
+                        fprintf(stderr, "[Plugins] WARNING: duplicate plugin '%s' from %s (keeping first: %s)\n",
+                                plugin.name.c_str(), path_str.c_str(), existing->second.filepath.c_str());
+                        continue;
+                    }
+                    fprintf(stderr, "[Plugins] User plugin '%s' from %s overrides %s\n",
+                            plugin.name.c_str(), path_str.c_str(), existing->second.filepath.c_str());
+                    map.erase(existing);  // closes the shipped plugin's lua_State
                 }
+                if (user_root) user_names.insert(plugin.name);
 
                 fprintf(stderr, "[Plugins]   %-12s %-24s (%s)\n",
                         expected_type == PluginType::Solver ? "solver" :

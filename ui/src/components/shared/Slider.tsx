@@ -13,6 +13,9 @@ interface SliderProps {
   label: string;
   value: number;
   onChange: (value: number) => void;
+  /** Fired once a change is finished: drag released, arrow key up, typed
+   *  value blurred or confirmed with Enter, or reset. Optional. */
+  onCommit?: () => void;
   min: number;
   max: number;
   step: number;
@@ -33,21 +36,24 @@ interface SliderProps {
    *  clicked. For a server-default overlay form, resetting means deleting
    *  the edit key rather than writing a value — the caller supplies that. */
   onReset?: () => void;
+  /** Classes for the row holding the range input (e.g. a fixed height to line
+   *  up with a select beside it). */
+  controlClassName?: string;
 }
 
 export const Slider: React.FC<SliderProps> = ({
   label, value, onChange, min, max, step, suffix = '', showInput = false, headerRight,
-  info, infoMeta, defaultValue, onReset,
+  info, infoMeta, defaultValue, onReset, onCommit, controlClassName,
 }) => {
   return (
     <div>
-      <div className="flex items-center justify-between mb-1.5">
+      <div className="flex items-center justify-between min-h-6 mb-1.5">
         <ParamLabel
           label={label}
           info={info}
           meta={infoMeta}
           className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
-          onReset={defaultValue !== undefined && value !== defaultValue ? (onReset ?? (() => onChange(defaultValue))) : undefined}
+          onReset={defaultValue !== undefined && value !== defaultValue ? () => { (onReset ?? (() => onChange(defaultValue)))(); onCommit?.(); } : undefined}
         />
         <div className="flex items-center gap-1.5">
         {showInput ? (
@@ -56,6 +62,8 @@ export const Slider: React.FC<SliderProps> = ({
             className="w-16 px-2 py-0.5 text-xs text-right text-zinc-700 dark:text-zinc-300 bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-white/10 rounded-lg outline-none focus:border-pink-500/50"
             value={value}
             onChange={e => onChange(parseFloat(e.target.value) || min)}
+            onBlur={onCommit}
+            onKeyDown={e => { if (e.key === 'Enter') onCommit?.(); }}
             min={min}
             max={max}
             step={step}
@@ -66,15 +74,19 @@ export const Slider: React.FC<SliderProps> = ({
         {headerRight}
         </div>
       </div>
-      <input
-        type="range"
-        value={value}
-        onChange={e => onChange(parseFloat(e.target.value))}
-        min={min}
-        max={max}
-        step={step}
-        className="w-full"
-      />
+      <div className={controlClassName}>
+        <input
+          type="range"
+          value={value}
+          onChange={e => onChange(parseFloat(e.target.value))}
+          onPointerUp={onCommit}
+          onKeyUp={onCommit}
+          min={min}
+          max={max}
+          step={step}
+          className="w-full"
+        />
+      </div>
     </div>
   );
 };

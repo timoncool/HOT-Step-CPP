@@ -96,6 +96,7 @@ export function cropWavFile(
   wavPath: string,
   inPointSec: number,
   outPointSec: number,
+  fadeOutSec = 0.005,
 ): CropResult {
   const buf = fs.readFileSync(wavPath);
   const info = parseWavHeader(buf);
@@ -143,10 +144,12 @@ export function cropWavFile(
       }
     }
 
-    // Fade-out at the end of the cropped region
-    for (let i = 0; i < fadeSamples; i++) {
-      const sampleIdx = croppedSamples - fadeSamples + i;
-      const gain = 0.5 * (1 + Math.cos(Math.PI * i / fadeSamples)); // 1 → 0
+    // Fade-out at the end of the cropped region (callers trimming a render to
+    // length pass a longer fadeOutSec so the cut sounds like an ending)
+    const outFade = Math.max(fadeSamples, Math.min(Math.floor(info.sampleRate * fadeOutSec), Math.floor(croppedSamples / 4)));
+    for (let i = 0; i < outFade; i++) {
+      const sampleIdx = croppedSamples - outFade + i;
+      const gain = 0.5 * (1 + Math.cos(Math.PI * i / outFade)); // 1 → 0
       for (let ch = 0; ch < info.numChannels; ch++) {
         const off = info.dataOffset + sampleIdx * frameSize + ch * bytesPerSample;
         if (off + bytesPerSample > newBuf.length) continue;

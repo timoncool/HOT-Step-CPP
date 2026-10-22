@@ -150,6 +150,18 @@ toggle's own field, never on anything the section contains: an accordion's `onRe
 content's own per-field resets (or an inner group "Reset" button) stay independent, each touching
 only what it says it does.
 
+## Phone bottom sheets
+
+Use `BottomSheet` for phone song actions; desktop actions keep their dropdown.
+The responsive parameter bar already provides phone sections, so `BarSection`
+keeps its desktop dropdown without a separate phone sheet.
+
+Sheet backdrop/content use z-index 59/60, above settings at 55 and below child
+dialogs at 70. A visible higher portal suspends the sheet's Tab and Escape
+handlers and backdrop dismissal. Closing the sheet returns focus to its opener.
+See [PWA and phone sheets](../../ui/PWA.md) for the full contract and production
+fixture, including child-dialog keyboard and focus checks.
+
 ## Error boundaries
 
 A render-time throw no longer blanks the tab. `ErrorBoundary`
@@ -190,5 +202,5 @@ down.
 ## Verifying a change
 
 Type-check (`npx tsc -b` from `ui/`), then ask the user to look at the screen; never use a browser
-agent for visual checks ([AGENTS.md](../../AGENTS.md#ui--browser-verification)). Say which page and
+agent for visual checks. Say which page and
 which control.

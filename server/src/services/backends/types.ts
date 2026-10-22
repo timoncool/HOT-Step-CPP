@@ -196,6 +196,8 @@ export interface BackendModels {
     trigger?: string;
     /** Joint export fallback from the dataset setting, absent from training metadata. */
     triggerInferred?: boolean;
+    /** Typed in the Adapters dropdown: the file, its run and its dataset carry none. */
+    triggerManual?: boolean;
     rank?: number;
     steps?: number;
     bytes?: number;
@@ -208,10 +210,9 @@ export interface BackendModels {
     valLoss?: number;
   }>;
   defaults?: Record<string, unknown>;
-  /** Optional per-bucket display metadata (size on disk, filename), keyed
-   *  bucket -> option value. Purely cosmetic; the UI renders the bare option
-   *  when absent. */
-  meta?: Record<string, Record<string, { label?: string; bytes?: number }>>;
+  /** Optional per-bucket metadata, keyed bucket -> option value.
+   * A disabledReason prevents selection and explains the missing dependency. */
+  meta?: Record<string, Record<string, { label?: string; bytes?: number; disabledReason?: string }>>;
 }
 
 /** Which model each bucket should use, e.g. { lm: 'q8_0', synth: 'Q4_K_M' }.

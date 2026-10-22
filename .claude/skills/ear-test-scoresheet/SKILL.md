@@ -5,6 +5,10 @@ description: The standard way to run a listening test in HOT-Step - a local HTML
 
 # Ear-test score sheet
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Rob's verdict (2026-09-23): "the best way so far we've had to score tests like
 this". Use it instead of asking for free-text impressions of a folder of WAVs.
 
@@ -129,7 +133,7 @@ exist, so re-running after a failure only fills the gaps. Config:
 - Watch free space on D: before a long ladder. A full disk cut one render off
   mid-write (a 0-byte WAV); delete it and re-run the ladder.
 - Prompts: use Lyric Studio lyrics the adapter never trained on, with their
-  own caption (`generations` table in `server/data/hotstep.db`: `caption`,
+  own caption (`generations` table in `<data root>/library/hotstep.db`: `caption`,
   `lyrics`). The same prompt and seed for every rung of a group.
 
 ## Hosted variant (only when needed)

@@ -1,5 +1,9 @@
 # Architecture
 
+Resolve runtime paths first using the [data folder configuration](config.md#dev-checkouts).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 HOT-Step CPP is a desktop app for local music generation. It has three tiers: a C++
 inference engine, a Node server that owns the database and orchestrates the engine, and a
 React UI in the browser. This page shows how they fit together and where each feature lives
@@ -11,7 +15,7 @@ in the source tree. Read it before you pick a file to edit.
 |---|---|---|---|
 | Engine | C++17, CUDA/Vulkan/Metal/CPU through GGML | `engine/` | Inference binaries. `ace-server` is the HTTP server the app talks to. Other tools: `ace-train`, `ace-caption`, `ace-midi`, `mastering`, `mp3-codec`, `neural-codec`, `quantize`, `vst-host`, and the upstream CLIs `ace-lm`, `ace-synth`, `ace-understand` |
 | Server | Node 20 to 24, TypeScript, Express, better-sqlite3 | `server/src/` | Job queue, SQLite, file storage, spawns and restarts the engine, serves the built UI |
-| UI | React 19, Vite, Zustand, Tailwind | `ui/src/` | Browser frontend, one component folder per studio |
+| UI | React 19, Vite, TanStack Query, Zustand, Tailwind | `ui/src/` | Browser frontend, Query server snapshots and client stores, one component folder per studio |
 
 ```
 Browser
@@ -40,8 +44,157 @@ ace-server    engine/tools/hot-step-server.cpp   127.0.0.1:8085
 | Vite dev server | 3000 | hard-coded in `ui/vite.config.ts` and `dev.bat` — the address agents use |
 | ace-server | 8085 | `ACESTEPCPP_PORT` |
 
-The `<data dir>` is `server/data/` in a git checkout. [config.md](config.md) has every
+The `<data dir>` is `<data root>/library/` in a git checkout. [config.md](config.md) has every
 variable, including how `DATA_DIR` resolves.
+
+## UI server state
+
+`ui/src/main.tsx` provides one HMR-stable QueryClient above AuthProvider and App.
+Query owns server lists, details, capabilities and job snapshots. Zustand,
+external stores and React state retain forms, playback, selections, unsaved
+edits and workflow execution. Editors can seed a working copy from a snapshot;
+background reads must preserve unsaved typing. Compatibility projections select
+the captured cache entry and must not become independent fetch owners.
+
+The [server-state contract](ui-server-state.md) defines the client, keys,
+transport signatures, retry policy and SSE bridge. Keys contain API base,
+resource, id and normalized filters, plus an opaque auth epoch and actual
+backend/worker only where relevant. Credentials stay out of keys. A scheduled
+training read captures its worker with its key and passes that target and
+Query's AbortSignal into the transport. Local run/review/mirror records omit
+worker scope. An auth change cancels and removes the previous epoch's queries.
+
+Default freshness is 30 seconds and retention is five minutes. Focus does not
+refetch; reconnect does. Reads retry network/5xx failures at most twice, never
+aborts or 4xx. Mutations never retry automatically. Active job polling normally
+runs every 1.5 seconds, stops at terminal status and backs off failed cycles up
+to 30 seconds. Resource overrides and runtime steps live in each area's README:
+
+| Area | Snapshot ownership and retained client work |
+|---|---|
+| [Global models](../../ui/src/queries/global-models/README.md) | Plugins, capabilities, VRAM, catalogues, model downloads, profiles, seeds, references and VST snapshots; parameter forms and selection intent stay local |
+| Training data | `queries/training-data/queries.ts` owns datasets, detail, jobs, preparation status, capabilities, workers, pipelines and batches; the training store projects only the selected worker/dataset and retains pending edits. Its missing README and remaining direct reads are requests below |
+| [Training runs](../../ui/src/queries/training-runs/README.md) | Worker status/jobs, local run/review/score/preparation records; charts/logs retain SSE reducers, form fields and playback stay local |
+| [Studios](../../ui/src/queries/studios/README.md) | MIDI jobs/notes, extraction/separation, projects, workflow snapshots and shared songs/plugins/models; composition, audio scheduling and explicit execution stay local |
+| [Cover and lyrics](../../ui/src/queries/cover-lyrics/README.md) | Catalogues, sources, profiles, presets, drafts, playlists and workflow snapshots; lyric edits and serial execution stay local |
+| [Shell and queue](../../ui/src/queries/shell-queue/README.md) | Library, recent songs, settings, preferences, browse results, generation status and queue projections; routing, playback, migration and completion effects stay client-owned |
+
+Commands capture their target before awaiting, then update or invalidate related
+list/detail keys after success. A failed command leaves the old snapshot visible.
+Deletion cancels old reads before the command and again after success, removes
+the accepted rows and invalidates. Canceling observation aborts an HTTP read;
+canceling a server job requires its explicit command.
+
+SSE remains the push channel. Shared log/download/training connections and
+workflow streams keep their existing reducers. Scoped bridges reconcile snapshots
+on events and reconnect, coalesce bursts and discard late events after teardown.
+Replay cannot repeat a submission or completion effect. MIDI's note stream
+retains its own live-note reducer and closes on unmount.
+
+The generation executor keeps serialization, IndexedDB persistence, manual rows
+and legacy server/browser ownership rules. Its existing projection loop schedules
+Query reads; it is not replaced by a second poller. Queue reads suppress Query
+retries because the executor already handles failures. Delivery is claimed only
+after the song read succeeds and occurs once per page. This cache migration adds
+no server durability or permission changes. Remaining integration gaps are
+explicitly recorded in the audit below.
+
+## UI server-state integration audit
+
+Audited implementation `a9748d5d`, including the foundation's historical
+manifest, current production service imports, direct fetches, stream openers,
+intervals and imperative store reads. Test files and test fakes are excluded
+from the production scan. The historical manifest remains with its foundation
+owner in [ui-server-state.md](ui-server-state.md#consumer-manifest); the
+reconciliation below records current dispositions without editing that owner's
+file. Historical counts describe files, not remaining HTTP calls.
+
+### Requests to area owners
+
+R1-R6 code reconciliation is complete in HOTSTEP-107 (`8909d3b3` and
+`d5a47ded`), HOTSTEP-108 (`a7a4536e`, accepted after Builder review) and
+HOTSTEP-109 (`0b000e03`, awaiting Tester review). Runtime acceptance remains
+with HOTSTEP-106; these closures do not claim live request-count reductions.
+
+| Request | Owner | Resolution |
+|---|---|---|
+| R1 | Engineer, training-data; Maker, training-runs | Closed in `8909d3b3` and `0b000e03`. Preparation follow and run panels share local `yue2-preparation` and `yue2-preparation-job` reads. Sequencing, terminal stop, captured selection guards and cancellation remain with the executor |
+| R2 | Engineer, training-data | Closed in `8909d3b3` and `d5a47ded`. Browse, scan preview, caption files, export preview and local audition revision reads enter Query. The training-data README classifies command-time reads. Caption forms seed once per selection visit, including A to pending B to A under StrictMode |
+| R3 | Engineer, shell-queue; Maker 2, cover-lyrics | Closed in `8909d3b3` and `a7a4536e`. `SONG_VIEWS` includes Cover's feed and both recent-song feeds; Cover writes/deletes and workflow events call the shared invalidator. HOTSTEP-108 passed Builder review |
+| R4 | Engineer, foundation; Maker and Maker 2, area adoption | Closed in `8909d3b3`, `a7a4536e` and `0b000e03`. Shared GPU, adapter-scan and workflow keys use the documented canonical reads and wire shapes. Workflow jobs retain auth and `after` filters; events invalidate all offsets for the captured job. Training commands/events also invalidate shared preparation snapshots |
+| R5 | Engineer, shell-queue; Maker, studios | Closed in `8909d3b3` and `0b000e03`. Peaks and player sidecars enter shared Query entries; Repaint uses the same LRC key and `fetchLrc` read. Track variants share the sidecar URL, missing files remain null, and crop/retranscription invalidates sidecars. Audio blobs and decoding remain media transports |
+| R6 | Engineer, foundation | Closed in `8909d3b3`. The foundation manifest records current dispositions and additional consumers, publishes the shared contracts and corrects the song-detail auth note. The key retains an epoch for sign-out cleanup although its read sends no bearer token |
+
+Files in R2 are under `ui/src/components/training-studio/`; other paths above
+are under `ui/src/`. The preparation context read at submission, recipe/preset
+resolution and scan commands used to construct a submission can remain explicit
+execution operations when documented as such. That does not exempt repeated
+preparation detail/job polling or a displayed server snapshot.
+
+### Surviving fetches, streams and timers
+
+All remaining direct fetch sites fall into the groups below. A service transport
+does not independently own a snapshot: its caller's Query options supply that
+ownership. R1, R2 and R5 now follow this rule through the shared reads.
+
+| Paths under `ui/src/` | Disposition and reason |
+|---|---|
+| `services/httpClient.ts`, `api.ts`, `trainingApi.ts`, `dataFolderApi.ts`, `audioQueueApi.ts`, `workflowApi.ts`, `preferencesApi.ts`, `trainingOperations.ts` | Shared/domain HTTP transports. Query owns read snapshots; POST/PUT/PATCH/DELETE commands stay explicit. Workflow event fetch is a resumable stream |
+| `services/{midiStudioApi,stemStudioApi,supersepApi,inspireApi,streamSessionsApi}.ts` | Raw fetches that remain are upload/start/control/cancel/delete commands. GET snapshots feed studios Query options; progress waiters use Query observers |
+| `services/{lireekApi,lyricWorkflowApi,coverWorkflowApi}.ts` | Command and streaming transports; lireek and draft read wrappers enter cover-lyrics Query. Approval/save operations are mutations |
+| `services/exportImportApi.ts` | Import, export resolution and profile validation commands; downloaded artifacts are media transport |
+| `queries/studios/lyrics.ts` | Shared `lrc` key and canonical `fetchLrc` read, also used by player consumers |
+| `App.tsx` | Timeout-bound health probes are liveness transport for offline/restart recovery, not cached feature data. Extract-kick/shutdown/restart are commands. Log presence is a shared stream. The health interval and animated-dot interval retain those purposes |
+| Cover, MIDI, Repaint, Stem source/builder and shared LatentImport components | Multipart audio/latent upload commands; Cover's analyze POST is an explicit analysis command |
+| Details MetadataEditorModal, SettingsPanel, DataFolderPanel | Cover upload and restart commands; displayed settings use Query |
+| Global bar SeedManagerDrawer, Yue2LmAdapterDropdown; `stores/{backendStore,globalParamsStore}.ts` | Seed writes, adapter import, model/backend selection and active-model mirror commands; random seed GET chooses a new value explicitly |
+| `components/library/CoverArtPromptModal.tsx` | Prompt-preview POST seeds editable command input; generation POST starts once; job status uses Query |
+| `components/lyric-studio/CuratedProfileModal.tsx` | Streaming profile-build command; completion invalidates source snapshots |
+| `hooks/useStreamAudio.ts`, `stores/mm3StreamStore.ts` | Audio/text stream transport, control and stop commands; recording interval is a local clock |
+| `components/shared/StemMixer.tsx`, queue audio fetch in `stores/audioGenQueueStore.ts` | Binary audio transport/decoding, not server metadata snapshots |
+| `stores/discoStore.ts` | Per-track disco sidecar decoded into an audio-reactive playback buffer; media transport |
+| `audio/peaksClient.ts`, player lyric readers, LRC utilities | Shared Query peaks, LRC and word-timing snapshots; utilities supply canonical transports |
+| `components/training-studio/sendAuditionToCustomGen.ts` | Local Query dataset revision read before the explicit draft command |
+| `services/sharedEventSource.ts` | Shared EventSource transport with subscription teardown |
+| `components/midi-studio/MidiPlayer.tsx` | Live-note EventSource and 200 ms note-buffer flush timer; terminal notes use Query |
+| `components/midi-studio/midiSynth.ts`, `components/training-studio/TrainingRunStats.tsx`, `utils/heapWatch.ts` | WebAudio scheduling, elapsed-time display and heap sampling intervals; no server reads |
+| `stores/audioGenQueueStore.ts` | Existing projection interval schedules Query reads, 1.5 s active and about 10 s idle. Serialized execution loops and one-second status reuse remain; no extra component poll owner |
+| `hooks/usePolling.ts` | Removed, with no surviving network callers |
+
+Imperative `getState`/`getSnapshot` reads were also checked. Global-parameter
+assembly, profile application, playback-engine snapshots and form selections
+are client reads. `backendStore` capability/model fields and VST chain fields
+are Query compatibility projections; `fetchModels` routes through Query.
+Create's backend refusal, Cover/Lyric adapter defaults and queue parameter
+capture consume those projections without starting a second read owner.
+Training's PipelineStageProgress/useTrainingStream capture worker/selection and
+apply the scoped store projection; their job refresh enters Query. Stream
+metrics, preview buffers and pending sample edits remain reducers/client state.
+The preparation executor and run panels share local Query detail/job snapshots.
+
+### Verification and remaining acceptance
+
+After `0b000e03`, `npx tsc -b` and all 277 UI tests pass, including shared
+adapter scan, GPU/preparation and LRC request tests and workflow replay-offset
+invalidation. The docs check passes with the same 11 screenshot warnings.
+
+At the original audited implementation, `npx tsc -b` passed in `ui/`. The full UI suite
+passed 265 tests, zero failures/skips, using:
+
+```powershell
+node --import ../server/node_modules/tsx/dist/loader.mjs --test --test-force-exit --test-timeout=60000 "src/**/*.test.ts"
+```
+
+The force-exit flag bounds retained app handles; the per-test timeout bounds a
+stuck test. Existing queue tests register their CSS loader.
+`node tools/docs/check-docs.mjs` passed after these doc edits, with 11 existing
+missing-screenshot warnings. Passing unit checks does not
+establish live request reductions. R1-R6 code closures and review owners are recorded above. The assigned runtime job on
+port 3000 still owns baseline comparisons, simultaneous consumers, tab return,
+delayed MIDI deletion and worker-switch replies, download completion, VST failed
+load retention and generation progress/delivery. This docs slice starts no app.
+Unavailable worker/GPU/download cases and human visual/listening feedback must
+remain explicit acceptance gaps.
 
 ## How the server runs the engine
 
@@ -90,7 +243,12 @@ to shut down first. See [building.md](building.md#engine-rebuild-rules).
 4. The engine accepts each `/lm` or `/synth` as an async job and returns a job id. The
    server polls `GET /job?id=<id>` and fetches the result with `GET /job?id=<id>&result=1`.
    The polling loop is `services/generation/pollUntilDone.ts`, which also holds the stall
-   and wall-clock watchdogs.
+   and wall-clock watchdogs. YuE2 supplies the submitted NAR chunk frame cap,
+   or 9000 frames for an uncapped song. During NAR and the completed semantic
+   handoff, the silence allowance is 400 ms per frame plus 2 minutes, with a
+   15-minute floor and a 9000-frame ceiling. Actual phase/step changes reset
+   the timer; repeated running responses do not. Other phases retain their
+   existing limits, and the user-configured wall-clock timeout still applies.
 5. The UI polls `GET /api/generate/status/:id` until the job finishes.
 
 `ace-server` answers HTTP on one thread. While it runs DiT, VAE or adapter work it cannot
@@ -115,6 +273,48 @@ backend does not support (`ui/src/stores/backendStore.ts`,
 `ui/src/components/shared/BackendCapabilityGate.tsx`). The active backend id is stored in
 the SQLite `settings` table under `active_backend_id` and switched with
 `POST /api/backends/active`. User-facing detail is in [../user/backends.md](../user/backends.md).
+
+### YuE2 build sessions
+
+Build by section keeps a session file per build under `<audioDir>/takes/<id>/`
+(`server/src/services/yue2Takes.ts`). Its shape and rules are defined once, in the
+header of `server/src/services/backends/yue2/coverArrangement.ts`; read that before
+changing sessions.
+
+- **Version 2 sessions.** A session carries `version`, a `revision` and an
+  `arrangement` (source sections `s0..`, the planned output occurrences `o0..`). A file
+  without a version is upgraded once on first open by `migrateLegacySession`.
+- **Revision.** It counts changes to what the next take would be sent: the plan, the
+  lyrics, later the settings. Every take records the revision and the parent (the
+  spine it resumed). Every mutation (generate, keep, undo, delete, lyrics) names the
+  revision the page saw, and a mismatch is refused with 409. Keep also needs the
+  take's revision and parent to match. Keep and undo never change the revision, so a
+  take made from an earlier spine is keepable again after undoing back to it.
+- **Build lyrics.** The Build page owns its lyrics. `POST /api/yue2-cover/build` takes
+  an optional `lyrics` that replaces `params.lyrics`, and
+  `POST /api/yue2-cover/build/:id/lyrics` replaces them later: it rewrites
+  `params.lyrics` and the stored engine request together (the route rebuilds the
+  request from the new params, as a render would), bumps the revision, and is refused
+  while takes are pending. Lyrics of sections already kept are locked, so kept audio
+  stays valid; text after them is free. Prepare lyrics and dataset sidecars are never
+  written. Until a session exists the text is a draft in the Cover Studio state,
+  checked by `POST /api/yue2-cover/build/lyrics-check`.
+- **Arrangement.** `POST /api/yue2-cover/build/:id/plan` replaces the occurrences not
+  yet built: `upcoming` lists source section ids (a new occurrence) or upcoming
+  occurrence ids (kept identity), and `finished` says the plan ends the song. Kept
+  occurrences never move. While the plan is open, a take's prompt adds the source
+  section after the last planned one (`lookaheadSection`) and stops a few seconds into
+  it, so the seam is composed without the user choosing what follows. An occurrence
+  can carry its own sung lines (`POST /api/yue2-cover/build/:id/occurrence-lyrics`,
+  unbuilt occurrences only), which `composeArrangement` writes in place of its block's.
+  Pairing sections with lyric tags counts empty tags, so of two same-kind sections the
+  instrumental one keeps Prepare's empty tag. The session keeps its score and lyrics in source order; every take and
+  Save song sends them written out in plan order (`composeArrangement`), with any lyric
+  schedule rebuilt from that text, or dropped when re-pairing the text would give a
+  block to the wrong occurrence. A take's `from`, `to` and `starts` index occurrences;
+  alignment, the take length cap and undo use the same indexes. The source order
+  sends the stored text unchanged. Repeats make the prompt longer; a request past the
+  model context fails with the engine's error in the session's `error`.
 
 ## Feature map
 
@@ -213,7 +413,7 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
 | `ui/src/App.tsx` | View routing. Views: create (default), `insta-gen`, `lyric-studio`, `cover-studio`, `stem-studio`, `stem-builder`, `song-builder`, `storm`, `midi-studio`, `training-studio`, `repaint`, `library`, `settings` |
 | `ui/src/components/<studio>/` | One folder per studio or panel. `global-bar/` is the parameter bar shared by all generation views; `shared/` holds reusable pieces |
 | `ui/src/stores/` | Zustand stores. `globalParamsStore.ts` holds generation params; others cover playback, backends, streaming, training, VST chain, post-processing |
-| `ui/src/services/` | Fetch wrappers. `api.ts` is the main one (base `/api`); studios with large surfaces have their own (`lireekApi.ts`, `trainingApi.ts`, `stemStudioApi.ts` and so on) |
+| `ui/src/services/` | Fetch wrappers. `httpClient.ts` is the shared transport (JSON/multipart/auth/cancellation/typed `ApiError`); `api.ts` is the main caller (base `/api`). Studios with large surfaces still have their own client file (`lireekApi.ts`, `trainingApi.ts`, `stemStudioApi.ts` and so on), moving onto `httpClient.ts` incrementally rather than in one pass |
 | `ui/src/hooks/` | Shared hooks such as `useCapabilities.ts` and `usePluginRegistry.ts` |
 | `ui/src/i18n/locales/` | UI strings. `en.json` is the source for control labels |
 
@@ -223,13 +423,30 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
   Tables include `songs`, `playlists`, `artists`, `lyrics_sets`, `profiles`, `generations`,
   `settings`, `album_presets`, `builder_projects`, `training_datasets` and others; the schema
   is in `server/src/db/database.ts`.
+- `workflow_documents` holds typed, schema-versioned, optimistically-revisioned client state:
+  named VST/scale/AI-continue/YuE2-joint presets, STORM tuning, ordered playlist snapshots and
+  Create/Cover/Repaint/STORM/Stem drafts (`server/src/services/workflows/revisions.ts`,
+  `server/src/services/preferences/`, `server/src/services/studioDrafts/`). A browser's legacy
+  `localStorage` copy is imported into it once, by exact key and content hash
+  (`document_import_receipts`), never overwritten afterward. The playlist stores ordered
+  snapshots independently of `playlists` and `playlist_songs`, so queue item IDs and variant
+  URLs need no live song row. `server/src/services/studioDrafts/` validates draft fields and
+  browser import keys. Existing `cover-draft` and `training-audition-create` IDs remain
+  readable through the handoff adapter. The UI's selected draft ID stays local. Create, Cover
+  and Repaint mirror their autosaved fields through `ui/src/services/studioDraftMirror.ts`.
+  Each editor keeps its own draft id and expected revision; the per-browser pointer
+  `hs-studioDraft:<studio>` only seeds a newly opened editor. A 409 creates a new draft and
+  never overwrites the other writer's content. `StudioDraftPicker` loads a draft after a
+  confirm if the editor has unsaved edits. Create's request content comes from
+  `ui/src/components/create/createContent.ts`, shared by Generate and draft resume.
 - Files under the data dir: `audio/` (outputs), `references/`, `vst/` (`chain.json`,
   `states/`), `lyrics/` (exports), `training/`.
 - A git checkout may also have a repo-root `data/` folder. It is not the live data dir.
-- Logs: `logs/YYYY-MM-DD_HH-MM-SS/` per session, holding `ace_engine.log`,
+- Logs: `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` per session, holding `ace_engine.log`,
   `node_console.log`, `generations/gen_<uuid>_<task>.log` and `training/<kind>_<jobId>.log`
   (written live by `pushEvent` in `labelingQueue.ts` plus each runner's `trainerLine`). The newest folder is the
-  current session.
+  current session. Server-generated log timestamps use the machine's local time
+  and include its UTC offset, matching the session directory's clock.
 
 ## Related
 
@@ -239,3 +456,232 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
 - [api.md](api.md)
 - [../user/backends.md](../user/backends.md)
 - [plugins-authoring.md](plugins-authoring.md)
+
+## Release storage boundary
+
+`server/src/dataroot/bootstrap.ts` resolves the release data folder before consumers open the database, logs or children. `HOT_STEP_ROOT` selects release mode; without it the checkout keeps its existing paths. The profile pointer and pending-transfer journal are outside both app and data folders. The release launcher and shutdown route share a profile `restart-requested` marker; dev retains its checkout marker.
+
+App-owned `server/data/` contains bundled catalogues and assistant knowledge. Managed library, models, adapters, settings, logs and downloaded tools live under the effective data root. External overrides remain external. See [Configuration](config.md#release-data-folder).
+
+## Consumer reconciliation ledger
+
+This ledger covers 187 historical manifest rows and 23 additional
+current files found through service imports, raw fetches, stream/interval
+openers or imperative store reads at `a9748d5d`. Rows name the owning area,
+not the owner of every imported transport. The area README tables above
+supply resource details; R1-R6 resolutions are recorded above. Query consumers may also contain
+client forms, explicit commands or streams. A type-only import needs no fetch
+migration. The historical test fake is retained here only to reconcile its row.
+
+| File under `ui/src/` | Area | Current disposition |
+|---|---|---|
+| `App.tsx` | shell-queue | Query library; liveness transport, commands, log stream |
+| `audio/peaksClient.ts` | shell-queue | Query shared `peaks`; invalidated by `forgetPeaks` |
+| `components/assistant/AssistantPanel.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/ArtistSettingsPanel.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/CoverArtistGrid.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/CoverRecentSongs.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/CoverStudio.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/RecentCovers.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/ScorePlanReview.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/SectionMatchReview.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/SourcePanel.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/Yue2Build.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/cover-studio/Yue2CoverPanel.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/Yue2CoverScore.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/create/AdaptersAccordion.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/create/AiGenerateModal.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/create/CreatePanel.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/create/MasteringSection.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/create/Mm3ComposeButton.tsx` | shell-queue | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/create/trainingCreateDraft.ts` | shell-queue | Explicit one-shot form handoff; command-time revision transport |
+| `components/details/MetadataEditorModal.tsx` | shell-queue | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/details/Yue2CoverDrift.tsx` | shell-queue | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/global-bar/AdaptersDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/CoverArtDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/GenerationDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/GlobalParamBar.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/MasteringDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/Mm3LmAdapterDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/ModelsDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/MonitorBar.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/PostProcessingDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/ProfilesModal.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/SeedManagerDrawer.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/global-bar/Yue2LmAdapterDropdown.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/insta-gen/InspirePreview.tsx` | studios | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/insta-gen/InstaGenPanel.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/library/CoverArtPromptModal.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/library/ImportTracksModal.tsx` | shell-queue | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/lyric-studio/AlbumGrid.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/AlbumHeader.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/ArtistGrid.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/ArtistPageSidebar.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/ArtistSidebar.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/CuratedProfileModal.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/LyricStudioV2.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/PresetSettingsModal.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/ProfilesTab.tsx` | cover-lyrics | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/lyric-studio/PromptEditor.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/ProviderSelector.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/QueuePanel.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/RecordingsTab.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/RenderAcrossModal.tsx` | cover-lyrics | Query consumer; forms/commands/streams stay client-owned |
+| `components/lyric-studio/SourceLyricsTab.tsx` | cover-lyrics | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/lyric-studio/WrittenSongsTab.tsx` | cover-lyrics | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/lyric-studio/playlistStore.ts` | cover-lyrics | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/lyric-studio/useAudioGeneration.ts` | cover-lyrics | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/midi-studio/MidiPlayer.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/midi-studio/MidiStudio.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/midi-studio/midiSynth.ts` | studios | Client WebAudio scheduling |
+| `components/model-manager/ModelManagerModal.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/model-manager/useDownloadStream.ts` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/model-manager/useModelRegistry.ts` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/player/LyricsBar.tsx` | shell-queue | Query shared `lrc` and `lyrics-json` |
+| `components/player/SectionMarkers.tsx` | shell-queue | Query shared `lrc` and `lyrics-json` |
+| `components/player/TrimControls.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/repaint-studio/RepaintStudio.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/settings/DataFolderPanel.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/settings/SettingsPanel.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/shared/FileBrowserModal.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/shared/LatentImport.tsx` | shell-queue | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/shared/PresetSyncNotices.tsx` | shell-queue | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/shared/StemMixer.tsx` | shell-queue | Binary media transport and client mixer |
+| `components/shared/StudioDraftPicker.tsx` | shell-queue | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/shared/UnifiedRecentSongs.tsx` | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `components/shared/VramIndicator.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/song-builder/SongBuilder.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/song-builder/followSection.ts` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-builder/RecentBuilds.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-builder/StemBuilder.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-studio/RecentExtractions.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-studio/SourceSelector.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-studio/StemStudio.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/stem-studio/TrackSelector.tsx` | studios | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/storm/AiContinuePresetModal.tsx` | studios | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/storm/StormLiveControls.tsx` | studios | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/storm/StormPage.tsx` | studios | Query consumer; forms/commands/streams stay client-owned |
+| `components/terminal/TerminalPanel.tsx` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/AuditionCard.tsx` | training-data | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/AuditionPlayer.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/BatchImportWizard.tsx` | training-data | Query shared browse and training-data scan-preview; explicit pipeline command |
+| `components/training-studio/BuildPanel.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/DatasetAssetChips.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/FolderPicker.tsx` | training-data | Query shared browse; obsolete navigation cancelled |
+| `components/training-studio/LabelPanel.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/LmAdapterPicker.tsx` | training-data | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Mm3RunsPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Mm3TrainCard.tsx` | training-runs | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/training-studio/MonitorPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/NewDatasetWizard.tsx` | training-data | Query scan-preview; explicit create command |
+| `components/training-studio/PipelineStageProgress.tsx` | training-data | Query job; selected-worker projection |
+| `components/training-studio/PreprocessOptionsForm.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/PreprocessPanel.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/PreprocessVariantCard.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/RefinePanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/ReviewPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/SampleDrawer.tsx` | training-data | Query caption snapshots seed local edits per visit; save commands update cache |
+| `components/training-studio/SampleGrid.tsx` | training-data | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/training-studio/SampleRow.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/SendToLyricStudio.tsx` | training-data | Query export preview seeds form; explicit export command |
+| `components/training-studio/TrainDitForm.tsx` | training-runs | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/TrainLmForm.tsx` | training-runs | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/TrainPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/TrainingRunStats.tsx` | training-runs | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/TrainingWorkerBar.tsx` | training-data | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/WorkersPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2AitkTrainCard.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2ArTrainCard.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2BatchPanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2ClearPreparedCard.tsx` | training-data | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2LadderReview.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2OptimisePanel.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2OptimizerFields.tsx` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/Yue2SplitChart.tsx` | training-data | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/training-studio/Yue2TrainCard.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/Yue2TrainStages.tsx` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/sendAuditionToCustomGen.ts` | training-data | Local Query dataset revision read; explicit draft command |
+| `components/training-studio/useMm3Status.ts` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/useTrainingStream.ts` | training-data | Shared SSE; scoped Query job refresh |
+| `components/training-studio/useYue2ArStatus.ts` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/useYue2Status.ts` | training-runs | Query consumer; forms/commands/streams stay client-owned |
+| `components/training-studio/yue2ChartData.ts` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/yue2JointCommand.ts` | training-data | Area service/store adapter; Query reads, explicit commands/client state |
+| `components/training-studio/yue2JointPresets.ts` | training-data | Client/types/props or scoped store projection; no independent HTTP read |
+| `context/AuthContext.tsx` | foundation | Query consumer; forms/commands/streams stay client-owned |
+| `hooks/useAssistantActions.ts` | studios | Client/types/props or scoped store projection; no independent HTTP read |
+| `hooks/useCapabilities.ts` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `hooks/useEventSource.ts` | global-models | Shared stream/reducer; no snapshot fetch |
+| `hooks/usePluginRegistry.ts` | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `hooks/usePolling.ts` | shell-queue | Removed |
+| `hooks/useStreamAudio.ts` | studios | Audio stream/commands; client recording clock |
+| `queries/contract.ts` | foundation | Query owner/policy; area contract applies |
+| `queries/keys.ts` | foundation | Query owner/policy; area contract applies |
+| `queries/sseBridge.ts` | foundation | Query owner/policy; area contract applies |
+| `services/api.ts` | foundation | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/assistantApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/audioQueueApi.ts` | shell-queue | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/coverWorkflowApi.ts` | cover-lyrics | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/dataFolderApi.ts` | shell-queue | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/exportImportApi.ts` | shell-queue | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/httpClient.ts` | foundation | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/inspireApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/lireekApi.ts` | cover-lyrics | Query-backed reads; commands/working-copy reducers |
+| `services/lyricWorkflowApi.ts` | cover-lyrics | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/midiStudioApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/preferencesApi.ts` | shell-queue | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/presetCollection.ts` | shell-queue | Query-backed reads; commands/working-copy reducers |
+| `services/repaintLayerWorkflowApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/settingDocument.ts` | shell-queue | Query-backed reads; commands/working-copy reducers |
+| `services/sharedEventSource.ts` | foundation | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/stemStudioApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/streamSessionsApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/studioDraftMirror.ts` | cover-lyrics | Query-backed reads; commands/working-copy reducers |
+| `services/studioDraftsApi.ts` | cover-lyrics | Query-backed reads; commands/working-copy reducers |
+| `services/supersepApi.ts` | studios | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/trainingApi.ts` | foundation | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/trainingOperations.ts` | training-data | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/trainingPreparationApi.ts` | training-data | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/trainingRecipesApi.ts` | training-data | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/trainingReviewApi.ts` | training-runs | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/workflowApi.ts` | shell-queue | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/yue2CoverApi.ts` | cover-lyrics | Query-backed reads; commands/working-copy reducers |
+| `stores/audioGenQueueStore.ts` | shell-queue | Query reads; client executor/scheduler and media transport |
+| `stores/audioQueueStoreTestFake.ts` | shell-queue | Test fake; excluded from production |
+| `stores/backendStore.ts` | global-models | Query exact-key projections and selection commands |
+| `stores/coverStemsStore.ts` | cover-lyrics | Query separation waiter; client execution/mixer |
+| `stores/discoStore.ts` | shell-queue | Media-sidecar playback buffer transport |
+| `stores/globalParamsStore.ts` | global-models | Client forms/persistence and active-model mirror command |
+| `stores/mm3StreamStore.ts` | shell-queue | Stream reducer and explicit execution |
+| `stores/postProcessStore.ts` | shell-queue | Query observer; explicit command and completion reducer |
+| `stores/streamingStore.ts` | cover-lyrics | Query-backed recovery; stream execution reducer |
+| `stores/trainingStore.ts` | training-data | Query projection and commands; shared preparation detail/job reads |
+| `stores/vstChainStore.ts` | global-models | Query projections/presets and editable command state |
+| `utils/downloadTrack.ts` | shell-queue | Explicit export command and download transport |
+| `utils/heapWatch.ts` | shell-queue | Client heap sampling timer |
+| `utils/lrcUtils.ts` | shell-queue | Canonical transport for shared Query `lrc` |
+| `utils/wordLrcUtils.ts` | shell-queue | Canonical transport for shared Query `lyrics-json` |
+| `utils/yue2CaptionSource.ts` | shell-queue | Query snapshot and captured command assembly |
+| `components/global-bar/VstChainDropdown.tsx` (added) | global-models | Query consumer; forms/commands/streams stay client-owned |
+| `components/shared/SongActionsMenu.tsx` (added) | shell-queue | Query consumer; forms/commands/streams stay client-owned |
+| `queries/cover-lyrics/reads.ts` (added) | cover-lyrics | Query owner/policy; area contract applies |
+| `queries/cover-lyrics/songs.ts` (added) | cover-lyrics | Query owner/policy; area contract applies |
+| `queries/cover-lyrics/workflows.ts` (added) | cover-lyrics | Query owner/policy; area contract applies |
+| `queries/global-models/options.ts` (added) | global-models | Query owner/policy; area contract applies |
+| `queries/global-models/presets.ts` (added) | global-models | Query owner/policy; area contract applies |
+| `queries/shell-queue/preferences.ts` (added) | shell-queue | Query owner/policy; area contract applies |
+| `queries/shell-queue/queue.ts` (added) | shell-queue | Query owner/policy; area contract applies |
+| `queries/shell-queue/settings.ts` (added) | shell-queue | Query owner/policy; area contract applies |
+| `queries/shell-queue/songs.ts` (added) | shell-queue | Query owner/policy; area contract applies |
+| `queries/studios/lyrics.ts` (added) | studios | Query owner/policy; area contract applies |
+| `queries/studios/midi.ts` (added) | studios | Query owner/policy; area contract applies |
+| `queries/studios/resources.ts` (added) | studios | Query owner/policy; area contract applies |
+| `queries/studios/shared.ts` (added) | studios | Query owner/policy; area contract applies |
+| `queries/studios/workflows.ts` (added) | studios | Query owner/policy; area contract applies |
+| `queries/training-data/queries.ts` (added) | training-data | Query owner/policy; area contract applies |
+| `queries/training-runs/events.ts` (added) | training-runs | Query owner/policy; area contract applies |
+| `queries/training-runs/hooks.ts` (added) | training-runs | Query owner/policy; area contract applies |
+| `queries/training-runs/queries.ts` (added) | training-runs | Query owner/policy; area contract applies |
+| `stores/playbackStore.ts` (added) | shell-queue | Client/types/props or scoped store projection; no independent HTTP read |
+| `utils/mm3CaptionSource.ts` (added) | shell-queue | Query-backed lireek read; client caption assembly |
+| `utils/paramProfiles.ts` (added) | shell-queue | Client/types/props or scoped store projection; no independent HTTP read |

@@ -9,7 +9,7 @@ GPL v3 -- Public version. Gradient norm stiffness detection only.
 Adapted for HOT-Step full-loop plugin API (owns_loop = true).
 All data uses 0-indexed FloatArray or 0-indexed Lua tables.
 
-Version: 3.0.0  (HOT-Step plugin port from v2.1.0)
+Version: 3.0.1  (HOT-Step plugin port from v2.1.0)
 --]]
 
 solver = {

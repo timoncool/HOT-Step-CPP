@@ -7,7 +7,8 @@
 // Outputs:
 //   docs/user/plugins.md          solver / scheduler / guidance / postprocess tables (engine/plugins + plugins/)
 //   docs/user/models.md           model registry tables (server/src/data/model-registry.json)
-//   docs/dev/api.md               HTTP route index (server/src/index.ts mounts + router.<verb> calls)
+//   docs/dev/api.md               HTTP route index (server/src/index.ts mounts + router.<verb> calls,
+//                                 plus the training operation domains registered in services/training)
 //   server/src/data/assistant-knowledge.md   marked blocks refreshed from docs/user
 //
 // Generated regions are delimited by <!-- generated:start NAME --> … <!-- generated:end NAME -->.
@@ -15,12 +16,12 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const CHECK = process.argv.includes('--check');
 const rel = (p) => path.relative(ROOT, p).replaceAll('\\', '/');
-const read = (p) => fs.readFileSync(p, 'utf8');
+const read = (p) => fs.readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 const exists = (p) => fs.existsSync(p);
 const walk = (dir, filter) =>
   exists(dir)
@@ -49,20 +50,23 @@ function fill(file, blocks) {
 }
 
 // ── Plugins ──────────────────────────────────────────────────────────────────
-// Each plugin declares one Lua table: solver = { name = "...", display = "...", ... }.
-function parsePlugin(file) {
+// Each plugin declares one Lua table, ending at its unindented closing brace.
+export function parsePlugin(file) {
   const src = read(file);
-  const m = src.match(/^(solver|scheduler|guidance|postprocess)\s*=\s*\{/m);
+  const m = src.match(/^(solver|scheduler|guidance|postprocess)\s*=\s*\{[\s\S]*?^\}/m);
   if (!m) return null;
-  const head = src.slice(m.index, m.index + 2500);
+  const head = m[0];
   const field = (k) => head.match(new RegExp(`^\\s*${k}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([\\w.-]+))`, 'm'))?.slice(1).find((x) => x !== undefined);
   const params = (head.match(/^\s*\{\s*key\s*=\s*"/gm) || []).length;
   return { type: m[1], file, name: field('name') ?? path.basename(file, '.lua'), display: field('display') ?? '', description: field('description') ?? '',
     nfe: field('nfe'), order: field('order'), stochastic: field('stochastic'), stateful: field('stateful'), params };
 }
+export const isSkippedPluginPath = (relPath) =>
+  /_INTERNAL/i.test(path.basename(relPath)) || /[\\/](archive|debug)[\\/]/i.test(relPath);
+
 function pluginTables() {
   const sources = [['engine/plugins', 'built in'], ['plugins', 'community']];
-  const all = sources.flatMap(([dir, origin]) => walk(path.join(ROOT, dir), (p) => p.endsWith('.lua')).map(parsePlugin).filter(Boolean).map((p) => ({ ...p, origin })));
+  const all = sources.flatMap(([dir, origin]) => walk(path.join(ROOT, dir), (p) => p.endsWith('.lua') && !isSkippedPluginPath(path.relative(ROOT, p))).map(parsePlugin).filter(Boolean).map((p) => ({ ...p, origin })));
   const by = (t) => all.filter((p) => p.type === t).sort((a, b) => a.display.localeCompare(b.display) || a.name.localeCompare(b.name));
   const params = (p) => (p.params ? `${p.params}` : '');
   return {
@@ -95,6 +99,58 @@ function modelTables() {
   return { out, families };
 }
 
+// ── Training operation domains ───────────────────────────────────────────────
+// /api/training/ops/<domain>/... is not a router.<verb> list in routes/: each
+// domain calls registerTrainingOperations('<domain>', mountFn) in
+// server/src/services/training, and mountFn adds its routes to the router it
+// is given. Read those calls. A path built from a loop variable is expanded
+// from the literal array the loop walks; anything else is an error, never a guess.
+function functionBody(src, name, file) {
+  const start = src.search(new RegExp(`function ${name}\\s*\\(`));
+  if (start < 0) throw new Error(`${file}: registerTrainingOperations names ${name}, which is not a function in that file`);
+  let depth = 0;
+  for (let i = src.indexOf('{', src.indexOf(')', start)); i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(start, i + 1);
+  }
+  throw new Error(`${file}: unbalanced braces in ${name}`);
+}
+export function trainingOperationRoutes(root = ROOT) {
+  const at = (p) => path.join(root, p);
+  const index = read(at('server/src/index.ts'));
+  const trainingVar = index.match(/^import (\w+) from '\.\/routes\/training\.js';/m)?.[1];
+  const trainingPrefix = trainingVar && index.match(new RegExp(`^app\\.use\\('([^']+)',\\s*${trainingVar}\\);`, 'm'))?.[1];
+  const opsMount = read(at('server/src/routes/training.ts')).match(/router\.use\('([^']+)',\s*trainingOperationsRouter\)/)?.[1];
+  if (!trainingPrefix || !opsMount) throw new Error('Cannot find the training router mount or its trainingOperationsRouter mount');
+  const rows = [];
+  for (const file of walk(at('server/src/services/training'), (p) => p.endsWith('.ts') && !p.endsWith('.test.ts')).sort()) {
+    const src = read(file);
+    const where = path.relative(root, file).replaceAll('\\', '/');
+    for (const [, domain, mountFn] of src.matchAll(/^registerTrainingOperations\('([a-z][a-z0-9-]*)',\s*(\w+)\)/gm)) {
+      const body = functionBody(src, mountFn, where);
+      // Every call on the mount's router parameter, whatever it is named. Only
+      // a verb with a string literal path is understood; anything else throws.
+      const router = body.match(/^function \w+\s*\(\s*(\w+)/)?.[1];
+      if (!router) throw new Error(`${where}: ${mountFn} takes no router parameter`);
+      for (const call of body.matchAll(new RegExp(`\\b${router}\\s*\\.\\s*(\\w+)\\s*\\(`, 'g'))) {
+        const after = body.slice(call.index + call[0].length);
+        const m = /^(get|post|put|delete|patch)$/.test(call[1]) ? after.match(/^\s*(['"`])([^'"`]*)\1/) : null;
+        if (!m) throw new Error(`${where}: cannot index ${router}.${call[1]}(${after.slice(0, 40).split('\n')[0]}…); use a verb with a literal path`);
+        const [verb, quote, raw] = [call[1], m[1], m[2]];
+        let paths = [raw];
+        for (const [token, name] of quote === '`' ? raw.matchAll(/\$\{(\w+)\}/g) : []) {
+          const loop = [...body.slice(0, call.index).matchAll(new RegExp(`for \\(const ${name} of \\[([^\\]]*)\\]`, 'g'))].pop();
+          if (!loop) throw new Error(`${where}: ${verb} ${raw} uses ${token} without a literal loop array`);
+          const values = [...loop[1].matchAll(/'([^']*)'/g)].map((v) => v[1]);
+          paths = paths.flatMap((p) => values.map((value) => p.replaceAll(token, value)));
+        }
+        for (const p of paths) rows.push({ verb: verb.toUpperCase(), path: `${trainingPrefix}${opsMount}/${domain}${p === '/' ? '' : p}`, file: where });
+      }
+    }
+  }
+  return rows;
+}
+
 // ── API routes ───────────────────────────────────────────────────────────────
 function routeIndex() {
   const index = read(path.join(ROOT, 'server/src/index.ts'));
@@ -109,6 +165,11 @@ function routeIndex() {
     const rows = routes.map((r) => [`\`${r.verb}\``, `\`${(prefix + (r.path === '/' ? '' : r.path)) || '/'}\``, `\`${r.file}\``]);
     return `### \`${prefix}\`\n\n${table(['Method', 'Path', 'Defined in'], rows)}`;
   });
+  const ops = trainingOperationRoutes();
+  if (ops.length) {
+    sections.push(`### \`${ops[0].path.slice(0, ops[0].path.indexOf('/ops/') + 4)}\` (training operation domains)\n\n${table(['Method', 'Path', 'Defined in'],
+      ops.map((r) => [`\`${r.verb}\``, `\`${r.path}\``, `\`${r.file}\``]))}`);
+  }
   return { routes: sections.join('\n\n'), count: sections.reduce((n, s) => n + (s.split('\n').length - 4), 0) };
 }
 
@@ -133,6 +194,7 @@ function assistantBlocks(plugins) {
   const troubleshooting = exists(path.join(ROOT, 'docs/user/troubleshooting.md')) ? read(path.join(ROOT, 'docs/user/troubleshooting.md')) : '';
   const backends = exists(path.join(ROOT, 'docs/user/backends.md')) ? read(path.join(ROOT, 'docs/user/backends.md')) : '';
   return {
+    'data-folder': read(path.join(ROOT, 'docs/user/data-folder.md')).trim().replace(/\[([^\]]+)\]\([^)]+\)/g, '$1'),
     studios: studios.map(([name, para]) => `- **${name}**: ${para}`).join('\n'),
     backends: firstParagraph(backends),
     solvers: plugins.solvers, schedulers: plugins.schedulers, guidance: plugins.guidance,
@@ -141,6 +203,8 @@ function assistantBlocks(plugins) {
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
+// Only when run as a script: importing this file (build-docs.test.mjs) runs nothing.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
 const plugins = pluginTables();
 fill(path.join(ROOT, 'docs/user/plugins.md'), plugins);
 
@@ -169,4 +233,5 @@ if (CHECK) {
   console.log('[build-docs] generated docs are current');
 } else {
   console.log(changed.length ? `[build-docs] updated: ${changed.join(', ')}` : '[build-docs] nothing changed');
+}
 }

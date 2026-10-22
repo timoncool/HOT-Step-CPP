@@ -38,15 +38,16 @@ All targets are defined in `engine/CMakeLists.txt`.
 | `ace-synth` | `tools/ace-synth.cpp` | ACE-Step text encoder, DiT and VAE from the command line: request JSONs in, MP3 or WAV out |
 | `ace-understand` | `tools/ace-understand.cpp` | Reverse pipeline: audio in, caption, lyrics and metadata out |
 | `ace-caption` | `tools/ace-caption.cpp` | MOSS-Music captioning: audio in, prose caption, MM3-format caption or lyrics out |
-| `ace-midi` | `tools/ace-midi.cpp` | MuScriptor audio-to-MIDI transcription (`--transcribe`), plus parity modes against a Python oracle |
+| `ace-midi` | `tools/ace-midi.cpp` | MuScriptor audio-to-MIDI transcription (`--transcribe`), plus parity modes against a Python oracle. With `--beat-model` it also runs Beat This! (see below) |
 | `ace-train` | `tools/ace-train.cpp` | Training toolchain, one subcommand per job (see [Training subcommands](#training-subcommands)) |
 | `neural-codec` | `tools/neural-codec.cpp` | ACE-Step VAE encode and decode, with optional Q8/Q4 latent compression |
 | `mp3-codec` | `tools/mp3-codec.cpp` | Standalone MP3 encoder and decoder |
 | `quantize` | `tools/quantize.cpp` | GGUF requantizer for ACE-Step, MM3 and YuE2 files, with optional `--imatrix` |
 | `mastering` | `tools/mastering.cpp` | Reference-based mastering (the matchering algorithm) |
-| `vst-host` | `tools/vst-host.cpp` | VST3 host: `--scan`, `--gui`, `--process`, `--process-chain`. Each plugin gets a 10 s warm-up pre-roll of the track's opening, fed time-reversed so plugin buffers hold the song's own start when the real pass begins |
+| `vst-host` | `tools/vst-host.cpp` | VST3 host: `--scan`, `--gui`, `--process`, `--process-chain`, `--monitor`. Each plugin gets a 10 s warm-up pre-roll of the track's opening, fed time-reversed so plugin buffers hold the song's own start when the real pass begins. `--monitor` (Windows, WASAPI) plays a track through the chain live, driven by a control file the server rewrites atomically with an increasing `seq`; see the note below |
 | `yue2-probe` | `tools/yue2-probe.cpp` | YuE2 bring-up and parity CLI (`--info`, `--load`, `--tokenize`, `--ar-parity` and more) |
 | `sa3-ggml-test`, `fattn-train-test`, `moss-ggml-test`, `bs-roformer-test`, `mdx23c-test` | `tools/*-test.cpp` | Parity tests against reference outputs |
+| `yue2-train-gemm-precision-test` | `tools/yue2-train-gemm-precision-test.cpp` | The YuE2 trainer's BF16 GEMMs against `YUE2_AITK_PRECISION=strict-f32`, forward and backward, at YuE2 shapes on the first GPU |
 | `convrot-graph-probe` | `tools/convrot-graph-probe.cpp` | ConvRot8 under repeated CUDA graph capture and replay (CUDA only, see [ggml-fork.md](ggml-fork.md)) |
 
 `fattn-train-test --backend cpu\|cuda\|vulkan` (default `cpu`, both arms on CPU) resolves the
@@ -57,6 +58,24 @@ CPU fallback. `--prec tf32` stays CUDA-only; Vulkan runs f32 at the same 1e-4 to
 `--bench`/`--bench-lm`/`--bench-tr` always target CUDA specifically (the tf32 arm is a
 tensor-core question) and reject `--backend vulkan` rather than silently ignoring it.
 
+`vst-host --monitor` first asks WASAPI's shared mode to take the track's own rate. If the
+device refuses, it renders at the device rate through a linear resampler
+(`tools/monitor-resampler.h`). The resampler keeps every processed source frame it has not
+yet passed, plus the fractional phase, across device callbacks, so the track advances by
+exactly `n * track_rate / device_rate` frames per `n` device frames whatever the callback
+sizes are. Seek, track change and stop drop the buffered frames; pause leaves them for the
+resume. A track at a new rate re-prepares every plugin at that rate.
+`engine/tests/test-monitor-resampler.cpp` checks continuity and frame accounting with
+irregular block sizes (compile line in the file). The plugin chain loop itself lives in
+`tools/monitor-chain.h` (`monitor_run_chain`): each block is cut into chunks of at most
+`MAX_CHUNK` frames and every chunk runs the plugins in order, ping-ponging between two
+scratch buffers, so a non-commutative chain keeps its order and the output may alias the
+input. `engine/tests/test-monitor-chain.cpp` checks order, in-place output and multi-chunk
+blocks without any plugin; it is opt-in (`-DBUILD_TESTING=ON`). On the Node side
+(`server/src/routes/vst.ts`), monitor start, restart and stop run one at a time, so
+overlapping requests cannot spawn two hosts on the same control and status files. Host
+lifecycle lines go to `logs/<session>/vst_host.log`.
+
 `tools/ace-server.cpp` is upstream's server, kept as a reference for syncs. It is
 not compiled. The shipped `ace-server` is built from `hot-step-server.cpp`.
 
@@ -64,6 +83,30 @@ The Node server starts `ace-server` with `--models`, `--host` and `--port`, and 
 `--adapters`, `--keep-loaded` and `--noise-profile` when they are configured
 (`server/src/services/aceEngineProcess.ts`). The app's default port is
 8085; the binary's own default is 8080.
+
+### ace-midi tempo, meter and bars
+
+`ace-midi --beat-model <dir>` runs Beat This! (`tools/beat-this.h`, a GGML port of
+CPJKU's beat and downbeat tracker, MIT weights `final0` as `model.safetensors`) on the
+source audio at its own rate. `tools/midi-grid.h` then fits upstream MuScriptor v0.4's
+grid to the beats: least-squares tempo, meter from downbeat spacing (written as n/4 when
+90% of bars agree), an onset-delay correction, and a tempo map when the beats do not fit
+one tempo within 5% of a beat. The MIDI gets a time signature, `set_tempo` in every track,
+and a whole-bar delay so tick 0 is a bar line. Without `--beat-model` the output is the old
+fixed 120 BPM file, byte for byte (`--validate-midi`).
+
+| Flag | Effect |
+|---|---|
+| `--beats-out <file>` | Tracked beats plus the written grid in audio seconds (`beats`, `bars`, `audio_shift_s`: add it to a MIDI time to get the audio time) |
+| `--bpm`, `--beats-per-bar`, `--first-downbeat` | Override the detected grid |
+| `--tempo-map` / `--fixed-tempo` | Force a tempo map or one tempo (default: map only when unsteady) |
+| `--beat-scale <2\|0.5\|…>` | Beats per detected beat, a power of two |
+| `--quantize [--grid N] [--quantize-strength x]` | Snap notes to 1/N beat (default: the measured subdivision) |
+| `--fill-gaps <beats>`, `--trim-leading-bars` | Hold notes over short rests; drop empty leading bars |
+| `--export <events.jsonl> --beats-in <beats.json>` | Re-export a transcription with new options; no MuScriptor model loaded |
+| `--abc-out <file> [--abc-ins <program>] [--abc-melody-only]` | Also write a YuE2 two-voice ABC lead sheet (`tools/midi-abc.h`) through SheetSage2's notation stage: voice notes → Vocal, one instrument's top line → Ins, a Krumhansl key estimate and half-bar template chords, notes pre-snapped to the 4-per-beat subbeat grid. Prints a `{"type":"abc",...}` summary line |
+| `--track <audio>` | Beats and grid only (needs `--beat-model` and `--beats-out`) |
+| `--self-test-grid` | Grid maths on synthetic beats with known answers |
 
 ## How ace-server is organised
 
@@ -73,6 +116,22 @@ it onto a FIFO queue and return `{"id":"..."}` straight away. Clients poll
 `GET /job?id=` and fetch the result with `GET /job?id=&result=1`. ACE-Step, MM3 and
 YuE2 jobs share that queue, so they never run on the GPU at the same time. The job
 table keeps 32 entries and evicts the oldest finished ones first.
+
+`POST /sa3-refine`, `/pp-vae-reencode` and `/yue2/align` answer in the same request,
+but `on_worker()` in `hot-step-server.cpp` runs their body on the worker thread while
+the HTTP thread waits. Every module shares one GGML backend, and two threads
+computing on it at once abort the Metal driver or corrupt the model store (GH #226).
+These routes therefore queue behind whatever job is running: a call made during a
+long YuE2 batch waits for the whole batch, so a direct engine client needs a timeout
+long enough to cover that wait. The MM3 bring-up endpoints and `POST /yue2/imatrix`
+are not wrapped yet and still compute on their HTTP thread.
+
+`POST /sa3-synth` and `/sa3-refine` cancel by connection: when the client closes it,
+both SA3 sampling loops stop before the next step, and a full-loop Lua solver sees
+`on_step` return true. `aceClient` then awaits `GET /worker-drain`, a no-op on the
+worker, so Node releases the lane only after the engine has stopped. Limits: a Lua
+`sample()` that ignores `on_step`'s return runs to its last step, and model load,
+encode and decode are not checked; the drain waits for them.
 
 Models are discovered by scanning `--models` at startup. ACE-Step files are
 classified by their GGUF `general.architecture` into LM, text encoder, DiT and VAE
@@ -117,6 +176,17 @@ build context, run DiT, decode). Task routing (text2music, cover, repaint, lego,
 extract, complete) is described in the
 [generation modes reference](../../engine/docs/ARCHITECTURE.md#generation-modes).
 
+On Metal, the matrix-matrix kernel (used when a matmul has more than 8 columns, so
+on every prefill) stages its f32 input as half. The 1.7B LM's SwiGLU output goes past
+half's 65504, which would make `down_proj` return inf and fill the KV cache with NaN.
+`qwen3_build_mlp` therefore takes a `down_scale`: `qw3lm_init_backend` sets it to 1/16
+on Metal and to 1 everywhere else, and the MLP scales the `down_proj` input by it and
+divides the output by it again. If a prefill still produces non-finite logits,
+`pipeline-lm.cpp` logs `[LM] ERROR: prefill logits are not finite`. On the server
+side, a `/lm` result that comes back without audio codes fails the generation with
+"LM planner returned no audio codes" (`services/backends/ace/generate.ts`) instead of
+rendering from the caption alone.
+
 ### MiniMax-Music3: planner LM, then DiT renderer
 
 ```
@@ -147,7 +217,7 @@ style + lyrics (+ optional ABC) -> tokenizer and prompt assembly (yue2-tokenizer
   -> semantic stage: the AR "composer" (yue2-lm-graph.h) samples codec ids
   -> NAR stage: mixture-of-transformers flow matching with a midpoint ODE solver
      (yue2-nar-graph.h), optionally chunked (nar_chunk_frames)
-  -> Oobleck VAE decode, "standard" or "legacy" variant (yue2-vae-graph.h)
+  -> Oobleck VAE decode, "standard", "legacy" or local "dec2x" variant (yue2-vae-graph.h)
   -> stitch and clamp -> 16-bit WAV (yue2-pipeline.h, yue2-job.h)
 ```
 
@@ -156,15 +226,65 @@ style + lyrics (+ optional ABC) -> tokenizer and prompt assembly (yue2-tokenizer
 stream is treated as a prefix: it is prefilled under the unchanged prompt and score,
 then the composer keeps sampling from frame `codec_ids.length`. Use it to keep a
 render's codecs up to a section boundary and recompose the rest. The frame clock, caps,
-`min_tokens` and the repetition window carry on from the prefix. The request needs one
-song, `cfg_scale` 1 and no `semantic_retries`, and the prefix must stay under both the
-context and the stage cap. The stage fails if the output does not begin with the exact
-prefix. The NAR and VAE then render the whole stream again, prefix included. Prefix
-noise is the same for the same `noise_seed`, but the NAR attends both ways across its
-chunk, so the prefix audio is close to the original render without being identical.
-Render the whole song; do not splice old prefix audio onto the new suffix.
+`min_tokens` and the repetition window carry on from the prefix. Under guidance
+(`cfg_scale` other than 1) the negative set is prefilled with the same prefix, because the
+decode feeds both sets each sampled frame. The request accepts one to four songs
+with a shared prefix and no `semantic_retries`, and the prefix must stay under both
+the context and the stage cap. Each `songs` entry can supply its own explicit seed.
+Matching prompts share the prefix prefill by copying KV rows and logits, including
+the negative CFG rows; scheduled lyrics replay the prefix as a batch. Every row's
+output must begin with the exact prefix, or the whole job fails. Reproduction by
+seed requires the same batch width.
+A lyric schedule still needs `cfg_scale` 1. The stage fails if the output does not begin with the exact
+prefix. The NAR and VAE then render the whole stream again, prefix included, unless
+`render_from_frame` starts them later. Prefix noise is the same for the same
+`noise_seed`, but the NAR attends both ways across its chunk, so the prefix audio is
+close to the original render without being identical. Render the whole song for
+anything kept; do not splice old prefix audio onto the new suffix.
+
+`render_from_frame` is what keeps late section takes cheap. Each NAR chunk attends
+over the prompt and its own frames only (`yue2_seal_chunks`), so starting the chunks
+at a later frame drops no context the NAR reads; the composer still prefills the
+whole prefix. The VAE decodes the same window, and each track reports it as
+`audio_from`. The window's audio is a slightly different render of the same codes
+than a full render, because the chunk edges and the peak normalisation move with
+it. On a 3.5-minute build a take went from 22.6 s to 7.7 s.
+Every finished track in the `/job` status `tracks` array carries its `semantic_ids`, and
+the server saves them beside the WAV as `<song>.semantic.json`, with the request that made
+them as `<song>.yue2-request.json`, so a later request can resume the stream. Add
+`preview_max_frames` to stop the composer at a section's end.
 `yue2-probe --continue-check <request.json>` checks prefix identity, cancellation and
 the context cap on any backend.
+
+NAR plugins and plan conditioning. `nar_solver` accepts `md_wasserstein_yue2`,
+`md_ancestral_yue2`, and the full-loop solvers `md_latent_eq_yue2` and `md_tlie_yue2`;
+`nar_scheduler` accepts `md_ht_scheduler V3`, `md_plan_aware_yue2`,
+`md_plan_loose_yue2` and `md_plan_overdrive_yue2`. Any other name fails the request.
+Full-loop solvers run through `yue2_nar_run_loop_solver` (`engine/src/yue2/yue2-nar-loop.h`),
+which turns a model error, a cancel or non-finite latents into a failed chunk;
+`engine/tests/test-yue2-nar-loop.cpp` checks it. The Lua host has no instruction or
+time budget, so a plugin that loops without calling `on_step` cannot be cancelled. A
+Lua solver gets a seed mixed from the variation's noise seed and the chunk's start
+frame, so each chunk draws its own solver noise. `postprocess_plugin` names a Lua
+postprocess plugin that replaces the native tiled VAE decode; empty (the default) or
+an unknown name keeps the native decode, and so does a plugin that fails.
+These `plugin_params` keys tune the NAR stage; every default leaves it unchanged:
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `yue2:cads_strength` | 0 | CADS noise on the conditioning, 0..1; 0 builds nothing |
+| `yue2:cads_t1`, `yue2:cads_t2` | 0.6, 0.9 | CADS anneal window |
+| `yue2:cads_rescale` | true | restore the clean conditioning's per-row mean and spread after noising |
+| `yue2:plan_w_start`, `yue2:plan_w_end` | 1, 1 | plan (AR-prefix) attention weight across the steps, clamped to 0..4 |
+| `yue2:plan_w_curve` | `linear` | `linear` or `cosine` ramp between them |
+| `yue2:plan_cfg` | 1 | plan CFG scale, 1..8; above 1 adds a plan-masked pass per velocity call |
+| `yue2:plan_cfg_t1`, `yue2:plan_cfg_t2` | 0, 1 | step window where plan CFG applies (swapped if reversed) |
+| `yue2:plan_cfg_rescale` | 0.7 | CFG-rescale blend, 0..1 |
+| `yue2:plan_cfg_level_match` | true | with plan CFG above 1, match the latent level to the no-CFG render |
+
+A YuE2 NAR scheduler can also set per-step plan weights through the `plan_strength`
+global, and Lua plugins on this path see the plan as `model_context.yue2`; both are
+in [Plugin authoring](plugins-authoring.md).
 
 YuE2 loads its weights itself, outside `model-store.h`. Under the default policy a
 YuE2 job first evicts every unreferenced store module (`store_evict_all`), as MM3 does,
@@ -172,8 +292,23 @@ because the store keeps 0-byte entries resident after use and their real VRAM wo
 make the YuE2 load run out of memory (#160, #195; the ONNX Runtime SA3 refiner was the
 case that hit it).
 
+The YuE2 VAE decoder cache belongs to its model. Unloading YuE2 or switching
+VAE variants destroys the decoder graph, scheduler compute buffers and derived
+weights before releasing the VAE weights or backend. A resident model reuses its
+cache between decodes. `yue2-vae-lifetime-test <models-dir>` checks both VAE
+variants, repeated unload/reload and cache reuse with real decoder allocations;
+set `GGML_BACKEND=CPU` or `GGML_BACKEND=CUDA0` to select the device.
+
 The AR and NAR halves live in one `yue2-lm-<type>.gguf` and are resident together;
-the VAE is a separate `yue2-vae-{standard,legacy}-<type>.gguf` (`yue2-model.h`). The
+the VAE is a separate `yue2-vae-{standard,legacy}-<type>.gguf` (`yue2-model.h`). A third,
+local-only variant, `dec2x` (`yue2-vae-dec2x-f32.gguf`), is a fine-tuned standard VAE whose
+decoder has 9 residual units per block instead of 3. It is not distributed; the UI lists
+it only when the engine finds the file. Its GGUF carries `yue2vae.dec_res_dilations` (the
+decoder's own unit list; the encoder keeps `res_dilations`) and a 40-frame decode halo,
+because the extra units widen the receptive field to 29 frames. Build one with
+`tools/yue2-vae-train` (train, then `export.py`, then `convert-yue2.py --src-vae-dec2x`);
+`yue2-probe --vae-roundtrip <in.f32> <out.f32> --vae <variant>` measures what any VAE
+loses on real audio. The
 NAR stage can use Lua solvers and schedulers through `infer_method` and
 `scheduler`. A song's composer (semantic stage) stops at `plan_cutoff` (default 1.5)
 times its plan's length plus 20 s (`yue2_plan_cap_frames`, the bars x beats / tempo
@@ -294,8 +429,11 @@ from about 135 ms to about 2 ms), while bounds and read-only checks stay and the
 pointer itself is never reachable. `math.random` is a port of Lua 5.4's
 xoshiro256** generator, so seeded plugins draw the same numbers as before. `PluginRegistry::init` (`lua-plugin-registry.h`) scans
 `engine/plugins/{solvers,schedulers,guidance,postprocess}/` and then the same four
-folders under the project root `plugins/`, once at startup. `ace-server` and
-`ace-synth` both call it. `lua-plugin.h` runs each file in its own sandboxed VM,
+folders under the project root `plugins/`, once at startup. `ace-server` then
+scans the root given by `--user-plugins`, which the release app sets to
+`<data folder>/plugins`. A user plugin replaces a shipped plugin of the same name
+(the shipped Lua state is closed and the log names both files); any other duplicate
+keeps the first one loaded. `ace-server` and `ace-synth` both call it. `lua-plugin.h` runs each file in its own sandboxed VM,
 passes float arrays without copying, reads each plugin's metadata and parameter
 schema, and exposes the native `apg()` helper and the optional `post_step()` hook
 to guidance plugins.
@@ -318,6 +456,30 @@ to guidance plugins.
 
 New plugins need no C++ rebuild. Writing one is covered in
 [plugins-authoring.md](plugins-authoring.md).
+
+## Stable Audio 3 sampling
+
+`POST /sa3-synth` generates from caption tokens using the same SA3 model and
+adapter path as StableStep. The Node backend defaults to 8 steps and the
+`md_pingpong_blend` Lua solver over the native `pingpong` wire sampler. Explicit
+`pingpong` or `euler` selects a native loop; an opted-in solver plugin takes
+precedence over the default Lua solver.
+
+Seed breeding is limited to noise-only synthesis. `seed_b` selects a second
+noise stream and `seed_blend` mixes it into the initial latent and each pingpong
+re-noise draw. Node resolves an omitted or blank blend to 0.5 when seed B is set;
+explicit 0 disables breeding and 1 selects seed B's noise. The native loop
+advances both streams together. The Lua solver uses `math.randomstream(seed_b)`
+for an independent host-backed 64-bit stream, selected through the shared
+`SolverState.seed_b` and `seed_blend` globals. Other
+solver callers retain disabled defaults of -1 and 0, including ACE-Step.
+StableStep refinement does not enable breeding.
+
+`engine/tests/test-sa3-seed-blend.cpp` exercises the real LuaJIT bridge without
+models or GPU work. Its header gives the standalone compile command. It checks
+blend 0/default/1, an analytic first-step noise mix, replay across reused plugin
+states and seed-B equivalence, including odd latent lengths and seeds above
+32 bits.
 
 ## Adapters at runtime
 
@@ -414,18 +576,27 @@ usage. `ace-train --help` prints the full option list.
 | `mm3-lm-loss`, `mm3-lm-probe` | MM3 LM trainer diagnostics and wiring gate |
 | `mm3-preprocess` | MM3 dataset to flow-DiT target latents |
 | `mm3-condition` | MM3 AR rollout to a flow-DiT conditioning cache |
-| `mm3-train-dit` | Train an MM3 flow-DiT LoRA |
+| `mm3-train-dit` | Train an MM3 flow-DiT LoRA, or DoRA with `--dora`; CLI-only |
 | `rec7-selftest` | Parity gate for the rec7 state encoder |
 | `yue2-preprocess` | Audio folder to cached YuE2 VAE latents and a manifest. Skips `*.engine.wav` (old server conversion-cache leftovers, duplicates of real tracks), as the dataset scanner does |
-| `yue2-tokenize` | Fill a YuE2 manifest's codec ids |
+| `yue2-tokenize` | Fill a YuE2 manifest's codec ids. `--dump-mert` also writes `codes/<stem>.mert.f16`, the tokenizer head's exact instance-normed `[T25, 1024]` MERT input, for head-training experiments |
 | `yue2-align` | Fill word timings for the AR lyric-cursor loss |
 | `yue2-sheet` | Fill the ABC lead sheet with SheetSage2; `--melody-only` serves cover inference, while training keeps full score by default |
-| `yue2-nar-train` | Train a YuE2 NAR LoRA |
+| `yue2-nar-train` | Train a YuE2 NAR LoRA. `--manifest` may repeat (all caches train as one set); `--companion` merges `nar_lora_joint_v9` under the NAR first, as the server does at render time, and the export records it in `companion` metadata. `--audio-loss <w>` adds an audio-domain term on low-noise steps, the clean-latent estimate decoded through the frozen VAE and scored against the source recording ([training internals](training-internals.md#yue2-nar-audio-domain-loss)) |
 | `yue2-ar-train` | Train a YuE2 AR (composer) LoRA |
 | `yue2-prepare-aitk`, `yue2-import-aitk-cache` | Build or import caches for joint training |
-| `yue2-joint-train` | YuE2 AR and NAR joint training. `--eval-base-loss` trains nothing: it prints the base planner CE and decoder flow MSE per song (the Optimise phase) |
+| `yue2-joint-train` | YuE2 AR and NAR joint training. `--eval-base-loss` trains nothing: it prints the base planner CE and decoder flow MSE per song (the Optimise phase). `--eval-adapted --resume <record> [--eval-dataset <held-out dataset.json>]` also trains nothing: it restores the checkpoint's adapters and prints base vs adapted planner CE and decoder MSE per song ([training internals](training-internals.md)). `--resume` restores optimizer state exactly; older 8-bit records load with a note ([training internals](training-internals.md)) |
 | `yue2-optim-check` | Optimizer self-check |
 | `spike` | Phase-0 evidence runs |
+
+`yue2-prepare-aitk --caption-dropout-trigger <text>` sets the exact style text
+for caption-dropout prefixes, without an "in the style of" wrapper. The value
+must be one line, at most 128 bytes; CR, LF and NUL are rejected. If omitted,
+the dropout style is the bare `--trigger` value, or empty when neither is set.
+Preparation tokenizes these prefixes; `yue2-joint-train --caption-dropout <p>`
+selects them during training. HOT-Approved uses this preparation flag with the
+trigger, falling back to the dataset slug. Older prepared datasets need
+re-preparing; the server invalidates the old Fixed recipe preparation cache.
 
 The flash-attention training ops these trainers use come from the HOT-ggml fork
 below. How the Training Studio drives these subcommands, and the design decisions
@@ -488,6 +659,7 @@ Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`,
 | `POST /models/restore-policy` | Undo a `?keep_loaded=1` switch |
 | `POST /pp-vae-reencode` | Round-trip audio through the post-processing VAE |
 | `POST /sa3-refine` | Stable Audio 3 SDEdit refine of a finished track |
+| `GET /worker-drain` | Answers once the worker queue ahead of it has finished |
 | `POST /supersep/separate`, `GET /supersep/progress`, `GET /supersep/result`, `GET /supersep/serve`, `POST /supersep/release`, `POST /supersep/recombine` | Stem separation jobs |
 | `POST /spectral-lifter` | Spectral Lifter clean-up (CPU) |
 | `GET /mm3/props`, `POST /mm3/warm`, `POST /mm3/unload`, `POST /mm3/select-model` | MM3 status, residency and quant selection |
@@ -498,6 +670,23 @@ Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`,
 | `POST /yue2/synth` | YuE2 generation (progress and result through `/job`) |
 | `POST /yue2/tokenize-check`, `POST /yue2/imatrix`, `POST /yue2/align` | YuE2 prompt check, imatrix collection, lyric forced alignment |
 
+## Headless smoke test
+
+`node tools/engine-smoke.mjs` renders two fixed-seed instrumentals with
+`ace-synth --check`, one 10 s and one 7.33 s (patch padding and ragged VAE tiles), and
+exits 1 unless both pass, each WAV is fresh and exactly frames x 1920 samples long, and
+the engine log yields per-stage times. No app, server or UI is
+involved. It resolves the models folder through `server/scripts/data-paths.ts`
+(override with `--models <dir>`), uses `acestep-v15-turbo-BF16.gguf` (override with
+`--dit <file>`), and writes requests, WAVs and logs to `logs/engine-smoke/`.
+`--self-test` renders six tracks, corrupts five inside ace-synth (NaN, subnormal,
+silence, DC, clip), forces a write failure, and passes only if every fault is caught.
+The block-based monitor chain has its own test, `engine/tests/test-monitor-chain.cpp`
+(odd block sizes, decaying tail, subnormal count); how to run it is in the
+engine-dev-loop skill. The checks and thresholds are in
+[engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md#ace-synth-reference).
+Engine hand-offs carry its `[Check Batch0]`, `stages:` and `wav:` lines as the render receipt.
+
 ## Related
 
 - [engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md): request JSON, generation modes, CLI flags, endpoints
@@ -505,3 +694,7 @@ Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`,
 - [building.md](building.md): build scripts, toolchains, optional SDKs
 - [plugins-authoring.md](plugins-authoring.md): writing Lua plugins
 - [training-internals.md](training-internals.md): the training system
+
+## Release data paths
+
+Release engine executables and shipped plugins remain app-owned. The server passes the data folder plugin overlay through `--user-plugins` and supplies absolute model and tool paths. Downloaded runtime libraries live under `<data folder>/tools/runtime`. See [Data folder and upgrades](../user/data-folder.md).

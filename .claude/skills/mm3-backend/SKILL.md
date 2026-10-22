@@ -5,6 +5,10 @@ description: Maps HOT-Step's native MiniMax-Music3 backend — engine port modul
 
 # MiniMax-Music3 backend
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Native C++/GGML port of [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3),
 built 2026-08-13 (release day) as HOT-Step's second generation backend behind an N-backend
 abstraction. **Status: rudimentary text2music only** (caption + lyrics + duration + seed);
@@ -78,7 +82,7 @@ Two things to know before touching the LM cluster:
 | Hooks | one include in `engine/tools/hot-step-server.cpp` (+ `mm3_register_routes`/`mm3_register_job_routes` call sites); checked by `engine/verify-hooks.ps1` (hooks 4/4b/4c) |
 | Server backend | `server/src/services/backends/` — `types.ts` (EngineBackend + capability manifest), `registry.ts`, `ace/`, `minimax/{client,index,generate}.ts`; routes `server/src/routes/backends.ts`; generation branch at top of `runGeneration` in `routes/generate.ts` |
 | UI | `stores/backendStore.ts`, `hooks/useCapabilities.ts`, `global-bar/BackendToggle.tsx` (hidden until ≥2 backends), `shared/BackendCapabilityGate.tsx` (studio guards), gating in `GlobalParamBar.tsx` |
-| Models | **5-way split since 2026-08-14** (ported from ServeurpersoCom/minimaxmusic.cpp): `models/mm3/mm3-{lm,depth,cond,dit,voc}-<quant>.gguf` (archs `qwen3` / `mm3-{depth,cond,dit,voc}`), legacy `mm3-synth-*` bundles still load (fill any role; split file wins per quant token). Per-role quant mixing (LM Q8_0 + DiT Q4_K_M is the headline combo); a DiT/adapter swap reloads only cond+dit+voc — LM stays warm. cond/voc are **never quantised** (f16 only). Hosted `scragnog/MiniMax-Music3-GGUF`; registry role `mm3`, packs rebuilt on split components in `server/src/data/model-registry.json` |
+| Models | **5-way split since 2026-08-14** (ported from ServeurpersoCom/minimaxmusic.cpp): `<data root>/models/mm3/mm3-{lm,depth,cond,dit,voc}-<quant>.gguf` (archs `qwen3` / `mm3-{depth,cond,dit,voc}`), legacy `mm3-synth-*` bundles still load (fill any role; split file wins per quant token). Per-role quant mixing (LM Q8_0 + DiT Q4_K_M is the headline combo); a DiT/adapter swap reloads only cond+dit+voc — LM stays warm. cond/voc are **never quantised** (f16 only). Hosted `scragnog/MiniMax-Music3-GGUF`; registry role `mm3`, packs rebuilt on split components in `server/src/data/model-registry.json` |
 | Converter | `engine/tools/convert-mm3.py` (safetensors→GGUF bundle; folds weight-norm; refuses pruned/int8_convrot) then `engine/tools/split-mm3.py` (byte-exact bundle→5-way split; idempotent; cond/voc only from native bundles) |
 | Fixtures / parity | `D:\Ace-Step-Latest\mm3-weights\fixtures\` (manifest.json + raw f32 dumps + reference WAVs), seed-spread study in `..\seed-spread-2026-08-13\`; venvs: `.venv-convert` (numpy/gguf), `.venv-ref` (patched diffusers @ dafe3733 — `patch_venv.py --restore`; `capture_fixtures.py --replay` rebuilds dumps without rerunning the model) |
 
@@ -154,7 +158,7 @@ candidate costs its own flow pass.
 7. Condition resample is **plain `nearest`, not `nearest-exact`** (differs on 199/689 positions).
 8. **Never use `std::normal_distribution`** for reproducible noise (stdlib-dependent bytes) —
    `mm3_fill_noise` uses splitmix64 + Box-Muller.
-9. GGUFs live in the **`models/mm3/` subdir** deliberately: the ACE registry scan globs only the
+9. GGUFs live in the **`<data root>/models/mm3/` subdir** deliberately: the ACE registry scan globs only the
    models root (unknown-arch warnings + 17 GB header reparse per boot if placed there).
 10. **Single-seed spectral/genre judgments are meaningless** — the reference's own 11-seed spread
     spans 272× in flatness and wanders off-genre with minimal captions. Structured 3-section
@@ -211,7 +215,7 @@ candidate costs its own flow pass.
     q,k = structure poison, proj_in/out = seed-dependent fuzz, MLP+V+out = timbre).
 18. **An MM3-only install must not kill the server at boot.** The startup gates in
     `hot-step-server.cpp` (`registry_scan` empty → exit 1; partial ACE synth without LM →
-    exit 1) predate MM3 and knew nothing about it: a user with only `models/mm3/*.gguf` got a
+    exit 1) predate MM3 and knew nothing about it: a user with only `<data root>/models/mm3/*.gguf` got a
     dead engine → empty model dropdowns for BOTH backends + the MM3 "weights missing" CTA,
     while the Model Manager (Node disk scan, checks subdirs) said everything was installed
     (GitHub issue #118). Both gates now fall through when `mm3_weights_present()`

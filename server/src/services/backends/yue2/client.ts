@@ -38,6 +38,8 @@
 // matching minimax/client.ts's own workaround.
 
 import { config } from '../../../config.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { Yue2AlignWord } from './align.js';
 import type { Yue2LyricScheduleWire } from './lyricSchedule.js';
 
@@ -49,12 +51,27 @@ const TIMEOUT_PROPS = 2_500;
 const TIMEOUT_QUICK = 15_000;   // synth submit, warm, unload, select-model
 /** An unload or a weight change waits engine-side for every render already on
  *  the NAR lane (#204), each up to a few minutes. Long enough for a full queue. */
+/** A uint64 seed, exact: a Number while it is a safe integer, else its decimal string
+ *  (JSON.parse/JS arithmetic round past 2^53; the engine takes either form). */
+export type Yue2Seed = number | string;
+export function yue2Seed(v: unknown): Yue2Seed | undefined {
+  if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return Number.isSafeInteger(v) ? v : String(BigInt(v));
+  if (typeof v !== 'string' || !/^\d{1,20}$/.test(v)) return undefined;
+  const b = BigInt(v);
+  return b > 0xFFFFFFFFFFFFFFFFn ? undefined : b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : b.toString();
+}
+export const yue2SeedPlus = (s: Yue2Seed, n: number): Yue2Seed => yue2Seed((BigInt(s) + BigInt(n)).toString())!;
+
 export const TIMEOUT_DRAIN = 30 * 60_000;
 
 // ── Wire shapes (mirrors engine/src/yue2/yue2-server.h, per the port plan) ──
 
 export interface Yue2PropsFile {
   found?: boolean;
+  probe_ok?: boolean;
+  name?: string;
+  bytes?: number;
+  error?: string;
   path?: string;
   [k: string]: unknown;
 }
@@ -115,6 +132,7 @@ export interface Yue2Props {
     convrot?: Yue2PropsFile;
     vae_standard?: Yue2PropsFile;
     vae_legacy?: Yue2PropsFile;
+    vae_dec2x?: Yue2PropsFile;
   };
   variants?: {
     lm?: Yue2LmVariants;
@@ -155,6 +173,10 @@ export interface Yue2AdapterScales {
   early: number;
   mid: number;
   late: number;
+  /** Planner strength: stands in for `global` on the jobs that only write the
+   *  score (plan_only), so the AR can plan at one strength and compose at
+   *  another. Server-side only, never a dial on the wire. Absent = `global`. */
+  plan?: number;
 }
 
 /** One adapter in a stack, with its own dials. The engine merges AR and NAR
@@ -170,7 +192,7 @@ export interface Yue2AdapterRef {
  *  mm3SelectModel's shape at YuE2's much smaller (two-part) scale. */
 export interface Yue2Selection {
   lm?: string;
-  vae_variant?: 'standard' | 'legacy';
+  vae_variant?: 'standard' | 'legacy' | 'dec2x';
   /** A NAR LoRA to merge into the LM at load, as an ABSOLUTE path.
    *
    *  The engine opens the path AS GIVEN — yue2-adapter.h resolves it against
@@ -214,7 +236,7 @@ export interface Yue2SelectModelResult {
 
 export interface Yue2WarmRequest {
   lm?: string;
-  vae_variant?: 'standard' | 'legacy';
+  vae_variant?: 'standard' | 'legacy' | 'dec2x';
 }
 
 export interface Yue2UnloadResult {
@@ -251,7 +273,7 @@ export interface Yue2SynthRequest {
   /** Recompose on a composer runaway (semantic stage at its cap): new seed,
    *  up to this many extra tries, before the NAR runs. 0/absent = off. */
   semantic_retries?: number;
-  seed?: number;
+  seed?: Yue2Seed;
   /** Optional override; unset = mode-dependent engine default
    *  (1.01 for cot=off, 1.0 otherwise, per protocol.py's own SongRequest). */
   cfg_scale?: number;
@@ -267,25 +289,31 @@ export interface Yue2SynthRequest {
   nar_chunk_frames?: number;
   ode_method?: 'midpoint';
   /** Optional NAR Lua overrides. Absent fields keep the checkpoint's midpoint path. */
-  infer_method?: 'md_wasserstein_yue2';
-  scheduler?: 'md_ht_scheduler V3';
+  infer_method?: 'md_wasserstein_yue2' | 'md_ancestral_yue2' | 'md_latent_eq_yue2' | 'md_tlie_yue2';
+  scheduler?: 'md_ht_scheduler V3' | 'md_plan_aware_yue2' | 'md_plan_loose_yue2' | 'md_plan_overdrive_yue2';
   plugin_params?: Record<string, string | number | boolean>;
-  vae_variant?: 'standard' | 'legacy';
+  vae_variant?: 'standard' | 'legacy' | 'dec2x';
   /** Validator-only per the plan; never sent by this backend's own mapping. */
   noise_source?: 'native' | 'fixture';
   /** Preview-only semantic frame ceiling; 0 leaves normal generation limits. */
   preview_max_frames?: number;
+  /** The codec frame the NAR and VAE start at; the audio covers only [it, end). Section-by-section takes. */
+  render_from_frame?: number;
+  /** The composer's codec stream, prefilled instead of sampled; with
+   *  continue_codec_ids, a prefix the composer resumes from. */
+  codec_ids?: number[];
+  continue_codec_ids?: boolean;
   /** Songs per request (seeds seed+i), 1..props.max_lm_batch. Omitted at 1. */
   lm_batch_size?: number;
   /** A coalesced batch: one entry per song with its own prompt, score and
    *  seeds; everything else comes from the request. Sets the batch size
    *  (1..props.max_lm_batch) and replaces style/lyrics/abc/seed/noise_seed.
    *  Not combinable with lm_batch_size > 1. Tracks come back song-major. */
-  songs?: Array<{ style: string; lyrics?: string; abc?: string; seed?: number; noise_seed?: number }>;
+  songs?: Array<{ style: string; lyrics?: string; abc?: string; seed?: Yue2Seed; noise_seed?: Yue2Seed }>;
   /** Noise variations per song (NAR noise seeds noise_seed+j), 1..props.max_synth_batch. Omitted at 1. */
   synth_batch_size?: number;
   /** NAR noise seed; defaults to `seed`. Set from a track's echoed noise_seed to replay one variation. */
-  noise_seed?: number;
+  noise_seed?: Yue2Seed;
   /** LM tab: per-stage sampler overrides. Absent = the checkpoint's own
    *  yue2.sampling.<stage>.* value (props.sampling shows them). */
   plan_temperature?: number;
@@ -312,6 +340,12 @@ export interface Yue2SynthRequest {
    *  and optionally its score lines, from the composer until its first Vocal
    *  note. Absent = off. Needs abc, one prompt for the batch and cfg_scale 1. */
   lyric_schedule?: Yue2LyricScheduleWire;
+  /** HOT-Step: name of a registered Lua postprocess plugin to route the VAE
+   *  decode through (yue2-pipeline.h's yue2_run_vae_stage hook). Absent/empty =
+   *  built-in tiled decode, byte-identical to before this field existed. The
+   *  plugin's params arrive via plugin_params using the "pluginName:key" prefix
+   *  the engine's shared plugin_params map expects. */
+  postprocess_plugin?: string;
 }
 
 export interface Yue2StageDefaults {
@@ -324,12 +358,16 @@ export interface Yue2StageDefaults {
 export interface Yue2TrackDetail {
   song: number;
   variation: number;
-  seed: number;
-  noise_seed: number;
+  seed: Yue2Seed;
+  noise_seed: Yue2Seed;
   end_reason?: Yue2JobEndReason;
   frames?: number;
   stage_end_reasons?: Partial<Record<'plan' | 'semantic' | 'nar' | 'vae', Yue2StageEndReason>>;
   abc?: string;
+  /** The composer's codec stream (raw ids), for resuming it with codec_ids. */
+  semantic_ids?: number[];
+  /** The codec frame the track's audio starts at (render_from_frame, clamped); 0 or missing: the start. */
+  audio_from?: number;
 }
 
 export interface Yue2SynthResponse {
@@ -417,6 +455,55 @@ export async function yue2Props(timeoutMs = TIMEOUT_PROPS): Promise<Yue2PropsRes
 /** The cached manifest without touching the engine (never blocks). */
 export function yue2PropsCached(): Yue2Props | null {
   return lastGoodProps;
+}
+
+/** Recheck disk even with a cached manifest: files can disappear while queued.
+ * Older engines may omit probe_ok, name and models_dir; retain their found flag. */
+export function yue2AssetReason(props: Yue2Props | null, file: Yue2PropsFile | undefined): string | undefined {
+  if (!props || !file) return 'Asset availability could not be verified. Refresh the model list.';
+  if (file.found !== true) return 'Not installed. Download it in Model Manager or choose an installed model.';
+  if (file.probe_ok === false) return `Metadata probe failed${file.error ? `: ${file.error}` : '.'}`;
+  const candidates = file.path ? [file.path] : props.models_dir && file.name
+    ? [path.join(props.models_dir, 'yue2', file.name), path.join(props.models_dir, file.name)] : [];
+  if (candidates.length && !candidates.some(p => {
+    try { const st = fs.statSync(p); return st.isFile() && st.size > 0; } catch { return false; }
+  })) return 'Not installed or empty on disk. Download it in Model Manager or choose an installed model.';
+  return undefined;
+}
+
+export type Yue2AssetPick = Pick<Yue2SynthRequest, 'lm_type' | 'plan_only' | 'semantic_only'> & { vae_variant?: string };
+
+/** Validate the captured pick, before planning can spend any GPU time. */
+export function yue2ValidateAssets(props: Yue2Props | null, pick: Yue2AssetPick): void {
+  const requireAsset = (label: string, file: Yue2PropsFile | undefined) => {
+    const reason = yue2AssetReason(props, file);
+    if (reason) throw new Error(`Cannot start generation: YuE2 ${label} ${reason.charAt(0).toLowerCase()}${reason.slice(1)}`);
+  };
+  const lm = pick.lm_type;
+  if (lm === 'convrot') {
+    // ConvRot still uses the GGUF for configuration and tokenization.
+    requireAsset('base LM', props?.files?.lm);
+    requireAsset('ConvRot LM', props?.files?.convrot);
+  } else if (lm && props?.variants?.lm) {
+    const variant = props.variants.lm.available.find(v => v.type === lm);
+    const file = props.variants.lm.selected === lm ? props.files?.lm
+      : variant ? { found: true, name: variant.filename } : { found: false };
+    requireAsset(`LM (${lm})`, file);
+  } else {
+    requireAsset('base LM', props?.files?.lm);
+  }
+  if (!pick.plan_only && !pick.semantic_only) {
+    const vae = pick.vae_variant || 'standard';
+    if (vae !== 'standard' && vae !== 'legacy' && vae !== 'dec2x') {
+      throw new Error(`Cannot start generation: unknown YuE2 VAE variant (${vae}). Choose standard, legacy or dec2x.`);
+    }
+    requireAsset(`VAE (${vae})`, props?.files?.[`vae_${vae}`]);
+  }
+}
+
+export async function yue2Preflight(pick: Yue2AssetPick): Promise<void> {
+  const { props } = await yue2Props();
+  yue2ValidateAssets(props, pick);
 }
 
 // ── Residency ──
@@ -540,7 +627,10 @@ export async function yue2FinalDetail(jobId: string): Promise<Yue2FinalDetail> {
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return {};
-    return await res.json() as Yue2FinalDetail;
+    const detail = await res.json() as Yue2FinalDetail;
+    // The engine echoes seeds as decimal strings (a uint64 does not survive JSON.parse as a number).
+    for (const t of detail.tracks ?? []) { t.seed = yue2Seed(t.seed) ?? t.seed; t.noise_seed = yue2Seed(t.noise_seed) ?? t.noise_seed; }
+    return detail;
   } catch {
     return {};
   }

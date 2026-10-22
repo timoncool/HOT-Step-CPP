@@ -30,6 +30,7 @@
 #include <cstring>
 #include <utility>
 #include <cmath>
+#include <cstdio>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -152,6 +153,11 @@ struct Yue2Request {
     // Training previews only: 0 retains the model's normal semantic limit.
     // This bounds work rather than trimming a full-song render afterward.
     int preview_max_frames = 0;
+    // Section-by-section takes: the NAR and VAE start at this codec frame
+    // (clamped to the stream), so a take renders only its lead-in and new part
+    // instead of the whole song. The composer still reads every frame. Each
+    // track reports the frame its audio starts at. 0 renders everything.
+    int render_from_frame = 0;
 
     float cfg_scale         = 0.0f;  // resolved by yue2_request_resolve_defaults if not present
     bool  cfg_scale_present = false;
@@ -185,8 +191,9 @@ struct Yue2Request {
     // With codec_ids: keep composing after them instead of stopping. The
     // supplied codes are a prefix (a saved render cut at a section boundary),
     // prefilled under the unchanged prompt and score; sampling picks up at
-    // frame codec_ids.size(). Needs a single song, cfg_scale 1 and no
-    // semantic_retries.
+    // frame codec_ids.size(). No semantic_retries. A batch (lm_batch_size or
+    // "songs", up to YUE2_MAX_LM_BATCH) gives every song the same prefix;
+    // each song composes on with its own seed.
     bool continue_codec_ids = false;
 
     // ── Ending controls, semantic stage only (2026-09-15) ────────────────
@@ -217,6 +224,17 @@ struct Yue2Request {
     // fallback on a mismatch (fails the request outright).
     Yue2NoiseSource noise_source = YUE2_NOISE_NATIVE;
     std::string     noise_fixture_path;
+
+    // ---- HOT-Step: Lua postprocess hook (fork addition) ----
+    // Name of a registered Lua postprocess plugin to route the VAE tiled
+    // decode through, instead of the built-in yue2_vae_decode_tiled path.
+    // "" (default) = built-in decode, byte-identical to before this field
+    // existed. Mirrors ACE's request.h postprocess_plugin field and SA3's
+    // Sa3PluginParams::postprocess_plugin (sa3-refine.h). See
+    // yue2_run_vae_stage (yue2-pipeline.h) for the attach point.
+    std::string postprocess_plugin;
+    // The plugin reads the request's existing plugin_params map above.
+    // ---- end HOT-Step: Lua postprocess hook ----
 };
 
 static bool yue2_req_num(yyjson_val * root, const char * key, double * out, bool * present, std::string * err) {
@@ -232,6 +250,44 @@ static bool yue2_req_num(yyjson_val * root, const char * key, double * out, bool
         return false;
     }
     *out     = yyjson_get_num(v);  // NOT yyjson_get_real -- a JSON int literal reads as 0 through that call
+    *present = true;
+    return true;
+}
+
+// A uint64 seed, exact: a JSON non-negative integer, or a decimal string (the
+// Node side sends strings past 2^53, which a double cannot hold).
+static bool yue2_req_seed(yyjson_val * root, const char * key, uint64_t * out, bool * present, std::string * err) {
+    *present       = false;
+    yyjson_val * v = root ? yyjson_obj_get(root, key) : nullptr;
+    if (!v || yyjson_is_null(v)) {
+        return true;
+    }
+    if (yyjson_is_uint(v)) {
+        *out = yyjson_get_uint(v);
+    } else if (yyjson_is_str(v) && yyjson_get_len(v) > 0 && yyjson_get_len(v) <= 20) {
+        const char * s = yyjson_get_str(v);
+        uint64_t     n = 0;
+        for (size_t i = 0; i < yyjson_get_len(v); i++) {
+            const unsigned d = (unsigned char) s[i] - '0';
+            if (d > 9 || n > (UINT64_MAX - d) / 10) {
+                if (err) {
+                    *err = std::string("\"") + key + "\" must be a non-negative integer or decimal string";
+                }
+                return false;
+            }
+            n = n * 10 + d;
+        }
+        *out = n;
+    } else {
+        double d = 0.0;
+        if (!yyjson_is_num(v) || (d = yyjson_get_num(v)) < 0.0 || d >= 18446744073709551616.0 || d != std::floor(d)) {
+            if (err) {
+                *err = std::string("\"") + key + "\" must be a non-negative integer or decimal string";
+            }
+            return false;
+        }
+        *out = (uint64_t) d;
+    }
     *present = true;
     return true;
 }
@@ -384,12 +440,11 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
     }
 
     double num = 0.0;
-    if (!yue2_req_num(root, "seed", &num, &present, err)) {
+    if (!yue2_req_seed(root, "seed", &out->seed, &present, err)) {
         yyjson_doc_free(doc);
         return false;
     }
     if (present) {
-        out->seed         = (uint64_t) num;
         out->seed_present = true;
     }
 
@@ -435,12 +490,11 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
         }
     }
 
-    if (!yue2_req_num(root, "noise_seed", &num, &present, err)) {
+    if (!yue2_req_seed(root, "noise_seed", &out->noise_seed, &present, err)) {
         yyjson_doc_free(doc);
         return false;
     }
     if (present) {
-        out->noise_seed         = (uint64_t) num;
         out->noise_seed_present = true;
     }
     struct BatchField {
@@ -510,20 +564,18 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
                 yyjson_doc_free(doc);
                 return false;
             }
-            if (!yue2_req_num(sv, "seed", &num, &sp, err)) {
+            if (!yue2_req_seed(sv, "seed", &spec.seed, &sp, err)) {
                 yyjson_doc_free(doc);
                 return false;
             }
             if (sp) {
-                spec.seed         = (uint64_t) num;
                 spec.seed_present = true;
             }
-            if (!yue2_req_num(sv, "noise_seed", &num, &sp, err)) {
+            if (!yue2_req_seed(sv, "noise_seed", &spec.noise_seed, &sp, err)) {
                 yyjson_doc_free(doc);
                 return false;
             }
             if (sp) {
-                spec.noise_seed         = (uint64_t) num;
                 spec.noise_seed_present = true;
             }
             out->songs.push_back(std::move(spec));
@@ -608,6 +660,17 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
             yyjson_doc_free(doc); return false;
         }
         out->preview_max_frames = static_cast<int>(num);
+    }
+
+    if (!yue2_req_num(root, "render_from_frame", &num, &present, err)) {
+        yyjson_doc_free(doc); return false;
+    }
+    if (present) {
+        if (!std::isfinite(num) || num < 0 || num > 9000 || std::floor(num) != num) {
+            if (err) *err = "render_from_frame must be an integer in [0,9000]";
+            yyjson_doc_free(doc); return false;
+        }
+        out->render_from_frame = static_cast<int>(num);
     }
 
     // "lyric_schedule": {"mode": "bias"|"mask", "bias"?: <0, "abc"?: bool,
@@ -736,8 +799,13 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
     }
     // Keep the initial YuE2 bridge deliberately narrow. Other Lua plugins may
     // need model callbacks, channel conventions, or their own loop contract.
-    if ((!out->nar_solver.empty() && out->nar_solver != "md_wasserstein_yue2") ||
-        (!out->nar_scheduler.empty() && out->nar_scheduler != "md_ht_scheduler V3")) {
+    if ((!out->nar_solver.empty() && out->nar_solver != "md_wasserstein_yue2" &&
+         out->nar_solver != "md_ancestral_yue2" && out->nar_solver != "md_latent_eq_yue2" &&
+         out->nar_solver != "md_tlie_yue2") ||
+        (!out->nar_scheduler.empty() && out->nar_scheduler != "md_ht_scheduler V3" &&
+         out->nar_scheduler != "md_plan_aware_yue2" &&
+         out->nar_scheduler != "md_plan_loose_yue2" &&
+         out->nar_scheduler != "md_plan_overdrive_yue2")) {
         if (err) *err = "unsupported YuE2 NAR solver or scheduler plugin";
         yyjson_doc_free(doc);
         return false;
@@ -777,9 +845,11 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
             out->vae_variant = YUE2_VAE_STANDARD;
         } else if (s == "legacy") {
             out->vae_variant = YUE2_VAE_LEGACY;
+        } else if (s == "dec2x") {
+            out->vae_variant = YUE2_VAE_DEC2X;
         } else {
             if (err) {
-                *err = "\"vae_variant\" must be \"standard\"|\"legacy\"";
+                *err = "\"vae_variant\" must be \"standard\"|\"legacy\"|\"dec2x\"";
             }
             yyjson_doc_free(doc);
             return false;
@@ -824,6 +894,13 @@ static bool yue2_parse_request(const std::string & body, Yue2Request * out, std:
     if ((out->plan_only || out->semantic_only) && out->synth_batch_size != 1) {
         out->synth_batch_size = 1;  // no NAR runs, so variations mean nothing
     }
+
+    // ---- HOT-Step: Lua postprocess hook (fork addition) ----
+    if (!yue2_req_str(root, "postprocess_plugin", &out->postprocess_plugin, &present, err)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    // ---- end HOT-Step: Lua postprocess hook ----
 
     yyjson_doc_free(doc);
     return true;

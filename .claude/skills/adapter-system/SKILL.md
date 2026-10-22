@@ -5,6 +5,10 @@ description: Explains how HOT-Step's LoRA/LoKr adapter system loads, merges, cac
 
 # Adapter (LoRA/LoKR) System
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 The deepest institutional-knowledge subsystem in HOT-Step CPP. Every rule below was
 paid for with a shipped bug or a failed research direction. Deeper detail (merge/runtime
 internals, cache-key construction, cross-arch research history) lives in
@@ -12,8 +16,15 @@ internals, cache-key construction, cross-arch research history) lives in
 
 ## Glossary (read first — no prior context assumed)
 
+Album-preset maintenance: Settings > General > Adapters > **Update adapter references**
+calls `POST /api/lireek/presets/update-adapter-references`. The service in
+`server/src/services/lireek/adapterReferences.ts` checks all five adapter columns in
+SQLite `album_presets`, clears missing weights in a transaction, and reports each
+preset and dropped path. It preserves live references and other columns. This is an
+explicit action, never a startup migration or a remapping operation.
+
 - **DiT** — Diffusion Transformer, the C++ model that denoises audio latents (32 layers on the XL base). Lives in `engine/src/dit.h` / `dit-graph.h`.
-- **LoRA** — low-rank adapter: two small matrices A, B whose product `B@A` is a delta added to a base weight. **LoKr** — LyCORIS Kronecker-product variant (`.lokr_w1/.lokr_w2` tensors). **DoRA** — adds a per-row multiplicative rescale; two on-disk namings, both supported in MERGE MODE ONLY: LyCORIS `dora_scale` (LoKr path) and PEFT `lora_magnitude_vector` (LoRA path, since 2026-07-19). With DoRA the delta carries only alpha/rank; user strength × group scale blends the decompose factor (`s = u·(m/‖W+Δ‖) + (1−u)`), so strength 0 does NOT fully disable a DoRA adapter.
+- **LoRA** adds a low-rank delta `B@A` to a base weight. **LoKr** uses LyCORIS Kronecker-product factors. **DoRA** adds a per-row magnitude rescale, named `dora_scale` in LyCORIS or `lora_magnitude_vector` in PEFT. Merge supports both; runtime rescaling requires `adapter_runtime_dora:true`, default false. Keep existing strength semantics: the delta carries alpha/rank, and user strength times group scale blends the rescale factor, so strength 0 does not fully disable an existing-format DoRA adapter. ACE preflight rejects configs whose `use_dora` contradicts the magnitude payload, even with runtime rescaling off.
 - **Delta (Δ)** — the full-size weight difference an adapter contributes: `W_adapted = W_base + scale·Δ`.
 - **Merge mode** — deltas are baked into base weights on load, before GPU upload (`adapter-merge.h`). **Runtime mode** — deltas live as separate GPU tensors, applied each sampling step as `y = W@x + Δ@x` (`adapter-runtime.h` + `dit-graph.h`).
 - **aceReq** — the JSON generation request (`AceRequest`) the Node server sends to the C++ engine's `/synth` endpoint.
@@ -39,7 +50,7 @@ internals, cache-key construction, cross-arch research history) lives in
 7. **Never assume runtime deltas are BF16.** They may be Q4_0/Q8_0. `mul_mat` dequantizes transparently, but any code that reads delta bytes directly assuming BF16 crashes (a delta-L2 diagnostic did exactly this — removed in `46603bf`).
 8. **LM echo sideband gotcha: never whitelist synth-request fields.** Sideband/ServerFields-only params (`adapter_runtime_quant`, `adapter_section_align_at`, `rebase_*`, …) do NOT survive the engine `/lm` round trip. `server/src/routes/generate.ts` rebuilds synth requests as `{...aceReq, ...LM-generated-fields-only}` (lines 238 and 320). A field whitelist here once made the Adapter VRAM and Alignment Timing knobs silently dead on the default path (fixed in `8ea519b`/`168dcb5`).
 9. **Edit the right files.** The compiled server is `engine/tools/hot-step-server.cpp` — `engine/tools/ace-server.cpp` is upstream reference code, not compiled. The live sampler is `engine/src/hot-step-sampler.h` — `dit-sampler.h` is dead upstream code. `pipeline-synth-ops.cpp:9` includes `hot-step-sampler.h`; losing that include on an upstream sync is **silent** (compiles, all solvers/schedulers/guidance go dead). After any sync run `engine/verify-hooks.ps1`.
-10. **Build & git rules.** After ANY engine edit: `.\dev-rebuild.bat` from repo root, immediately — NEVER `engine/build.cmd` directly (you cannot reliably tell whether the app is running; Node auto-respawns ace-server → infinite respawn + file-lock loop), never `cmake --clean-first` (20+ min CUDA recompile). TypeScript changes: `npx tsc --noEmit`, not `npm run build`. Git: stage explicit paths only — never `git add -A` or `add -f` (re-adds gitignored models/checkpoints/local docs); commit locally often; push only with explicit user approval.
+10. **Build & git rules.** After ANY engine edit: `.\dev-rebuild.bat` from repo root, immediately — NEVER `engine/build.cmd` directly (you cannot reliably tell whether the app is running; Node auto-respawns ace-server → infinite respawn + file-lock loop), never `cmake --clean-first` (20+ min CUDA recompile). TypeScript changes: `npx tsc --noEmit`, not `npm run build`. Git: stage explicit paths only — never `git add -A` or `add -f` (re-adds gitignored <data root>/models/checkpoints/local docs); commit locally often; push only with explicit user approval.
 
 ## How an adapter reaches the GPU (request flow)
 
@@ -98,10 +109,11 @@ slices of the trajectory ("structure" expert early / "timbre" expert late — TD
 - **Training side**: Side-Step `--timestep-window-min/max` (rejection-resampled
   logit-normal; discrete mode filters the 8-step schedule) trains matching
   interval experts. T-LoRA: the high-noise expert overfits fastest — lower rank.
-- Inherits per-section constraints: runtime-only (no DoRA rescale), N× VRAM
+- Inherits per-section constraints: runtime-only, N× VRAM
   (Q4_0 knob), no basin re-base. `runtime_lowrank` is CLOBBERED to plain runtime
   (server + engine) — windows currently require the full-delta path; masked
   low-rank apply is untried future work.
+  DoRA rescaling requires the opt-in `adapter_runtime_dora` flag.
 - **VRAM trap (shipped bug, fixed same day)**: windows force runtime mode
   server-side, but `getGlobalParams()` gated `adapterRuntimeQuant` on the
   *selected* mode — a Merge-mode user with windows got full BF16 deltas
@@ -122,7 +134,7 @@ slices of the trajectory ("structure" expert early / "timbre" expert late — TD
 | Path | Role |
 |---|---|
 | `engine/src/adapter-merge.h` | Merge mode: safetensors/PEFT/LyCORIS parsing, LoKr detection (:440), GPU merge graph (`adapter_merge_on_backend` :523, contains the DoRA weight-decompose for both GPU and host paths), delta compute (`adapter_compute_delta` :480), basin re-base (`adapter_rebase_fetch` :78), PEFT DoRA magnitude detection (`lora_is_magnitude` :183), per-module `alpha_pattern` parser (`adapter_read_alpha_pattern` :238 — REQUIRED for PEFT rank_pattern adapters, else per-module strength is alpha_global/rank_actual ≈ wildly wrong), entry `adapter_merge` (:1453) |
-| `engine/src/adapter-runtime.h` | Runtime mode: `DiTLoRA*` structs (:39-70), slot map `dit_lora_slot` (:105), stack delta-sum `adapter_stage_delta` (:173), quantized finalize (:804), `adapter_load_runtime_stack` (:1011), DoRA merge-only warnings (PEFT :299, LoKr :510) |
+| `engine/src/adapter-runtime.h` | Runtime mode: `DiTLoRA` storage, slot mapping, stack delta staging, quantized finalization and `adapter_load_runtime_stack`; opt-in `adapter_runtime_dora_stack` builds effective DoRA deltas through the merger. |
 | `engine/src/adapter-cancel.h` | `g_adapter_cancel` atomic + `adapter_cancel_requested()` — cooperative cancel of the ~17 s delta precompute; separate header so the server avoids ggml deps |
 | `engine/src/adapter-trt.h` | TensorRT IRefitter merge variant (`#ifdef HOT_STEP_TRT`) |
 | `engine/src/dit.h` | Load orchestration: merge-vs-runtime, fusion skip (:420), once-per-stack re-base (:565), per-section per-adapter loads (:618), fail-don't-cache (:648). Fork hook: includes `adapter-merge.h`/`adapter-runtime.h` (:11/:13) |
@@ -154,7 +166,7 @@ slices of the trajectory ("structure" expert early / "timbre" expert late — TD
 | Adapter VRAM / Alignment Timing knobs "do nothing" | A ServerFields param dropped in an LM round-trip whitelist — Golden rule 8 |
 | Merge stack with re-base outputs only the LAST adapter | Re-base applied per adapter instead of once per stack (`dit.h:565`) |
 | Section adapters roughly twice as strong as expected | Section deltas loaded with stack scale instead of unit scale (`dit.h:628`) |
-| DoRA adapter sounds wrong in runtime mode | DoRA is merge-only; runtime can't express the multiplicative rescale — engine warns and applies plain LoRA (`adapter-runtime.h:299` PEFT, `:510` LoKr) |
+| DoRA adapter sounds wrong in runtime mode | Runtime DoRA magnitudes defaults off for compatibility. Enable it in the ACE Adapters section, or send `adapter_runtime_dora:true` to ACE/MM3. Low-Rank may materialize full-size deltas. Merge and LM behavior are unchanged. |
 | PEFT adapter with per-module ranks (`rank_pattern` in adapter_config.json) sounds weak/distorted | `alpha_pattern` must be parsed per module (`adapter_read_alpha_pattern`) — the global `lora_alpha` over the actual per-tensor rank gives e.g. 128/512 instead of the trained 1024/512. Also requires `adapter_config.json` to sit NEXT TO the .safetensors (alpha fallback is rank ⇒ wrong strength without it) |
 | All solvers/schedulers/guidance dead after an upstream sync (compiles fine) | `pipeline-synth-ops.cpp` lost the `hot-step-sampler.h` include — run `engine/verify-hooks.ps1` |
 
@@ -171,7 +183,7 @@ slices of the trajectory ("structure" expert early / "timbre" expert late — TD
 
 - `HOTSTEP_BCAST_TEST=1` then run `engine\build\Release\ace-synth.exe` — numeric self-test of mask broadcast ops on the real backend, no models needed (`engine/tools/ace-synth.cpp:160`).
 - `HOTSTEP_SECTION_NOMASK=1` — apply section deltas unmasked (`dit-graph.h:90`). Adapters audible ⇒ mask values are the problem; still silent ⇒ wiring/upload is the problem.
-- Logs: newest `logs\<session>\ace_engine.log` or `logs\<session>\generations\gen_*.log`. Useful greps: `[Adapter-RT] Loaded`, `[Adapter-RT] P2:`, `header-anchored`, `[Adapter] Basin re-base`, `Per-section masking`.
+- Logs: newest `<data root>/logs\<session>\ace_engine.log` or `<data root>/logs\<session>\generations\gen_*.log`. Useful greps: `[Adapter-RT] Loaded`, `[Adapter-RT] P2:`, `header-anchored`, `[Adapter] Basin re-base`, `Per-section masking`.
 - Audible validation is **by ear only** — ask the user to listen; do not use a browser agent for UI/audio verification. Do not delete experiment output files on your own prediction of their worth.
 
 ## Deeper reading

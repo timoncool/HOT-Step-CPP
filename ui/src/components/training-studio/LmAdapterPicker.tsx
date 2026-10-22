@@ -8,7 +8,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { adapterApi } from '../../services/api';
+import { useQuery } from '@tanstack/react-query';
+import { trainingQueries } from '../../queries/training-data/queries';
 
 export interface LmAdapterOption {
   label: string;
@@ -41,43 +42,27 @@ export const LmAdapterPicker: React.FC<LmAdapterPickerProps> = ({
   value, onChange, disabled = false, placeholder, extraOptions,
 }) => {
   const { t } = useTranslation();
-  const [registry, setRegistry] = useState<LmAdapterOption[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState('');
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState('');
   const [cursor, setCursor] = useState(0);
   const rootRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // One scan per mount. The registry is a filesystem walk on the server and the
-  // set of adapters does not change while a card is on screen.
-  useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    adapterApi.lmList().then(
-      (res) => {
-        if (!alive) return;
-        // Per-base + per-run layout: names are unsuffixed and an artist can
-        // have several sizes and several training runs — tag both so every
-        // entry stays distinguishable.
-        setRegistry(res.adapters.map(a => ({
-          label: [a.name, a.lmSize, a.run].filter(Boolean).join(' · '),
-          value: a.path, kind: a.kind, size: a.size,
-          evalScore: a.evalScore, evalVerdict: a.evalVerdict,
-        })));
-        setLoading(false);
-      },
-      (err: unknown) => {
-        if (!alive) return;
-        // Advisory: a failed scan must still leave the field usable — the value
-        // is a plain string and the server validates it either way (C16).
-        setLoadError(err instanceof Error ? err.message : String(err));
-        setLoading(false);
-      },
-    );
-    return () => { alive = false; };
-  }, []);
+  // The registry is a filesystem walk on the server, and every picker on
+  // screen shares one read of it.
+  const lmQuery = useQuery(trainingQueries.lmAdapters());
+  const loading = lmQuery.isPending;
+  // Advisory: a failed scan must still leave the field usable — the value is a
+  // plain string and the server validates it either way (C16).
+  const loadError = lmQuery.error ? lmQuery.error.message : '';
+  // Per-base + per-run layout: names are unsuffixed and an artist can have
+  // several sizes and several training runs — tag both so every entry stays
+  // distinguishable.
+  const registry = useMemo<LmAdapterOption[]>(() => (lmQuery.data?.adapters ?? []).map(a => ({
+    label: [a.name, a.lmSize, a.run].filter(Boolean).join(' · '),
+    value: a.path, kind: a.kind, size: a.size,
+    evalScore: a.evalScore, evalVerdict: a.evalVerdict,
+  })), [lmQuery.data]);
 
   const options = useMemo<LmAdapterOption[]>(
     () => [...(extraOptions ?? []), ...registry],

@@ -1,3 +1,4 @@
+import { VramIndicator } from '../shared/VramIndicator';
 // TerminalPanel.tsx — Live engine log viewer with search and VRAM display
 //
 // Mirrors ace-server stderr output in the app. Supports search filtering,
@@ -8,14 +9,10 @@
 // useEventSource, this keeps the UI responsive even during heavy logging.
 
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
-import { Search, X, Trash2, Cpu, ArrowDown, Pin, PinOff, Wifi, WifiOff } from 'lucide-react';
+import { Search, X, Trash2, ArrowDown, Pin, PinOff, Wifi, WifiOff } from 'lucide-react';
 import { useEventSource, type LogLine } from '../../hooks/useEventSource';
 
-interface VramInfo {
-  used_mb: number;
-  total_mb: number;
-  free_mb: number;
-}
+
 
 interface TerminalPanelProps {
   /** Omitted when embedded in the activity column — no close button is shown. */
@@ -105,7 +102,6 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ onClose, embedded 
   const { lines, connected, clear } = useEventSource('/api/logs', true);
   const [search, setSearch] = useState('');
   const [streamTab, setStreamTab] = useState('all');
-  const [vram, setVram] = useState<VramInfo | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
 
@@ -222,28 +218,6 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ onClose, embedded 
     window.addEventListener('pointercancel', release);
   }, []);
 
-  // Poll VRAM every 5 seconds
-  useEffect(() => {
-    const fetchVram = async () => {
-      try {
-        const res = await fetch('/api/logs/vram');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.total_mb > 0) {
-            setVram(data);
-          }
-        }
-      } catch { /* ignore */ }
-    };
-    fetchVram();
-    const interval = setInterval(fetchVram, 5000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const vramPercent = vram && vram.total_mb > 0
-    ? Math.round((vram.used_mb / vram.total_mb) * 100)
-    : 0;
-
   return (
     <div className="h-full flex flex-col overflow-hidden bg-white dark:bg-[#0d0d0f]">
       {/* Header */}
@@ -258,32 +232,8 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({ onClose, embedded 
             )}
           </div>
 
-          {/* VRAM badge */}
-          {vram && vram.total_mb > 0 && (
-            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-zinc-100/80 dark:bg-zinc-800/80 border border-zinc-200 dark:border-white/5">
-              <Cpu size={11} className="text-zinc-500" />
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-zinc-500">VRAM</span>
-                <span className={`text-[10px] font-mono font-medium ${
-                  vramPercent > 90 ? 'text-red-400' :
-                  vramPercent > 70 ? 'text-yellow-400' :
-                  'text-emerald-400'
-                }`}>
-                  {(vram.used_mb / 1024).toFixed(1)} / {(vram.total_mb / 1024).toFixed(1)} GB
-                </span>
-                <div className="w-12 h-1 rounded-full bg-zinc-200 dark:bg-zinc-700 overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all duration-500 ${
-                      vramPercent > 90 ? 'bg-red-500' :
-                      vramPercent > 70 ? 'bg-yellow-500' :
-                      'bg-emerald-500'
-                    }`}
-                    style={{ width: `${vramPercent}%` }}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
+          {/* VRAM badge — hover lists the loaded models, with unload */}
+          <VramIndicator />
 
           {/* Line count */}
           <span className="text-[10px] text-zinc-600 font-mono">

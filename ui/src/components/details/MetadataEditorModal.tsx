@@ -8,14 +8,15 @@
 
 import React, { useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { X, Image as ImageIcon, Loader2, Save } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { Song } from '../../types';
 import { songApi } from '../../services/api';
+import { events, useUpload, writeAndInvalidate } from '../../queries/writes';
 
 interface MetadataEditorModalProps {
   song: Song;
-  token: string;
   onClose: () => void;
   onSaved: (song: Song) => void;
 }
@@ -34,7 +35,7 @@ const Field: React.FC<{ label: string; value: string; onChange: (v: string) => v
   </div>
 );
 
-export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, token, onClose, onSaved }) => {
+export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, onClose, onSaved }) => {
   const { t } = useTranslation();
   const gp: any = song.generationParams || {};
   const overrides: any = (() => {
@@ -55,23 +56,20 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
   const [lyrics, setLyrics] = useState(song.lyrics || '');
   const [coverUrl, setCoverUrl] = useState(song.coverUrl || song.cover_url || '');
 
-  const [uploading, setUploading] = useState(false);
+  const queryClient = useQueryClient();
+  const { mutate: uploadCover, isPending: uploading } = useUpload<{ cover_url?: string }>();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const handleCoverFile = async (file: File) => {
-    setUploading(true); setError('');
-    try {
-      const form = new FormData();
-      form.append('image', file);
-      const res = await fetch('/api/upload/cover-image', { method: 'POST', body: form });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Upload failed');
-      const d = await res.json();
-      if (d.cover_url) setCoverUrl(d.cover_url);
-    } catch (e: any) {
-      setError(e.message || 'Cover upload failed');
-    } finally { setUploading(false); }
+  const handleCoverFile = (file: File) => {
+    setError('');
+    uploadCover({
+      path: '/upload/cover-image',
+      files: [{ field: 'image', file }],
+      onSuccess: d => { if (d.cover_url) setCoverUrl(d.cover_url); },
+      onError: e => setError(e instanceof Error && e.message ? e.message : 'Cover upload failed'),
+    });
   };
 
   const handleSave = async () => {
@@ -91,7 +89,7 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
           comment: comment.trim() || undefined,
         },
       };
-      const { song: updated } = await songApi.update(song.id, payload, token);
+      const { song: updated } = await writeAndInvalidate(queryClient, () => songApi.update(song.id, payload), events('song:written'));
       onSaved(updated);
       onClose();
     } catch (e: any) {

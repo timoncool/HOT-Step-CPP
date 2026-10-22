@@ -14,6 +14,11 @@ How to create custom solvers, schedulers, and guidance modes for the HOT-Step CP
 3. Implement the required function (`step`, `schedule`, or `guide`)
 4. Restart the app — your plugin appears in the UI automatically
 
+In a release, put your own plugins in the data folder's `plugins/` (same
+`solvers/`, `schedulers/`, `guidance/` and `postprocess/` subfolders), so they
+survive an update. The engine scans it after the shipped plugins; a plugin
+whose name matches a shipped one is skipped with a warning in the engine log.
+
 No C++ rebuild required. The engine hot-loads all `.lua` files at startup.
 
 ---
@@ -239,6 +244,14 @@ The `post_step` hook has access to the same globals as `guide()` (`step_idx`, `t
 
 The hook is **not called on the final step** (the latent is about to be decoded, so further projection is pointless).
 
+A guidance plugin that only needs `post_step()` still has to declare `guide()`. ACE and MM3 call `guide()` every step and its `result` buffer holds the previous step's velocity on entry, so a missing `guide()` leaves stale or zero velocity whenever CFG is on. Route it through native APG:
+
+```lua
+function guide(pred_cond, pred_uncond, guidance_scale, result, Oc, T, norm_threshold)
+    apg(pred_cond, pred_uncond, guidance_scale, result, Oc, T, norm_threshold)
+end
+```
+
 ---
 
 ## Parameter Schema
@@ -283,6 +296,8 @@ Parameters can be shown/hidden based on another parameter's value:
   visible_when = { key = "mode", equals = "quality" },
   hint = "Only visible when Mode is set to Quality" }
 ```
+
+> **Note:** Use string values for `equals` (e.g. `"true"`, `"2"`) for maximum compatibility. The engine also accepts Lua booleans (`true`/`false`) and numbers directly, so `equals = true` now works. Numbers are written the way JavaScript's `String()` writes them (`2`, `2.5`, `0.00001`, `1e+21`), since that is the form the UI compares against. Older builds only accept strings, so prefer strings if you distribute plugins for use with unpatched releases.
 
 ### Transform Expressions
 
@@ -343,14 +358,22 @@ Read-only arrays (like `pred_cond` and `pred_uncond` in guidance) will raise an 
 | `params` | table | Plugin parameters |
 
 **Stochastic solvers and reproducibility.** Before the first `step()` of a
-generation (and before every `sample()` of a full-loop solver) the engine calls
-`math.randomseed(seed)` on the plugin's Lua state, so `math.random()` is a pure
+generation (and before every `sample()` of a full-loop solver) the engine seeds
+the plugin's host RNG directly, so `math.random()` is a pure
 function of the job seed and identical payloads render identically. Do **not**
 re-seed from a clock or leave the RNG unseeded: the engine seeds `math.random`
 from the clock when the state is created, and plugin states live for the whole
 ace-server process, so an unseeded plugin makes every render irreproducible.
-Deriving your own stream from the `seed` global is fine (and recommended if you
-want a stream that is independent of what else the plugin drew).
+For an independent stream, call `local random_b = math.randomstream(seed_b)`.
+The returned function accepts the same arguments as `math.random` and uses a
+separate host-backed xoshiro256** state, initially equivalent to
+`math.randomseed(seed_b, 0)`. Seeds must be finite integers within JavaScript's
+safe integer range. Creating or drawing from this stream leaves the main RNG
+unchanged. Create it again at `step_index == 0` to replay a generation, and reset
+any cached Gaussian spare there too; a Lua wrapper around `math.randomseed`
+does not observe the host's direct reseed. LuaJIT's Lua bit operators are
+32-bit and `math.tointeger` is unavailable, so do not use them to emulate this
+64-bit generator.
 
 ### Guidance globals
 
@@ -361,6 +384,118 @@ want a stream that is independent of what else the plugin drew).
 | `dt` | float | Timestep delta |
 | `t_curr` | float | Current timestep |
 | `params` | table | Plugin parameters |
+
+---
+
+### `model_context` (all plugin types)
+
+Every call (solver step, scheduler, guidance, postprocess) also gets a
+`model_context` global with info about which backend is currently running:
+
+| Field | Type | ACE | MM3 | SA3 |
+|-------|------|-----|-----|-----|
+| `native_sr` | int | 48000 | 44100 | 44100 |
+| `latent_rms` | float | 2.0 | 2.35 (range 1.76-3.14) | 0.685 |
+| `model_id` | string | `"ace"` | `"mm3"` | `"sa3"` |
+
+`latent_rms` is roughly how "loud" that model's native latent space runs.
+A rms-target slider tuned against ACE's ~2.0 and pointed at SA3 unchanged
+just keeps inflating the signal past where SA3 actually settles, like a
+thermostat built for a big house bolted onto a studio apartment. Plugins
+that expose an rms-target param should scale it by `model_context.latent_rms
+/ 2.0` instead of hardcoding the ACE number. `md_solver_commons.lua` has
+the helpers: `C.rms_scale()` returns that ratio, and `C.rms_scaled(p, key,
+ace_default)` resolves a param with the convention that **`0` means "auto"**
+(scale `ace_default` by the ratio) and any nonzero value is the user's
+explicit override, used as-is.
+
+Watch the trap: in Lua, `0` is truthy, only `nil` and `false` are falsy. A
+naive `params.rms_target or default` will keep a user's `0` as `0` instead
+of treating it as "unset". Compare against `0` explicitly, the way
+`C.rms_scaled` does, rather than relying on Lua's truthiness.
+
+`model_context` is always present with sane ACE-matching defaults, so a
+plugin that never reads it behaves exactly as before.
+
+### `model_context.yue2` (YuE2 NAR solvers and schedulers only)
+
+On the YuE2 NAR path (a Lua `infer_method` or `scheduler` on `/yue2/synth`),
+`model_context.yue2` carries the song plan (the ABC score the LM wrote or the
+user supplied) plus the chunk being solved. It is `nil` on every other path
+(ACE, MM3, SA3, YuE2 postprocess), so guard with
+`local y = model_context and model_context.yue2`.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `tempo` | number | quarter-note bpm from the plan's `Q:` line, 0 if missing |
+| `meter`, `beats_per_bar` | string, int | `M:` text (e.g. `"4/4"`) and its numerator |
+| `bars` | int | vocal-voice bars (`Z4` counts as 4) |
+| `vocal_bars`, `vocal_pct` | int, number | bars with at least one sung note, and that as a percent of `bars` |
+| `total_s` | number | `bars * beats_per_bar * 60 / tempo` (0 without a tempo) |
+| `sections` | array | `{name, start_s, end_s, start_bar, end_bar}` from the plan's `% name` comment lines (lowercased, e.g. `"chorus"`, `"pre-chorus"`), empty if the plan has none |
+| `frame_rate` | number | NAR latent frames per second (25) |
+| `song`, `song_frames` | int | batch song index and its total latent frames |
+| `chunk` | table | `{index, count, start_frame, end_frame, start_s, end_s}`; index is 0-based, end is exclusive |
+
+Section times are plan time at a constant tempo; the rendered audio can run a
+little long or short of them, and a preview render (`preview_max_frames`)
+only covers the start. Schedulers run once per chunk, so a scheduler can shape
+each chunk differently:
+
+```lua
+local y = model_context and model_context.yue2
+local dense = false
+if y then
+    for _, s in ipairs(y.sections) do
+        if s.name == "chorus" and s.start_s < y.chunk.end_s and s.end_s > y.chunk.start_s then
+            dense = true
+        end
+    end
+end
+local gamma = dense and 2.5 or 1.0
+for i = 0, num_steps - 1 do output[i] = 1.0 - (i / num_steps) ^ gamma end
+```
+
+`plugins/schedulers/md_plan_aware_yue2.lua` is the full version, and it logs
+the table once per chunk.
+
+#### `plan_strength` (YuE2 NAR schedulers only)
+
+A YuE2 NAR scheduler may also set a global array `plan_strength` with one
+number per step (1-indexed, length `num_steps`). After `schedule()` returns,
+the engine reads it, clears it, and scales the plan conditioning (the AR-prefix
+V the NAR decoder attends to) by `plan_strength[i + 1]` during step `i`.
+1 = stock, below 1 loosens the plan, above 1 leans on it harder (clamped to
+0..4). If it is missing or the wrong length, the engine uses the
+`yue2:plan_w_start` / `yue2:plan_w_end` / `yue2:plan_w_curve` (linear or
+cosine) params instead, which default to 1 (off, bit-identical).
+
+```lua
+local w = {}
+for i = 0, num_steps - 1 do
+  output[i] = 1.0 - i / num_steps
+  w[i + 1] = math.min(1.0, 0.5 + i / num_steps)  -- loose early, locked later
+end
+plan_strength = w
+```
+
+`plugins/schedulers/md_plan_loose_yue2.lua` is the full version.
+
+#### Full-loop solvers on YuE2
+
+The YuE2 NAR runs `owns_loop = true` solvers through the same
+`sample(xt, vt_buf, schedule, n, model_fn)` contract as ACE, one chunk per
+call. `schedule` holds the chunk's descending `t` values (1 = noise) with no
+trailing 0, and the update after the last entry goes to `t = 0`.
+`model_fn(x, t)` writes the plan-conditioned velocity into `vt_buf`, with any
+plan strength, plan CFG and CADS applied, and `t` must lie in [0, 1]. Call
+`on_step(i, t, t_next)` after each step and return when it answers `true`: that
+is a cancel, a model error or non-finite latents, and every later `model_fn`
+call writes zeros without running the model. The latent is time-major,
+`n = frames * 64`. Multi-evaluation `step()` solvers (`needs_model` without
+`owns_loop`) are still refused on YuE2. Only names on the engine's YuE2
+allowlist run there; `docs/dev/engine.md` lists them.
+`plugins/solvers/md_tlie_yue2.lua` and `md_latent_eq_yue2.lua` are examples.
 
 ---
 
@@ -458,9 +593,14 @@ end
 
 ## Tips
 
+- **Sigma schedule has no trailing 0.** The HOT-Step engine passes the schedule to full-loop solvers without a trailing 0 entry (unlike ComfyUI). This means the schedule length equals the step count: use `n_steps = #sigmas`, not `#sigmas - 1`. With `#sigmas - 1` the loop exits one step early, the terminal x0 projection never runs, and the output keeps residual noise at the final sigma level.
 - **Test with Euler + Linear first.** The simplest solver/scheduler combination isolates your plugin's behaviour.
 - **Use `print()` for debugging.** Output goes to the terminal panel in the app.
 - **Lua tables for scratch space.** If you need temporary arrays, use Lua tables: `local tmp = {}; for i = 0, n-1 do tmp[i] = 0 end`. They're slower than FloatArrays but work for intermediate calculations.
 - **Be careful with the loop range.** FloatArrays are 0-indexed: `for i = 0, n - 1 do ... end`.
 - **Guidance plugins: always use `apg()`.** Raw math without APG produces audio artifacts. Apply your custom logic as a delta on top.
 - **Stateful plugins** can use file-level `local` variables to carry state across steps (e.g., previous velocity buffers, error accumulators). These reset when the plugin is reloaded.
+
+## Release data paths
+
+In releases, install user Lua plugins under `<data folder>/plugins`, retaining category subdirectories. The engine scans shipped plugins first and the user overlay last, so matching plugin names in the overlay take precedence. Migration preserves plugins that the new build does not ship. See [Data folder and upgrades](../user/data-folder.md).

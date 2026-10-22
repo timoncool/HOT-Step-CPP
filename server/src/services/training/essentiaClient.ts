@@ -44,6 +44,25 @@ export function essentiaKeyString(key: string, scale: string): string {
   return titled ? `${key} ${titled}` : key;
 }
 
+export interface EssentiaTempoBounds { minTempo?: number; maxTempo?: number }
+
+/** The extractor accepts these as rhythm profile keys; omit the profile for defaults. */
+export function essentiaTempoProfile(bounds?: EssentiaTempoBounds): string | null {
+  if (!bounds || (bounds.minTempo === undefined && bounds.maxTempo === undefined)) return null;
+  const min = bounds.minTempo, max = bounds.maxTempo;
+  if (min !== undefined && (!Number.isInteger(min) || min < 40 || min > 180)) throw new Error('Essentia minTempo must be 40–180 BPM');
+  if (max !== undefined && (!Number.isInteger(max) || max < 60 || max > 250)) throw new Error('Essentia maxTempo must be 60–250 BPM');
+  if (min !== undefined && max !== undefined && min >= max) throw new Error('Essentia minTempo must be below maxTempo');
+  return `rhythm:\n${min === undefined ? '' : `  minTempo: ${min}\n`}${max === undefined ? '' : `  maxTempo: ${max}\n`}`;
+}
+
+/** Prefer an embedded tempo only when it resolves an Essentia octave error. */
+export function reconcileEssentiaBpm(essentia: number | null, tag: number | null): number | null {
+  if (essentia === null || tag === null || !Number.isFinite(essentia) || !Number.isFinite(tag) || essentia <= 0 || tag <= 0) return essentia;
+  if (Math.abs(tag - essentia / 2) <= 2 || Math.abs(tag - essentia * 2) <= 2) return tag;
+  return essentia;
+}
+
 function run(bin: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile(bin, args, { timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, signal }, (error) => {
@@ -64,11 +83,13 @@ function run(bin: string, args: string[], timeoutMs: number, signal?: AbortSigna
 export async function analyzeWithEssentia(
   audioPath: string,
   signal?: AbortSignal,
+  tempoBounds?: EssentiaTempoBounds,
 ): Promise<EssentiaResult | null> {
   if (!essentiaAvailable()) return null;
 
   const stamp = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const tmpJson = path.join(os.tmpdir(), `hs_training_essentia_${stamp}.json`);
+  const tmpProfile = path.join(os.tmpdir(), `hs_training_essentia_${stamp}.yaml`);
   let tmpWav: string | null = null;
   let inputPath = audioPath;
 
@@ -89,7 +110,9 @@ export async function analyzeWithEssentia(
       inputPath = tmpWav;
     }
 
-    await run(config.essentia.bin, [inputPath, tmpJson], 120_000, signal);
+    const profile = essentiaTempoProfile(tempoBounds);
+    if (profile) fs.writeFileSync(tmpProfile, profile);
+    await run(config.essentia.bin, profile ? [inputPath, tmpJson, tmpProfile] : [inputPath, tmpJson], 120_000, signal);
     if (!fs.existsSync(tmpJson)) return null;
 
     const data = JSON.parse(fs.readFileSync(tmpJson, 'utf-8')) as any;
@@ -118,6 +141,7 @@ export async function analyzeWithEssentia(
     return null;
   } finally {
     try { fs.unlinkSync(tmpJson); } catch { /* never existed */ }
+    try { fs.unlinkSync(tmpProfile); } catch { /* no custom tempo profile */ }
     if (tmpWav) { try { fs.unlinkSync(tmpWav); } catch { /* never existed */ } }
   }
 }

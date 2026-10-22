@@ -179,6 +179,10 @@ struct HotStepParams {
     // since the base is typically already 4-bit (NVFP4). Runtime mode only.
     std::string adapter_runtime_quant = "bf16";
 
+    // Opt-in DoRA fix: materialize merge-equivalent effective runtime deltas.
+    // False preserves the legacy runtime result, including section/gain paths.
+    bool adapter_runtime_dora = false;
+
     // Multi-adapter stack. When non-empty, supersedes the single adapter_path
     // passed to dit_ggml_load: every entry is applied with its own scale —
     // merged sequentially into the base weights (merge mode) or summed into the

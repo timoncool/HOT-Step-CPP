@@ -1,10 +1,14 @@
+import { useQueryClient } from '@tanstack/react-query';
+import { useStudioSongs } from '../../queries/studios/shared';
+import { sharedKeys } from '../../queries/keys';
+import { queryManager } from '../../queries/invalidation';
 // RecentBuilds.tsx — Recent stem builds sidebar section
 //
 // Fetches recent songs generated via Stem Builder (source = 'stem-builder')
 // and displays them in a compact list. Each item can be played or used as
 // a new source for iterative composition.
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Play, ArrowUp, Trash2 } from 'lucide-react';
 import { songApi } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
@@ -37,15 +41,13 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
   onUseAsSource,
 }) => {
   const { token } = useAuth();
-  const [builds, setBuilds] = useState<RecentBuild[]>([]);
-  const [loading, setLoading] = useState(false);
+  const client = useQueryClient();
+  const songsQuery = useStudioSongs();
+  const loading = songsQuery.isPending;
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const loadBuilds = useCallback(async () => {
-    if (!token) return;
-    setLoading(true);
-    try {
-      const { songs } = await songApi.list(token);
+  const builds = useMemo(() => {
+      const songs = songsQuery.data?.songs ?? [];
       // Filter to stem-builder generations by checking generation_params
       const stemBuilds = songs
         .filter((s: any) => {
@@ -75,15 +77,11 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
             createdAt: s.created_at,
           };
         });
-      setBuilds(stemBuilds);
-    } catch (err) {
-      console.error('[RecentBuilds] Failed to load:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, [token]);
-
-  useEffect(() => { loadBuilds(); }, [loadBuilds, refreshTrigger]);
+      return stemBuilds;
+  }, [songsQuery.data]);
+  useEffect(() => {
+    if (refreshTrigger) void queryManager.keys(client, sharedKeys.songs());
+  }, [client, refreshTrigger]);
 
   /** Delete a build. A stem build is an ordinary song row (source
    *  'stem-builder'), so the normal song delete removes the DB row and the
@@ -93,19 +91,22 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
     if (!token) return;
     if (!window.confirm(`Delete "${build.title}"? This removes the audio file too.`)) return;
     setDeletingId(build.id);
-    // Drop it from the list first so the sidebar feels immediate; a failure
-    // puts it back via the reload below.
-    setBuilds(prev => prev.filter(b => b.id !== build.id));
     try {
-      await songApi.delete(build.id, token);
+      const key = sharedKeys.songs();
+      await client.cancelQueries({ queryKey: key });
+      await songApi.delete(build.id);
+      await client.cancelQueries({ queryKey: key });
+      client.setQueryData<typeof songsQuery.data>(key, data => data && ({ ...data, songs: data.songs.filter(song => song.id !== build.id) }));
+      client.removeQueries({ queryKey: sharedKeys.song(build.id) });
+      await queryManager.keys(client, key);
     } catch (err) {
       console.error('[RecentBuilds] Delete failed:', err);
-      loadBuilds();
     } finally {
       setDeletingId(null);
     }
-  }, [token, loadBuilds]);
+  }, [token, client]);
 
+  if (songsQuery.error) return <div role="alert">{songsQuery.error.message}</div>;
   if (loading && builds.length === 0) {
     return (
       <div className="text-xs text-zinc-600 p-3 text-center">Loading...</div>

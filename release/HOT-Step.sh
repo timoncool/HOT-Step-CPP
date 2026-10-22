@@ -16,15 +16,16 @@ echo ""
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export HOT_STEP_ROOT="$DIR"
 
-# Create models directory if it doesn't exist (first run)
-mkdir -p "$DIR/models"
+# Restart state belongs to the profile, independent of the active data folder.
+RESTART_MARKER="$("$DIR/runtime/bin/node" "$DIR/profile-path.mjs")" || exit 1
+[ -n "$RESTART_MARKER" ] || exit 1
 
 # Open browser after a short delay (desktop only — silent on headless)
 if [ "$(uname)" = "Darwin" ]; then OPENER=open; else OPENER=xdg-open; fi
 (sleep 5 && "$OPENER" "http://localhost:3001" 2>/dev/null) &
 
 # ── Restart loop ──────────────────────────────────────────
-# The server writes .restart-requested when the user clicks
+# The server writes the profile restart marker when the user clicks
 # "Restart" in the UI. After node exits, we check for the
 # marker — if it exists, we delete it and relaunch.
 while true; do
@@ -33,8 +34,8 @@ while true; do
     "$DIR/runtime/bin/node" "$DIR/server/server.mjs"
 
     # Check for restart marker
-    if [ -f "$DIR/.restart-requested" ]; then
-        rm "$DIR/.restart-requested"
+    if [ -f "$RESTART_MARKER" ]; then
+        rm "$RESTART_MARKER"
         echo ""
         echo "[HOT-Step] Restarting..."
         echo ""

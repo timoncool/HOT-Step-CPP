@@ -9,21 +9,50 @@ Builds a labeled dataset from your own audio and trains a style adapter on it, e
 
 The "Training" entry in the sidebar (`/training-studio`). Labeling with local BPM/key analysis works even if the engine is down; AI captioning needs either the local MOSS captioner or a configured cloud LLM provider (Settings > AI Services); preprocessing and training need the `ace-train` binary bundled with the app.
 
-Training follows whichever generation backend is active (ACE-Step, MiniMax-Music3, or YuE2). A pill next to the title names it when more than one backend is available, and the phases below change shape with it. Switch backends from the pill in the top bar, not from inside this studio.
+Training follows whichever generation backend is active (ACE-Step, MiniMax-Music3, or YuE2). A pill next to the title names it when more than one backend is available, and the phases below change shape with it. Switch backends from the engine picker at the top of the sidebar, not from inside this studio.
 
 An external agent (Claude Code, Codex) can also drive the dataset and training pipeline through the `hotstep` MCP server. See [Driving HOT-Step with an agent](../mcp.md).
+
+## Preparing your files
+
+The folder you point the studio at is the source of truth: audio files live there, and each track's metadata lives in a small text **sidecar** next to it. Nothing is cached — edit or delete a sidecar on disk and the studio reflects that change. On first scan a track with no usable caption shows as **unlabeled**; the Label step fills in captions, lyrics and BPM/key for you, but you can also author sidecars by hand to skip it.
+
+**Supported audio:** `.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`. When several files share a base name (e.g. `song.flac` and `song.mp3`), only one is kept, in this priority order: `.flac` > `.wav` > `.m4a` > `.aac` > `.ogg` > `.opus` > `.mp3`.
+
+For a track at `…/MyArtist/song.wav`, the studio looks for sidecars beside it and uses the first convention that matches, in this order:
+
+1. **Single sidecar** — `song.txt` with one `key: value` per line. The six recognised keys are `caption`, `genre`, `bpm`, `key`, `signature`, `is_instrumental`; everything after a `lyrics:` line is taken verbatim as the lyric. A track counts as labeled as soon as this file has a `caption:` line:
+   ```
+   caption: dreamy lo-fi beat, soft vinyl crackle, warm bass
+   genre: lofi hip hop
+   bpm: 82
+   key: F# minor
+   signature: 4/4
+   is_instrumental: true
+   lyrics: [verse]
+   ...
+   ```
+   Only `caption` and `lyrics` matter for labeling; the rest are optional.
+2. **Split files** — `song.caption.txt` holds the caption (its whole contents) and `song.lyrics.txt` holds the lyrics. Used when there is no usable single sidecar.
+3. **Lyrics-only** — a bare `song.txt` with no `key: value` lines is read as plain lyrics, so the track has lyrics but still no caption and stays unlabeled until one is added.
+
+**How a caption is found:** a track's caption is the `caption:` line from its single sidecar, or the whole contents of a `song.caption.txt` file — whichever exists first. If neither is present the track has no caption and shows as **unlabeled**; that is what the Label step generates (an AI caption for style/genre, Genius for lyrics, Essentia for BPM/key).
+
+**File names with dots:** a sidecar's base name is the audio file minus its final extension, so `feat. jo.smith.wav` pairs with `feat. jo.smith.txt` — only the last dot (the extension) is stripped.
+
+Some backends also read a model-specific caption sidecar beside the generic ones above: `<name>.mm3.txt` for MiniMax-Music3's structured caption and `<name>.yue2.txt` for YuE2's planner sentence.
 
 ## Workflow
 
 1. Click **New dataset**, pick a source folder (recursively scanned by default), and confirm the auto-filled name, trigger word, and lyric language. HOT-Step scans the folder and shows a preview (file count, extensions, whether a `dataset.json` already exists) before anything is created.
    If another dataset already uses that trigger, HOT-Step appends this dataset's slug suffix; the resulting trigger appears on its card so the two datasets stay distinct.
-2. On the **Label** step, run local analysis: Essentia for BPM/key, Genius for lyrics, and an AI caption (local MOSS, or a configured cloud provider) for style and genre. Scope the run to unlabeled tracks, all tracks, or a grid selection, and choose a merge policy for tracks that already have partial data.
-3. On the **Review** step, check and hand-edit every track in a spreadsheet-style grid: caption, genre, BPM, key, time signature, language, instrumental flag, lyrics, per-track trigger tag, and an exclude checkbox. Select rows for bulk edits or a scoped re-label.
+2. On the **Label** step, run local analysis: Essentia for BPM/key, Genius for lyrics, and an AI caption (local MOSS, or a configured cloud provider) for style and genre. Optional minimum and maximum tempo fields narrow Essentia's search range for this run; blank fields keep its defaults. If a file's embedded BPM tag is half or double Essentia's estimate, the tag resolves that tempo ambiguity; otherwise Essentia's estimate is kept. Scope the run to unlabeled tracks, all tracks, or a grid selection, and choose a merge policy for tracks that already have partial data.
+3. On the **Review** step, check and hand-edit every track in a spreadsheet-style grid: caption, genre, BPM, key, time signature, language, instrumental flag, lyrics, per-track trigger tag, and an exclude checkbox. The BPM cell has ½ and 2× buttons to correct a detected half or double tempo; the changed value saves like a typed edit before you build the dataset. Select rows for bulk edits or a scoped re-label.
 4. On the **Build** step, set the trigger word's position in the caption (prepend, append, replace) and a genre-mix ratio, then build. This writes `dataset.json` next to the audio, in the same format Side-Step's own dataset builder produces.
 5. Move to **Preprocess** (ACE) or **Codes** (MiniMax-Music3): pick the base DiT/VAE/text-encoder models and how much of each track to encode, then start. This runs in the standalone `ace-train` binary, which needs the GPU to itself, so the app stops the local engine for the duration and restarts it afterward. Under YuE2 this phase is **Prepare**: the latent cache, semantic codes, lead sheets and (with lyric timing on) the vocal stems and alignment, with a **Perform all stages** button that runs whichever are missing.
 6. YuE2 only: **Optimise** takes optional measurements of the prepared album before training, saved in the dataset folder as `_hotstep-optimisation.json` (see [YuE2 training](../training/yue2.md#optimise-optional)).
 7. Move to **Train** and start a run. ACE offers two adapter cards, a planner LoRA (LM) and a sound LoRA (DiT); MiniMax-Music3 trains a single planner LoRA from RVQ codes; YuE2 trains the planner and decoder adapters together; its **Perform all stages** button runs any missing preparation first, then training. Each form shows only the handful of settings that change what gets trained; everything else sits behind an Advanced drawer.
-8. Watch the run: a live loss chart and stats update as it trains, and periodic milestone checkpoints appear as badges once the run has enough epochs behind it. YuE2 checkpoint loss labels show the mean of up to 20 logged steps through that checkpoint.
+8. Watch the run: a live loss chart and stats update as it trains, and saved milestone checkpoints appear as badges. YuE2 shows separate AR and NAR charts by step, side by side or stacked in a narrow window. Its checkpoint loss labels show the mean of up to 20 logged steps through that checkpoint.
 9. Use **Audition** to A/B the trained planner against the base model on identical caption, lyrics, and seed, decoded straight through without the DiT. Optionally render both sides through the DiT too for a fuller comparison. Click a milestone badge to audition that checkpoint directly.
 10. For YuE2 only, every run's checkpoint ladder is previewed and scored on the Train page (see [YuE2 training](../training/yue2.md#picking-the-adapter)), and **Review** lists every dataset with a ladder still to score. The older **Refine** phase (KL-rung refinement of the earlier recipe) is hidden; Review still opens its ladders.
 11. Use **Import multiple…** from the dataset list to queue several source folders through label, build, and (for ACE) preprocess and train in one unattended run; the **Monitor** phase shows its progress as a queue of datasets, each with a chip per pipeline stage. This is separate from YuE2's own **Train multiple…**, which runs preparation, joint training and refinement over several already-created datasets instead.
@@ -60,6 +89,8 @@ recipe, an untouched field keeps following it and only fields you actually chang
 | Preprocess / Codes form | Base model pickers plus an Advanced drawer for encoding settings; MiniMax-Music3 shows an RVQ codes export instead, including an optional cover-laundering pass for dense mixes. |
 | LM card / DiT card (Train) | Adapter name, a handful of always-visible settings, an Advanced drawer, and a Start button. Running shows a live chart, stats, and a done-state summary with the adapter's output path once finished. |
 | Training GPU (YuE2 Joint Training) | On NVIDIA builds, pick a card for this run or use the GPU selected in Settings. The choice applies to the training child; see [YuE2 training](../training/yue2.md#recommended-settings). |
+| AR (stage 1) / NAR (stage 2) charts (YuE2) | "Stage 1 writes the song's coarse token plan from lyrics and tags." "Stage 2 turns stage 1's tokens into fine audio detail." Joint runs show AR CE and KL vs base on the AR side, Decoder loss and Reconstruction on the NAR side. See [Reading the training charts](../training/yue2.md#reading-the-training-charts) for the metrics and stop readings. |
+| More (YuE2 charts) | Reveals extra series controls: Cursor CE and Learning rate on the joint AR side, Drift and Learning rate on the joint NAR side. Grad norm appears once below the pair for joint runs, alongside step count, Pace and VRAM when recorded. |
 | Milestone badges | Appear once a run has saved checkpoints; click one to audition that checkpoint. |
 | Audition card | Same-seed A/B between the base planner and the trained adapter, with an optional DiT render pass. |
 | Send to Lyric Studio (Build step) | Exports the dataset's artist/album metadata into Lyric Studio, optionally linking the dataset's trained adapters and a reference track as that album's generation preset. |
@@ -87,6 +118,12 @@ Side-Step is a separate, more comprehensive Python training suite by the same au
 
 <!-- TODO(verify): confirm whether a dataset's audio files are required to stay in their original source folder after Build/Preprocess/Train, or whether the folder can be moved once dataset.json and any tensor caches exist. -->
 <!-- TODO(verify): confirm whether the generation-side adapter picker reads the adapter folder live or needs a refresh/restart after a training run finishes. -->
+
+Dataset and training-status views keep results separate for each **Train on**
+target. Switching workers does not cancel the job on the previous worker.
+Run indexes, mirrored previews and review records remain local to this PC.
+Active job status refreshes while work runs and stops at a terminal state;
+returning to Train, Review or Refine does not repeat a start or audition command.
 
 ## Related
 

@@ -1,5 +1,9 @@
 # Validating Changes — Reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Deep detail backing [SKILL.md](SKILL.md). All paths/line refs verified against the
 repo on 2026-07-02. Line numbers drift as code changes — treat them as anchors,
 re-verify before relying on exact positions.
@@ -106,13 +110,13 @@ totalMs? }`.
 
 ## 6. Output files
 
-**Live data dir = `server\data`** — `config.data.dir = path.resolve(__dirname, '..',
+**Live data dir = `<data root>/library`** — `config.data.dir = path.resolve(__dirname, '..',
 DATA_DIR='./data')` with `__dirname = server/src` under tsx
 (`server/src/config.ts:191-199`). The repo-root `data\` directory exists but is
 stale/legacy (last touched 2026-06-04 at verification time). Never verify outputs
 against root `data\`.
 
-Per successful track, written into `server\data\audio\` (`generate.ts:839-1034`):
+Per successful track, written into `<data root>/library\audio\` (`generate.ts:839-1034`):
 
 | File | When |
 |---|---|
@@ -122,7 +126,7 @@ Per successful track, written into `server\data\audio\` (`generate.ts:839-1034`)
 | `<uuid>_mastered.wav` | only if post-processing/mastering enabled |
 | `<uuid>.lyrics.json` | only if Whisper transcription enabled |
 
-DB: row inserted into `songs` in `server\data\hotstep.db`
+DB: row inserted into `songs` in `<data root>/library\hotstep.db`
 (`generate.ts:1152-1161`); `generation_params` column holds the full request params
 JSON (your reproduction recipe), `quality_scores` holds advisory evaluator telemetry.
 
@@ -131,7 +135,7 @@ JSON (your reproduction recipe), `quality_scores` holds advisory evaluator telem
 Session folders (`server/src/services/logger.ts:40-58`), name-sorted = time-sorted:
 
 ```
-logs/YYYY-MM-DD_HH-MM-SS/
+<data root>/logs/YYYY-MM-DD_HH-MM-SS/
   ├── node_console.log                        # all Node stdout/stderr, mirrored
   ├── ace_engine.log                          # ace-server (C++ engine) stdout/stderr
   └── generations/gen_<jobId>_<taskType>.log  # per-generation, flushed ON COMPLETION
@@ -148,7 +152,7 @@ logs/YYYY-MM-DD_HH-MM-SS/
 - Failure triage order: matching `gen_*.log` → cross-ref `ace_engine.log` +
   `node_console.log`. Startup/crash issues: `node_console.log` + `ace_engine.log`.
 - Clean engine start looks like (verified against a real session log,
-  `logs/2026-07-01_12-21-25/ace_engine.log`): model registry scan lines
+  `<data root>/logs/2026-07-01_12-21-25/ace_engine.log`): model registry scan lines
   (`[Server] Scanning models in ...`, `[Registry] ... -> DiT/LM/Text-Enc`), then
   `[Server] Listening on 127.0.0.1:8085`, with no exception in between.
 
@@ -198,6 +202,6 @@ tested **with the LM phase on** (omit `skipLm`) to prove the param reaches
 - No live smoke generation was run while authoring this reference (app not
   confirmed running at the time). The request/poll flow is derived from code
   (`generate.ts`, `translateParams.ts`, `auth.ts`); the log and output shapes were
-  confirmed against real 2026-07-01 session logs and actual `server\data\audio`
+  confirmed against real 2026-07-01 session logs and actual `<data root>/library\audio`
   contents. If a live smoke contradicts this document, trust the live run and
   update this file.

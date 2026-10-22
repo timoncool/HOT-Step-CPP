@@ -515,6 +515,29 @@ async function renderPreviewSet(
   }
 }
 
+/** Point the dataset's album presets at the run's final checkpoint, unless the
+ *  job opted out (`updateLinkedPresets: false`, for test runs). Deps are
+ *  injectable so the on/off cases can be tested without a database. */
+export function refreshLinkedMm3Presets(
+  job: TrainingJob, opts: { updateLinkedPresets?: boolean }, finalCkpt: string | undefined,
+  deps = { refresh: refreshMm3PresetsForNewRun, lookup: getDataset },
+): void {
+  if (!finalCkpt) return;
+  if (opts.updateLinkedPresets === false) {
+    log(job, 'info', 'Update linked album presets is off: album presets left as they were.');
+    return;
+  }
+  const weights = path.join(finalCkpt, 'adapter_model.safetensors');
+  const rel = path.relative(mm3AdapterRoot(), weights);
+  if (!fs.existsSync(weights) || !rel || rel.startsWith('..') || path.isAbsolute(rel)) return;
+  const dsRow = deps.lookup(job.datasetId);
+  const touched = deps.refresh({ slug: dsRow?.slug || '', lyricsSetId: dsRow?.lyricsSetId }, rel);
+  if (touched) {
+    log(job, 'info', `${touched} Lyric Studio album preset(s) now use this run's final checkpoint.`);
+    pushLog(`[Training] mm3-train-lm job ${job.id}: ${touched} album preset(s) updated to ${rel}`);
+  }
+}
+
 export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
   const opts = job.opts as ResolvedMm3TrainLmOptions | undefined;
   if (!opts?.manifest || !opts.codesDir || !opts.outDir) {
@@ -705,18 +728,7 @@ export async function runMm3TrainLmJob(job: TrainingJob): Promise<void> {
       // Album presets follow the newest run (2026-09-11), as the ACE trainers'
       // presets do: the dataset's exported lyrics set, and any preset already
       // on an older run of this dataset, now point at the final checkpoint.
-      if (finalCkpt) {
-        const weights = path.join(finalCkpt, 'adapter_model.safetensors');
-        const rel = path.relative(mm3AdapterRoot(), weights);
-        if (fs.existsSync(weights) && rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
-          const dsRow = getDataset(job.datasetId);
-          const touched = refreshMm3PresetsForNewRun({ slug: dsRow?.slug || '', lyricsSetId: dsRow?.lyricsSetId }, rel);
-          if (touched) {
-            log(job, 'info', `${touched} Lyric Studio album preset(s) now use this run's final checkpoint.`);
-            pushLog(`[Training] mm3-train-lm job ${job.id}: ${touched} album preset(s) updated to ${rel}`);
-          }
-        }
-      }
+      refreshLinkedMm3Presets(job, opts, finalCkpt);
       // Reaching here means the run ENDED (step cap or target loss); a cancel,
       // a pause or a crash never gets this far, so their state survives for a
       // continuation. A finished run's optimizer state (~4.2 GB at r128) is

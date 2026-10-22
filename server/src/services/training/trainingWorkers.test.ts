@@ -6,7 +6,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { config } from '../../config.js';
-import { listWorkers, resolveDatasetFile } from './trainingWorkers.js';
+import express from 'express';
+import type { Server } from 'node:http';
+import { listWorkers, resolveDatasetFile, TOKEN_HEADER, workerTokenGate } from './trainingWorkers.js';
 import { labelsDir } from './paths.js';
 
 test('pushed file paths stay inside the dataset or its labels folder', () => {
@@ -359,5 +361,28 @@ test('pullLinked rejects traversal in a linked pair\'s jobId or log seg', () => 
     runPullInIsolatedRoot(root, script);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test('the worker token gate trusts direct loopback, not a LAN browser forwarded over loopback by the dev proxy', async () => {
+  const saved = config.workers.acceptToken;
+  config.workers.acceptToken = 'secret';
+  const app = express();
+  app.use('/api', workerTokenGate);
+  app.get('/api/ping', (_req, res) => { res.json({ ok: true }); });
+  const server: Server = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/ping`;
+  // Headers as Vite's proxy (xfwd) sends them: any client value, then the client's address.
+  const status = async (headers: Record<string, string> = {}) => (await fetch(url, { headers })).status;
+  try {
+    assert.equal(await status(), 200, 'direct loopback');
+    assert.equal(await status({ 'x-forwarded-for': '127.0.0.1' }), 200, 'browser on the worker via :3000');
+    assert.equal(await status({ 'x-forwarded-for': '192.168.1.20' }), 401, 'LAN browser via :3000');
+    assert.equal(await status({ 'x-forwarded-for': '127.0.0.1,192.168.1.20' }), 401, 'LAN browser spoofing a loopback hop');
+    assert.equal(await status({ 'x-forwarded-for': '192.168.1.20', [TOKEN_HEADER]: 'secret' }), 200, 'LAN browser with the token');
+  } finally {
+    config.workers.acceptToken = saved;
+    await new Promise<void>(r => server.close(() => r()));
   }
 });

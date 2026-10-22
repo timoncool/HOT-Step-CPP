@@ -1,0 +1,3651 @@
+﻿<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd"[]>
+<score-partwise version="3.0">
+  <work>
+    <work-title>Kyrie</work-title>
+  </work>
+  <identification>
+    <creator type="composer">Music by Mark Feezell / DrFeezell.com
+Text from the Mass Ordinary</creator>
+    <creator type="lyricist">Mark Feezell</creator>
+    <rights>Composed 2003 by Mark Feezell / DrFeezell.com. Dedicated to the Public Domain (CC0 1.0) 2024. 
+No use restrictions whatsoever. Visit DrFeezell.com for the latest editions and updates. </rights>
+    <encoding>
+      <encoding-date>2024-03-16</encoding-date>
+      <encoder>Feezell, Mark</encoder>
+      <software>Sibelius 23.11.1</software>
+      <software>Direct export, not from Dolet</software>
+      <encoding-description>Sibelius / MusicXML 3.0</encoding-description>
+      <supports element="print" type="yes" value="yes" attribute="new-system" />
+      <supports element="print" type="yes" value="yes" attribute="new-page" />
+      <supports element="accidental" type="yes" />
+      <supports element="beam" type="yes" />
+      <supports element="stem" type="yes" />
+    </encoding>
+  </identification>
+  <defaults>
+    <scaling>
+      <millimeters>215.9</millimeters>
+      <tenths>1330</tenths>
+    </scaling>
+    <page-layout>
+      <page-height>1721</page-height>
+      <page-width>1330</page-width>
+      <page-margins type="both">
+        <left-margin>78</left-margin>
+        <right-margin>109</right-margin>
+        <top-margin>85</top-margin>
+        <bottom-margin>85</bottom-margin>
+      </page-margins>
+    </page-layout>
+    <system-layout>
+      <system-margins>
+        <left-margin>45</left-margin>
+        <right-margin>0</right-margin>
+      </system-margins>
+      <system-distance>92</system-distance>
+    </system-layout>
+    <appearance>
+      <line-width type="stem">0.9375</line-width>
+      <line-width type="beam">5</line-width>
+      <line-width type="staff">0.9375</line-width>
+      <line-width type="light barline">1.5625</line-width>
+      <line-width type="heavy barline">5</line-width>
+      <line-width type="leger">1.5625</line-width>
+      <line-width type="ending">1.5625</line-width>
+      <line-width type="wedge">1.25</line-width>
+      <line-width type="enclosure">0.9375</line-width>
+      <line-width type="tuplet bracket">1.25</line-width>
+      <line-width type="bracket">5</line-width>
+      <line-width type="dashes">1.5625</line-width>
+      <line-width type="extend">0.9375</line-width>
+      <line-width type="octave shift">1.5625</line-width>
+      <line-width type="pedal">1.5625</line-width>
+      <line-width type="slur middle">1.5625</line-width>
+      <line-width type="slur tip">0.625</line-width>
+      <line-width type="tie middle">1.5625</line-width>
+      <line-width type="tie tip">0.625</line-width>
+      <note-size type="cue">75</note-size>
+      <note-size type="grace">60</note-size>
+    </appearance>
+    <music-font font-family="Opus Std" font-size="18.4025" />
+    <word-font font-family="Times New Roman" font-size="11.0703" />
+    <lyric-font font-family="Times New Roman" font-size="11.0703" />
+    <lyric-language xml:lang="en" />
+  </defaults>
+  <credit page="1">
+    <credit-words default-x="680" default-y="79" font-family="Times New Roman" font-style="italic" font-size="20.4153" font-weight="normal" justify="center" valign="middle">Kyrie</credit-words>
+  </credit>
+  <credit page="1">
+    <credit-words default-x="1252" default-y="93" font-family="Times New Roman" font-style="normal" font-size="10.2076" font-weight="normal" justify="right" valign="middle">Music by Mark Feezell / DrFeezell.com
+Text from the Mass Ordinary</credit-words>
+  </credit>
+  <credit page="1">
+    <credit-words default-x="680" default-y="75" font-family="Times New Roman" font-style="normal" font-size="9.345" font-weight="normal" justify="center" valign="middle">Composed 2003 by Mark Feezell / DrFeezell.com. Dedicated to the Public Domain (CC0 1.0) 2024. 
+No use restrictions whatsoever. Visit DrFeezell.com for the latest editions and updates. </credit-words>
+  </credit>
+  <credit page="2">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">1</credit-words>
+  </credit>
+  <credit page="3">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">2</credit-words>
+  </credit>
+  <credit page="4">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">3</credit-words>
+  </credit>
+  <credit page="5">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">4</credit-words>
+  </credit>
+  <credit page="6">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">5</credit-words>
+  </credit>
+  <credit page="7">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">6</credit-words>
+  </credit>
+  <credit page="8">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">7</credit-words>
+  </credit>
+  <credit page="9">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">8</credit-words>
+  </credit>
+  <credit page="10">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">9</credit-words>
+  </credit>
+  <credit page="11">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">10</credit-words>
+  </credit>
+  <credit page="12">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">11</credit-words>
+  </credit>
+  <credit page="13">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">12</credit-words>
+  </credit>
+  <credit page="14">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">13</credit-words>
+  </credit>
+  <credit page="15">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">14</credit-words>
+  </credit>
+  <credit page="16">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">15</credit-words>
+  </credit>
+  <credit page="17">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">16</credit-words>
+  </credit>
+  <credit page="18">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">17</credit-words>
+  </credit>
+  <credit page="19">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">18</credit-words>
+  </credit>
+  <credit page="20">
+    <credit-words default-x="1330" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">19</credit-words>
+  </credit>
+  <credit page="21">
+    <credit-words default-x="0" default-y="1721" font-style="normal" font-weight="normal" justify="left" valign="middle">20</credit-words>
+  </credit>
+  <credit page="20">
+    <credit-words default-x="148" default-y="1341" font-family="Times New Roman" font-style="normal" font-size="11.0703" font-weight="normal" justify="left" valign="middle" enclosure="rectangle">Kyrie Performance Notes / Program Notes: 
+
+Kyrie is a 6 minute composition for SATB chorus (with occasional divisi) and piano
+based on the texts of the Kyrie and Agnus Dei from the Ordinary of the Mass.
+
+The texts and translation are as follows:
+
+Kyrie eleison.
+Christe eleison.
+Agnus Dei, qui tollis peccata mundi,
+miserere nobis. Dona nobis pacem.
+Kyrie eleison.
+
+Lord, have mercy on us.
+Christ, have mercy on us.
+Lamb of God, who takes away the sins of the world,
+Have mercy on us. Grant us peace.
+Lord, have mercy on us.
+
+The setting for "Dona nobis pacem" stands in stark contrast to the tranquility
+traditionally associated with that text. It seemed appropriate to the composer to set
+the texts as though the penitents have not received the peace they seek. After all, 
+if they had, why would they still plead for it? In this sense, Kyrie continues the
+tradition of certain Psalms, ending in anticipation of a divine response. </credit-words>
+  </credit>
+  <part-list>
+    <part-group type="start" number="1">
+      <group-symbol>bracket</group-symbol>
+    </part-group>
+    <score-part id="P1">
+      <part-name>P1</part-name>
+      <part-abbreviation>S.</part-abbreviation>
+      <part-abbreviation-display>
+        <display-text>S.</display-text>
+      </part-abbreviation-display>
+      <score-instrument id="P1-I1">
+        <instrument-name>Soprano (2)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Soprano Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+      <score-instrument id="P1-I2">
+        <instrument-name>Soprano (3)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Soprano Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+    </score-part>
+    <score-part id="P2">
+      <part-name>P2</part-name>
+      <part-abbreviation>A.</part-abbreviation>
+      <part-abbreviation-display>
+        <display-text>A.</display-text>
+      </part-abbreviation-display>
+      <score-instrument id="P2-I1">
+        <instrument-name>Alto (2)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Alto Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+      <score-instrument id="P2-I2">
+        <instrument-name>Alto (3)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Alto Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+    </score-part>
+    <score-part id="P3">
+      <part-name>P3</part-name>
+      <part-abbreviation>T.</part-abbreviation>
+      <part-abbreviation-display>
+        <display-text>T.</display-text>
+      </part-abbreviation-display>
+      <score-instrument id="P3-I1">
+        <instrument-name>Tenor (2)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Tenor Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+      <score-instrument id="P3-I2">
+        <instrument-name>Tenor (3)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Tenor Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+    </score-part>
+    <score-part id="P4">
+      <part-name>P4</part-name>
+      <part-abbreviation>B.</part-abbreviation>
+      <part-abbreviation-display>
+        <display-text>B.</display-text>
+      </part-abbreviation-display>
+      <score-instrument id="P4-I1">
+        <instrument-name>Bass (2) (2)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Bass Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+      <score-instrument id="P4-I2">
+        <instrument-name>Bass (2) (3)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Bass Ensemble</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+    </score-part>
+    <part-group type="stop" number="1" />
+    <part-group type="start" number="2">
+      <group-symbol>brace</group-symbol>
+    </part-group>
+    <score-part id="P5">
+      <part-name>P5</part-name>
+      <score-instrument id="P5-I1">
+        <instrument-name>Piano (2) (2)</instrument-name>
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+        </virtual-instrument>
+      </score-instrument>
+      <score-instrument id="P5-I2">
+        <instrument-name>Piano (3)</instrument-name>
+        <instrument-sound>keyboard.piano.grand</instrument-sound>
+        <solo />
+        <virtual-instrument>
+          <virtual-library>General MIDI</virtual-library>
+          <virtual-name>Acoustic Piano</virtual-name>
+        </virtual-instrument>
+      </score-instrument>
+    </score-part>
+    <part-group type="stop" number="2" />
+  </part-list>
+  <part id="P1">
+    <!--============== Part: P1, Measure: 1 ==============-->
+    <measure number="1" width="1008">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>133</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+          <top-system-distance>63</top-system-distance>
+        </system-layout>
+        <part-name-display>
+          <display-text>SOPRANO</display-text>
+        </part-name-display>
+        <part-abbreviation-display>
+          <display-text>S.</display-text>
+        </part-abbreviation-display>
+      </print>
+      <attributes>
+        <divisions>256</divisions>
+        <key color="#000000">
+          <fifths>0</fifths>
+          <mode>minor</mode>
+        </key>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staves>1</staves>
+        <clef number="1" color="#000000">
+          <sign>G</sign>
+          <line>2</line>
+        </clef>
+        <staff-details number="1" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+      </attributes>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P1-I1" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <barline>
+        <bar-style>none</bar-style>
+      </barline>
+    </measure>
+    <!--============== Part: P1, Measure: 1 ==============-->
+    <measure number="1" width="434">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>165</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+          <top-system-distance>147</top-system-distance>
+        </system-layout>
+      </print>
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>6</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <note default-x="104">
+        <rest />
+        <duration>1536</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 2 ==============-->
+    <measure number="2" width="184">
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics default-x="24" default-y="18" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <pp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <metronome default-y="35" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <beat-unit>quarter</beat-unit>
+            <per-minute>68</per-minute>
+          </metronome>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="36" default-y="-50">
+        <pitch>
+          <step>C</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="over" />
+          <articulations>
+            <tenuto />
+          </articulations>
+        </notations>
+        <lyric default-y="-73" number="part1verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>Ky</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="36">
+        <chord />
+        <pitch>
+          <step>D</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P1-I2" />
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="73" default-y="-50">
+        <pitch>
+          <step>C</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>1</staff>
+        <notations>
+          <articulations>
+            <tenuto />
+          </articulations>
+        </notations>
+        <lyric default-y="-73" number="part1verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="73">
+        <chord />
+        <pitch>
+          <step>D</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P1-I2" />
+        <type>quarter</type>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="over" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="110" default-y="-45">
+        <pitch>
+          <step>D</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>down</stem>
+        <staff>1</staff>
+        <notations>
+          <fermata>normal</fermata>
+        </notations>
+        <lyric default-y="-73" number="part1verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>e,</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="110">
+        <chord />
+        <pitch>
+          <step>G</step>
+          <octave>5</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P1-I2" />
+        <type>half</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 3 ==============-->
+    <measure number="3" width="369">
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>7</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <direction>
+        <direction-type>
+          <words justify="left" valign="middle" font-style="normal" font-weight="normal">rit.</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note default-x="34">
+        <rest />
+        <duration>1792</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 4 ==============-->
+    <measure number="4" width="264">
+      <print new-system="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>76</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+          <system-distance>76</system-distance>
+        </system-layout>
+      </print>
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <direction>
+        <direction-type>
+          <rehearsal default-x="89" font-family="Times New Roman" font-style="normal" font-size="18.5463" font-weight="bold" color="#000000" enclosure="square">A</rehearsal>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <metronome default-y="6" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <beat-unit>quarter</beat-unit>
+            <per-minute>74</per-minute>
+          </metronome>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note default-x="115">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 5 ==============-->
+    <measure number="5" width="157">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 6 ==============-->
+    <measure number="6" width="163">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 7 ==============-->
+    <measure number="7" width="185">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P1-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P1, Measure: 8 ==============-->
+    <!--============== Part: P1, Measure: 9 ==============-->
+    <!--============== Part: P1, Measure: 10 ==============-->
+    <!--============== Part: P1, Measure: 11 ==============-->
+    <!--============== Part: P1, Measure: 12 ==============-->
+    <!--============== Part: P1, Measure: 13 ==============-->
+    <!--============== Part: P1, Measure: 14 ==============-->
+    <!--============== Part: P1, Measure: 15 ==============-->
+    <!--============== Part: P1, Measure: 16 ==============-->
+    <!--============== Part: P1, Measure: 17 ==============-->
+    <!--============== Part: P1, Measure: 18 ==============-->
+    <!--============== Part: P1, Measure: 19 ==============-->
+    <!--============== Part: P1, Measure: 20 ==============-->
+    <!--============== Part: P1, Measure: 21 ==============-->
+    <!--============== Part: P1, Measure: 22 ==============-->
+    <!--============== Part: P1, Measure: 23 ==============-->
+    <!--============== Part: P1, Measure: 24 ==============-->
+    <!--============== Part: P1, Measure: 25 ==============-->
+    <!--============== Part: P1, Measure: 26 ==============-->
+    <!--============== Part: P1, Measure: 27 ==============-->
+    <!--============== Part: P1, Measure: 28 ==============-->
+    <!--============== Part: P1, Measure: 29 ==============-->
+    <!--============== Part: P1, Measure: 30 ==============-->
+    <!--============== Part: P1, Measure: 31 ==============-->
+    <!--============== Part: P1, Measure: 32 ==============-->
+    <!--============== Part: P1, Measure: 33 ==============-->
+    <!--============== Part: P1, Measure: 34 ==============-->
+    <!--============== Part: P1, Measure: 35 ==============-->
+    <!--============== Part: P1, Measure: 36 ==============-->
+    <!--============== Part: P1, Measure: 37 ==============-->
+    <!--============== Part: P1, Measure: 38 ==============-->
+    <!--============== Part: P1, Measure: 39 ==============-->
+    <!--============== Part: P1, Measure: 40 ==============-->
+    <!--============== Part: P1, Measure: 41 ==============-->
+    <!--============== Part: P1, Measure: 42 ==============-->
+    <!--============== Part: P1, Measure: 43 ==============-->
+    <!--============== Part: P1, Measure: 44 ==============-->
+    <!--============== Part: P1, Measure: 45 ==============-->
+    <!--============== Part: P1, Measure: 46 ==============-->
+    <!--============== Part: P1, Measure: 47 ==============-->
+    <!--============== Part: P1, Measure: 48 ==============-->
+    <!--============== Part: P1, Measure: 49 ==============-->
+    <!--============== Part: P1, Measure: 50 ==============-->
+    <!--============== Part: P1, Measure: 51 ==============-->
+    <!--============== Part: P1, Measure: 52 ==============-->
+    <!--============== Part: P1, Measure: 53 ==============-->
+    <!--============== Part: P1, Measure: 54 ==============-->
+    <!--============== Part: P1, Measure: 55 ==============-->
+    <!--============== Part: P1, Measure: 56 ==============-->
+    <!--============== Part: P1, Measure: 57 ==============-->
+    <!--============== Part: P1, Measure: 58 ==============-->
+    <!--============== Part: P1, Measure: 59 ==============-->
+    <!--============== Part: P1, Measure: 60 ==============-->
+    <!--============== Part: P1, Measure: 61 ==============-->
+    <!--============== Part: P1, Measure: 62 ==============-->
+    <!--============== Part: P1, Measure: 63 ==============-->
+    <!--============== Part: P1, Measure: 64 ==============-->
+    <!--============== Part: P1, Measure: 65 ==============-->
+    <!--============== Part: P1, Measure: 66 ==============-->
+    <!--============== Part: P1, Measure: 67 ==============-->
+    <!--============== Part: P1, Measure: 68 ==============-->
+    <!--============== Part: P1, Measure: 69 ==============-->
+    <!--============== Part: P1, Measure: 70 ==============-->
+    <!--============== Part: P1, Measure: 71 ==============-->
+    <!--============== Part: P1, Measure: 72 ==============-->
+    <!--============== Part: P1, Measure: 73 ==============-->
+    <!--============== Part: P1, Measure: 74 ==============-->
+    <!--============== Part: P1, Measure: 75 ==============-->
+    <!--============== Part: P1, Measure: 76 ==============-->
+    <!--============== Part: P1, Measure: 77 ==============-->
+    <!--============== Part: P1, Measure: 78 ==============-->
+    <!--============== Part: P1, Measure: 79 ==============-->
+    <!--============== Part: P1, Measure: 80 ==============-->
+    <!--============== Part: P1, Measure: 81 ==============-->
+    <!--============== Part: P1, Measure: 82 ==============-->
+    <!--============== Part: P1, Measure: 83 ==============-->
+    <!--============== Part: P1, Measure: 84 ==============-->
+    <!--============== Part: P1, Measure: 85 ==============-->
+    <!--============== Part: P1, Measure: 86 ==============-->
+    <!--============== Part: P1, Measure: 87 ==============-->
+    <!--============== Part: P1, Measure: 88 ==============-->
+    <!--============== Part: P1, Measure: 89 ==============-->
+    <!--============== Part: P1, Measure: 90 ==============-->
+    <!--============== Part: P1, Measure: 91 ==============-->
+    <!--============== Part: P1, Measure: 92 ==============-->
+    <!--============== Part: P1, Measure: 93 ==============-->
+    <!--============== Part: P1, Measure: 94 ==============-->
+    <!--============== Part: P1, Measure: 95 ==============-->
+    <!--============== Part: P1, Measure: 96 ==============-->
+    <!--============== Part: P1, Measure: 97 ==============-->
+    <!--============== Part: P1, Measure: 98 ==============-->
+    <!--============== Part: P1, Measure: 99 ==============-->
+    <!--============== Part: P1, Measure: 100 ==============-->
+    <!--============== Part: P1, Measure: 101 ==============-->
+    <!--============== Part: P1, Measure: 102 ==============-->
+    <!--============== Part: P1, Measure: 103 ==============-->
+    <!--============== Part: P1, Measure: 104 ==============-->
+    <!--============== Part: P1, Measure: 105 ==============-->
+    <!--============== Part: P1, Measure: 106 ==============-->
+    <!--============== Part: P1, Measure: 107 ==============-->
+    <!--============== Part: P1, Measure: 108 ==============-->
+    <!--============== Part: P1, Measure: 109 ==============-->
+    <!--============== Part: P1, Measure: 110 ==============-->
+    <!--============== Part: P1, Measure: 111 ==============-->
+    <!--============== Part: P1, Measure: 112 ==============-->
+    <!--============== Part: P1, Measure: 113 ==============-->
+    <!--============== Part: P1, Measure: 114 ==============-->
+    <!--============== Part: P1, Measure: 115 ==============-->
+    <!--============== Part: P1, Measure: 116 ==============-->
+    <!--============== Part: P1, Measure: 117 ==============-->
+    <!--============== Part: P1, Measure: 118 ==============-->
+    <!--============== Part: P1, Measure: 119 ==============-->
+    <!--============== Part: P1, Measure: 120 ==============-->
+    <!--============== Part: P1, Measure: 121 ==============-->
+    <!--============== Part: P1, Measure: 122 ==============-->
+    <!--============== Part: P1, Measure: 123 ==============-->
+    <!--============== Part: P1, Measure: 124 ==============-->
+    <!--============== Part: P1, Measure: 125 ==============-->
+    <!--============== Part: P1, Measure: 126 ==============-->
+    <!--============== Part: P1, Measure: 127 ==============-->
+    <!--============== Part: P1, Measure: 128 ==============-->
+    <!--============== Part: P1, Measure: 129 ==============-->
+    <!--============== Part: P1, Measure: 130 ==============-->
+    <!--============== Part: P1, Measure: 131 ==============-->
+    <!--============== Part: P1, Measure: 132 ==============-->
+    <!--============== Part: P1, Measure: 133 ==============-->
+    <!--============== Part: P1, Measure: 134 ==============-->
+    <!--============== Part: P1, Measure: 135 ==============-->
+    <!--============== Part: P1, Measure: 136 ==============-->
+    <!--============== Part: P1, Measure: 137 ==============-->
+    <!--============== Part: P1, Measure: 138 ==============-->
+    <!--============== Part: P1, Measure: 139 ==============-->
+    <!--============== Part: P1, Measure: 140 ==============-->
+    <!--============== Part: P1, Measure: 141 ==============-->
+    <!--============== Part: P1, Measure: 142 ==============-->
+    <!--============== Part: P1, Measure: 143 ==============-->
+    <!--============== Part: P1, Measure: 144 ==============-->
+    <!--============== Part: P1, Measure: 145 ==============-->
+    <!--============== Part: P1, Measure: 146 ==============-->
+    <!--============== Part: P1, Measure: 147 ==============-->
+    <!--============== Part: P1, Measure: 148 ==============-->
+    <!--============== Part: P1, Measure: 149 ==============-->
+    <!--============== Part: P1, Measure: 150 ==============-->
+    <!--============== Part: P1, Measure: 151 ==============-->
+    <!--============== Part: P1, Measure: 152 ==============-->
+    <!--============== Part: P1, Measure: 153 ==============-->
+    <!--============== Part: P1, Measure: 154 ==============-->
+    <!--============== Part: P1, Measure: 155 ==============-->
+    <!--============== Part: P1, Measure: 156 ==============-->
+    <!--============== Part: P1, Measure: 157 ==============-->
+    <!--============== Part: P1, Measure: 158 ==============-->
+    <!--============== Part: P1, Measure: 159 ==============-->
+    <!--============== Part: P1, Measure: 160 ==============-->
+    <!--============== Part: P1, Measure: 161 ==============-->
+    <!--============== Part: P1, Measure: 162 ==============-->
+    <!--============== Part: P1, Measure: 163 ==============-->
+    <!--============== Part: P1, Measure: 164 ==============-->
+    <!--============== Part: P1, Measure: 165 ==============-->
+    <!--============== Part: P1, Measure: 166 ==============-->
+    <!--============== Part: P1, Measure: 167 ==============-->
+    <!--============== Part: P1, Measure: 168 ==============-->
+    <!--============== Part: P1, Measure: 169 ==============-->
+    <!--============== Part: P1, Measure: 170 ==============-->
+    <!--============== Part: P1, Measure: 171 ==============-->
+    <!--============== Part: P1, Measure: 172 ==============-->
+    <!--============== Part: P1, Measure: 173 ==============-->
+    <!--============== Part: P1, Measure: 174 ==============-->
+    <!--============== Part: P1, Measure: 175 ==============-->
+    <!--============== Part: P1, Measure: 176 ==============-->
+    <!--============== Part: P1, Measure: 177 ==============-->
+    <!--============== Part: P1, Measure: 178 ==============-->
+    <!--============== Part: P1, Measure: 179 ==============-->
+    <!--============== Part: P1, Measure: 180 ==============-->
+    <!--============== Part: P1, Measure: 181 ==============-->
+    <!--============== Part: P1, Measure: 182 ==============-->
+    <!--============== Part: P1, Measure: 183 ==============-->
+    <!--============== Part: P1, Measure: 184 ==============-->
+    <!--============== Part: P1, Measure: 185 ==============-->
+    <!--============== Part: P1, Measure: 186 ==============-->
+    <!--============== Part: P1, Measure: 187 ==============-->
+    <!--============== Part: P1, Measure: 188 ==============-->
+    <!--============== Part: P1, Measure: 189 ==============-->
+    <!--============== Part: P1, Measure: 190 ==============-->
+    <!--============== Part: P1, Measure: 191 ==============-->
+    <!--============== Part: P1, Measure: 192 ==============-->
+    <!--============== Part: P1, Measure: 193 ==============-->
+    <!--============== Part: P1, Measure: 194 ==============-->
+    <!--============== Part: P1, Measure: 195 ==============-->
+    <!--============== Part: P1, Measure: 196 ==============-->
+  </part>
+  <part id="P2">
+    <!--============== Part: P2, Measure: 1 ==============-->
+    <measure number="1" width="1008">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>133</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>80</staff-distance>
+        </staff-layout>
+        <part-name-display>
+          <display-text>ALTO</display-text>
+        </part-name-display>
+        <part-abbreviation-display>
+          <display-text>A.</display-text>
+        </part-abbreviation-display>
+      </print>
+      <attributes>
+        <divisions>256</divisions>
+        <key color="#000000">
+          <fifths>0</fifths>
+          <mode>minor</mode>
+        </key>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staves>1</staves>
+        <clef number="1" color="#000000">
+          <sign>G</sign>
+          <line>2</line>
+        </clef>
+        <staff-details number="1" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+      </attributes>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P2-I1" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <barline>
+        <bar-style>none</bar-style>
+      </barline>
+    </measure>
+    <!--============== Part: P2, Measure: 1 ==============-->
+    <measure number="1" width="434">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>165</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>65</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>6</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <note default-x="104">
+        <rest />
+        <duration>1536</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 2 ==============-->
+    <measure number="2" width="184">
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics default-x="23" default-y="12" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <pp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="36" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="under" />
+          <articulations>
+            <tenuto />
+          </articulations>
+        </notations>
+        <lyric default-y="-93" number="part2verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>Ky</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="73" default-y="-10">
+        <pitch>
+          <step>D</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="under" />
+          <articulations>
+            <tenuto />
+          </articulations>
+        </notations>
+        <lyric default-y="-93" number="part2verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="110" default-y="5">
+        <pitch>
+          <step>E</step>
+          <alter>-1</alter>
+          <octave>4</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <fermata>normal</fermata>
+        </notations>
+        <lyric default-y="-93" number="part2verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>e,</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="110">
+        <chord />
+        <pitch>
+          <step>G</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P2-I2" />
+        <type>half</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 3 ==============-->
+    <measure number="3" width="369">
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>7</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note default-x="34">
+        <rest />
+        <duration>1792</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 4 ==============-->
+    <measure number="4" width="264">
+      <print new-system="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>76</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>73</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <note default-x="115">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <dynamics default-x="148" default-y="16" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="154" default-y="-20">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>Ky</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="225" default-y="-20">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 5 ==============-->
+    <measure number="5" width="157">
+      <note color="#000000" default-x="15">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>1024</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>e</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 6 ==============-->
+    <measure number="6" width="163">
+      <note default-x="15">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="2" default-y="23" color="#000000" type="crescendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="53" default-y="-20">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>e</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="125" default-y="-15">
+        <pitch>
+          <step>C</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>le</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 7 ==============-->
+    <measure number="7" width="185">
+      <direction>
+        <direction-type>
+          <wedge default-x="-9" default-y="23" color="#000000" type="stop" />
+        </direction-type>
+        <offset sound="no">1023</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="15">
+        <pitch>
+          <step>E</step>
+          <alter>-1</alter>
+          <octave>4</octave>
+        </pitch>
+        <duration>1024</duration>
+        <instrument id="P2-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part2verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>i</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P2, Measure: 8 ==============-->
+    <!--============== Part: P2, Measure: 9 ==============-->
+    <!--============== Part: P2, Measure: 10 ==============-->
+    <!--============== Part: P2, Measure: 11 ==============-->
+    <!--============== Part: P2, Measure: 12 ==============-->
+    <!--============== Part: P2, Measure: 13 ==============-->
+    <!--============== Part: P2, Measure: 14 ==============-->
+    <!--============== Part: P2, Measure: 15 ==============-->
+    <!--============== Part: P2, Measure: 16 ==============-->
+    <!--============== Part: P2, Measure: 17 ==============-->
+    <!--============== Part: P2, Measure: 18 ==============-->
+    <!--============== Part: P2, Measure: 19 ==============-->
+    <!--============== Part: P2, Measure: 20 ==============-->
+    <!--============== Part: P2, Measure: 21 ==============-->
+    <!--============== Part: P2, Measure: 22 ==============-->
+    <!--============== Part: P2, Measure: 23 ==============-->
+    <!--============== Part: P2, Measure: 24 ==============-->
+    <!--============== Part: P2, Measure: 25 ==============-->
+    <!--============== Part: P2, Measure: 26 ==============-->
+    <!--============== Part: P2, Measure: 27 ==============-->
+    <!--============== Part: P2, Measure: 28 ==============-->
+    <!--============== Part: P2, Measure: 29 ==============-->
+    <!--============== Part: P2, Measure: 30 ==============-->
+    <!--============== Part: P2, Measure: 31 ==============-->
+    <!--============== Part: P2, Measure: 32 ==============-->
+    <!--============== Part: P2, Measure: 33 ==============-->
+    <!--============== Part: P2, Measure: 34 ==============-->
+    <!--============== Part: P2, Measure: 35 ==============-->
+    <!--============== Part: P2, Measure: 36 ==============-->
+    <!--============== Part: P2, Measure: 37 ==============-->
+    <!--============== Part: P2, Measure: 38 ==============-->
+    <!--============== Part: P2, Measure: 39 ==============-->
+    <!--============== Part: P2, Measure: 40 ==============-->
+    <!--============== Part: P2, Measure: 41 ==============-->
+    <!--============== Part: P2, Measure: 42 ==============-->
+    <!--============== Part: P2, Measure: 43 ==============-->
+    <!--============== Part: P2, Measure: 44 ==============-->
+    <!--============== Part: P2, Measure: 45 ==============-->
+    <!--============== Part: P2, Measure: 46 ==============-->
+    <!--============== Part: P2, Measure: 47 ==============-->
+    <!--============== Part: P2, Measure: 48 ==============-->
+    <!--============== Part: P2, Measure: 49 ==============-->
+    <!--============== Part: P2, Measure: 50 ==============-->
+    <!--============== Part: P2, Measure: 51 ==============-->
+    <!--============== Part: P2, Measure: 52 ==============-->
+    <!--============== Part: P2, Measure: 53 ==============-->
+    <!--============== Part: P2, Measure: 54 ==============-->
+    <!--============== Part: P2, Measure: 55 ==============-->
+    <!--============== Part: P2, Measure: 56 ==============-->
+    <!--============== Part: P2, Measure: 57 ==============-->
+    <!--============== Part: P2, Measure: 58 ==============-->
+    <!--============== Part: P2, Measure: 59 ==============-->
+    <!--============== Part: P2, Measure: 60 ==============-->
+    <!--============== Part: P2, Measure: 61 ==============-->
+    <!--============== Part: P2, Measure: 62 ==============-->
+    <!--============== Part: P2, Measure: 63 ==============-->
+    <!--============== Part: P2, Measure: 64 ==============-->
+    <!--============== Part: P2, Measure: 65 ==============-->
+    <!--============== Part: P2, Measure: 66 ==============-->
+    <!--============== Part: P2, Measure: 67 ==============-->
+    <!--============== Part: P2, Measure: 68 ==============-->
+    <!--============== Part: P2, Measure: 69 ==============-->
+    <!--============== Part: P2, Measure: 70 ==============-->
+    <!--============== Part: P2, Measure: 71 ==============-->
+    <!--============== Part: P2, Measure: 72 ==============-->
+    <!--============== Part: P2, Measure: 73 ==============-->
+    <!--============== Part: P2, Measure: 74 ==============-->
+    <!--============== Part: P2, Measure: 75 ==============-->
+    <!--============== Part: P2, Measure: 76 ==============-->
+    <!--============== Part: P2, Measure: 77 ==============-->
+    <!--============== Part: P2, Measure: 78 ==============-->
+    <!--============== Part: P2, Measure: 79 ==============-->
+    <!--============== Part: P2, Measure: 80 ==============-->
+    <!--============== Part: P2, Measure: 81 ==============-->
+    <!--============== Part: P2, Measure: 82 ==============-->
+    <!--============== Part: P2, Measure: 83 ==============-->
+    <!--============== Part: P2, Measure: 84 ==============-->
+    <!--============== Part: P2, Measure: 85 ==============-->
+    <!--============== Part: P2, Measure: 86 ==============-->
+    <!--============== Part: P2, Measure: 87 ==============-->
+    <!--============== Part: P2, Measure: 88 ==============-->
+    <!--============== Part: P2, Measure: 89 ==============-->
+    <!--============== Part: P2, Measure: 90 ==============-->
+    <!--============== Part: P2, Measure: 91 ==============-->
+    <!--============== Part: P2, Measure: 92 ==============-->
+    <!--============== Part: P2, Measure: 93 ==============-->
+    <!--============== Part: P2, Measure: 94 ==============-->
+    <!--============== Part: P2, Measure: 95 ==============-->
+    <!--============== Part: P2, Measure: 96 ==============-->
+    <!--============== Part: P2, Measure: 97 ==============-->
+    <!--============== Part: P2, Measure: 98 ==============-->
+    <!--============== Part: P2, Measure: 99 ==============-->
+    <!--============== Part: P2, Measure: 100 ==============-->
+    <!--============== Part: P2, Measure: 101 ==============-->
+    <!--============== Part: P2, Measure: 102 ==============-->
+    <!--============== Part: P2, Measure: 103 ==============-->
+    <!--============== Part: P2, Measure: 104 ==============-->
+    <!--============== Part: P2, Measure: 105 ==============-->
+    <!--============== Part: P2, Measure: 106 ==============-->
+    <!--============== Part: P2, Measure: 107 ==============-->
+    <!--============== Part: P2, Measure: 108 ==============-->
+    <!--============== Part: P2, Measure: 109 ==============-->
+    <!--============== Part: P2, Measure: 110 ==============-->
+    <!--============== Part: P2, Measure: 111 ==============-->
+    <!--============== Part: P2, Measure: 112 ==============-->
+    <!--============== Part: P2, Measure: 113 ==============-->
+    <!--============== Part: P2, Measure: 114 ==============-->
+    <!--============== Part: P2, Measure: 115 ==============-->
+    <!--============== Part: P2, Measure: 116 ==============-->
+    <!--============== Part: P2, Measure: 117 ==============-->
+    <!--============== Part: P2, Measure: 118 ==============-->
+    <!--============== Part: P2, Measure: 119 ==============-->
+    <!--============== Part: P2, Measure: 120 ==============-->
+    <!--============== Part: P2, Measure: 121 ==============-->
+    <!--============== Part: P2, Measure: 122 ==============-->
+    <!--============== Part: P2, Measure: 123 ==============-->
+    <!--============== Part: P2, Measure: 124 ==============-->
+    <!--============== Part: P2, Measure: 125 ==============-->
+    <!--============== Part: P2, Measure: 126 ==============-->
+    <!--============== Part: P2, Measure: 127 ==============-->
+    <!--============== Part: P2, Measure: 128 ==============-->
+    <!--============== Part: P2, Measure: 129 ==============-->
+    <!--============== Part: P2, Measure: 130 ==============-->
+    <!--============== Part: P2, Measure: 131 ==============-->
+    <!--============== Part: P2, Measure: 132 ==============-->
+    <!--============== Part: P2, Measure: 133 ==============-->
+    <!--============== Part: P2, Measure: 134 ==============-->
+    <!--============== Part: P2, Measure: 135 ==============-->
+    <!--============== Part: P2, Measure: 136 ==============-->
+    <!--============== Part: P2, Measure: 137 ==============-->
+    <!--============== Part: P2, Measure: 138 ==============-->
+    <!--============== Part: P2, Measure: 139 ==============-->
+    <!--============== Part: P2, Measure: 140 ==============-->
+    <!--============== Part: P2, Measure: 141 ==============-->
+    <!--============== Part: P2, Measure: 142 ==============-->
+    <!--============== Part: P2, Measure: 143 ==============-->
+    <!--============== Part: P2, Measure: 144 ==============-->
+    <!--============== Part: P2, Measure: 145 ==============-->
+    <!--============== Part: P2, Measure: 146 ==============-->
+    <!--============== Part: P2, Measure: 147 ==============-->
+    <!--============== Part: P2, Measure: 148 ==============-->
+    <!--============== Part: P2, Measure: 149 ==============-->
+    <!--============== Part: P2, Measure: 150 ==============-->
+    <!--============== Part: P2, Measure: 151 ==============-->
+    <!--============== Part: P2, Measure: 152 ==============-->
+    <!--============== Part: P2, Measure: 153 ==============-->
+    <!--============== Part: P2, Measure: 154 ==============-->
+    <!--============== Part: P2, Measure: 155 ==============-->
+    <!--============== Part: P2, Measure: 156 ==============-->
+    <!--============== Part: P2, Measure: 157 ==============-->
+    <!--============== Part: P2, Measure: 158 ==============-->
+    <!--============== Part: P2, Measure: 159 ==============-->
+    <!--============== Part: P2, Measure: 160 ==============-->
+    <!--============== Part: P2, Measure: 161 ==============-->
+    <!--============== Part: P2, Measure: 162 ==============-->
+    <!--============== Part: P2, Measure: 163 ==============-->
+    <!--============== Part: P2, Measure: 164 ==============-->
+    <!--============== Part: P2, Measure: 165 ==============-->
+    <!--============== Part: P2, Measure: 166 ==============-->
+    <!--============== Part: P2, Measure: 167 ==============-->
+    <!--============== Part: P2, Measure: 168 ==============-->
+    <!--============== Part: P2, Measure: 169 ==============-->
+    <!--============== Part: P2, Measure: 170 ==============-->
+    <!--============== Part: P2, Measure: 171 ==============-->
+    <!--============== Part: P2, Measure: 172 ==============-->
+    <!--============== Part: P2, Measure: 173 ==============-->
+    <!--============== Part: P2, Measure: 174 ==============-->
+    <!--============== Part: P2, Measure: 175 ==============-->
+    <!--============== Part: P2, Measure: 176 ==============-->
+    <!--============== Part: P2, Measure: 177 ==============-->
+    <!--============== Part: P2, Measure: 178 ==============-->
+    <!--============== Part: P2, Measure: 179 ==============-->
+    <!--============== Part: P2, Measure: 180 ==============-->
+    <!--============== Part: P2, Measure: 181 ==============-->
+    <!--============== Part: P2, Measure: 182 ==============-->
+    <!--============== Part: P2, Measure: 183 ==============-->
+    <!--============== Part: P2, Measure: 184 ==============-->
+    <!--============== Part: P2, Measure: 185 ==============-->
+    <!--============== Part: P2, Measure: 186 ==============-->
+    <!--============== Part: P2, Measure: 187 ==============-->
+    <!--============== Part: P2, Measure: 188 ==============-->
+    <!--============== Part: P2, Measure: 189 ==============-->
+    <!--============== Part: P2, Measure: 190 ==============-->
+    <!--============== Part: P2, Measure: 191 ==============-->
+    <!--============== Part: P2, Measure: 192 ==============-->
+    <!--============== Part: P2, Measure: 193 ==============-->
+    <!--============== Part: P2, Measure: 194 ==============-->
+    <!--============== Part: P2, Measure: 195 ==============-->
+    <!--============== Part: P2, Measure: 196 ==============-->
+  </part>
+  <part id="P3">
+    <!--============== Part: P3, Measure: 1 ==============-->
+    <measure number="1" width="1008">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>133</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>80</staff-distance>
+        </staff-layout>
+        <part-name-display>
+          <display-text>TENOR</display-text>
+        </part-name-display>
+        <part-abbreviation-display>
+          <display-text>T.</display-text>
+        </part-abbreviation-display>
+      </print>
+      <attributes>
+        <divisions>256</divisions>
+        <key color="#000000">
+          <fifths>0</fifths>
+          <mode>minor</mode>
+        </key>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staves>1</staves>
+        <clef number="1" color="#000000">
+          <sign>G</sign>
+          <line>2</line>
+          <clef-octave-change>-1</clef-octave-change>
+        </clef>
+        <staff-details number="1" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+        <transpose>
+          <diatonic>0</diatonic>
+          <chromatic>0</chromatic>
+          <octave-change>-1</octave-change>
+        </transpose>
+      </attributes>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P3-I1" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <barline>
+        <bar-style>none</bar-style>
+      </barline>
+    </measure>
+    <!--============== Part: P3, Measure: 1 ==============-->
+    <measure number="1" width="434">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>165</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>82</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>6</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+        <transpose>
+          <diatonic>0</diatonic>
+          <chromatic>0</chromatic>
+          <octave-change>-1</octave-change>
+        </transpose>
+      </attributes>
+      <note default-x="104">
+        <rest />
+        <duration>1536</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 2 ==============-->
+    <measure number="2" width="184">
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note default-x="36">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 3 ==============-->
+    <measure number="3" width="369">
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>7</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note print-object="no" default-x="34">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+        <notations>
+          <fermata>angled</fermata>
+        </notations>
+      </note>
+      <direction>
+        <direction-type>
+          <words default-x="20" default-y="28" justify="left" valign="middle" font-family="Times New Roman" font-style="normal" font-size="11.0703" font-weight="normal">Unison, chantlike</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <dynamics default-x="28" default-y="10" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="34" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>e</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="61" default-y="15">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="under" />
+        </notations>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>le</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="88" default-y="10">
+        <pitch>
+          <step>A</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="114" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="141">
+        <pitch>
+          <step>F</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="168" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <words default-x="189" default-y="41" justify="left" valign="middle" font-family="Times New Roman" font-style="normal" font-size="11.9329" font-weight="bold">rit.</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <wedge default-x="11" default-y="26" color="#000000" type="diminuendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="195" default-y="-50">
+        <pitch>
+          <step>C</step>
+          <octave>4</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>down</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="221" default-y="15">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="248" default-y="10">
+        <pitch>
+          <step>A</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="275" default-y="15">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="under" />
+        </notations>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="-8" default-y="26" color="#000000" type="stop" />
+        </direction-type>
+        <offset sound="no">255</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="309" default-y="10">
+        <pitch>
+          <step>A</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <fermata>normal</fermata>
+        </notations>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>i</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 4 ==============-->
+    <measure number="4" width="264">
+      <print new-system="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>76</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>82</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics default-x="109" default-y="16" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <p />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="115" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>son,</text>
+        </lyric>
+      </note>
+      <direction>
+        <direction-type>
+          <dynamics default-x="177" default-y="20" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="186" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>Ky</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 5 ==============-->
+    <measure number="5" width="157">
+      <note color="#000000" default-x="15" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="53" default-y="5">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>768</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <dot />
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-66" number="part3verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>e,</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 6 ==============-->
+    <measure number="6" width="163">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 7 ==============-->
+    <measure number="7" width="185">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P3-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P3, Measure: 8 ==============-->
+    <!--============== Part: P3, Measure: 9 ==============-->
+    <!--============== Part: P3, Measure: 10 ==============-->
+    <!--============== Part: P3, Measure: 11 ==============-->
+    <!--============== Part: P3, Measure: 12 ==============-->
+    <!--============== Part: P3, Measure: 13 ==============-->
+    <!--============== Part: P3, Measure: 14 ==============-->
+    <!--============== Part: P3, Measure: 15 ==============-->
+    <!--============== Part: P3, Measure: 16 ==============-->
+    <!--============== Part: P3, Measure: 17 ==============-->
+    <!--============== Part: P3, Measure: 18 ==============-->
+    <!--============== Part: P3, Measure: 19 ==============-->
+    <!--============== Part: P3, Measure: 20 ==============-->
+    <!--============== Part: P3, Measure: 21 ==============-->
+    <!--============== Part: P3, Measure: 22 ==============-->
+    <!--============== Part: P3, Measure: 23 ==============-->
+    <!--============== Part: P3, Measure: 24 ==============-->
+    <!--============== Part: P3, Measure: 25 ==============-->
+    <!--============== Part: P3, Measure: 26 ==============-->
+    <!--============== Part: P3, Measure: 27 ==============-->
+    <!--============== Part: P3, Measure: 28 ==============-->
+    <!--============== Part: P3, Measure: 29 ==============-->
+    <!--============== Part: P3, Measure: 30 ==============-->
+    <!--============== Part: P3, Measure: 31 ==============-->
+    <!--============== Part: P3, Measure: 32 ==============-->
+    <!--============== Part: P3, Measure: 33 ==============-->
+    <!--============== Part: P3, Measure: 34 ==============-->
+    <!--============== Part: P3, Measure: 35 ==============-->
+    <!--============== Part: P3, Measure: 36 ==============-->
+    <!--============== Part: P3, Measure: 37 ==============-->
+    <!--============== Part: P3, Measure: 38 ==============-->
+    <!--============== Part: P3, Measure: 39 ==============-->
+    <!--============== Part: P3, Measure: 40 ==============-->
+    <!--============== Part: P3, Measure: 41 ==============-->
+    <!--============== Part: P3, Measure: 42 ==============-->
+    <!--============== Part: P3, Measure: 43 ==============-->
+    <!--============== Part: P3, Measure: 44 ==============-->
+    <!--============== Part: P3, Measure: 45 ==============-->
+    <!--============== Part: P3, Measure: 46 ==============-->
+    <!--============== Part: P3, Measure: 47 ==============-->
+    <!--============== Part: P3, Measure: 48 ==============-->
+    <!--============== Part: P3, Measure: 49 ==============-->
+    <!--============== Part: P3, Measure: 50 ==============-->
+    <!--============== Part: P3, Measure: 51 ==============-->
+    <!--============== Part: P3, Measure: 52 ==============-->
+    <!--============== Part: P3, Measure: 53 ==============-->
+    <!--============== Part: P3, Measure: 54 ==============-->
+    <!--============== Part: P3, Measure: 55 ==============-->
+    <!--============== Part: P3, Measure: 56 ==============-->
+    <!--============== Part: P3, Measure: 57 ==============-->
+    <!--============== Part: P3, Measure: 58 ==============-->
+    <!--============== Part: P3, Measure: 59 ==============-->
+    <!--============== Part: P3, Measure: 60 ==============-->
+    <!--============== Part: P3, Measure: 61 ==============-->
+    <!--============== Part: P3, Measure: 62 ==============-->
+    <!--============== Part: P3, Measure: 63 ==============-->
+    <!--============== Part: P3, Measure: 64 ==============-->
+    <!--============== Part: P3, Measure: 65 ==============-->
+    <!--============== Part: P3, Measure: 66 ==============-->
+    <!--============== Part: P3, Measure: 67 ==============-->
+    <!--============== Part: P3, Measure: 68 ==============-->
+    <!--============== Part: P3, Measure: 69 ==============-->
+    <!--============== Part: P3, Measure: 70 ==============-->
+    <!--============== Part: P3, Measure: 71 ==============-->
+    <!--============== Part: P3, Measure: 72 ==============-->
+    <!--============== Part: P3, Measure: 73 ==============-->
+    <!--============== Part: P3, Measure: 74 ==============-->
+    <!--============== Part: P3, Measure: 75 ==============-->
+    <!--============== Part: P3, Measure: 76 ==============-->
+    <!--============== Part: P3, Measure: 77 ==============-->
+    <!--============== Part: P3, Measure: 78 ==============-->
+    <!--============== Part: P3, Measure: 79 ==============-->
+    <!--============== Part: P3, Measure: 80 ==============-->
+    <!--============== Part: P3, Measure: 81 ==============-->
+    <!--============== Part: P3, Measure: 82 ==============-->
+    <!--============== Part: P3, Measure: 83 ==============-->
+    <!--============== Part: P3, Measure: 84 ==============-->
+    <!--============== Part: P3, Measure: 85 ==============-->
+    <!--============== Part: P3, Measure: 86 ==============-->
+    <!--============== Part: P3, Measure: 87 ==============-->
+    <!--============== Part: P3, Measure: 88 ==============-->
+    <!--============== Part: P3, Measure: 89 ==============-->
+    <!--============== Part: P3, Measure: 90 ==============-->
+    <!--============== Part: P3, Measure: 91 ==============-->
+    <!--============== Part: P3, Measure: 92 ==============-->
+    <!--============== Part: P3, Measure: 93 ==============-->
+    <!--============== Part: P3, Measure: 94 ==============-->
+    <!--============== Part: P3, Measure: 95 ==============-->
+    <!--============== Part: P3, Measure: 96 ==============-->
+    <!--============== Part: P3, Measure: 97 ==============-->
+    <!--============== Part: P3, Measure: 98 ==============-->
+    <!--============== Part: P3, Measure: 99 ==============-->
+    <!--============== Part: P3, Measure: 100 ==============-->
+    <!--============== Part: P3, Measure: 101 ==============-->
+    <!--============== Part: P3, Measure: 102 ==============-->
+    <!--============== Part: P3, Measure: 103 ==============-->
+    <!--============== Part: P3, Measure: 104 ==============-->
+    <!--============== Part: P3, Measure: 105 ==============-->
+    <!--============== Part: P3, Measure: 106 ==============-->
+    <!--============== Part: P3, Measure: 107 ==============-->
+    <!--============== Part: P3, Measure: 108 ==============-->
+    <!--============== Part: P3, Measure: 109 ==============-->
+    <!--============== Part: P3, Measure: 110 ==============-->
+    <!--============== Part: P3, Measure: 111 ==============-->
+    <!--============== Part: P3, Measure: 112 ==============-->
+    <!--============== Part: P3, Measure: 113 ==============-->
+    <!--============== Part: P3, Measure: 114 ==============-->
+    <!--============== Part: P3, Measure: 115 ==============-->
+    <!--============== Part: P3, Measure: 116 ==============-->
+    <!--============== Part: P3, Measure: 117 ==============-->
+    <!--============== Part: P3, Measure: 118 ==============-->
+    <!--============== Part: P3, Measure: 119 ==============-->
+    <!--============== Part: P3, Measure: 120 ==============-->
+    <!--============== Part: P3, Measure: 121 ==============-->
+    <!--============== Part: P3, Measure: 122 ==============-->
+    <!--============== Part: P3, Measure: 123 ==============-->
+    <!--============== Part: P3, Measure: 124 ==============-->
+    <!--============== Part: P3, Measure: 125 ==============-->
+    <!--============== Part: P3, Measure: 126 ==============-->
+    <!--============== Part: P3, Measure: 127 ==============-->
+    <!--============== Part: P3, Measure: 128 ==============-->
+    <!--============== Part: P3, Measure: 129 ==============-->
+    <!--============== Part: P3, Measure: 130 ==============-->
+    <!--============== Part: P3, Measure: 131 ==============-->
+    <!--============== Part: P3, Measure: 132 ==============-->
+    <!--============== Part: P3, Measure: 133 ==============-->
+    <!--============== Part: P3, Measure: 134 ==============-->
+    <!--============== Part: P3, Measure: 135 ==============-->
+    <!--============== Part: P3, Measure: 136 ==============-->
+    <!--============== Part: P3, Measure: 137 ==============-->
+    <!--============== Part: P3, Measure: 138 ==============-->
+    <!--============== Part: P3, Measure: 139 ==============-->
+    <!--============== Part: P3, Measure: 140 ==============-->
+    <!--============== Part: P3, Measure: 141 ==============-->
+    <!--============== Part: P3, Measure: 142 ==============-->
+    <!--============== Part: P3, Measure: 143 ==============-->
+    <!--============== Part: P3, Measure: 144 ==============-->
+    <!--============== Part: P3, Measure: 145 ==============-->
+    <!--============== Part: P3, Measure: 146 ==============-->
+    <!--============== Part: P3, Measure: 147 ==============-->
+    <!--============== Part: P3, Measure: 148 ==============-->
+    <!--============== Part: P3, Measure: 149 ==============-->
+    <!--============== Part: P3, Measure: 150 ==============-->
+    <!--============== Part: P3, Measure: 151 ==============-->
+    <!--============== Part: P3, Measure: 152 ==============-->
+    <!--============== Part: P3, Measure: 153 ==============-->
+    <!--============== Part: P3, Measure: 154 ==============-->
+    <!--============== Part: P3, Measure: 155 ==============-->
+    <!--============== Part: P3, Measure: 156 ==============-->
+    <!--============== Part: P3, Measure: 157 ==============-->
+    <!--============== Part: P3, Measure: 158 ==============-->
+    <!--============== Part: P3, Measure: 159 ==============-->
+    <!--============== Part: P3, Measure: 160 ==============-->
+    <!--============== Part: P3, Measure: 161 ==============-->
+    <!--============== Part: P3, Measure: 162 ==============-->
+    <!--============== Part: P3, Measure: 163 ==============-->
+    <!--============== Part: P3, Measure: 164 ==============-->
+    <!--============== Part: P3, Measure: 165 ==============-->
+    <!--============== Part: P3, Measure: 166 ==============-->
+    <!--============== Part: P3, Measure: 167 ==============-->
+    <!--============== Part: P3, Measure: 168 ==============-->
+    <!--============== Part: P3, Measure: 169 ==============-->
+    <!--============== Part: P3, Measure: 170 ==============-->
+    <!--============== Part: P3, Measure: 171 ==============-->
+    <!--============== Part: P3, Measure: 172 ==============-->
+    <!--============== Part: P3, Measure: 173 ==============-->
+    <!--============== Part: P3, Measure: 174 ==============-->
+    <!--============== Part: P3, Measure: 175 ==============-->
+    <!--============== Part: P3, Measure: 176 ==============-->
+    <!--============== Part: P3, Measure: 177 ==============-->
+    <!--============== Part: P3, Measure: 178 ==============-->
+    <!--============== Part: P3, Measure: 179 ==============-->
+    <!--============== Part: P3, Measure: 180 ==============-->
+    <!--============== Part: P3, Measure: 181 ==============-->
+    <!--============== Part: P3, Measure: 182 ==============-->
+    <!--============== Part: P3, Measure: 183 ==============-->
+    <!--============== Part: P3, Measure: 184 ==============-->
+    <!--============== Part: P3, Measure: 185 ==============-->
+    <!--============== Part: P3, Measure: 186 ==============-->
+    <!--============== Part: P3, Measure: 187 ==============-->
+    <!--============== Part: P3, Measure: 188 ==============-->
+    <!--============== Part: P3, Measure: 189 ==============-->
+    <!--============== Part: P3, Measure: 190 ==============-->
+    <!--============== Part: P3, Measure: 191 ==============-->
+    <!--============== Part: P3, Measure: 192 ==============-->
+    <!--============== Part: P3, Measure: 193 ==============-->
+    <!--============== Part: P3, Measure: 194 ==============-->
+    <!--============== Part: P3, Measure: 195 ==============-->
+    <!--============== Part: P3, Measure: 196 ==============-->
+  </part>
+  <part id="P4">
+    <!--============== Part: P4, Measure: 1 ==============-->
+    <measure number="1" width="1008">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>133</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>80</staff-distance>
+        </staff-layout>
+        <part-name-display>
+          <display-text>BASS</display-text>
+        </part-name-display>
+        <part-abbreviation-display>
+          <display-text>B.</display-text>
+        </part-abbreviation-display>
+      </print>
+      <attributes>
+        <divisions>256</divisions>
+        <key color="#000000">
+          <fifths>0</fifths>
+          <mode>minor</mode>
+        </key>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staves>1</staves>
+        <clef number="1" color="#000000">
+          <sign>F</sign>
+          <line>4</line>
+        </clef>
+        <staff-details number="1" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+      </attributes>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P4-I1" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <barline>
+        <bar-style>none</bar-style>
+      </barline>
+    </measure>
+    <!--============== Part: P4, Measure: 1 ==============-->
+    <measure number="1" width="434">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>165</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>86</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>6</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics default-x="98" default-y="18" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mf />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <words default-x="98" default-y="42" justify="left" valign="middle" font-family="Times New Roman" font-style="normal" font-size="11.0703" font-weight="normal">Solo, in the style of chant</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="104" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part4verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>Ky</text>
+        </lyric>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="11" default-y="24" color="#000000" type="crescendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="135" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-80" number="part4verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>ri</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="162">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="under" />
+        </notations>
+        <lyric default-y="-80" number="part4verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>e</text>
+          <extend />
+        </lyric>
+      </note>
+      <note color="#000000" default-x="189" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="215" default-y="10">
+        <pitch>
+          <step>C</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="242" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="-2" default-y="24" color="#000000" type="stop" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <wedge default-y="24" color="#000000" type="diminuendo" number="2" />
+        </direction-type>
+        <offset sound="no">50</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="269" default-y="10">
+        <pitch>
+          <step>C</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="295" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="322" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="349">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="12" default-y="24" color="#000000" type="stop" number="2" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="375" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="under" />
+          <fermata>normal</fermata>
+        </notations>
+      </note>
+      <note print-object="no" default-x="402">
+        <rest />
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <staff>1</staff>
+        <notations>
+          <fermata>angled</fermata>
+        </notations>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 2 ==============-->
+    <measure number="2" width="184">
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note default-x="36">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 3 ==============-->
+    <measure number="3" width="369">
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>7</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note print-object="no" default-x="34">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+        <notations>
+          <fermata>angled</fermata>
+        </notations>
+      </note>
+      <direction>
+        <direction-type>
+          <words default-x="20" default-y="26" justify="left" valign="middle" font-family="Times New Roman" font-style="normal" font-size="11.0703" font-weight="normal">Unison, chantlike</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <dynamics default-x="28" default-y="10" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mp />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="34" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-73" number="part4verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>e</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="61" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="under" />
+        </notations>
+        <lyric default-y="-73" number="part4verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>le</text>
+        </lyric>
+      </note>
+      <note color="#000000" default-x="88">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="114" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="141" default-y="-10">
+        <pitch>
+          <step>F</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="168" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <words default-x="193" default-y="36" justify="left" valign="middle" font-family="Times New Roman" font-style="normal" font-size="11.9329" font-weight="bold">rit.</words>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <direction>
+        <direction-type>
+          <wedge default-x="11" default-y="25" color="#000000" type="diminuendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="195" default-y="10">
+        <pitch>
+          <step>C</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="221" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="248">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="275" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>128</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="under" />
+        </notations>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="-8" default-y="25" color="#000000" type="stop" />
+        </direction-type>
+        <offset sound="no">255</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="309">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <fermata>normal</fermata>
+        </notations>
+        <lyric default-y="-73" number="part4verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>i</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 4 ==============-->
+    <measure number="4" width="264">
+      <print new-system="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>76</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="1">
+          <staff-distance>86</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+      </attributes>
+      <direction>
+        <direction-type>
+          <dynamics default-x="109" default-y="16" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <p />
+          </dynamics>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="115" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-77" number="part4verse1" color="#000000">
+          <syllabic>end</syllabic>
+          <text>son,</text>
+        </lyric>
+      </note>
+      <note default-x="186">
+        <rest />
+        <duration>512</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 5 ==============-->
+    <measure number="5" width="157">
+      <note default-x="15">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 6 ==============-->
+    <measure number="6" width="163">
+      <note default-x="15">
+        <rest />
+        <duration>512</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="1" default-y="23" color="#000000" type="crescendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="86" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-77" number="part4verse1" color="#000000">
+          <syllabic>begin</syllabic>
+          <text>e</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 7 ==============-->
+    <measure number="7" width="185">
+      <note color="#000000" default-x="15" default-y="-5">
+        <pitch>
+          <step>G</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>768</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <dot />
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-77" number="part4verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>le</text>
+        </lyric>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="-10" default-y="23" color="#000000" type="stop" />
+        </direction-type>
+        <offset sound="no">255</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="146">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P4-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <lyric default-y="-77" number="part4verse1" color="#000000">
+          <syllabic>middle</syllabic>
+          <text>i</text>
+        </lyric>
+      </note>
+    </measure>
+    <!--============== Part: P4, Measure: 8 ==============-->
+    <!--============== Part: P4, Measure: 9 ==============-->
+    <!--============== Part: P4, Measure: 10 ==============-->
+    <!--============== Part: P4, Measure: 11 ==============-->
+    <!--============== Part: P4, Measure: 12 ==============-->
+    <!--============== Part: P4, Measure: 13 ==============-->
+    <!--============== Part: P4, Measure: 14 ==============-->
+    <!--============== Part: P4, Measure: 15 ==============-->
+    <!--============== Part: P4, Measure: 16 ==============-->
+    <!--============== Part: P4, Measure: 17 ==============-->
+    <!--============== Part: P4, Measure: 18 ==============-->
+    <!--============== Part: P4, Measure: 19 ==============-->
+    <!--============== Part: P4, Measure: 20 ==============-->
+    <!--============== Part: P4, Measure: 21 ==============-->
+    <!--============== Part: P4, Measure: 22 ==============-->
+    <!--============== Part: P4, Measure: 23 ==============-->
+    <!--============== Part: P4, Measure: 24 ==============-->
+    <!--============== Part: P4, Measure: 25 ==============-->
+    <!--============== Part: P4, Measure: 26 ==============-->
+    <!--============== Part: P4, Measure: 27 ==============-->
+    <!--============== Part: P4, Measure: 28 ==============-->
+    <!--============== Part: P4, Measure: 29 ==============-->
+    <!--============== Part: P4, Measure: 30 ==============-->
+    <!--============== Part: P4, Measure: 31 ==============-->
+    <!--============== Part: P4, Measure: 32 ==============-->
+    <!--============== Part: P4, Measure: 33 ==============-->
+    <!--============== Part: P4, Measure: 34 ==============-->
+    <!--============== Part: P4, Measure: 35 ==============-->
+    <!--============== Part: P4, Measure: 36 ==============-->
+    <!--============== Part: P4, Measure: 37 ==============-->
+    <!--============== Part: P4, Measure: 38 ==============-->
+    <!--============== Part: P4, Measure: 39 ==============-->
+    <!--============== Part: P4, Measure: 40 ==============-->
+    <!--============== Part: P4, Measure: 41 ==============-->
+    <!--============== Part: P4, Measure: 42 ==============-->
+    <!--============== Part: P4, Measure: 43 ==============-->
+    <!--============== Part: P4, Measure: 44 ==============-->
+    <!--============== Part: P4, Measure: 45 ==============-->
+    <!--============== Part: P4, Measure: 46 ==============-->
+    <!--============== Part: P4, Measure: 47 ==============-->
+    <!--============== Part: P4, Measure: 48 ==============-->
+    <!--============== Part: P4, Measure: 49 ==============-->
+    <!--============== Part: P4, Measure: 50 ==============-->
+    <!--============== Part: P4, Measure: 51 ==============-->
+    <!--============== Part: P4, Measure: 52 ==============-->
+    <!--============== Part: P4, Measure: 53 ==============-->
+    <!--============== Part: P4, Measure: 54 ==============-->
+    <!--============== Part: P4, Measure: 55 ==============-->
+    <!--============== Part: P4, Measure: 56 ==============-->
+    <!--============== Part: P4, Measure: 57 ==============-->
+    <!--============== Part: P4, Measure: 58 ==============-->
+    <!--============== Part: P4, Measure: 59 ==============-->
+    <!--============== Part: P4, Measure: 60 ==============-->
+    <!--============== Part: P4, Measure: 61 ==============-->
+    <!--============== Part: P4, Measure: 62 ==============-->
+    <!--============== Part: P4, Measure: 63 ==============-->
+    <!--============== Part: P4, Measure: 64 ==============-->
+    <!--============== Part: P4, Measure: 65 ==============-->
+    <!--============== Part: P4, Measure: 66 ==============-->
+    <!--============== Part: P4, Measure: 67 ==============-->
+    <!--============== Part: P4, Measure: 68 ==============-->
+    <!--============== Part: P4, Measure: 69 ==============-->
+    <!--============== Part: P4, Measure: 70 ==============-->
+    <!--============== Part: P4, Measure: 71 ==============-->
+    <!--============== Part: P4, Measure: 72 ==============-->
+    <!--============== Part: P4, Measure: 73 ==============-->
+    <!--============== Part: P4, Measure: 74 ==============-->
+    <!--============== Part: P4, Measure: 75 ==============-->
+    <!--============== Part: P4, Measure: 76 ==============-->
+    <!--============== Part: P4, Measure: 77 ==============-->
+    <!--============== Part: P4, Measure: 78 ==============-->
+    <!--============== Part: P4, Measure: 79 ==============-->
+    <!--============== Part: P4, Measure: 80 ==============-->
+    <!--============== Part: P4, Measure: 81 ==============-->
+    <!--============== Part: P4, Measure: 82 ==============-->
+    <!--============== Part: P4, Measure: 83 ==============-->
+    <!--============== Part: P4, Measure: 84 ==============-->
+    <!--============== Part: P4, Measure: 85 ==============-->
+    <!--============== Part: P4, Measure: 86 ==============-->
+    <!--============== Part: P4, Measure: 87 ==============-->
+    <!--============== Part: P4, Measure: 88 ==============-->
+    <!--============== Part: P4, Measure: 89 ==============-->
+    <!--============== Part: P4, Measure: 90 ==============-->
+    <!--============== Part: P4, Measure: 91 ==============-->
+    <!--============== Part: P4, Measure: 92 ==============-->
+    <!--============== Part: P4, Measure: 93 ==============-->
+    <!--============== Part: P4, Measure: 94 ==============-->
+    <!--============== Part: P4, Measure: 95 ==============-->
+    <!--============== Part: P4, Measure: 96 ==============-->
+    <!--============== Part: P4, Measure: 97 ==============-->
+    <!--============== Part: P4, Measure: 98 ==============-->
+    <!--============== Part: P4, Measure: 99 ==============-->
+    <!--============== Part: P4, Measure: 100 ==============-->
+    <!--============== Part: P4, Measure: 101 ==============-->
+    <!--============== Part: P4, Measure: 102 ==============-->
+    <!--============== Part: P4, Measure: 103 ==============-->
+    <!--============== Part: P4, Measure: 104 ==============-->
+    <!--============== Part: P4, Measure: 105 ==============-->
+    <!--============== Part: P4, Measure: 106 ==============-->
+    <!--============== Part: P4, Measure: 107 ==============-->
+    <!--============== Part: P4, Measure: 108 ==============-->
+    <!--============== Part: P4, Measure: 109 ==============-->
+    <!--============== Part: P4, Measure: 110 ==============-->
+    <!--============== Part: P4, Measure: 111 ==============-->
+    <!--============== Part: P4, Measure: 112 ==============-->
+    <!--============== Part: P4, Measure: 113 ==============-->
+    <!--============== Part: P4, Measure: 114 ==============-->
+    <!--============== Part: P4, Measure: 115 ==============-->
+    <!--============== Part: P4, Measure: 116 ==============-->
+    <!--============== Part: P4, Measure: 117 ==============-->
+    <!--============== Part: P4, Measure: 118 ==============-->
+    <!--============== Part: P4, Measure: 119 ==============-->
+    <!--============== Part: P4, Measure: 120 ==============-->
+    <!--============== Part: P4, Measure: 121 ==============-->
+    <!--============== Part: P4, Measure: 122 ==============-->
+    <!--============== Part: P4, Measure: 123 ==============-->
+    <!--============== Part: P4, Measure: 124 ==============-->
+    <!--============== Part: P4, Measure: 125 ==============-->
+    <!--============== Part: P4, Measure: 126 ==============-->
+    <!--============== Part: P4, Measure: 127 ==============-->
+    <!--============== Part: P4, Measure: 128 ==============-->
+    <!--============== Part: P4, Measure: 129 ==============-->
+    <!--============== Part: P4, Measure: 130 ==============-->
+    <!--============== Part: P4, Measure: 131 ==============-->
+    <!--============== Part: P4, Measure: 132 ==============-->
+    <!--============== Part: P4, Measure: 133 ==============-->
+    <!--============== Part: P4, Measure: 134 ==============-->
+    <!--============== Part: P4, Measure: 135 ==============-->
+    <!--============== Part: P4, Measure: 136 ==============-->
+    <!--============== Part: P4, Measure: 137 ==============-->
+    <!--============== Part: P4, Measure: 138 ==============-->
+    <!--============== Part: P4, Measure: 139 ==============-->
+    <!--============== Part: P4, Measure: 140 ==============-->
+    <!--============== Part: P4, Measure: 141 ==============-->
+    <!--============== Part: P4, Measure: 142 ==============-->
+    <!--============== Part: P4, Measure: 143 ==============-->
+    <!--============== Part: P4, Measure: 144 ==============-->
+    <!--============== Part: P4, Measure: 145 ==============-->
+    <!--============== Part: P4, Measure: 146 ==============-->
+    <!--============== Part: P4, Measure: 147 ==============-->
+    <!--============== Part: P4, Measure: 148 ==============-->
+    <!--============== Part: P4, Measure: 149 ==============-->
+    <!--============== Part: P4, Measure: 150 ==============-->
+    <!--============== Part: P4, Measure: 151 ==============-->
+    <!--============== Part: P4, Measure: 152 ==============-->
+    <!--============== Part: P4, Measure: 153 ==============-->
+    <!--============== Part: P4, Measure: 154 ==============-->
+    <!--============== Part: P4, Measure: 155 ==============-->
+    <!--============== Part: P4, Measure: 156 ==============-->
+    <!--============== Part: P4, Measure: 157 ==============-->
+    <!--============== Part: P4, Measure: 158 ==============-->
+    <!--============== Part: P4, Measure: 159 ==============-->
+    <!--============== Part: P4, Measure: 160 ==============-->
+    <!--============== Part: P4, Measure: 161 ==============-->
+    <!--============== Part: P4, Measure: 162 ==============-->
+    <!--============== Part: P4, Measure: 163 ==============-->
+    <!--============== Part: P4, Measure: 164 ==============-->
+    <!--============== Part: P4, Measure: 165 ==============-->
+    <!--============== Part: P4, Measure: 166 ==============-->
+    <!--============== Part: P4, Measure: 167 ==============-->
+    <!--============== Part: P4, Measure: 168 ==============-->
+    <!--============== Part: P4, Measure: 169 ==============-->
+    <!--============== Part: P4, Measure: 170 ==============-->
+    <!--============== Part: P4, Measure: 171 ==============-->
+    <!--============== Part: P4, Measure: 172 ==============-->
+    <!--============== Part: P4, Measure: 173 ==============-->
+    <!--============== Part: P4, Measure: 174 ==============-->
+    <!--============== Part: P4, Measure: 175 ==============-->
+    <!--============== Part: P4, Measure: 176 ==============-->
+    <!--============== Part: P4, Measure: 177 ==============-->
+    <!--============== Part: P4, Measure: 178 ==============-->
+    <!--============== Part: P4, Measure: 179 ==============-->
+    <!--============== Part: P4, Measure: 180 ==============-->
+    <!--============== Part: P4, Measure: 181 ==============-->
+    <!--============== Part: P4, Measure: 182 ==============-->
+    <!--============== Part: P4, Measure: 183 ==============-->
+    <!--============== Part: P4, Measure: 184 ==============-->
+    <!--============== Part: P4, Measure: 185 ==============-->
+    <!--============== Part: P4, Measure: 186 ==============-->
+    <!--============== Part: P4, Measure: 187 ==============-->
+    <!--============== Part: P4, Measure: 188 ==============-->
+    <!--============== Part: P4, Measure: 189 ==============-->
+    <!--============== Part: P4, Measure: 190 ==============-->
+    <!--============== Part: P4, Measure: 191 ==============-->
+    <!--============== Part: P4, Measure: 192 ==============-->
+    <!--============== Part: P4, Measure: 193 ==============-->
+    <!--============== Part: P4, Measure: 194 ==============-->
+    <!--============== Part: P4, Measure: 195 ==============-->
+    <!--============== Part: P4, Measure: 196 ==============-->
+  </part>
+  <part id="P5">
+    <!--============== Part: P5, Measure: 1 ==============-->
+    <measure number="1" width="1008">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>133</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="2">
+          <staff-distance>58</staff-distance>
+        </staff-layout>
+        <part-name-display>
+          <display-text>PIANO</display-text>
+        </part-name-display>
+      </print>
+      <attributes>
+        <divisions>256</divisions>
+        <key color="#000000">
+          <fifths>0</fifths>
+          <mode>minor</mode>
+        </key>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staves>2</staves>
+        <clef number="1" color="#000000">
+          <sign>G</sign>
+          <line>2</line>
+        </clef>
+        <clef number="2" color="#000000">
+          <sign>F</sign>
+          <line>4</line>
+        </clef>
+        <staff-details number="1" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+        <staff-details number="2" print-object="yes">
+          <staff-lines>0</staff-lines>
+        </staff-details>
+      </attributes>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P5-I1" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <barline>
+        <bar-style>none</bar-style>
+      </barline>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note default-x="43">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P5-I1" />
+        <voice>3</voice>
+        <type>whole</type>
+        <staff>2</staff>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 1 ==============-->
+    <measure number="1" width="434">
+      <print new-page="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>165</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="2">
+          <staff-distance>58</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>6</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <clef number="1" print-object="no" color="#000000">
+          <sign>F</sign>
+          <line>4</line>
+        </clef>
+        <staff-details number="1" print-object="yes" />
+        <staff-details number="2" print-object="yes" />
+      </attributes>
+      <note default-x="104">
+        <rest />
+        <duration>1536</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <backup>
+        <duration>1536</duration>
+      </backup>
+      <note default-x="104">
+        <rest />
+        <duration>1536</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>whole</type>
+        <staff>2</staff>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 2 ==============-->
+    <measure number="2" width="184">
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <direction>
+        <direction-type>
+          <metronome default-y="35" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <beat-unit>quarter</beat-unit>
+            <per-minute>68</per-minute>
+          </metronome>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note default-x="36">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note default-x="36">
+        <rest />
+        <duration>1024</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>whole</type>
+        <staff>2</staff>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 3 ==============-->
+    <measure number="3" width="369">
+      <attributes>
+        <time print-object="no" color="#000000">
+          <beats>7</beats>
+          <beat-type>4</beat-type>
+        </time>
+      </attributes>
+      <note default-x="34">
+        <rest />
+        <duration>1792</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>whole</type>
+        <staff>1</staff>
+      </note>
+      <backup>
+        <duration>1792</duration>
+      </backup>
+      <note default-x="34">
+        <rest />
+        <duration>1792</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>whole</type>
+        <staff>2</staff>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 4 ==============-->
+    <measure number="4" width="264">
+      <print new-system="yes">
+        <system-layout>
+          <system-margins>
+            <left-margin>76</left-margin>
+            <right-margin>0</right-margin>
+          </system-margins>
+        </system-layout>
+        <staff-layout number="2">
+          <staff-distance>60</staff-distance>
+        </staff-layout>
+      </print>
+      <attributes>
+        <time color="#000000">
+          <beats>4</beats>
+          <beat-type>4</beat-type>
+        </time>
+        <staff-details number="1" print-object="yes" />
+        <staff-details number="2" print-object="yes" />
+      </attributes>
+      <direction>
+        <direction-type>
+          <metronome default-y="5" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <beat-unit>quarter</beat-unit>
+            <per-minute>74</per-minute>
+          </metronome>
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note default-x="115">
+        <rest />
+        <duration>512</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <staff>1</staff>
+      </note>
+      <note default-x="186">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="203" default-y="-9">
+        <grace slash="yes" />
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="start" orientation="under" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="225">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <tied type="start" orientation="under" />
+        </notations>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <direction>
+        <direction-type>
+          <dynamics default-x="111" default-y="22" color="#000000" font-family="Opus Text Std" font-style="normal" font-size="11.0703" font-weight="normal">
+            <mp />
+          </dynamics>
+        </direction-type>
+        <voice>3</voice>
+        <staff>2</staff>
+      </direction>
+      <note color="#000000" default-x="115">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>1024</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>whole</type>
+        <staff>2</staff>
+        <notations>
+          <tied type="start" orientation="under" />
+        </notations>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 5 ==============-->
+    <measure number="5" width="157">
+      <attributes />
+      <note color="#000000" default-x="15">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <slur color="#000000" type="stop" orientation="under" />
+          <tied type="stop" orientation="under" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="53" default-y="5">
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>1</staff>
+      </note>
+      <note color="#000000" default-x="119" default-y="10">
+        <pitch>
+          <step>C</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <tied type="start" orientation="under" />
+        </notations>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note color="#000000" default-x="15" default-y="-20">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="stop" orientation="under" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="86" default-y="-20">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="start" orientation="under" />
+        </notations>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 6 ==============-->
+    <measure number="6" width="163">
+      <attributes />
+      <note color="#000000" default-x="15" default-y="10">
+        <pitch>
+          <step>C</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>1</staff>
+        <notations>
+          <tied type="stop" orientation="under" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="53" default-y="-55">
+        <pitch>
+          <step>D</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>768</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <dot />
+        <stem>down</stem>
+        <staff>1</staff>
+        <notations>
+          <tied type="start" orientation="over" />
+        </notations>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note color="#000000" default-x="15" default-y="-20">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>half</type>
+        <stem>up</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="stop" orientation="under" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="86" default-y="-20">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>2</staff>
+      </note>
+      <note print-object="no" default-x="125">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>quarter</type>
+        <staff>2</staff>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note print-object="no" default-x="15">
+        <rest />
+        <duration>512</duration>
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>half</type>
+        <staff>2</staff>
+      </note>
+      <note print-object="no" default-x="86">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>quarter</type>
+        <staff>2</staff>
+      </note>
+      <note color="#000000" default-x="125" default-y="-82">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="start" orientation="over" />
+        </notations>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 7 ==============-->
+    <measure number="7" width="185">
+      <attributes />
+      <direction>
+        <direction-type>
+          <wedge default-x="11" default-y="-72" color="#000000" type="crescendo" />
+        </direction-type>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="15" default-y="-55">
+        <pitch>
+          <step>D</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>1</staff>
+        <notations>
+          <tied type="stop" orientation="over" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="53" default-y="-40">
+        <pitch>
+          <step>G</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>1</staff>
+      </note>
+      <direction>
+        <direction-type>
+          <wedge default-x="-8" default-y="-72" color="#000000" type="stop" />
+        </direction-type>
+        <offset sound="no">511</offset>
+        <voice>1</voice>
+        <staff>1</staff>
+      </direction>
+      <note color="#000000" default-x="92" default-y="-35">
+        <pitch>
+          <step>A</step>
+          <octave>3</octave>
+        </pitch>
+        <duration>512</duration>
+        <instrument id="P5-I2" />
+        <voice>1</voice>
+        <type>half</type>
+        <stem>down</stem>
+        <staff>1</staff>
+      </note>
+      <backup>
+        <duration>256</duration>
+      </backup>
+      <note print-object="no" default-x="146">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>2</voice>
+        <type>quarter</type>
+        <staff>1</staff>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note default-x="15">
+        <rest />
+        <duration>512</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>half</type>
+        <staff>2</staff>
+      </note>
+      <note default-x="92">
+        <rest />
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>quarter</type>
+        <staff>2</staff>
+      </note>
+      <note color="#000000" default-x="124" default-y="-9">
+        <grace slash="yes" />
+        <pitch>
+          <step>B</step>
+          <alter>-1</alter>
+          <octave>2</octave>
+        </pitch>
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>eighth</type>
+        <stem>up</stem>
+        <staff>2</staff>
+      </note>
+      <note color="#000000" default-x="146">
+        <pitch>
+          <step>A</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>3</voice>
+        <type>quarter</type>
+        <stem>up</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="start" orientation="over" />
+        </notations>
+      </note>
+      <backup>
+        <duration>1024</duration>
+      </backup>
+      <note color="#000000" default-x="15" default-y="-82">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <tie type="stop" />
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="stop" orientation="over" />
+        </notations>
+      </note>
+      <note color="#000000" default-x="53" default-y="-82">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>256</duration>
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>quarter</type>
+        <stem>down</stem>
+        <staff>2</staff>
+      </note>
+      <note color="#000000" default-x="92" default-y="-82">
+        <pitch>
+          <step>D</step>
+          <octave>2</octave>
+        </pitch>
+        <duration>512</duration>
+        <tie type="start" />
+        <instrument id="P5-I2" />
+        <voice>4</voice>
+        <type>half</type>
+        <stem>down</stem>
+        <staff>2</staff>
+        <notations>
+          <tied type="start" orientation="under" />
+        </notations>
+      </note>
+    </measure>
+    <!--============== Part: P5, Measure: 8 ==============-->
+    <!--============== Part: P5, Measure: 9 ==============-->
+    <!--============== Part: P5, Measure: 10 ==============-->
+    <!--============== Part: P5, Measure: 11 ==============-->
+    <!--============== Part: P5, Measure: 12 ==============-->
+    <!--============== Part: P5, Measure: 13 ==============-->
+    <!--============== Part: P5, Measure: 14 ==============-->
+    <!--============== Part: P5, Measure: 15 ==============-->
+    <!--============== Part: P5, Measure: 16 ==============-->
+    <!--============== Part: P5, Measure: 17 ==============-->
+    <!--============== Part: P5, Measure: 18 ==============-->
+    <!--============== Part: P5, Measure: 19 ==============-->
+    <!--============== Part: P5, Measure: 20 ==============-->
+    <!--============== Part: P5, Measure: 21 ==============-->
+    <!--============== Part: P5, Measure: 22 ==============-->
+    <!--============== Part: P5, Measure: 23 ==============-->
+    <!--============== Part: P5, Measure: 24 ==============-->
+    <!--============== Part: P5, Measure: 25 ==============-->
+    <!--============== Part: P5, Measure: 26 ==============-->
+    <!--============== Part: P5, Measure: 27 ==============-->
+    <!--============== Part: P5, Measure: 28 ==============-->
+    <!--============== Part: P5, Measure: 29 ==============-->
+    <!--============== Part: P5, Measure: 30 ==============-->
+    <!--============== Part: P5, Measure: 31 ==============-->
+    <!--============== Part: P5, Measure: 32 ==============-->
+    <!--============== Part: P5, Measure: 33 ==============-->
+    <!--============== Part: P5, Measure: 34 ==============-->
+    <!--============== Part: P5, Measure: 35 ==============-->
+    <!--============== Part: P5, Measure: 36 ==============-->
+    <!--============== Part: P5, Measure: 37 ==============-->
+    <!--============== Part: P5, Measure: 38 ==============-->
+    <!--============== Part: P5, Measure: 39 ==============-->
+    <!--============== Part: P5, Measure: 40 ==============-->
+    <!--============== Part: P5, Measure: 41 ==============-->
+    <!--============== Part: P5, Measure: 42 ==============-->
+    <!--============== Part: P5, Measure: 43 ==============-->
+    <!--============== Part: P5, Measure: 44 ==============-->
+    <!--============== Part: P5, Measure: 45 ==============-->
+    <!--============== Part: P5, Measure: 46 ==============-->
+    <!--============== Part: P5, Measure: 47 ==============-->
+    <!--============== Part: P5, Measure: 48 ==============-->
+    <!--============== Part: P5, Measure: 49 ==============-->
+    <!--============== Part: P5, Measure: 50 ==============-->
+    <!--============== Part: P5, Measure: 51 ==============-->
+    <!--============== Part: P5, Measure: 52 ==============-->
+    <!--============== Part: P5, Measure: 53 ==============-->
+    <!--============== Part: P5, Measure: 54 ==============-->
+    <!--============== Part: P5, Measure: 55 ==============-->
+    <!--============== Part: P5, Measure: 56 ==============-->
+    <!--============== Part: P5, Measure: 57 ==============-->
+    <!--============== Part: P5, Measure: 58 ==============-->
+    <!--============== Part: P5, Measure: 59 ==============-->
+    <!--============== Part: P5, Measure: 60 ==============-->
+    <!--============== Part: P5, Measure: 61 ==============-->
+    <!--============== Part: P5, Measure: 62 ==============-->
+    <!--============== Part: P5, Measure: 63 ==============-->
+    <!--============== Part: P5, Measure: 64 ==============-->
+    <!--============== Part: P5, Measure: 65 ==============-->
+    <!--============== Part: P5, Measure: 66 ==============-->
+    <!--============== Part: P5, Measure: 67 ==============-->
+    <!--============== Part: P5, Measure: 68 ==============-->
+    <!--============== Part: P5, Measure: 69 ==============-->
+    <!--============== Part: P5, Measure: 70 ==============-->
+    <!--============== Part: P5, Measure: 71 ==============-->
+    <!--============== Part: P5, Measure: 72 ==============-->
+    <!--============== Part: P5, Measure: 73 ==============-->
+    <!--============== Part: P5, Measure: 74 ==============-->
+    <!--============== Part: P5, Measure: 75 ==============-->
+    <!--============== Part: P5, Measure: 76 ==============-->
+    <!--============== Part: P5, Measure: 77 ==============-->
+    <!--============== Part: P5, Measure: 78 ==============-->
+    <!--============== Part: P5, Measure: 79 ==============-->
+    <!--============== Part: P5, Measure: 80 ==============-->
+    <!--============== Part: P5, Measure: 81 ==============-->
+    <!--============== Part: P5, Measure: 82 ==============-->
+    <!--============== Part: P5, Measure: 83 ==============-->
+    <!--============== Part: P5, Measure: 84 ==============-->
+    <!--============== Part: P5, Measure: 85 ==============-->
+    <!--============== Part: P5, Measure: 86 ==============-->
+    <!--============== Part: P5, Measure: 87 ==============-->
+    <!--============== Part: P5, Measure: 88 ==============-->
+    <!--============== Part: P5, Measure: 89 ==============-->
+    <!--============== Part: P5, Measure: 90 ==============-->
+    <!--============== Part: P5, Measure: 91 ==============-->
+    <!--============== Part: P5, Measure: 92 ==============-->
+    <!--============== Part: P5, Measure: 93 ==============-->
+    <!--============== Part: P5, Measure: 94 ==============-->
+    <!--============== Part: P5, Measure: 95 ==============-->
+    <!--============== Part: P5, Measure: 96 ==============-->
+    <!--============== Part: P5, Measure: 97 ==============-->
+    <!--============== Part: P5, Measure: 98 ==============-->
+    <!--============== Part: P5, Measure: 99 ==============-->
+    <!--============== Part: P5, Measure: 100 ==============-->
+    <!--============== Part: P5, Measure: 101 ==============-->
+    <!--============== Part: P5, Measure: 102 ==============-->
+    <!--============== Part: P5, Measure: 103 ==============-->
+    <!--============== Part: P5, Measure: 104 ==============-->
+    <!--============== Part: P5, Measure: 105 ==============-->
+    <!--============== Part: P5, Measure: 106 ==============-->
+    <!--============== Part: P5, Measure: 107 ==============-->
+    <!--============== Part: P5, Measure: 108 ==============-->
+    <!--============== Part: P5, Measure: 109 ==============-->
+    <!--============== Part: P5, Measure: 110 ==============-->
+    <!--============== Part: P5, Measure: 111 ==============-->
+    <!--============== Part: P5, Measure: 112 ==============-->
+    <!--============== Part: P5, Measure: 113 ==============-->
+    <!--============== Part: P5, Measure: 114 ==============-->
+    <!--============== Part: P5, Measure: 115 ==============-->
+    <!--============== Part: P5, Measure: 116 ==============-->
+    <!--============== Part: P5, Measure: 117 ==============-->
+    <!--============== Part: P5, Measure: 118 ==============-->
+    <!--============== Part: P5, Measure: 119 ==============-->
+    <!--============== Part: P5, Measure: 120 ==============-->
+    <!--============== Part: P5, Measure: 121 ==============-->
+    <!--============== Part: P5, Measure: 122 ==============-->
+    <!--============== Part: P5, Measure: 123 ==============-->
+    <!--============== Part: P5, Measure: 124 ==============-->
+    <!--============== Part: P5, Measure: 125 ==============-->
+    <!--============== Part: P5, Measure: 126 ==============-->
+    <!--============== Part: P5, Measure: 127 ==============-->
+    <!--============== Part: P5, Measure: 128 ==============-->
+    <!--============== Part: P5, Measure: 129 ==============-->
+    <!--============== Part: P5, Measure: 130 ==============-->
+    <!--============== Part: P5, Measure: 131 ==============-->
+    <!--============== Part: P5, Measure: 132 ==============-->
+    <!--============== Part: P5, Measure: 133 ==============-->
+    <!--============== Part: P5, Measure: 134 ==============-->
+    <!--============== Part: P5, Measure: 135 ==============-->
+    <!--============== Part: P5, Measure: 136 ==============-->
+    <!--============== Part: P5, Measure: 137 ==============-->
+    <!--============== Part: P5, Measure: 138 ==============-->
+    <!--============== Part: P5, Measure: 139 ==============-->
+    <!--============== Part: P5, Measure: 140 ==============-->
+    <!--============== Part: P5, Measure: 141 ==============-->
+    <!--============== Part: P5, Measure: 142 ==============-->
+    <!--============== Part: P5, Measure: 143 ==============-->
+    <!--============== Part: P5, Measure: 144 ==============-->
+    <!--============== Part: P5, Measure: 145 ==============-->
+    <!--============== Part: P5, Measure: 146 ==============-->
+    <!--============== Part: P5, Measure: 147 ==============-->
+    <!--============== Part: P5, Measure: 148 ==============-->
+    <!--============== Part: P5, Measure: 149 ==============-->
+    <!--============== Part: P5, Measure: 150 ==============-->
+    <!--============== Part: P5, Measure: 151 ==============-->
+    <!--============== Part: P5, Measure: 152 ==============-->
+    <!--============== Part: P5, Measure: 153 ==============-->
+    <!--============== Part: P5, Measure: 154 ==============-->
+    <!--============== Part: P5, Measure: 155 ==============-->
+    <!--============== Part: P5, Measure: 156 ==============-->
+    <!--============== Part: P5, Measure: 157 ==============-->
+    <!--============== Part: P5, Measure: 158 ==============-->
+    <!--============== Part: P5, Measure: 159 ==============-->
+    <!--============== Part: P5, Measure: 160 ==============-->
+    <!--============== Part: P5, Measure: 161 ==============-->
+    <!--============== Part: P5, Measure: 162 ==============-->
+    <!--============== Part: P5, Measure: 163 ==============-->
+    <!--============== Part: P5, Measure: 164 ==============-->
+    <!--============== Part: P5, Measure: 165 ==============-->
+    <!--============== Part: P5, Measure: 166 ==============-->
+    <!--============== Part: P5, Measure: 167 ==============-->
+    <!--============== Part: P5, Measure: 168 ==============-->
+    <!--============== Part: P5, Measure: 169 ==============-->
+    <!--============== Part: P5, Measure: 170 ==============-->
+    <!--============== Part: P5, Measure: 171 ==============-->
+    <!--============== Part: P5, Measure: 172 ==============-->
+    <!--============== Part: P5, Measure: 173 ==============-->
+    <!--============== Part: P5, Measure: 174 ==============-->
+    <!--============== Part: P5, Measure: 175 ==============-->
+    <!--============== Part: P5, Measure: 176 ==============-->
+    <!--============== Part: P5, Measure: 177 ==============-->
+    <!--============== Part: P5, Measure: 178 ==============-->
+    <!--============== Part: P5, Measure: 179 ==============-->
+    <!--============== Part: P5, Measure: 180 ==============-->
+    <!--============== Part: P5, Measure: 181 ==============-->
+    <!--============== Part: P5, Measure: 182 ==============-->
+    <!--============== Part: P5, Measure: 183 ==============-->
+    <!--============== Part: P5, Measure: 184 ==============-->
+    <!--============== Part: P5, Measure: 185 ==============-->
+    <!--============== Part: P5, Measure: 186 ==============-->
+    <!--============== Part: P5, Measure: 187 ==============-->
+    <!--============== Part: P5, Measure: 188 ==============-->
+    <!--============== Part: P5, Measure: 189 ==============-->
+    <!--============== Part: P5, Measure: 190 ==============-->
+    <!--============== Part: P5, Measure: 191 ==============-->
+    <!--============== Part: P5, Measure: 192 ==============-->
+    <!--============== Part: P5, Measure: 193 ==============-->
+    <!--============== Part: P5, Measure: 194 ==============-->
+    <!--============== Part: P5, Measure: 195 ==============-->
+    <!--============== Part: P5, Measure: 196 ==============-->
+  </part>
+</score-partwise>

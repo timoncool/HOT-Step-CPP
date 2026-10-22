@@ -11,6 +11,7 @@ import type { EngineBackend } from './types.js';
 import { aceBackend } from './ace/index.js';
 import { minimaxBackend } from './minimax/index.js';
 import { yue2Backend } from './yue2/index.js';
+import { sa3Backend } from './sa3/index.js';
 
 const SETTING_KEY = 'active_backend_id';
 const DEFAULT_BACKEND_ID = 'ace';
@@ -22,11 +23,15 @@ const backends: Record<string, EngineBackend> = {
   ace: aceBackend,
   'minimax-m3': minimaxBackend,
   yue2: yue2Backend,
+  // HOT-Step: Stable Audio 3 as a primary backend (backends/sa3/). Last in
+  // the toggle, after the two it does not change.
+  sa3: sa3Backend,
 };
 
 /** Look up a backend by id, or undefined if unregistered. */
 export function getBackend(id: string): EngineBackend | undefined {
-  return backends[id];
+  // Own properties only: 'toString' and friends are not backends.
+  return Object.hasOwn(backends, id) ? backends[id] : undefined;
 }
 
 /** All registered backends, in registration order. */
@@ -38,12 +43,12 @@ export function listBackends(): EngineBackend[] {
  *  value doesn't name a registered backend (e.g. a backend was removed). */
 export function getActiveBackendId(): string {
   const id = getSetting(SETTING_KEY, DEFAULT_BACKEND_ID);
-  return backends[id] ? id : DEFAULT_BACKEND_ID;
+  return getBackend(id) ? id : DEFAULT_BACKEND_ID;
 }
 
 /** Set the active backend id. Returns false (no-op) if `id` isn't registered. */
 export function setActiveBackendId(id: string): boolean {
-  if (!backends[id]) return false;
+  if (!getBackend(id)) return false;
   setSetting(SETTING_KEY, id);
   return true;
 }

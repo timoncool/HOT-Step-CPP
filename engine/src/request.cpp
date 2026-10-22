@@ -28,6 +28,9 @@ void request_init(AceRequest * r) {
     r->lm_batch_size        = 1;
     r->synth_batch_size     = 1;
     r->seed                 = -1;
+    r->seed_b               = -1;
+    r->seed_blend           = 0.0f;
+    r->seed_blend_end       = -1.0f;
     r->lm_temperature       = 0.85f;
     r->lm_cfg_scale         = 2.0f;
     r->lm_cfg_cutoff_ratio  = 1.0f;
@@ -222,6 +225,17 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "lm_seed")) && yyjson_is_num(v)) {
         r->lm_seed = (int64_t) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "seed_b")) && yyjson_is_num(v)) {
+        r->seed_b = (int64_t) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "seed_blend")) && yyjson_is_num(v)) {
+        float t       = (float) yyjson_get_num(v);
+        r->seed_blend = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    }
+    if ((v = yyjson_obj_get(obj, "seed_blend_end")) && yyjson_is_num(v)) {
+        float t           = (float) yyjson_get_num(v);
+        r->seed_blend_end = t < 0.0f ? -1.0f : (t > 1.0f ? 1.0f : t);  // negative = off
     }
     if ((v = yyjson_obj_get(obj, "lm_top_k")) && yyjson_is_num(v)) {
         r->lm_top_k = (int) yyjson_get_num(v);
@@ -527,6 +541,15 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
     if (all || r->lm_seed != def.lm_seed) {
         yyjson_mut_obj_add_sint(doc, root, "lm_seed", r->lm_seed);
+    }
+    if (all || r->seed_b != def.seed_b) {
+        yyjson_mut_obj_add_sint(doc, root, "seed_b", r->seed_b);
+    }
+    if (all || r->seed_blend != def.seed_blend) {
+        yyjson_mut_obj_add_real(doc, root, "seed_blend", r->seed_blend);
+    }
+    if (all || r->seed_blend_end != def.seed_blend_end) {
+        yyjson_mut_obj_add_real(doc, root, "seed_blend_end", r->seed_blend_end);
     }
     if (all || r->use_cot_caption != def.use_cot_caption) {
         yyjson_mut_obj_add_bool(doc, root, "use_cot_caption", r->use_cot_caption);

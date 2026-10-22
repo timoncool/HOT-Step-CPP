@@ -142,6 +142,8 @@
     "settings.ai.unslothUsernameDesc": "Unsloth 認証用のユーザー名。",
     "settings.ai.unslothPassword": "Unsloth パスワード",
     "settings.ai.unslothPasswordDesc": "Unsloth 認証用のパスワード。",
+    "settings.ai.unslothKeyless": "キーレスのローカル Studio",
+    "settings.ai.unslothKeylessDesc": "ローカルの Unsloth Studio が「keyless API access」設定を有効にして実行されている場合にオンにしてください。ユーザー名とパスワードが不要になります。それ以外の場合はオフのままにしてください。これをオンにするか両方の認証情報を設定するまで、プロバイダーは非表示のままです。",
     "settings.ai.llamacppUrl": "llama.cpp URL",
     "settings.ai.llamacppUrlDesc": "llama.cpp サーバー (llama-server) のベース URL。",
     "settings.ai.openaiCompatUrl": "互換エンドポイント URL",

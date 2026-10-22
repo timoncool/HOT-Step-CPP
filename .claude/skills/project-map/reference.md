@@ -1,5 +1,9 @@
 # Project Map — Deep Reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Companion to [SKILL.md](SKILL.md). All paths repo-relative to the HOT-Step CPP root. Line numbers verified against `master` on 2026-07-02; they drift over time — treat as anchors, re-grep if a ref misses.
 
 ## 1. Engine source map (`engine/src/`, headers unless noted)
@@ -86,15 +90,15 @@ Fields the C++ struct does not know about (the **sideband**) are dropped by the 
 - **aceClient.ts**: `BASE = config.aceServer.url`; timeouts :17-19 (15 s / 30 s / 300 s); `AceProps` :22; `AceRequest` :38; job status types :154+.
 - **Post-processing** (`services/generation/postProcessing.ts`): `runPostProcessingChain` :70; stage order QE(unmastered) :105 → PP-VAE :135 → Spectral Lifter :151 → Vocal Naturalizer :171 → gain offset :198 → VST chain :248 → Mastering :264 → LUFS :282 → QE(mastered) :303. `parallelQualityEval` runs pre-QE concurrently with PP-VAE.
 - **logs.ts**: `pushLog` :34, `subscribeLines` :49 (in-memory ring feeding terminal panel), `GET /` :56, `GET /vram` :100, `GET /models-loaded` :120, `POST /models-unload` :133.
-- **stemStudio.ts**: two modes documented in header :1-8 — `extract` (generative, sequential DiT `/synth` per track) and `supersep` (ONNX NN). Both persist to `server/data/stems/<jobId>/`.
+- **stemStudio.ts**: two modes documented in header :1-8 — `extract` (generative, sequential DiT `/synth` per track) and `supersep` (ONNX NN). Both persist to `<data root>/library/stems/<jobId>/`.
 
 ## 5. Config / env (`server/src/config.ts`)
 
 - Portable mode: `HOT_STEP_ROOT` env → `PROJECT_ROOT` (config.ts:13-16). Dev: two levels up from `server/src/`.
 - `.env` bootstrapped from `.env.example` on first launch (:20-30).
 - ace-server exe auto-located: `engine/ace-server.exe` (portable) → `engine/build/Release/` (VS) → `engine/build/` (Ninja) → `engine/build/Debug/` (:46-52). Override: `ACESTEPCPP_EXE`.
-- Defaults: models `models/`, adapters `adapters/`, port 8085, host 127.0.0.1, vaeChunk 1024, vaeOverlap 64 (:100-105). Node server: port 3001, host 0.0.0.0 (:186-187).
-- ffmpeg: portable `server/ffmpeg.exe` else `ffmpeg-static` npm package (:68-93). Essentia: `Essentia/essentia_streaming_extractor_music.exe` or `ESSENTIA_BIN` (:181). Whisper: `tools/whisper/whisper-cli.exe` + `models/whisper/` (:254-255). vst-host.exe lives next to ace-server.exe (:236-240).
+- Defaults: models `<data root>/models/`, adapters `<data root>/adapters/`, port 8085, host 127.0.0.1, vaeChunk 1024, vaeOverlap 64 (:100-105). Node server: port 3001, host 0.0.0.0 (:186-187).
+- ffmpeg: portable `server/ffmpeg.exe` else `ffmpeg-static` npm package (:68-93). Essentia: `Essentia/essentia_streaming_extractor_music.exe` or `ESSENTIA_BIN` (:181). Whisper: `tools/whisper/whisper-cli.exe` + `<data root>/models/whisper/` (:254-255). vst-host.exe lives next to ace-server.exe (:236-240).
 - Lireek LLM providers (:202-231): gemini (default), openai, anthropic, ollama, lmstudio, unsloth, llamacpp, openai-compat — impls in `server/src/services/lireek/llm/`.
 - Settings UI whitelist `EXPOSED_ENV_KEYS` :265-286; restart-required set :289-294; hot-reload `reloadEnvConfig()` :300.
 

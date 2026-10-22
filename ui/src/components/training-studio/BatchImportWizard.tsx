@@ -11,9 +11,10 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, FolderOpen, FolderPlus, Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { adapterApi } from '../../services/api';
+import { queryClient } from '../../queries/client';
+import { trainingQueries as tq } from '../../queries/training-data/queries';
 import {
-  PIPELINE_STAGES, scanPreview,
+  PIPELINE_STAGES,
   type MergePolicy, type PipelineStage, type TrainingDatasetSummary,
 } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
@@ -130,7 +131,7 @@ export const BatchImportWizard: React.FC<BatchImportWizardProps> = ({ open, onCl
     if (gen !== genRef.current) return;
     setRows(prev => prev.map(r => (r.path === path ? { ...r, scanning: true, scanError: null } : r)));
     try {
-      const preview = await scanPreview(path, true);
+      const preview = await queryClient.query(tq.scanPreview(useTrainingStore.getState().trainingWorker, path, true));
       if (gen !== genRef.current) return;
       setRows(prev => prev.map(r => (r.path === path
         ? { ...r, scanning: false, audioFiles: preview.audioFiles, checked: r.checked && preview.audioFiles > 0 }
@@ -162,7 +163,7 @@ export const BatchImportWizard: React.FC<BatchImportWizardProps> = ({ open, onCl
     setLoadingRoot(true);
     setRows([]);
     try {
-      const result = await adapterApi.browse(dir, 'trainingAudio');
+      const result = await queryClient.query(tq.browse(dir, 'trainingAudio'));
       if (gen !== genRef.current) return;
       const subdirs = result.entries.filter(e => e.type === 'dir' && e.name !== '..');
       const initial: FolderRow[] = subdirs.map(e => ({
@@ -279,7 +280,7 @@ export const BatchImportWizard: React.FC<BatchImportWizardProps> = ({ open, onCl
         className="fixed inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4"
         onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
       >
-        <div className="w-[680px] max-h-[85vh] flex flex-col overflow-hidden rounded-xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-suno-card shadow-2xl">
+        <div className="w-full max-[1023px]:max-w-full min-[1024px]:w-[680px] max-h-[85vh] max-[1023px]:max-h-[100dvh] flex flex-col overflow-hidden rounded-xl border border-zinc-200 dark:border-white/10 bg-white dark:bg-suno-card shadow-2xl">
           <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-200 dark:border-white/5">
             <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">{t('trainingStudio.batch.title')}</h3>
             <button onClick={onClose} className="text-zinc-500 hover:text-zinc-800 dark:hover:text-white transition-colors">

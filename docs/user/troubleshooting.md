@@ -302,3 +302,7 @@ maintainer is most active.
 - [Model Manager](studios/model-manager.md)
 - [Settings](studios/settings.md)
 - [Model files](models.md)
+
+## Release data location
+
+In a release, session logs live under the shared data folder's `logs/`, and settings under `settings/.env`. If startup shows a data-folder explanation page, retain the profile pointer, fix the reported path or reconnect the drive, then restart. See [Data folder and upgrades](data-folder.md). Development checkouts keep their existing log and settings paths.

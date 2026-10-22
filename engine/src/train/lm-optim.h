@@ -20,8 +20,10 @@
 
 #include "train/lm-common.h"
 #include "train/lm-graph.h"
+#include "yue2-aitk-host-profile.h"
 
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -222,6 +224,10 @@ struct LmOptim {
      *  bug to find later. */
     float adam_beta1   = 0.9f;
     float adam_beta2   = 0.999f;
+    /** AdamW epsilon. 1e-8 is what every run before this field had; the
+     *  YuE2 joint trainer's --adam-eps sets it (torch's AdamW default is
+     *  1e-8 too, but the fixed-recipe method passes 1e-6). */
+    float adam_eps     = 1e-8f;
     float grad_clip    = 1.0f;
     int   total_steps  = 1;
     int   warmup_steps = 1;
@@ -625,6 +631,34 @@ static ggml_tensor * lm_cautious(ggml_context * ctx, ggml_tensor * upd, ggml_ten
     return ggml_div(ctx, ggml_mul(ctx, upd, mask), mean);
 }
 
+// Which backend the scheduler put each optimizer graph's nodes on. Logged
+// once per run per graph kind by default; under YUE2_AITK_HOST_PROFILE=1,
+// every call logs, so a CPU fallback that only shows up after the scheduler
+// settles (not on the first graph) is still caught. The scheduler keeps a
+// CPU backend as its fallback, so an op the GPU refuses would otherwise run
+// on the CPU silently.
+static void lm_optim_report_placement(ggml_backend_sched_t sched, ggml_cgraph * g, const char * what) {
+    static std::unordered_map<std::string, bool> seen;
+    if (seen[what] && !yue2_aitk_prof::on()) return;
+    seen[what] = true;
+    std::unordered_map<std::string, int> per_backend;
+    std::unordered_map<std::string, int> cpu_ops;
+    for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+        ggml_tensor * t = ggml_graph_node(g, i);
+        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, t);
+        const std::string name = b ? ggml_backend_name(b) : "unassigned";
+        per_backend[name]++;
+        if (!b || ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_CPU) cpu_ops[ggml_op_desc(t)]++;
+    }
+    std::string line = std::string("[lm-optim] ") + what + " graph placement:";
+    for (const auto & kv : per_backend) line += " " + kv.first + "=" + std::to_string(kv.second);
+    if (!cpu_ops.empty()) {
+        line += " | on CPU:";
+        for (const auto & kv : cpu_ops) line += " " + kv.first + "x" + std::to_string(kv.second);
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 static bool lm_optim_step_prodigy(LmOptim * o, ggml_backend_sched_t sched, float lr_now, LmStepStats * out) {
     const float  b1  = 0.9f;
     const float  b2  = 0.999f;
@@ -666,7 +700,7 @@ static bool lm_optim_step_prodigy(LmOptim * o, ggml_backend_sched_t sched, float
         }
         ggml_build_forward_expand(go, ggml_cpy(ctx, tree(ctx, sq), o->t_gnorm2));
         ggml_backend_sched_reset(sched);
-        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS;
+        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS; lm_optim_report_placement(sched, go, "prodigy gradient norm");
         ggml_free(ctx);
         if (!ok) {
             return false;
@@ -715,7 +749,7 @@ static bool lm_optim_step_prodigy(LmOptim * o, ggml_backend_sched_t sched, float
         ggml_build_forward_expand(go, ggml_cpy(ctx, tree(ctx, nums), o->t_pnum));
         ggml_build_forward_expand(go, ggml_cpy(ctx, tree(ctx, l1s), o->t_ps1));
         ggml_backend_sched_reset(sched);
-        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS;
+        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS; lm_optim_report_placement(sched, go, "prodigy statistics");
         ggml_free(ctx);
         if (!ok) {
             return false;
@@ -786,7 +820,7 @@ static bool lm_optim_step_prodigy(LmOptim * o, ggml_backend_sched_t sched, float
             ggml_build_forward_expand(go, ggml_cpy(ctx, ggml_sub(ctx, cur, ggml_scale(ctx, upd, step_j)), o->params[j]));
         }
         ggml_backend_sched_reset(sched);
-        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS;
+        const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS; lm_optim_report_placement(sched, go, "prodigy update");
         ggml_free(ctx);
         if (!ok) {
             return false;
@@ -910,10 +944,12 @@ static bool lm_optim_step(LmOptim * o, ggml_backend_sched_t sched, LmStepStats *
                 ggml_tensor * m_new = ggml_add(ctx, ggml_scale(ctx, o->mom_m[j], b1), ggml_scale(ctx, g, 1.0f - b1));
                 ggml_tensor * v_new = ggml_add(ctx, ggml_scale(ctx, o->mom_v[j], b2), ggml_scale(ctx, ggml_sqr(ctx, g), 1.0f - b2));
                 ggml_tensor * mh    = ggml_scale(ctx, m_new, b1h);
-                // The fused op's eps is 1e-8 (p7[3] below); t_eps is 1e-6 by
-                // this struct's contract, so 0.01 * t_eps is that scalar
-                // without another caller-allocated tensor.
-                ggml_tensor * vh    = ggml_add(ctx, ggml_sqrt(ctx, ggml_scale(ctx, v_new, b2h)), ggml_scale(ctx, o->t_eps, 1e-2f));
+                // The fused op's eps is adam_eps (p7[3] below); t_eps is 1e-6 by
+                // this struct's contract, so (adam_eps / 1e-6) * t_eps is that
+                // scalar without another caller-allocated tensor. The default
+                // keeps the literal 1e-2 so old runs stay bit-identical.
+                const float eps_mul = o->adam_eps == 1e-8f ? 1e-2f : o->adam_eps / 1e-6f;
+                ggml_tensor * vh    = ggml_add(ctx, ggml_sqrt(ctx, ggml_scale(ctx, v_new, b2h)), ggml_scale(ctx, o->t_eps, eps_mul));
                 ggml_tensor * upd   = ggml_div(ctx, mh, vh);
                 if (o->cautious) {
                     upd = lm_cautious(ctx, upd, g);
@@ -1006,7 +1042,7 @@ static bool lm_optim_step(LmOptim * o, ggml_backend_sched_t sched, LmStepStats *
     const float p7[7] = { lr,
                           b1,
                           b2,
-                          1e-8f,
+                          o->adam_eps,
                           o->weight_decay,
                           1.0f / (1.0f - powf(b1, (float) o->opt_iter)),
                           1.0f / (1.0f - powf(b2, (float) o->opt_iter)) };
@@ -1019,7 +1055,7 @@ static bool lm_optim_step(LmOptim * o, ggml_backend_sched_t sched, LmStepStats *
     }
 
     ggml_backend_sched_reset(sched);
-    const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS;
+    const bool ok = ggml_backend_sched_graph_compute(sched, go) == GGML_STATUS_SUCCESS; lm_optim_report_placement(sched, go, "adamw/muon step");
 
     float gn2v = 0.0f;
     ggml_backend_tensor_get(o->t_gnorm2, &gn2v, 0, sizeof(float));

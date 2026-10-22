@@ -160,6 +160,41 @@ function C.bool_param(p, key, default)
     return p[key]
 end
 
+-- ═══════════════════════════════════════════════════════════════════════════
+-- MODEL-AWARE LATENT RMS
+-- ACE-Step latents measure ~2.0 RMS; SA3 measures ~0.685 on a 24-step native
+-- render; MM3 TBD. Any rms_target / latent-pressure servo tuned against ACE's
+-- 2.0 and dropped onto a lower-RMS model spends every step inflating the
+-- latent toward a magnitude the model never produces natively. Read
+-- model_context.latent_rms (injected by the engine, see lua-plugin.h) and
+-- scale off it instead of the hardcoded ACE number.
+--
+-- Convention: UI-exposed rms-target params default to 0, which means "auto"
+-- -- scale the ACE-tuned reference value by rms_scale(). Any nonzero value
+-- the user actually sets is used as-is (explicit wins, never auto-scaled).
+-- ═══════════════════════════════════════════════════════════════════════════
+
+function C.latent_rms_base()
+    local v = model_context and tonumber(model_context.latent_rms)
+    if not v or v <= 0 then v = 2.0 end
+    return v
+end
+
+function C.rms_scale()
+    return C.latent_rms_base() / 2.0
+end
+
+-- Resolves a UI rms-target-style param. 0 or nil means "auto": the supplied
+-- ace_default (what this param would be tuned to on ACE, RMS ~2.0) scaled by
+-- rms_scale(). A nonzero value is returned unchanged (user override wins).
+function C.rms_scaled(p, key, ace_default)
+    local v = C.num_param(p, key, 0)
+    if v == 0 then
+        return ace_default * C.rms_scale()
+    end
+    return v
+end
+
 -- Batch routing: reads engine globals, returns B, NPB with sanity fallback
 function C.get_batch_routing(n)
     local B   = (batch_n and batch_n > 0) and batch_n or 1
@@ -487,11 +522,11 @@ C.LOOKBACK_PARAMS = {
 
 C.RMS_PARAMS = {
     { key = "rms_servo", type = "toggle", label = "RMS Servo",
-      default = false, hint = "Per-batch downward-only RMS ceiling. ACE-Step latents run ~2.0 RMS -- calibrate targets before enabling." },
+      default = false, hint = "Per-batch downward-only RMS ceiling. Targets auto-scale from the model's native latent RMS (ACE ~2.0, SA3 ~0.685) -- calibrate before enabling if you override the targets below." },
     { key = "rms_target_min", type = "slider", label = "RMS Target Min",
-      default = 1.2, min = 0.1, max = 3.0, step = 0.05, hint = "RMS ceiling at low sigma." },
+      default = 0, min = 0.0, max = 3.0, step = 0.05, hint = "RMS ceiling at low sigma. 0 = auto (1.2, scaled to the active model's latent RMS)." },
     { key = "rms_target_max", type = "slider", label = "RMS Target Max",
-      default = 2.5, min = 0.5, max = 5.0, step = 0.05, hint = "RMS ceiling at high sigma." },
+      default = 0, min = 0.0, max = 5.0, step = 0.05, hint = "RMS ceiling at high sigma. 0 = auto (2.5, scaled to the active model's latent RMS)." },
     { key = "rms_servo_gain", type = "slider", label = "RMS Servo Gain",
       default = 0.6, min = 0.1, max = 1.0, step = 0.05, hint = "Servo correction aggressiveness." },
 }
@@ -541,8 +576,8 @@ function C.read_common_opts(p)
         lb_lambda     = C.num_param(p, "look_back_lambda", 0.15),
         lb_snr_power  = C.num_param(p, "look_back_snr_power", 1.3),
         f_rms         = C.bool_param(p, "rms_servo", false),
-        rms_tgt_min   = C.num_param(p, "rms_target_min", 1.2),
-        rms_tgt_max   = C.num_param(p, "rms_target_max", 2.5),
+        rms_tgt_min   = C.rms_scaled(p, "rms_target_min", 1.2),
+        rms_tgt_max   = C.rms_scaled(p, "rms_target_max", 2.5),
         rms_gain      = C.num_param(p, "rms_servo_gain", 0.6),
         eta           = C.num_param(p, "eta", 0.0),
         seed          = math.floor(C.num_param(p, "seed", 42)),

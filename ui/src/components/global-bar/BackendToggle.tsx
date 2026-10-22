@@ -1,99 +1,122 @@
-// BackendToggle.tsx — compact backend picker for the global param bar
+import { useQuery } from '@tanstack/react-query';
+import { backendsOptions } from '../../queries/global-models/options';
+// BackendToggle.tsx — the generation-engine picker at the top of the left
+// sidebar, directly under the logo.
 //
 // Lists registered engine backends (GET /api/backends) and switches the
-// active one via backendStore.switchBackend(). Styled to match the compact
-// controls in the bar's right-hand cluster (see the Profiles button in
-// GlobalParamBar.tsx) rather than the full BarSection accordion — this is a
-// small pill, not a params dropdown.
+// active one via backendStore.switchBackend(). Deliberately large and bold:
+// it is where the engine is changed, and the sidebar's studio list follows it.
+// The option list is portaled to document.body because the sidebar scrolls
+// (overflow-y-auto would clip an absolute dropdown).
 //
-// CRITICAL: renders null while only one backend is registered. Every install
-// today has exactly one ('ace'), so this control must stay completely
-// invisible until a second backend (e.g. MiniMax-Music3) actually exists —
-// see docs/plans/multi-backend-architecture.md §4.5.
+// CRITICAL: renders null while only one backend is registered — see
+// docs/plans/multi-backend-architecture.md §4.5.
 
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { Layers, Check } from 'lucide-react';
+import { Layers, Check, ChevronDown } from 'lucide-react';
 import { useBackendStore } from '../../stores/backendStore';
 import { useCapabilities } from '../../hooks/useCapabilities';
 
-export const BackendToggle: React.FC = () => {
+export const BackendToggle: React.FC<{ collapsed?: boolean }> = ({ collapsed = false }) => {
   const { t } = useTranslation();
   const backends = useBackendStore(s => s.backends);
   const activeBackendId = useBackendStore(s => s.activeBackendId);
-  const fetchBackends = useBackendStore(s => s.fetchBackends);
   const switchBackend = useBackendStore(s => s.switchBackend);
   const { capabilities } = useCapabilities();
-  const [open, setOpen] = useState(false);
-  const wrapRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { void fetchBackends(); }, [fetchBackends]);
+  useQuery(backendsOptions());
 
   useEffect(() => {
-    if (!open) return;
+    if (!pos) return;
     const onDocClick = (e: MouseEvent) => {
-      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      if (!buttonRef.current?.contains(target) && !listRef.current?.contains(target)) setPos(null);
     };
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
-  }, [open]);
+  }, [pos]);
 
   // The whole feature must be invisible until a second backend is registered.
   if (backends.length < 2) return null;
 
   const active = backends.find(b => b.id === activeBackendId) || backends[0];
 
-  // Optional plain-text notice a backend's manifest can carry (backendStore.ts
-  // BackendCoreCapabilities.notice) — e.g. a weights-licence reminder with an
-  // upstream contact address. Generic: keyed off the manifest field,
-  // never a backend id. Surfaced as a tooltip rather than an extra line under
-  // the picker so a notice never changes the bar's fixed height.
+  // Optional plain-text notice a backend's manifest can carry (e.g. a
+  // weights-licence reminder). Generic: keyed off the manifest field, never a
+  // backend id. Surfaced as a tooltip.
   const notice = typeof capabilities?.license === 'string' ? capabilities.license : (typeof capabilities?.core?.notice === 'string' ? capabilities.core.notice : undefined);
   const pickerTitle = notice ? `${t('globalBar.backend')} — ${notice}` : t('globalBar.backend');
 
+  const toggle = () => {
+    if (pos) { setPos(null); return; }
+    const r = buttonRef.current?.getBoundingClientRect();
+    if (r) setPos(collapsed ? { top: r.top, left: r.right + 6 } : { top: r.bottom + 4, left: r.left });
+  };
+
   return (
-    <div ref={wrapRef} className="relative flex-shrink-0 flex items-center">
+    <>
       <button
+        ref={buttonRef}
         type="button"
-        onClick={() => setOpen(o => !o)}
+        onClick={toggle}
         title={pickerTitle}
-        className="group flex items-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-pink-500/10 transition-colors duration-150"
+        className={`w-full rounded-xl border-2 border-pink-500/60 bg-pink-500/10 hover:bg-pink-500/20 transition-colors text-left ${
+          collapsed ? 'flex flex-col items-center gap-1 px-1 py-2' : 'flex items-center gap-2 px-3 py-2.5'
+        }`}
       >
-        <Layers size={13} className="flex-shrink-0 text-zinc-500 group-hover:text-pink-400 transition-colors duration-150" />
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400 group-hover:text-zinc-800 dark:group-hover:text-zinc-200 transition-colors duration-150 max-w-[120px] truncate">
+        <Layers size={collapsed ? 18 : 16} className="flex-shrink-0 text-pink-400" />
+        <span className={`min-w-0 ${collapsed ? 'text-center' : 'flex-1'}`}>
+          {!collapsed && (
+            <span className="block text-[9px] font-semibold uppercase tracking-wider text-pink-400/80">
+              {t('globalBar.engine', 'Generation engine')}
+            </span>
+          )}
           {/*
             The MiniMax-Music3 community license (§4.2 "commercial products
             must prominently display 'MiniMax-Music3'") is satisfied by
-            rendering the server's displayName string verbatim here — do not
-            reformat, truncate-with-ellipsis-only-partial, or substitute a
-            friendlier label for that backend.
+            rendering the server's displayName string verbatim here — wrapped,
+            never truncated, and never a friendlier substitute label.
           */}
-          {active?.displayName || active?.id}
+          <span className={`block font-bold text-zinc-900 dark:text-white break-words ${collapsed ? 'text-[10px] leading-tight' : 'text-sm leading-snug'}`}>
+            {active?.displayName || active?.id}
+          </span>
         </span>
+        {!collapsed && <ChevronDown size={14} className={`flex-shrink-0 text-pink-400 transition-transform ${pos ? 'rotate-180' : ''}`} />}
       </button>
 
-      {open && (
-        <div className="absolute top-full left-0 mt-1 z-50 min-w-[180px] rounded-xl border border-zinc-300 dark:border-white/10 bg-white dark:bg-zinc-900 shadow-2xl shadow-black/30 dark:shadow-black/60 p-1 global-bar-dropdown-enter">
+      {pos && createPortal(
+        <div
+          ref={listRef}
+          data-portal-layer
+          className="fixed z-[9999] min-w-[200px] rounded-xl border border-zinc-300 dark:border-white/10 bg-white dark:bg-zinc-900 shadow-2xl shadow-black/30 dark:shadow-black/60 p-1 global-bar-dropdown-enter"
+          style={{ top: pos.top, left: pos.left }}
+        >
           {backends.map(b => (
             <button
               key={b.id}
               type="button"
               onClick={() => {
-                setOpen(false);
+                setPos(null);
                 if (b.id !== activeBackendId) void switchBackend(b.id);
               }}
-              className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg text-xs text-left transition-colors ${
+              className={`w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg text-sm text-left transition-colors ${
                 b.id === activeBackendId
-                  ? 'bg-pink-500/10 text-pink-400'
+                  ? 'bg-pink-500/10 text-pink-400 font-semibold'
                   : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
               }`}
             >
-              <span className="truncate">{b.displayName}</span>
-              {b.id === activeBackendId && <Check size={12} className="flex-shrink-0" />}
+              <span>{b.displayName}</span>
+              {b.id === activeBackendId && <Check size={14} className="flex-shrink-0" />}
             </button>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
-    </div>
+    </>
   );
 };

@@ -5,6 +5,10 @@ description: Guides adding or modifying a feature in the HOT-Step CPP Node/TypeS
 
 # Node Server Feature Development
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 The Node server (`server/src/`) is the middle tier of HOT-Step CPP, a local AI music-generation app. It serves the React UI, owns the SQLite database, and orchestrates the C++ inference engine (`ace-server.exe`, spawned as a child process). This skill covers how to add or change a server feature the way this codebase does it.
 
 **Glossary (no prior context assumed):**
@@ -39,7 +43,7 @@ UI (fetch /api/*) → Express :3001 (dev: Vite on :3000 proxies /api to it) → 
 4. **Never block a request on long work.** The engine is single-threaded; generations take minutes. Return a job id immediately and let the UI poll (see the worked example). The generation queue is deliberately serialized to one job at a time (generate.ts:1286-1292).
 5. **Never call `getDb()` at module import time.** `initDb()` runs at index.ts:60; a query executed during module load throws `Database not initialized. Call initDb() first.` (database.ts:17-22). Query only inside handlers/functions.
 6. **Declare static routes before `/:id` params.** Express matches in order — `GET /recent` after `GET /:id` returns a 404 for id "recent". See the explicit warning at songs.ts:47 and seeds.ts (`/favorites`, `/random` at lines 131/143 precede `/:name` at 156).
-7. **Git: all work on `master`, stage explicit paths (never `git add -A`, never `git add -f` on gitignored paths — `data/`, `logs/`, `docs/plans/`, `checkpoints/` are gitignored on purpose), commit locally often, push only with explicit user approval.** Pushing any `v*` tag triggers a full multi-platform CI release build.
+7. **Git: all work on `master`, stage explicit paths (never `git add -A`, never `git add -f` on gitignored paths — `data/`, `<data root>/logs/`, `docs/plans/`, `checkpoints/` are gitignored on purpose), commit locally often, push only with explicit user approval.** Pushing any `v*` tag triggers a full multi-platform CI release build.
 8. **PowerShell syntax: `;` not `&&`** for command chaining on this machine.
 9. **Don't visually verify the UI with a browser agent** — ask the human user; they provide screenshots. (Hitting API endpoints programmatically is fine.)
 10. **If your change touches C++ (`engine/src/`), rebuild via `dev-rebuild.bat` at repo root — never `engine/build.cmd` directly** (you cannot reliably tell whether the app is running; the Node server auto-respawns ace-server on crash, index.ts:284-309 → infinite respawn + file-lock loop). **Never `cmake --clean-first`** (20+ min CUDA recompile); for stale `.obj` issues delete only `engine/build/acestep-core.dir/` and `engine/build/Release/acestep-core.lib`.
@@ -51,7 +55,7 @@ UI (fetch /api/*) → Express :3001 (dev: Vite on :3000 proxies /api to it) → 
 2. Save any `server/src/**/*.ts` file → tsx watch restarts the **whole Node process**, which kills and respawns ace-server too (it's a child process). Expect a few seconds of engine downtime after every save; a generation in flight will die.
 3. The restart loop re-enters if a `.restart-requested` marker file exists at repo root — this is how the in-app "restart server" works without killing Vite.
 4. Type-check before committing: `cd d:\Ace-Step-Latest\hot-step-cpp\server; npx tsc --noEmit`.
-5. Logs land in `logs/<YYYY-MM-DD_HH-MM-SS>/` at repo root: `node_console.log` (server), `ace_engine.log` (engine), `generations/gen_<jobId>_<task>.log` (per generation). Newest folder = current session.
+5. Logs land in `<data root>/logs/<YYYY-MM-DD_HH-MM-SS>/` at repo root: `node_console.log` (server), `ace_engine.log` (engine), `generations/gen_<jobId>_<task>.log` (per generation). Newest folder = current session.
 
 ## Procedure: add a new feature (route + service)
 
@@ -92,7 +96,7 @@ UI (fetch /api/*) → Express :3001 (dev: Vite on :3000 proxies /api to it) → 
    cd d:\Ace-Step-Latest\hot-step-cpp; git add server/src/routes/myFeature.ts server/src/services/myFeature.ts server/src/index.ts; git commit -m "feat(server): my feature"
    ```
 
-**Not every feature needs SQLite.** `routes/seeds.ts` stores JSON files under `server/data/seeds/` on purpose (ComfyUI-compatible, import/export-friendly) with a filename-sanitization regex at seeds.ts:44. Use seeds.ts as the template for small self-contained features; use generate.ts for engine-orchestrating ones.
+**Not every feature needs SQLite.** `routes/seeds.ts` stores JSON files under `<data root>/library/seeds/` on purpose (ComfyUI-compatible, import/export-friendly) with a filename-sanitization regex at seeds.ts:44. Use seeds.ts as the template for small self-contained features; use generate.ts for engine-orchestrating ones.
 
 ## Procedure: SQLite schema change
 
@@ -109,11 +113,11 @@ All DB work lives in `server/src/db/database.ts`. One connection, **synchronous*
    The loop runs `ALTER` only when the column is absent and logs `[DB] Migration: ...`. **Use this idiom for new columns.** (A second, older idiom — `try { db.exec("ALTER TABLE ...") } catch {}` — exists for the lireek tables at database.ts:262-278; don't add to it.)
 3. **Column conventions**: TEXT primary keys are UUIDs (`uuidv4()`) for core tables; lireek (Lyric Studio) tables use `INTEGER PRIMARY KEY AUTOINCREMENT`; timestamps `TEXT DEFAULT (datetime('now'))`; booleans are INTEGER 0/1, re-hydrated as `!!row.is_public` (songs.ts:38); complex values are JSON-in-TEXT parsed with `JSON.parse(s.tags || '[]')`.
 4. **Query style**: inline `getDb().prepare(sql).get/all/run(...params)` with `?` placeholders — no statement-caching layer. Dynamic filters append to the SQL string and a params array (songs.ts:24-32), including JSON queries like `json_extract(generation_params, '$.source') = ?`.
-5. **Don't imitate the two-database pattern.** `db/lireekDb.ts` is a query-helper module over the *same* connection; its `initLireekDb`/`closeLireekDb` are deprecated no-ops (lireekDb.ts:12-23). The old separate `lireek.db` was consolidated into `server/data/hotstep.db` (one-time `ATTACH DATABASE` migration at database.ts:293-386, a good reference if you ever need bulk data migration).
+5. **Don't imitate the two-database pattern.** `db/lireekDb.ts` is a query-helper module over the *same* connection; its `initLireekDb`/`closeLireekDb` are deprecated no-ops (lireekDb.ts:12-23). The old separate `lireek.db` was consolidated into `<data root>/library/hotstep.db` (one-time `ATTACH DATABASE` migration at database.ts:293-386, a good reference if you ever need bulk data migration).
 
 ## Procedure: add a config / .env setting
 
-`server/src/config.ts` builds one exported `config` object (config.ts:96-257) grouping `aceServer` (engine exe autodetected from 4 candidate paths at config.ts:46-52; port default 8085), `server` (port 3001), `data` (getter `dbPath` → `server/data/hotstep.db`; `DATA_DIR` in `.env` resolves relative to `server/`, NOT the repo root — config.ts:192. A stale legacy `data/` dir may exist at repo root with an outdated hotstep.db; ignore it), `lireek` (LLM keys/endpoints), `vst`, `whisper`, `essentia`. `.env` lives at repo root and is auto-bootstrapped from `.env.example` on first launch (config.ts:22-30).
+`server/src/config.ts` builds one exported `config` object (config.ts:96-257) grouping `aceServer` (engine exe autodetected from 4 candidate paths at config.ts:46-52; port default 8085), `server` (port 3001), `data` (getter `dbPath` → `<data root>/library/hotstep.db`; `DATA_DIR` in `.env` resolves relative to `server/`, NOT the repo root — config.ts:192. A stale legacy `data/` dir may exist at repo root with an outdated hotstep.db; ignore it), `lireek` (LLM keys/endpoints), `vst`, `whisper`, `essentia`. `.env` lives at repo root and is auto-bootstrapped from `.env.example` on first launch (config.ts:22-30).
 
 To expose a new env setting in the Settings UI, you must touch **three places** in config.ts or it silently won't work:
 
@@ -154,7 +158,7 @@ The Settings route (`POST /api/settings/env`, settings.ts:109-174 — note: the 
 6. **Persist**: on success, `INSERT INTO songs (...)` with a fresh uuid, `generation_params` = `JSON.stringify(job.params)` (generate.ts:1150-1161); audio files go under `config.data.audioDir` and are served statically at `/audio/*` (index.ts:98).
 7. **Companion endpoints**: `GET /status/:id` returns `{ jobId, status, stage, progress, result, error, ace_job_id, ace_phase, ace_phase_progress }` (generate.ts:1391-1406); `POST /cancel/:id` sets status, cancels the engine job, fires the AbortController; plus `/cancel-all`, `/queue`, `/reset-queue`, and `GET /stream/:id` (SSE previews).
 
-**Per-generation logging** (services/logger.ts): `startGenerationLog(jobId, taskType)` → `logGeneration(jobId, 'INFO'|'DEBUG'|'WARNING'|'ERROR', msg)` / `logGenerationParams(jobId, obj)` → `finishGenerationLog(jobId, taskType)` or `failGenerationLog(jobId, error, taskType)`. Lines are **buffered in memory and flushed to `logs/<session>/generations/gen_<jobId>_<task>.log` only on completion** (logger.ts:95-178) — a crash before finish loses the buffer, but every line is also streamed live via `pushLog`.
+**Per-generation logging** (services/logger.ts): `startGenerationLog(jobId, taskType)` → `logGeneration(jobId, 'INFO'|'DEBUG'|'WARNING'|'ERROR', msg)` / `logGenerationParams(jobId, obj)` → `finishGenerationLog(jobId, taskType)` or `failGenerationLog(jobId, error, taskType)`. Lines are **buffered in memory and flushed to `<data root>/logs/<session>/generations/gen_<jobId>_<task>.log` only on completion** (logger.ts:95-178) — a crash before finish loses the buffer, but every line is also streamed live via `pushLog`.
 
 ## Key files
 
@@ -183,7 +187,7 @@ The Settings route (`POST /api/settings/env`, settings.ts:109-174 — note: the 
 |---|---|---|
 | `Database not initialized. Call initDb() first.` | A module ran a DB query at import time, before index.ts:60 | Move queries inside handlers/functions |
 | Engine requests time out during generation | Normal — single-threaded httplib engine can't respond mid-compute | Use the right timeout tier; retry transient poll errors; never treat a poll timeout as job failure |
-| `Generation stalled — no progress for Ns` | The 120 s watchdog fired and cancelled a wedged engine job | Check `gen_*.log` + `ace_engine.log` in the newest `logs/` session; the queue is unblocked automatically |
+| `Generation stalled — no progress for Ns` | The 120 s watchdog fired and cancelled a wedged engine job | Check `gen_*.log` + `ace_engine.log` in the newest `<data root>/logs/` session; the queue is unblocked automatically |
 | `[ace-server] Crashed 3 times within 30s — giving up` | Missing engine DLL / broken build; crash limiter halts respawn and sets engine not-ready (index.ts:296-301) | Fix the engine build (via `dev-rebuild.bat`); check `ace_engine.log` |
 | New env setting saves but never takes effect | Key missing from the `apply(...)` list in `reloadEnvConfig()` or from `EXPOSED_ENV_KEYS` | Touch all three places in config.ts (see procedure above) |
 | Setting saved, hot-reload reports OK, engine ignores it | Key is spawn-time (in `RESTART_REQUIRED_KEYS`) | Restart the app so the engine child respawns with new args |

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { MIN, REPO, api, apiRaw, health, waitEngineReady, state } from './lib.mjs';
+import { MIN, REPO, api, apiRaw, health, waitEngineReady, state, pluginDeclaration } from './lib.mjs';
 
 test('health: server ok, engine ready', { timeout: 15 * MIN }, async () => {
   const h = await waitEngineReady();
@@ -25,7 +25,7 @@ test('ACE model catalogue has a DiT, a VAE and an LM', async () => {
   for (const k of ['dit', 'vae', 'lm']) assert.ok(Array.isArray(b[k]) && b[k].length, `no ${k} models listed`);
 });
 
-test('plugin registry lists every solver, scheduler and guidance file in engine/plugins', async () => {
+test('plugin registry lists declared solver, scheduler and guidance names in engine/plugins', async () => {
   const reg = await api('GET', '/api/plugins');
   const dirs = { solvers: 'solvers', schedulers: 'schedulers', guidance: 'guidance' };
   const missing = [];
@@ -35,8 +35,10 @@ test('plugin registry lists every solver, scheduler and guidance file in engine/
     if (!fs.existsSync(folder)) continue;
     for (const f of fs.readdirSync(folder)) {
       if (!f.endsWith('.lua') || f.startsWith('_')) continue;
-      const stem = f.slice(0, -4);
-      if (!names.has(stem)) missing.push(`${dir}/${f}`);
+      const plugin = pluginDeclaration(fs.readFileSync(path.join(folder, f), 'utf8'));
+      if (!plugin) continue;
+      assert.ok(plugin.name, `${dir}/${f} declares a plugin without a literal name`);
+      if (!names.has(plugin.name)) missing.push(`${dir}/${f} (${plugin.name})`);
     }
     assert.ok((reg[key] ?? []).length > 0, `registry has no ${key}`);
   }
@@ -96,6 +98,9 @@ test('read-only endpoints answer 200', async (t) => {
     await t.test(route, async () => {
       const r = await apiRaw('GET', route, undefined, { auth: true, timeoutMs: 30_000 });
       assert.equal(r.status, 200, `${route} -> ${r.status}: ${typeof r.body === 'object' ? JSON.stringify(r.body).slice(0, 200) : String(r.body).slice(0, 200)}`);
+      if (route === '/api/logs?after=-1') {
+        assert.match(r.contentType, /^text\/event-stream(?:\s*;|$)/i);
+      }
     });
   }
 });

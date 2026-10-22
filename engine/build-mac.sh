@@ -5,6 +5,7 @@
 #   - Xcode (full install, not just command line tools — needed for Metal)
 #   - CMake 3.20+   (brew install cmake)
 #   - Ninja          (brew install ninja)  — optional but faster
+#   - PowerShell     (brew install powershell)  — runs verify-hooks.ps1
 #
 # Usage:
 #   ./build-mac.sh          # Release build with Metal
@@ -23,6 +24,18 @@ echo "║        Apple Silicon + Metal             ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 echo "Build type: ${BUILD_TYPE}"
+
+# Same hook check build.cmd runs: stop before CMake if a fork hook or a
+# HOT-ggml change is missing. Fails closed when pwsh is not installed.
+if ! command -v pwsh &>/dev/null; then
+    echo "ERROR: pwsh not found; it runs the engine hook check (verify-hooks.ps1)." >&2
+    echo "       Install it with: brew install powershell" >&2
+    exit 1
+fi
+if ! pwsh -NoProfile -File verify-hooks.ps1; then
+    echo "ERROR: hook check failed; fix the hooks above before building." >&2
+    exit 1
+fi
 
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"

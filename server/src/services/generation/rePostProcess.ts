@@ -27,6 +27,7 @@ import {
 } from '../logger.js';
 import { runOnGpuLane, gpuLaneBusy, gpuLaneDepth } from './gpuLane.js';
 import { runPostProcessingChain, normalizePpParams, type PostProcessParams } from './postProcessing.js';
+import { registerJobsBusyCheck, trackBusy } from '../../dataroot/pointer.js';
 
 export interface RePostProcessJob {
   id: string;
@@ -40,6 +41,7 @@ export interface RePostProcessJob {
 }
 
 const jobs = new Map<string, RePostProcessJob>();
+registerJobsBusyCheck('post-processing', jobs);
 
 /** Songs with a re-run in flight, so a double-click cannot start two. */
 const inFlight = new Set<string>();
@@ -82,8 +84,9 @@ export function requestedPpStages(params: PostProcessParams): string[] {
   if (params.spectralLifterEnabled) stages.push('Spectral Lifter');
   if (params.vocalNaturalizerEnabled && !params.instrumental) stages.push('Vocal Naturalizer');
   if ((params.gainOffsetDb ?? 0) !== 0) stages.push('Gain Offset');
-  if (vstChainActive()) stages.push('VST chain');
-  if (params.masteringEnabled && params.masteringReference) stages.push('Mastering');
+  const albumMaster = params.masterToAlbumLyricsSet !== undefined && params.masterToAlbumLyricsSet !== null;
+  if (!albumMaster && vstChainActive()) stages.push('VST chain');
+  if (params.masteringEnabled && (params.masteringReference || albumMaster)) stages.push('Mastering');
   if (params.lufsEnabled && params.lufsTarget !== undefined) stages.push('Final Normalizer');
   return stages;
 }
@@ -279,7 +282,7 @@ export function startRePostProcess(song: any, params: PostProcessParams): RePost
   const lane = cpuOnly
     ? (fn: () => Promise<void>) => fn()
     : (fn: () => Promise<void>) => runOnGpuLane(fn, { label: 'postprocess:' + jobId });
-  void lane(async () => {
+  void trackBusy('post-processing', lane(async () => {
     job.status = 'running';
     job.stage = 'Starting...';
 
@@ -326,7 +329,7 @@ export function startRePostProcess(song: any, params: PostProcessParams): RePost
     console.error(`[PostProcess] Song ${song.id} failed: ${msg}`);
   }).finally(() => {
     inFlight.delete(song.id);
-  });
+  }));
 
   return job;
 }

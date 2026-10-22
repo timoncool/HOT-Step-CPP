@@ -96,7 +96,8 @@ older shells — this repo's convention). `gh` is already authenticated as
 
 Use this to verify CI compiles across all platforms without cutting a real
 release. Hyphenated tags build everything but are excluded from changelog
-anchoring.
+anchoring. Never *publish* a `-CI-Test` draft: publishing a release also publishes
+the RunPod container image (`runpod-image.yml`); delete the draft instead.
 
 ```powershell
 git tag -a vX.Y.Z-CI-Test -m "compile test"
@@ -312,3 +313,7 @@ recent test-tag naming history): see [reference.md](reference.md).
   absent** on your checkout.
 - `CLAUDE.md` — repo-wide git rules (master only, explicit-path staging, push
   needs approval) that still apply during releasing.
+
+## Shared data layout
+
+Check all three CI assemblers and both local packagers when changing release layout. Packages use `release/.env.example`, leave managed paths unset and copy `server/src/data/` wholesale into app-owned `server/data/`. Include `profile-path.mjs` with each launcher. Release restart state is `<profile>/restart-requested`, matching `dataroot/paths.ts`; dev keeps its checkout marker. Run the prereq script for layout fixtures and distribution checks. See [Data folder and upgrades](../../../docs/user/data-folder.md).

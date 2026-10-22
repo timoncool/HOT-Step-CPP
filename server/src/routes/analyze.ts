@@ -13,6 +13,8 @@ import os from 'os';
 import multer from 'multer';
 import { parseBuffer } from 'music-metadata';
 import { config, getFFmpegPath } from '../config.js';
+import * as audioMeta from '../services/training/audioMeta.js';
+import { reconcileEssentiaBpm } from '../services/training/essentiaClient.js';
 
 const router = Router();
 
@@ -116,7 +118,9 @@ router.post('/', async (req: Request, res: Response) => {
         const raw = await fs.readFile(tmpFile, 'utf-8');
         const data = JSON.parse(raw);
 
-        const bpm = Math.round(data?.rhythm?.bpm ?? 0);
+        const rawBpm = Math.round(data?.rhythm?.bpm ?? 0);
+        const tagBpm = await audioMeta.readBpmTag(audioPath);
+        const bpm = reconcileEssentiaBpm(rawBpm, tagBpm) ?? 0;
         // key_edma is the 2.1_beta5+ field; key_key/key_scale is the older layout
         // (see essentiaClient.ts).
         const tonal = data?.tonal ?? {};

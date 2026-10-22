@@ -1,0 +1,1668 @@
+{
+  "baseline-v2": {
+    "runs": [
+      {
+        "name": "run-1",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 383.643408541
+        },
+        "complete": true,
+        "expected_steps": 7,
+        "max_rss_bytes": 16170074112,
+        "pipeline_compilations": [
+          59
+        ],
+        "warmup_steps": [],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 41180.013542,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6444.150166,
+              "AR frozen teacher forward": 5588.946375,
+              "AR CE and KL backward": 3312.669625,
+              "AR transformer backward": 19220.139584,
+              "Refresh detached AR conditioning": 1197.312625,
+              "NAR forward": 1269.171375,
+              "NAR flow backward": 3877.603666,
+              "Joint clipping and optimizer update": 267.7755
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 2,
+            "ar_ce": 5.86328722133758,
+            "ar_kl": 0.00044263153319146225,
+            "nar_mse": 1.2379819204934177,
+            "gradient_norm": 0.1250310377161501,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 45196.328709,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6857.858,
+              "AR frozen teacher forward": 6265.171708,
+              "AR CE and KL backward": 3565.655084,
+              "AR transformer backward": 21738.5025,
+              "Refresh detached AR conditioning": 1311.210833,
+              "NAR forward": 1290.010125,
+              "NAR flow backward": 3903.036583,
+              "Joint clipping and optimizer update": 262.639834
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 3,
+            "ar_ce": 4.376926733554495,
+            "ar_kl": 0.0004318475974050769,
+            "nar_mse": 0.8777727380969925,
+            "gradient_norm": 0.09017534234331492,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 82655.483458,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 12677.791958,
+              "AR frozen teacher forward": 11650.837625,
+              "AR CE and KL backward": 5638.395542,
+              "AR transformer backward": 41574.717708,
+              "Refresh detached AR conditioning": 4166.863917,
+              "NAR forward": 1683.483208,
+              "NAR flow backward": 4998.322542,
+              "Joint clipping and optimizer update": 262.656875
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 4,
+            "ar_ce": 4.203646536666275,
+            "ar_kl": 0.0006702078962169269,
+            "nar_mse": 0.902860446458445,
+            "gradient_norm": 0.08975093917701038,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52796.668958,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 7631.935583,
+              "AR frozen teacher forward": 6964.79575,
+              "AR CE and KL backward": 3863.272875,
+              "AR transformer backward": 24188.259875,
+              "Refresh detached AR conditioning": 3523.614584,
+              "NAR forward": 1602.799791,
+              "NAR flow backward": 4760.314292,
+              "Joint clipping and optimizer update": 259.328792
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 5,
+            "ar_ce": 4.0179744301127265,
+            "ar_kl": 0.000763822454271347,
+            "nar_mse": 1.2427637723471223,
+            "gradient_norm": 0.09195834907217204,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 42808.243667,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6030.729375,
+              "AR frozen teacher forward": 5509.60525,
+              "AR CE and KL backward": 3406.434916,
+              "AR transformer backward": 18991.874459,
+              "Refresh detached AR conditioning": 2642.819083,
+              "NAR forward": 1485.979917,
+              "NAR flow backward": 4478.523208,
+              "Joint clipping and optimizer update": 260.233125
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 6,
+            "ar_ce": 5.699079019891994,
+            "ar_kl": 0.0017365643867556179,
+            "nar_mse": 1.0413032725389226,
+            "gradient_norm": 0.10585570578453485,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 26430.619958,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 3588.73875,
+              "AR frozen teacher forward": 3250.233042,
+              "AR CE and KL backward": 2315.50125,
+              "AR transformer backward": 11068.669708,
+              "Refresh detached AR conditioning": 951.090167,
+              "NAR forward": 1228.530916,
+              "NAR flow backward": 3762.885167,
+              "Joint clipping and optimizer update": 262.556375
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 7,
+            "ar_ce": 5.920067774246836,
+            "ar_kl": 0.004319191726648683,
+            "nar_mse": 1.173319216382153,
+            "gradient_norm": 0.10383433101580763,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52153.339125,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 8072.531458,
+              "AR frozen teacher forward": 7361.821625,
+              "AR CE and KL backward": 4046.525792,
+              "AR transformer backward": 25931.504458,
+              "Refresh detached AR conditioning": 1302.601292,
+              "NAR forward": 1288.572833,
+              "NAR flow backward": 3890.570375,
+              "Joint clipping and optimizer update": 257.2695
+            }
+          }
+        ]
+      },
+      {
+        "name": "run-2",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 381.988506041
+        },
+        "complete": true,
+        "expected_steps": 7,
+        "max_rss_bytes": 16167124992,
+        "pipeline_compilations": [
+          59
+        ],
+        "warmup_steps": [],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40716.132666,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6081.796709,
+              "AR frozen teacher forward": 5575.393291,
+              "AR CE and KL backward": 3303.342292,
+              "AR transformer backward": 19160.647125,
+              "Refresh detached AR conditioning": 1191.744292,
+              "NAR forward": 1265.408166,
+              "NAR flow backward": 3864.452,
+              "Joint clipping and optimizer update": 271.352459
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 2,
+            "ar_ce": 5.86328722133758,
+            "ar_kl": 0.00044263153319146225,
+            "nar_mse": 1.2379819204934177,
+            "gradient_norm": 0.1250310377161501,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 45044.285292,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6843.318417,
+              "AR frozen teacher forward": 6236.0855,
+              "AR CE and KL backward": 3541.756625,
+              "AR transformer backward": 21690.538833,
+              "Refresh detached AR conditioning": 1296.683334,
+              "NAR forward": 1282.7905,
+              "NAR flow backward": 3892.425958,
+              "Joint clipping and optimizer update": 258.2485
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 3,
+            "ar_ce": 4.376926733554495,
+            "ar_kl": 0.0004318475974050769,
+            "nar_mse": 0.8777727380969925,
+            "gradient_norm": 0.09017534234331492,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 82585.211,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 12601.347916,
+              "AR frozen teacher forward": 11583.11025,
+              "AR CE and KL backward": 5713.945625,
+              "AR transformer backward": 41653.806292,
+              "Refresh detached AR conditioning": 4136.119833,
+              "NAR forward": 1665.774709,
+              "NAR flow backward": 4969.056708,
+              "Joint clipping and optimizer update": 259.191292
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 4,
+            "ar_ce": 4.203646536666275,
+            "ar_kl": 0.0006702078962169269,
+            "nar_mse": 0.902860446458445,
+            "gradient_norm": 0.08975093917701038,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52645.996083,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 7599.536708,
+              "AR frozen teacher forward": 6937.911167,
+              "AR CE and KL backward": 3857.300375,
+              "AR transformer backward": 24118.592208,
+              "Refresh detached AR conditioning": 3511.858125,
+              "NAR forward": 1596.953792,
+              "NAR flow backward": 4760.545125,
+              "Joint clipping and optimizer update": 261.152791
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 5,
+            "ar_ce": 4.0179744301127265,
+            "ar_kl": 0.000763822454271347,
+            "nar_mse": 1.2427637723471223,
+            "gradient_norm": 0.09195834907217204,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 42699.777791,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6004.493375,
+              "AR frozen teacher forward": 5502.4465,
+              "AR CE and KL backward": 3416.508542,
+              "AR transformer backward": 18954.925958,
+              "Refresh detached AR conditioning": 2621.323958,
+              "NAR forward": 1477.282042,
+              "NAR flow backward": 4447.678458,
+              "Joint clipping and optimizer update": 273.205709
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 6,
+            "ar_ce": 5.699079019891994,
+            "ar_kl": 0.0017365643867556179,
+            "nar_mse": 1.0413032725389226,
+            "gradient_norm": 0.10585570578453485,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 26363.455209,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 3565.441792,
+              "AR frozen teacher forward": 3237.36025,
+              "AR CE and KL backward": 2312.970958,
+              "AR transformer backward": 11037.594834,
+              "Refresh detached AR conditioning": 958.754916,
+              "NAR forward": 1227.473292,
+              "NAR flow backward": 3766.643292,
+              "Joint clipping and optimizer update": 255.033875
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 7,
+            "ar_ce": 5.920067774246836,
+            "ar_kl": 0.004319191726648683,
+            "nar_mse": 1.173319216382153,
+            "gradient_norm": 0.10383433101580763,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52116.084667,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 8059.944125,
+              "AR frozen teacher forward": 7357.094709,
+              "AR CE and KL backward": 4042.109708,
+              "AR transformer backward": 25913.977792,
+              "Refresh detached AR conditioning": 1298.623833,
+              "NAR forward": 1284.421833,
+              "NAR flow backward": 3890.922459,
+              "Joint clipping and optimizer update": 267.116208
+            }
+          }
+        ]
+      },
+      {
+        "name": "run-3",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 381.63990045799994
+        },
+        "complete": true,
+        "expected_steps": 7,
+        "max_rss_bytes": 16167010304,
+        "pipeline_compilations": [
+          59
+        ],
+        "warmup_steps": [],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40724.109875,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6120.293375,
+              "AR frozen teacher forward": 5562.543458,
+              "AR CE and KL backward": 3285.777375,
+              "AR transformer backward": 19146.161083,
+              "Refresh detached AR conditioning": 1196.072125,
+              "NAR forward": 1275.219584,
+              "NAR flow backward": 3856.801541,
+              "Joint clipping and optimizer update": 278.999125
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 2,
+            "ar_ce": 5.86328722133758,
+            "ar_kl": 0.00044263153319146225,
+            "nar_mse": 1.2379819204934177,
+            "gradient_norm": 0.1250310377161501,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 45044.622084,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6831.779417,
+              "AR frozen teacher forward": 6244.353125,
+              "AR CE and KL backward": 3551.504083,
+              "AR transformer backward": 21685.5415,
+              "Refresh detached AR conditioning": 1296.074834,
+              "NAR forward": 1281.787625,
+              "NAR flow backward": 3893.288,
+              "Joint clipping and optimizer update": 257.963125
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 3,
+            "ar_ce": 4.376926733554495,
+            "ar_kl": 0.0004318475974050769,
+            "nar_mse": 0.8777727380969925,
+            "gradient_norm": 0.09017534234331492,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 82273.492291,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 12609.486458,
+              "AR frozen teacher forward": 11588.011917,
+              "AR CE and KL backward": 5574.47825,
+              "AR transformer backward": 41462.239666,
+              "Refresh detached AR conditioning": 4137.9165,
+              "NAR forward": 1667.914042,
+              "NAR flow backward": 4969.754042,
+              "Joint clipping and optimizer update": 261.386833
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 4,
+            "ar_ce": 4.203646536666275,
+            "ar_kl": 0.0006702078962169269,
+            "nar_mse": 0.902860446458445,
+            "gradient_norm": 0.08975093917701038,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52646.109041,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 7587.437292,
+              "AR frozen teacher forward": 6927.925333,
+              "AR CE and KL backward": 3855.53925,
+              "AR transformer backward": 24141.043292,
+              "Refresh detached AR conditioning": 3510.832125,
+              "NAR forward": 1593.573125,
+              "NAR flow backward": 4769.348958,
+              "Joint clipping and optimizer update": 258.398792
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 5,
+            "ar_ce": 4.0179744301127265,
+            "ar_kl": 0.000763822454271347,
+            "nar_mse": 1.2427637723471223,
+            "gradient_norm": 0.09195834907217204,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 42742.231709,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6019.968166,
+              "AR frozen teacher forward": 5498.5985,
+              "AR CE and KL backward": 3398.378792,
+              "AR transformer backward": 18974.289417,
+              "Refresh detached AR conditioning": 2650.998208,
+              "NAR forward": 1478.355125,
+              "NAR flow backward": 4459.033875,
+              "Joint clipping and optimizer update": 260.233792
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 6,
+            "ar_ce": 5.699079019891994,
+            "ar_kl": 0.0017365643867556179,
+            "nar_mse": 1.0413032725389226,
+            "gradient_norm": 0.10585570578453485,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 26384.600834,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 3566.751084,
+              "AR frozen teacher forward": 3238.963166,
+              "AR CE and KL backward": 2309.582917,
+              "AR transformer backward": 11052.817167,
+              "Refresh detached AR conditioning": 953.074583,
+              "NAR forward": 1229.245042,
+              "NAR flow backward": 3769.447791,
+              "Joint clipping and optimizer update": 262.434167
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 7,
+            "ar_ce": 5.920067774246836,
+            "ar_kl": 0.004319191726648683,
+            "nar_mse": 1.173319216382153,
+            "gradient_norm": 0.10383433101580763,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52134.630834,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 8071.855042,
+              "AR frozen teacher forward": 7370.920167,
+              "AR CE and KL backward": 4041.09225,
+              "AR transformer backward": 25915.890625,
+              "Refresh detached AR conditioning": 1301.768166,
+              "NAR forward": 1287.388,
+              "NAR flow backward": 3885.742209,
+              "Joint clipping and optimizer update": 258.03475
+            }
+          }
+        ]
+      }
+    ],
+    "step1_seconds": [
+      41.180013542,
+      40.716132666,
+      40.724109875
+    ],
+    "median_seconds": 40.724109875,
+    "range_seconds": 0.4638808759999975,
+    "repeatability": [
+      {
+        "pair": [
+          "run-1",
+          "run-2"
+        ],
+        "max_abs_difference": {
+          "ar_ce": 0.0,
+          "ar_kl": 0.0,
+          "nar_mse": 0.0,
+          "gradient_norm": 0.0
+        }
+      },
+      {
+        "pair": [
+          "run-1",
+          "run-3"
+        ],
+        "max_abs_difference": {
+          "ar_ce": 0.0,
+          "ar_kl": 0.0,
+          "nar_mse": 0.0,
+          "gradient_norm": 0.0
+        }
+      },
+      {
+        "pair": [
+          "run-2",
+          "run-3"
+        ],
+        "max_abs_difference": {
+          "ar_ce": 0.0,
+          "ar_kl": 0.0,
+          "nar_mse": 0.0,
+          "gradient_norm": 0.0
+        }
+      }
+    ]
+  },
+  "warm-baseline-full": {
+    "runs": [
+      {
+        "name": "run-1",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 456.57303341700003
+        },
+        "complete": true,
+        "expected_steps": 7,
+        "max_rss_bytes": 17485889536,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40775.966667,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6160.304375,
+              "AR frozen teacher forward": 5581.088,
+              "AR CE and KL backward": 3297.961292,
+              "AR transformer backward": 19154.506042,
+              "Refresh detached AR conditioning": 1189.197416,
+              "NAR forward": 1270.758875,
+              "NAR flow backward": 3852.293834,
+              "Joint clipping and optimizer update": 267.78475
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 36133.546667,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6432.78725,
+              "AR frozen teacher forward": 459.807958,
+              "AR CE and KL backward": 3515.982334,
+              "AR transformer backward": 19145.526625,
+              "Refresh detached AR conditioning": 1194.370083,
+              "NAR forward": 1267.045292,
+              "NAR flow backward": 3852.724833,
+              "Joint clipping and optimizer update": 263.491083
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 2,
+            "ar_ce": 5.86328722133758,
+            "ar_kl": 0.00044263153319146225,
+            "nar_mse": 1.2379819204934177,
+            "gradient_norm": 0.1250310377161501,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 45047.293875,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6838.9115,
+              "AR frozen teacher forward": 6240.706375,
+              "AR CE and KL backward": 3543.814708,
+              "AR transformer backward": 21687.584125,
+              "Refresh detached AR conditioning": 1298.799709,
+              "NAR forward": 1281.2955,
+              "NAR flow backward": 3895.244083,
+              "Joint clipping and optimizer update": 258.784208
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 3,
+            "ar_ce": 4.376926733554495,
+            "ar_kl": 0.0004318475974050769,
+            "nar_mse": 0.8777727380969925,
+            "gradient_norm": 0.09017534234331492,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 82389.937417,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 12633.107875,
+              "AR frozen teacher forward": 11597.938292,
+              "AR CE and KL backward": 5581.353708,
+              "AR transformer backward": 41519.650917,
+              "Refresh detached AR conditioning": 4135.932166,
+              "NAR forward": 1672.824042,
+              "NAR flow backward": 4985.109792,
+              "Joint clipping and optimizer update": 261.954875
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 4,
+            "ar_ce": 4.203646536666275,
+            "ar_kl": 0.0006702078962169269,
+            "nar_mse": 0.902860446458445,
+            "gradient_norm": 0.08975093917701038,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52655.596125,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 7601.777583,
+              "AR frozen teacher forward": 6934.100375,
+              "AR CE and KL backward": 3843.771084,
+              "AR transformer backward": 24135.103,
+              "Refresh detached AR conditioning": 3517.867291,
+              "NAR forward": 1593.271584,
+              "NAR flow backward": 4770.553041,
+              "Joint clipping and optimizer update": 257.333875
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 5,
+            "ar_ce": 4.0179744301127265,
+            "ar_kl": 0.000763822454271347,
+            "nar_mse": 1.2427637723471223,
+            "gradient_norm": 0.09195834907217204,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 42698.292417,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6019.242583,
+              "AR frozen teacher forward": 5504.382583,
+              "AR CE and KL backward": 3400.337084,
+              "AR transformer backward": 18938.100083,
+              "Refresh detached AR conditioning": 2627.646208,
+              "NAR forward": 1483.356042,
+              "NAR flow backward": 4457.572875,
+              "Joint clipping and optimizer update": 265.451958
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 6,
+            "ar_ce": 5.699079019891994,
+            "ar_kl": 0.0017365643867556179,
+            "nar_mse": 1.0413032725389226,
+            "gradient_norm": 0.10585570578453485,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 26366.782833,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 3556.956333,
+              "AR frozen teacher forward": 3240.025042,
+              "AR CE and KL backward": 2307.873625,
+              "AR transformer backward": 11046.800208,
+              "Refresh detached AR conditioning": 948.813667,
+              "NAR forward": 1228.866708,
+              "NAR flow backward": 3773.488167,
+              "Joint clipping and optimizer update": 261.976375
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 7,
+            "ar_ce": 5.920067774246836,
+            "ar_kl": 0.004319191726648683,
+            "nar_mse": 1.173319216382153,
+            "gradient_norm": 0.10383433101580763,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 51999.398083,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 8069.649125,
+              "AR frozen teacher forward": 7368.382292,
+              "AR CE and KL backward": 4041.635167,
+              "AR transformer backward": 25780.576625,
+              "Refresh detached AR conditioning": 1303.13375,
+              "NAR forward": 1288.132,
+              "NAR flow backward": 3890.62975,
+              "Joint clipping and optimizer update": 255.135958
+            }
+          }
+        ]
+      }
+    ],
+    "step1_seconds": [
+      36.133546667000005
+    ],
+    "median_seconds": 36.133546667000005,
+    "range_seconds": 0.0,
+    "repeatability": []
+  },
+  "warm-baseline-repeats": {
+    "runs": [
+      {
+        "name": "run-1",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 154.14656045799998
+        },
+        "complete": true,
+        "expected_steps": 1,
+        "max_rss_bytes": 17482956800,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40636.382416,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6077.50825,
+              "AR frozen teacher forward": 5557.614917,
+              "AR CE and KL backward": 3280.198708,
+              "AR transformer backward": 19134.880375,
+              "Refresh detached AR conditioning": 1187.194084,
+              "NAR forward": 1262.719375,
+              "NAR flow backward": 3867.087125,
+              "Joint clipping and optimizer update": 267.0865
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 35453.1325,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6073.18725,
+              "AR frozen teacher forward": 103.197625,
+              "AR CE and KL backward": 3518.822959,
+              "AR transformer backward": 19161.581041,
+              "Refresh detached AR conditioning": 1196.445625,
+              "NAR forward": 1261.230625,
+              "NAR flow backward": 3863.46975,
+              "Joint clipping and optimizer update": 273.274042
+            }
+          }
+        ]
+      },
+      {
+        "name": "run-2",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 154.360119541
+        },
+        "complete": true,
+        "expected_steps": 1,
+        "max_rss_bytes": 17481777152,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40691.316125,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6083.832458,
+              "AR frozen teacher forward": 5570.398292,
+              "AR CE and KL backward": 3309.277083,
+              "AR transformer backward": 19140.770584,
+              "Refresh detached AR conditioning": 1187.640291,
+              "NAR forward": 1266.975834,
+              "NAR flow backward": 3860.624458,
+              "Joint clipping and optimizer update": 269.784167
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 35366.55625,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6070.243917,
+              "AR frozen teacher forward": 96.429375,
+              "AR CE and KL backward": 3487.664875,
+              "AR transformer backward": 19131.294292,
+              "Refresh detached AR conditioning": 1188.275375,
+              "NAR forward": 1274.002958,
+              "NAR flow backward": 3856.265792,
+              "Joint clipping and optimizer update": 260.410458
+            }
+          }
+        ]
+      }
+    ],
+    "step1_seconds": [
+      35.4531325,
+      35.36655625
+    ],
+    "median_seconds": 35.409844375000006,
+    "range_seconds": 0.08657625000000024,
+    "repeatability": [
+      {
+        "pair": [
+          "run-1",
+          "run-2"
+        ],
+        "max_abs_difference": {
+          "ar_ce": 0.0,
+          "ar_kl": 0.0,
+          "nar_mse": 0.0,
+          "gradient_norm": 0.0
+        }
+      }
+    ]
+  },
+  "warm-current-full": {
+    "runs": [
+      {
+        "name": "run-1",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 455.880638875
+        },
+        "complete": true,
+        "expected_steps": 7,
+        "max_rss_bytes": 17485905920,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40609.963583,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6068.26925,
+              "AR frozen teacher forward": 5555.009666,
+              "AR CE and KL backward": 3281.32125,
+              "AR transformer backward": 19115.220875,
+              "Refresh detached AR conditioning": 1191.268667,
+              "NAR forward": 1265.622917,
+              "NAR flow backward": 3864.737291,
+              "Joint clipping and optimizer update": 266.584667
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 35846.568791,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6080.715208,
+              "AR frozen teacher forward": 427.519667,
+              "AR CE and KL backward": 3576.745583,
+              "AR transformer backward": 19166.178375,
+              "Refresh detached AR conditioning": 1194.273709,
+              "NAR forward": 1270.807375,
+              "NAR flow backward": 3862.656916,
+              "Joint clipping and optimizer update": 265.693542
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 2,
+            "ar_ce": 5.86328722133758,
+            "ar_kl": 0.00044263153319146225,
+            "nar_mse": 1.2379819204934177,
+            "gradient_norm": 0.1250310377161501,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 45108.893208,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6855.865,
+              "AR frozen teacher forward": 6253.496583,
+              "AR CE and KL backward": 3543.934292,
+              "AR transformer backward": 21712.840208,
+              "Refresh detached AR conditioning": 1302.483,
+              "NAR forward": 1280.323125,
+              "NAR flow backward": 3903.356833,
+              "Joint clipping and optimizer update": 254.691459
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 3,
+            "ar_ce": 4.376926733554495,
+            "ar_kl": 0.0004318475974050769,
+            "nar_mse": 0.8777727380969925,
+            "gradient_norm": 0.09017534234331492,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 82294.624208,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 12617.92,
+              "AR frozen teacher forward": 11588.174167,
+              "AR CE and KL backward": 5563.106458,
+              "AR transformer backward": 41470.788875,
+              "Refresh detached AR conditioning": 4134.104542,
+              "NAR forward": 1671.535083,
+              "NAR flow backward": 4986.67975,
+              "Joint clipping and optimizer update": 260.027125
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 4,
+            "ar_ce": 4.203646536666275,
+            "ar_kl": 0.0006702078962169269,
+            "nar_mse": 0.902860446458445,
+            "gradient_norm": 0.08975093917701038,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 52622.204667,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 7583.873042,
+              "AR frozen teacher forward": 6939.580417,
+              "AR CE and KL backward": 3854.373041,
+              "AR transformer backward": 24129.891875,
+              "Refresh detached AR conditioning": 3494.810959,
+              "NAR forward": 1595.936083,
+              "NAR flow backward": 4760.400167,
+              "Joint clipping and optimizer update": 261.443458
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 5,
+            "ar_ce": 4.0179744301127265,
+            "ar_kl": 0.000763822454271347,
+            "nar_mse": 1.2427637723471223,
+            "gradient_norm": 0.09195834907217204,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 42784.318542,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6032.047917,
+              "AR frozen teacher forward": 5507.27475,
+              "AR CE and KL backward": 3412.013,
+              "AR transformer backward": 18971.099291,
+              "Refresh detached AR conditioning": 2638.830125,
+              "NAR forward": 1483.664709,
+              "NAR flow backward": 4476.724166,
+              "Joint clipping and optimizer update": 260.668625
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 6,
+            "ar_ce": 5.699079019891994,
+            "ar_kl": 0.0017365643867556179,
+            "nar_mse": 1.0413032725389226,
+            "gradient_norm": 0.10585570578453485,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 26368.837083,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 3571.986458,
+              "AR frozen teacher forward": 3241.30775,
+              "AR CE and KL backward": 2311.435625,
+              "AR transformer backward": 11035.309459,
+              "Refresh detached AR conditioning": 949.832291,
+              "NAR forward": 1231.508042,
+              "NAR flow backward": 3769.710708,
+              "Joint clipping and optimizer update": 255.834542
+            }
+          },
+          {
+            "stage": "joint",
+            "step": 7,
+            "ar_ce": 5.920067774246836,
+            "ar_kl": 0.004319191726648683,
+            "nar_mse": 1.173319216382153,
+            "gradient_norm": 0.10383433101580763,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 51933.300833,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 8075.005375,
+              "AR frozen teacher forward": 7361.781458,
+              "AR CE and KL backward": 4039.303375,
+              "AR transformer backward": 25742.948917,
+              "Refresh detached AR conditioning": 1296.1955,
+              "NAR forward": 1275.394166,
+              "NAR flow backward": 3882.630375,
+              "Joint clipping and optimizer update": 258.130792
+            }
+          }
+        ]
+      }
+    ],
+    "step1_seconds": [
+      35.846568790999996
+    ],
+    "median_seconds": 35.846568790999996,
+    "range_seconds": 0.0,
+    "repeatability": []
+  },
+  "warm-current-repeats": {
+    "runs": [
+      {
+        "name": "run-1",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 154.285339375
+        },
+        "complete": true,
+        "expected_steps": 1,
+        "max_rss_bytes": 17483907072,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40636.335875,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6071.454541,
+              "AR frozen teacher forward": 5551.808959,
+              "AR CE and KL backward": 3282.910791,
+              "AR transformer backward": 19154.738667,
+              "Refresh detached AR conditioning": 1188.291292,
+              "NAR forward": 1262.231875,
+              "NAR flow backward": 3862.008125,
+              "Joint clipping and optimizer update": 260.885416
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 35650.270125,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 5961.454042,
+              "AR frozen teacher forward": 487.832041,
+              "AR CE and KL backward": 3490.699959,
+              "AR transformer backward": 19156.638916,
+              "Refresh detached AR conditioning": 1178.975084,
+              "NAR forward": 1252.332333,
+              "NAR flow backward": 3858.663083,
+              "Joint clipping and optimizer update": 261.893
+            }
+          }
+        ]
+      },
+      {
+        "name": "run-2",
+        "exit": {
+          "exit_code": 0,
+          "wall_seconds": 154.396208375
+        },
+        "complete": true,
+        "expected_steps": 1,
+        "max_rss_bytes": 17481170944,
+        "pipeline_compilations": [
+          59,
+          0
+        ],
+        "warmup_steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 40638.240917,
+            "gemm": "bf16",
+            "gemm_bf16": 2724,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6061.20825,
+              "AR frozen teacher forward": 5550.832625,
+              "AR CE and KL backward": 3294.441167,
+              "AR transformer backward": 19138.50525,
+              "Refresh detached AR conditioning": 1198.946458,
+              "NAR forward": 1271.755417,
+              "NAR flow backward": 3858.407375,
+              "Joint clipping and optimizer update": 262.026416
+            }
+          }
+        ],
+        "steps": [
+          {
+            "stage": "joint",
+            "step": 1,
+            "ar_ce": 5.772480878271892,
+            "ar_kl": 0,
+            "nar_mse": 1.2171014851901856,
+            "gradient_norm": 0.12340854106558385,
+            "lr": 9.999999747378752e-05,
+            "cursor_ce": 0,
+            "cursor_weight": 0,
+            "cursor_frames": 0,
+            "step_ms": 35615.3605,
+            "gemm": "bf16",
+            "gemm_bf16": 2528,
+            "gemm_f32": 618,
+            "attention_forward": "unknown",
+            "attention_backward": "unknown",
+            "stage_ms": {
+              "AR adapted forward": 6060.5615,
+              "AR frozen teacher forward": 321.371167,
+              "AR CE and KL backward": 3491.211166,
+              "AR transformer backward": 19161.664042,
+              "Refresh detached AR conditioning": 1188.902583,
+              "NAR forward": 1267.994584,
+              "NAR flow backward": 3857.815541,
+              "Joint clipping and optimizer update": 263.87225
+            }
+          }
+        ]
+      }
+    ],
+    "step1_seconds": [
+      35.650270125000006,
+      35.6153605
+    ],
+    "median_seconds": 35.6328153125,
+    "range_seconds": 0.034909625000004496,
+    "repeatability": [
+      {
+        "pair": [
+          "run-1",
+          "run-2"
+        ],
+        "max_abs_difference": {
+          "ar_ce": 0.0,
+          "ar_kl": 0.0,
+          "nar_mse": 0.0,
+          "gradient_norm": 0.0
+        }
+      }
+    ]
+  },
+  "comparison": {
+    "baseline_step1_seconds": [
+      36.133546667000005,
+      35.4531325,
+      35.36655625
+    ],
+    "current_step1_seconds": [
+      35.846568790999996,
+      35.650270125000006,
+      35.6153605
+    ],
+    "baseline_median_seconds": 35.4531325,
+    "current_median_seconds": 35.650270125000006,
+    "median_delta_current_minus_baseline_seconds": 0.19713762500000342,
+    "all_logged_numeric_fields_exactly_equal": true,
+    "original_argv_with_private_paths_replaced": [
+      "ace-train",
+      "yue2-joint-train",
+      "--checkpoint",
+      "<BASE>",
+      "--dataset",
+      "<DATASET>",
+      "--output",
+      "<NEW_OUTPUT>",
+      "--steps",
+      "1500",
+      "--save-every",
+      "200",
+      "--seed",
+      "42",
+      "--device",
+      "MTL0",
+      "--rank",
+      "64",
+      "--alpha",
+      "64",
+      "--optimizer",
+      "adamw-lm",
+      "--adam-eps",
+      "1e-6",
+      "--lr",
+      "0.0001",
+      "--weight-decay",
+      "0.01",
+      "--kl-weight",
+      "0.2",
+      "--abc-dropout",
+      "0.5",
+      "--caption-dropout",
+      "0.5",
+      "--style-norms",
+      "{\"exempt\":[],\"sheets\":6}",
+      "--planner-lr-scale",
+      "0.5",
+      "--lr-schedule",
+      "constant",
+      "--ar-loss-weight",
+      "0.5",
+      "--companion",
+      "<COMPANION>",
+      "--cursor-weight",
+      "0",
+      "--pause-at",
+      "200"
+    ],
+    "input_hashes": [
+      {
+        "alias": "input-01",
+        "bytes": 360718,
+        "sha256": "c051f0380448dbd3ee7ffd9dfb116276d0b4eea7e10eedc8cd2c9d58c1dcb4df"
+      },
+      {
+        "alias": "input-02",
+        "bytes": 1291008,
+        "sha256": "b9aaae5a84f579377e74513542a15d1732b4ec5803618b6f971c65ea9d513d5c"
+      },
+      {
+        "alias": "input-03",
+        "bytes": 2008832,
+        "sha256": "2a004db6f5ab2bc3d802df4777d7c78729fe57869a9e3e9a05b4b709bd7b0ca4"
+      },
+      {
+        "alias": "input-04",
+        "bytes": 1449984,
+        "sha256": "b00dd2e9e0f00bb5d1bcc210ec4a0f78729c4bd13ce9ab72530211c758578a3a"
+      },
+      {
+        "alias": "input-05",
+        "bytes": 1867264,
+        "sha256": "ea9448ab3f5c875da7a20941158163f207044a5be00a70e51cd429a27667bd76"
+      },
+      {
+        "alias": "input-06",
+        "bytes": 1353216,
+        "sha256": "4068993ba6c8b47f07245572baecc397a40c78cda19bc4c3d55aa98660819ef4"
+      },
+      {
+        "alias": "input-07",
+        "bytes": 2285056,
+        "sha256": "270bcada5a58d167a42865695f3192efcf0f4fac192ca9ecac6c6c43d52b23ca"
+      },
+      {
+        "alias": "input-08",
+        "bytes": 475771,
+        "sha256": "22b93c973d24ac29bce45824dd4b3909fc1b9ca56c214b25fecf544bb29f64bf"
+      },
+      {
+        "alias": "input-09",
+        "bytes": 140560592,
+        "sha256": "585f303da1d5252d228d1e8ac6d4c4d11d970df9297406935cc8bdafa49cfa7e"
+      },
+      {
+        "alias": "input-10",
+        "bytes": 1360020736,
+        "sha256": "6a205c7ca90f60b388d925c0e4aea8f4ed8bb4404520bb49dbd095d1b7320bd1"
+      },
+      {
+        "alias": "input-11",
+        "bytes": 7267839328,
+        "sha256": "3beefa2f0f78354521c0f26764585fbd7f8760beab14be6d34f4b2cd832c4dcb"
+      },
+      {
+        "alias": "input-12",
+        "bytes": 1211632224,
+        "sha256": "aaea8c9fb75bf83baf3b99bac27a0eba61029e747df703a11e91a53309695687"
+      },
+      {
+        "alias": "input-13",
+        "bytes": 530348768,
+        "sha256": "c4ffc363b246f404c1d150075da4c41c4a031524036042ce45aeb500d4d5fe71"
+      }
+    ]
+  }
+}

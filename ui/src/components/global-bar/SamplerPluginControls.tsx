@@ -27,6 +27,7 @@
 import React from 'react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
 import { usePluginRegistry } from '../../hooks/usePluginRegistry';
+import { useCapabilities } from '../../hooks/useCapabilities';
 import { PluginControls } from './PluginControls';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
@@ -41,10 +42,15 @@ const ACCENT = 'sky';
 export const SamplerPluginControls: React.FC = () => {
   const gp = useGlobalParams() as any;
   const { registry, findSolver, findScheduler, findGuidance } = usePluginRegistry();
+  const { capabilities } = useCapabilities();
 
   // owns_loop solvers drive their own iteration and would bypass MM3's
-  // per-step overlap blend, breaking every window seam.
-  const solvers = (registry.solvers ?? []).filter(s => !s.owns_loop);
+  // per-step overlap blend, breaking every window seam. A backend that
+  // renders in a single pass (no seams to break) declares
+  // features.samplerPluginsOwnsLoop and gets the full list — SA3 does
+  // (sa3-refine.h dispatches them via lua_call_solver_loop). MM3 does not.
+  const allowOwnsLoop = !!(capabilities?.features as any)?.samplerPluginsOwnsLoop;
+  const solvers = (registry.solvers ?? []).filter(s => allowOwnsLoop || !s.owns_loop);
   const schedulers = registry.schedulers ?? [];
   const guidance = registry.guidance ?? [];
 

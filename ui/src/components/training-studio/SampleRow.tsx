@@ -96,6 +96,12 @@ export const SampleRow: React.FC<SampleRowProps> = ({
     />
   );
 
+  const adjustBpm = async (factor: number) => {
+    if (readOnly || sample.bpm === null || sample.bpm <= 0) return;
+    await editSample(sample.sampleId, { bpm: Math.round(sample.bpm * factor) });
+    await flushSample(sample.sampleId);
+  };
+
   const status = STATUS_META[sample.labelStatus] ?? STATUS_META.unlabeled;
   const lyricLines = sample.lyrics ? sample.lyrics.split('\n').filter(l => l.trim()).length : 0;
 
@@ -138,7 +144,19 @@ export const SampleRow: React.FC<SampleRowProps> = ({
     ),
 
     genre: textCell('genre', sample.genre),
-    bpm: numberCell('bpm', sample.bpm),
+    bpm: (
+      <div className="flex items-center gap-0.5">
+        <div className="min-w-0 flex-1">{numberCell('bpm', sample.bpm)}</div>
+        {([['½', 0.5], ['2×', 2]] as const).map(([label, factor]) => (
+          <button key={label} type="button" disabled={readOnly || sample.bpm === null || sample.bpm <= 0}
+            onClick={() => void adjustBpm(factor)}
+            title={t('trainingStudio.grid.adjustBpm', { factor: label, defaultValue: `Multiply BPM by ${label}` })}
+            aria-label={t('trainingStudio.grid.adjustBpm', { factor: label, defaultValue: `Multiply BPM by ${label}` })}
+            className="rounded px-1 py-0.5 text-[10px] text-zinc-600 hover:bg-amber-500/10 hover:text-amber-600 disabled:opacity-40 dark:text-zinc-400"
+          >{label}</button>
+        ))}
+      </div>
+    ),
     key: textCell('key', sample.key),
     signature: textCell('signature', sample.signature),
     language: textCell('language', sample.language),

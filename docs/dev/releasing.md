@@ -10,6 +10,25 @@ every platform and creates a **draft** GitHub Release; you review and publish it
 A separate `Cache Warm` workflow keeps the engine build cache on `master` so
 release builds take ~10–15 min instead of ~1.5h for the CUDA jobs.
 
+Starting with the next release containing `.github/workflows/runpod-image.yml`,
+the separate `RunPod image` workflow runs when you **publish** the GitHub Release
+(not on tag push, so the draft stays private) and publishes
+`ghcr.io/scragnog/hot-step-cpp:<release-tag>`, plus `:latest` unless the release is
+a prerelease or the tag is hyphenated (`-CI-Test`). It uses `GITHUB_TOKEN`
+with `packages: write`, builds the `runpod` Docker target for Linux x86_64 and
+has its own cache and concurrency group. It runs independently of the portable
+release jobs, so inspect its result separately; neither workflow gates the other.
+Ordinary `master` pushes do not build images. See the [RunPod guide](runpod.md)
+for pulling the image or building your own.
+
+Manual `RunPod image` dispatch must select an existing `v*` release tag; branch
+dispatches fail before checkout or publishing, and the same `:latest` rule applies
+(a manual run of a plain `vX.Y.Z` tag does update `latest`, including reruns of older
+tags). Publishing a throwaway `-CI-Test` release builds and pushes its own image tag,
+so delete drafts instead of publishing them. On the first GHCR
+publication, check the package visibility and make it public for anonymous pulls,
+or configure registry credentials in RunPod for a private package.
+
 ## Prerequisites
 
 - `gh` authenticated (as `scragnog`).
@@ -57,7 +76,74 @@ every render in `_experiments/_LISTENING/<stamp>-release-gate/` with a score
 sheet: listen before you tag, because nothing mechanical judges quality.
 Details and flags: [tools/release-gate/README.md](../../tools/release-gate/README.md).
 
-## 1. (Optional) Compile-test before releasing
+Every assembler (the local `release/build-release.ps1` and each CI platform job) also runs `release/smoke-boot.mjs` on the freshly bundled `server.mjs`, once the server and its native deps are staged, before anything is packaged. It boots the bundle from the staged release root, with a throwaway data folder and profile, no engine, on a free port, and fails the build if it exits or never answers `/api/health` (60 s). Run it with the Node the release ships, because the staged `better-sqlite3` is built for that version. A bundle that dies at startup cannot be zipped.
+
+The server bundle is `server/server.mjs` plus `server/chunks/`. esbuild code splitting is on deliberately: without it, the top-level await in `dataroot/bootstrap.ts` plus the server's import cycles deadlock the bundle at startup (exit 13, the 1.4.1 bug).
+
+## 1. Windows preflight before releasing
+
+After the intended changes are committed and pushed to `master`, manually dispatch the
+Release workflow. Both the push and dispatch require the maintainer's approval:
+
+```bash
+gh workflow run release.yml --ref master
+```
+
+Manual dispatch uses the same five Windows build jobs and fresh `windows-2022` archive
+test jobs as a tag release. It derives `0.0.0-preflight-<12-character commit SHA>` from
+the dispatched commit for both the packaged `VERSION` and archive names. There is no
+version input or branch name in the archive path. It uploads artifacts only, creates no
+tag or release, and skips Linux, macOS, Essentia and all release notes/creation work.
+
+Inspect all five `test-windows-artifacts` results and their `windows-smoke-<variant>`
+evidence artifacts. Each job verifies the shipping zip's SHA256, extracts it under
+`HOT Step smoke` outside the checkout, boots the packaged server with its bundled Node,
+checks engine endpoints with stub models, and runs the model-free backend diagnostic.
+The fresh test VM installs no toolkit and receives no build tree. Child process `PATH`
+contains Windows system directories plus the isolated registry-provisioned CUDA runtime.
+Missing backend and runtime DLL negative checks must fail as expected. CUDA runtime
+downloads are cached by their registry entries; the logs record bytes and download time.
+See [Windows archive gate](building.md#windows-archive-gate) for acceptance and limits.
+
+A tag release depends on every Windows archive test passing before creating its draft.
+It collects the original checksummed `release-*` artifacts, excluding smoke evidence.
+The Windows preflight proves startup and backend loading on hosted runners; the local
+release gate and listening check above still cover model execution and audio quality.
+
+### Optional CPU generation measurement
+
+For a measured CPU trial, obtain approval for both pushing the reviewed commits and
+dispatching the workflow. Push first: `--ref master` uses the remote branch, so local
+commits are not included until pushed. After approval and a successful push, run:
+
+```bash
+gh workflow run release.yml --ref master -f cpu_generation_trial=true
+```
+
+The input defaults to `false`. This still builds and tests all five Windows variants;
+only the added generation job uses the CPU archive. It downloads approximately
+3.3 GB of models without caching, with a ten-minute download budget, then attempts
+one ten-second LM generation and one-step synthesis within five minutes total,
+including engine startup. It starts the archive's `ace-server.exe`, submits `/lm`,
+polls `/job`, then submits `/synth?format=wav16` and fetches the completed WAV,
+using the same HTTP sequence as the app. The trial does not need standalone
+LM or synthesis executables.
+It creates no tag or release and does not gate release creation.
+
+Inspect the `cpu-generation-trial` job and its evidence artifact directly. The job
+uses `continue-on-error`, so a green workflow alone does not prove generation passed.
+Report the run link, `download.json` download seconds, `inference.json` inference
+seconds and peak working set bytes, and whether WAV validation passed. If it times
+out or fails, report that outcome rather than a successful generation time.
+The artifact includes logs and any generated audio for inspection.
+If the packaged server cannot start or become healthy, the step fails and records
+null inference time and peak RAM, rather than reporting a measurement.
+
+The reduced-step trial establishes execution only, not audio quality or normal
+generation speed. Keep it non-gating until hosted measurements support a decision.
+See [trial details and validation limits](building.md#optional-hosted-cpu-generation-trial).
+
+### Optional full-platform compile test
 
 To verify CI compiles without cutting a real release, push a throwaway
 **hyphenated** tag — it triggers the same build pipeline but is ignored by the
@@ -80,9 +166,10 @@ git tag -a vX.Y.Z -m "vX.Y.Z — <one-line summary>"
 git push origin vX.Y.Z
 ```
 
-This triggers `Release` → builds Windows (cuda13.1 / cuda12.8 / vulkan / cpu),
-Linux (same four), macOS (Metal) → creates a **draft** release with **22 assets**
-(11 archives + 11 `.sha256`).
+This triggers `Release`: builds Windows (`cuda13.1`, `cuda12.8`, `cuda12-volta`,
+`vulkan`, `cpu`), Linux (those five plus `rocm`) and macOS (Metal), then tests all
+five Windows archives before creating a **draft** release with **24 assets**
+(12 archives + 12 `.sha256`).
 
 To change the commit or re-run: delete + re-push the tag (it rebuilds).
 
@@ -105,11 +192,20 @@ filesystem path.
 
 ## 4. Publish
 
-The workflow leaves the release as a **draft**. Verify the asset count (18) and
-the `What's Changed` notes, then:
+The workflow leaves the release as a **draft**. Before publishing, arrange the
+release body in this order:
+
+1. Curated release notes under a `Highlights` heading.
+2. GitHub's generated `What's Changed` list and `Full Changelog` link, generated
+   against the previous release tag. Keep both; never replace them with the
+   curated notes.
+3. The Downloads table, unchanged.
+
+Verify the asset count and notes, then leave the draft for the maintainer to
+publish. The maintainer uses:
 
 ```bash
-gh release view vX.Y.Z --json assets --jq '.assets | length'   # expect 22
+gh release view vX.Y.Z --json assets --jq '.assets | length'   # expect 24
 gh release edit vX.Y.Z --draft=false --latest
 ```
 
@@ -215,3 +311,9 @@ itself, for that one matrix entry only.
 
 - Workflows: [`.github/workflows/release.yml`](../../.github/workflows/release.yml),
   [`.github/workflows/cache-warm.yml`](../../.github/workflows/cache-warm.yml)
+
+## Data layout acceptance
+
+Archives contain app binaries and immutable `server/data/` resources. User data is initialized in sibling `HOT-Step-Data` or reused through the profile pointer. Package `release/.env.example`, `profile-path.mjs`, the platform launcher and `README.txt`, plus `open-browser-if-needed.mjs` on Windows (a Node helper; the launcher must never start PowerShell, which antivirus quarantines); do not create mutable app-root models or adapters. Windows uses `runtime/node.exe`, Linux and macOS use `runtime/bin/node`. Local packagers follow the same layout.
+
+The prereq script checks three workflow platform sections and both local assemblers, required engine targets and wholesale resource copies, unset managed defaults, profile marker agreement and disposable release/dev fixtures. Run it without `--offline` to retain Hugging Face checks. Actual native platform startup remains a release smoke-test requirement. See [Data folder and upgrades](../user/data-folder.md).

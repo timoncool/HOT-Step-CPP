@@ -1,9 +1,10 @@
+import { useReferences } from '../../queries/global-models/hooks';
 // MasteringDropdown.tsx — Mastering config for the global param bar
 //
 // The on/off toggle is in the bar header (ToggleSwitch).
 // This dropdown shows reference track selection and options when mastering is enabled.
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Upload, Trash2, Music2 } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
@@ -15,11 +16,6 @@ import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 import { GLOBAL_PARAM_DEFAULTS } from '../../stores/globalParamsStore';
 
-interface ReferenceTrack {
-  name: string;
-  size: number;
-  url: string;
-}
 
 const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`;
@@ -31,43 +27,36 @@ export const MasteringDropdown: React.FC = () => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
   const { token } = useAuth();
-  const [references, setReferences] = useState<ReferenceTrack[]>([]);
+  const { references: references, refresh: refreshReferences } = useReferences();
   const [uploading, setUploading] = useState(false);
 
-  useEffect(() => {
-    masteringApi.listReferences()
-      .then(data => setReferences(data.references))
-      .catch(() => {});
-  }, []);
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !token) return;
     try {
       setUploading(true);
-      const result = await masteringApi.uploadReference(file, token);
+      const result = await masteringApi.uploadReference(file);
       gp.setMasteringReference(result.name);
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
+      await refreshReferences();
     } catch (err) {
       console.error('[Mastering] Upload failed:', err);
     } finally {
       setUploading(false);
       e.target.value = '';
     }
-  }, [token, gp]);
+  }, [token, gp, refreshReferences]);
 
   const handleDelete = useCallback(async (name: string) => {
     if (!token) return;
     try {
-      await masteringApi.deleteReference(name, token);
+      await masteringApi.deleteReference(name);
       if (gp.masteringReference === name) gp.setMasteringReference('');
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
+      await refreshReferences();
     } catch (err) {
       console.error('[Mastering] Delete failed:', err);
     }
-  }, [token, gp]);
+  }, [token, gp, refreshReferences]);
 
   if (!gp.masteringEnabled) {
     return (

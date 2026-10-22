@@ -632,6 +632,9 @@ export const MM3_LM_DEFAULTS = {
    *  continued in practice, and the state outweighed the adapter itself. A
    *  run that stops short (cancel, crash, pause) keeps it regardless. */
   keepResumeState: false,
+  /** Repoint the linked Lyric Studio album presets at the final checkpoint
+   *  when the run ends. On = the long-standing behaviour; off for test runs. */
+  updateLinkedPresets: true,
   /** Cadence follows checkpoints instead of the clock (Rob, 2026-08-25): a
    *  preview per checkpoint means every audition candidate on disk has an ear
    *  sample attached, and none are rendered twice. */
@@ -1143,6 +1146,8 @@ export interface ResolvedMm3TrainLmOptions {
   scoreLastEndOnly?: boolean;
   /** Server-side only (no engine flag): keep resume-state.bin after completion. */
   keepResumeState?: boolean;
+  /** Repoint linked album presets at the final checkpoint. Absent = true. */
+  updateLinkedPresets?: boolean;
   /** Tracks longer than maxFrames: exclude (engine --drop-over-frames), crop,
    *  or excise (cut a repeated section out and train the result whole).
    *  See MM3_LM_DEFAULTS.longTracks. Absent = exclude. */

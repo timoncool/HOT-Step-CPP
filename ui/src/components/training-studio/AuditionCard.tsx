@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { AuditionOptions, AuditionPreview, AuditionSideSpec, LsGenerationsResponse } from '../../services/trainingApi';
-import { getLsGenerations } from '../../services/trainingApi';
+import { useQuery } from '@tanstack/react-query';
+import { trainingQueries } from '../../queries/training-data/queries';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
@@ -62,6 +63,8 @@ function hasIdenticalCodes(preview: AuditionPreview): boolean {
   return hashes.length >= 2 && hashes.every(h => h === hashes[0]);
 }
 
+const NO_LS_LINK: LsGenerationsResponse = { lyricsSetId: 0, artist: '', album: '', generations: [] };
+
 export const AuditionCard: React.FC<AuditionCardProps> = ({ milestoneRequest }) => {
   const { t } = useTranslation();
   const capabilities = useTrainingStore(s => s.capabilities);
@@ -106,8 +109,6 @@ export const AuditionCard: React.FC<AuditionCardProps> = ({ milestoneRequest }) 
   // server-side either way.
   const [renderSteps, setRenderSteps] = usePersistedState('hs-auditionRenderSteps', 8);
   // Lyric Studio prompt source: the linked album's generated lyrics.
-  const [lsData, setLsData] = useState<LsGenerationsResponse | null>(null);
-  const [lsLoading, setLsLoading] = useState(false);
   const [lsGenId, setLsGenId] = useState(0);
   // The render runs on whatever DiT the user has selected in the models tab
   // (Rob, 2026-07-29) — the same hs-ditModel every generation uses. '' falls
@@ -154,7 +155,6 @@ export const AuditionCard: React.FC<AuditionCardProps> = ({ milestoneRequest }) 
     setAdapterPickedByUser(false);
     setAdapterPath('');
     setAdapterLabel('');
-    setLsData(null);
     setLsGenId(0);
   } else if (adapterExists && trainedDir && trainedDir !== seenTrainedDir) {
     setSeenTrainedDir(trainedDir);
@@ -219,14 +219,14 @@ export const AuditionCard: React.FC<AuditionCardProps> = ({ milestoneRequest }) 
   // lazily on first selection of the source. The first fetch for a never-linked
   // dataset runs the export preview's artist/album detection server-side and
   // persists the resolved link, so later fetches are one indexed query.
-  useEffect(() => {
-    if (source !== 'lyricstudio' || !selectedDatasetId || lsData || lsLoading) return;
-    setLsLoading(true);
-    getLsGenerations(selectedDatasetId)
-      .then(d => setLsData(d))
-      .catch(() => setLsData({ lyricsSetId: 0, artist: '', album: '', generations: [] }))
-      .finally(() => setLsLoading(false));
-  }, [source, selectedDatasetId, lsData, lsLoading]);
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const lsQuery = useQuery({
+    ...trainingQueries.lsGenerations(worker, selectedDatasetId ?? ''),
+    enabled: source === 'lyricstudio' && !!selectedDatasetId,
+  });
+  // A failed lookup reads as "not linked", which offers the link flow.
+  const lsData: LsGenerationsResponse | null = lsQuery.data ?? (lsQuery.isError ? NO_LS_LINK : null);
+  const lsLoading = lsQuery.isFetching;
 
   const lsGen = lsData?.generations.find(g => g.id === lsGenId);
 

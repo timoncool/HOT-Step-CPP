@@ -8,6 +8,7 @@
 // requests. All fetch calls need generous timeouts to survive these stalls.
 
 import { config } from '../config.js';
+import { engineCrashSeq } from './aceEngineProcess.js';
 
 const BASE = config.aceServer.url;
 
@@ -18,6 +19,39 @@ const TIMEOUT_QUICK  =  15_000;   // health checks, props, job submit
 const TIMEOUT_POLL   =  30_000;   // job polling — fail fast, let watchdog decide on stalls
 const TIMEOUT_RESULT = 300_000;   // fetching large audio results (encode + transfer)
 const TIMEOUT_SA3    = 1_800_000; // /sa3-refine — first call may build a TensorRT engine (many minutes)
+
+/** Combines a caller-supplied AbortSignal with a timeout signal. Node 20+ has
+ *  AbortSignal.any(); server/package.json only requires >=18, so fall back to
+ *  a manual combine (whichever aborts first wins) when it's missing. */
+function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!signal) return timeoutSignal;
+  if (typeof (AbortSignal as any).any === 'function') {
+    return (AbortSignal as any).any([signal, timeoutSignal]);
+  }
+  const combined = new AbortController();
+  const onAbort = (src: AbortSignal) => {
+    if (!combined.signal.aborted) combined.abort((src as any).reason);
+  };
+  if (signal.aborted) onAbort(signal);
+  else signal.addEventListener('abort', () => onAbort(signal), { once: true });
+  if (timeoutSignal.aborted) onAbort(timeoutSignal);
+  else timeoutSignal.addEventListener('abort', () => onAbort(timeoutSignal), { once: true });
+  return combined.signal;
+}
+
+/** GET /sa3/props wire shape (engine hot-step-server.cpp, HOT-Step). */
+export interface Sa3Props {
+  backend: string;              // 'sa3'
+  model: string;                // 'Stable Audio 3'
+  available: boolean;           // any weight set present
+  synth_ready: boolean;         // weights + tokenizer present
+  backend_hint: 'onnx' | 'gguf' | 'none';
+  sample_rate: number;          // 44100
+  prompt_token_limit: number;   // 256
+  files?: { onnx?: { found: boolean }; gguf?: { found: boolean }; tokenizer?: { found: boolean } };
+  adapters: string[];           // sa3-adapters/*.gguf stems
+}
 
 /** Props response from GET /props */
 /** Sample format for a post-processing endpoint's WAV response (`out_fmt`).
@@ -59,6 +93,12 @@ export interface AceRequest {
   /** LM-phase sampling seed (caption/lyrics/audio-codes). Independent from
    *  `seed`, which drives DiT synthesis. -1 or omitted lets the engine pick. */
   lm_seed?: number;
+  /** Seed breeding: second DiT noise seed (-1/omitted = off). */
+  seed_b?: number;
+  /** Seed breeding blend, 0 = seed only, 1 = seed_b only (slerp). */
+  seed_blend?: number;
+  /** Seed morph: blend at the end of the song (-1/omitted = off; blend ramps seed_blend -> this over time). */
+  seed_blend_end?: number;
   lm_batch_size?: number;
   synth_batch_size?: number;
   lm_temperature?: number;
@@ -140,6 +180,8 @@ export interface AceRequest {
   /** Runtime adapter delta VRAM precision: "bf16" (full), "q8_0" (~½), "q4_k" (~¼).
    *  Quantizes precomputed deltas in VRAM at load; no disk change. Runtime mode only. */
   adapter_runtime_quant?: string;
+  /** Opt in to DoRA magnitude rescaling in runtime DiT adapters. Default false. */
+  adapter_runtime_dora?: boolean;
   /** Merge (low VRAM): re-encode merged weights to the base's native quant instead of
    *  F32 promotion (~¼ the merged-DiT VRAM on a Q8 base). Merge mode only. */
   adapter_merge_lowvram?: boolean;
@@ -304,6 +346,38 @@ async function aceFetch(url: string, init?: RequestInit): Promise<Response> {
       console.warn(`[aceClient] ${method} ${url}: ${code} (attempt ${attempt}/3, retrying)`);
       await new Promise(r => setTimeout(r, 500 * attempt));
     }
+  }
+}
+
+/** POST to a synchronous engine route that runs on the worker thread
+ *  (/sa3-synth, /sa3-refine). Aborting the fetch closes the socket, which the
+ *  engine checks before every sampling step; it then returns early. GET
+ *  /worker-drain queues behind that call, so after any failed fetch (abort or
+ *  transport error alike) we await it before rethrowing: the caller's lane is
+ *  released only once the engine has stopped. */
+async function workerPost(url: string, init: RequestInit): Promise<Response> {
+  const crashSeqAtStart = engineCrashSeq();
+  try {
+    return await aceFetch(url, init);
+  } catch (err) {
+    await drainWorker(crashSeqAtStart);
+    throw err;
+  }
+}
+
+/** Resolves only on proof that the worker is free: a 2xx from /worker-drain,
+ *  or the engine process having died since `crashSeqAtStart`. A drain that
+ *  fails or times out proves nothing, so it is retried. */
+async function drainWorker(crashSeqAtStart: number, retryMs = 1000): Promise<void> {
+  for (;;) {
+    try {
+      const res = await fetch(`${BASE}/worker-drain`, { signal: AbortSignal.timeout(TIMEOUT_SA3) });
+      if (res.ok) return;
+      // Any other status (a 404 from an engine older than the route included)
+      // proves nothing about the render, so keep holding.
+    } catch { /* unreachable or timed out: not proof that it stopped */ }
+    if (engineCrashSeq() !== crashSeqAtStart) return;
+    await new Promise(r => setTimeout(r, retryMs));
   }
 }
 
@@ -707,6 +781,9 @@ export const aceClient = {
       guidanceMode?: string;
       guidanceScale?: number;                          // only sent when > 1
       pluginParams?: Record<string, string | number>;  // "<plugin>:<key>" -> value
+      /** Postprocess plugin: replaces the built-in latent->audio decode.
+       *  Same field name/semantics as ACE's request.ts postprocessPlugin. */
+      postprocessPlugin?: string;
       /** Response sample format. Omitted = s16. */
       outFmt?: WavOutFormat;
     },
@@ -743,9 +820,10 @@ export const aceClient = {
     if (opts.pluginParams && Object.keys(opts.pluginParams).length > 0) {
       params.set('plugin_params', JSON.stringify(opts.pluginParams));
     }
+    if (opts.postprocessPlugin) params.set('postprocess_plugin', opts.postprocessPlugin);
     if (opts.outFmt) params.set('out_fmt', opts.outFmt);
 
-    const res = await aceFetch(`${BASE}/sa3-refine?${params.toString()}`, {
+    const res = await workerPost(`${BASE}/sa3-refine?${params.toString()}`, {
       method: 'POST',
       headers: { 'Content-Type': 'audio/wav' },
       body: wavBuffer,
@@ -754,6 +832,100 @@ export const aceClient = {
     if (!res.ok) {
       const errBody = await res.text().catch(() => 'Unknown error');
       throw new Error(`ace-server POST /sa3-refine failed (${res.status}): ${errBody}`);
+    }
+    const arrayBuf = await res.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  },
+
+  /** GET /sa3/props — HOT-Step SA3 primary backend readiness probe.
+   *  Cheap: file-existence checks only, never loads a model. Soft-fails to
+   *  null so backends/sa3/index.ts can report `up: false` without throwing. */
+  async sa3Props(): Promise<Sa3Props | null> {
+    try {
+      const res = await fetch(`${BASE}/sa3/props`, { signal: AbortSignal.timeout(5_000) });
+      if (!res.ok) return null;
+      return await res.json() as Sa3Props;
+    } catch {
+      return null;
+    }
+  },
+
+  /** POST /sa3-synth — HOT-Step SA3 text-to-audio from pure noise.
+   *
+   *  /sa3-refine minus the input: no WAV body, no strength, no level matching.
+   *  Same tokenized prompt, same steps/sampler/seed, same adapters, same Lua
+   *  plugin routing (engine hot-step-server.cpp /sa3-synth →
+   *  sa3_refine_run_backend with noise_only=true). Returns a WAV at 44.1k (or
+   *  outSr) of exactly `durationSec` seconds. */
+  async submitSa3Synth(
+    opts: {
+      tokens: number[];       // exactly 256 padded T5Gemma token ids
+      nTokens: number;        // real (non-pad) token count
+      durationSec: number;    // requested length, 1..600 s
+      steps?: number;         // sampler steps (engine default 8)
+      sampler?: 'pingpong' | 'euler';
+      seed?: number;
+      /** Seed breeding: second noise seed (-1/omitted = off). */
+      seedB?: number;
+      /** Seed breeding blend, 0 = seed only, 1 = seedB only (slerp). */
+      seedBlend?: number;
+      outSr?: number;
+      backend?: 'auto' | 'onnx' | 'gguf';
+      adapters?: Array<{ name: string; scale: number }>;
+      solver?: string;
+      scheduler?: string;
+      guidanceMode?: string;
+      guidanceScale?: number;
+      pluginParams?: Record<string, string | number>;
+      /** Postprocess plugin: replaces the built-in latent->audio decode.
+       *  Same field name/semantics as ACE's request.ts postprocessPlugin. */
+      postprocessPlugin?: string;
+      outFmt?: WavOutFormat;
+      /** Diagnostic: bare filename; engine writes the final latent (flat f32,
+       *  [256][L]) to models/sa3-latents/<name> and logs its RMS. */
+      dumpLatent?: string;
+      /** Cancellation: combined with the TIMEOUT_SA3 timeout signal. Aborting
+       *  stops the engine at its next sampling step; the call settles only
+       *  after the engine has stopped (see workerPost). */
+      signal?: AbortSignal;
+    },
+  ): Promise<Buffer> {
+    const params = new URLSearchParams();
+    params.set('tokens', opts.tokens.join(','));
+    params.set('n_tokens', String(opts.nTokens));
+    params.set('duration', String(opts.durationSec));
+    if (opts.dumpLatent) params.set('dump_latent', opts.dumpLatent);
+    if (opts.backend && opts.backend !== 'auto') params.set('backend', opts.backend);
+    if (opts.adapters && opts.adapters.length > 0) {
+      params.set('adapters', opts.adapters.map(a => `${a.name}:${a.scale}`).join(','));
+    }
+    if (opts.steps !== undefined) params.set('steps', String(opts.steps));
+    if (opts.sampler) params.set('sampler', opts.sampler);
+    if (opts.seed !== undefined) params.set('seed', String(opts.seed));
+    if (opts.seedB !== undefined && opts.seedB >= 0 && opts.seedBlend !== undefined && opts.seedBlend > 0) {
+      params.set('seed_b', String(Math.floor(opts.seedB)));
+      params.set('seed_blend', String(Math.min(1, opts.seedBlend)));
+    }
+    if (opts.outSr !== undefined) params.set('out_sr', String(opts.outSr));
+    if (opts.solver) params.set('solver', opts.solver);
+    if (opts.scheduler) params.set('scheduler', opts.scheduler);
+    if (opts.guidanceMode) params.set('guidance_mode', opts.guidanceMode);
+    if (opts.guidanceScale !== undefined && opts.guidanceScale > 1) {
+      params.set('guidance_scale', String(opts.guidanceScale));
+    }
+    if (opts.pluginParams && Object.keys(opts.pluginParams).length > 0) {
+      params.set('plugin_params', JSON.stringify(opts.pluginParams));
+    }
+    if (opts.postprocessPlugin) params.set('postprocess_plugin', opts.postprocessPlugin);
+    if (opts.outFmt) params.set('out_fmt', opts.outFmt);
+
+    const res = await workerPost(`${BASE}/sa3-synth?${params.toString()}`, {
+      method: 'POST',
+      signal: withTimeout(opts.signal, TIMEOUT_SA3),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => 'Unknown error');
+      throw new Error(`ace-server POST /sa3-synth failed (${res.status}): ${errBody}`);
     }
     const arrayBuf = await res.arrayBuffer();
     return Buffer.from(arrayBuf);

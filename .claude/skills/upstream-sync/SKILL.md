@@ -5,6 +5,10 @@ description: Safely pulls upstream acestep.cpp changes into the HOT-Step engine 
 
 # Syncing with upstream acestep.cpp
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 ## When to use this skill
 
 - Pulling new commits from upstream `acestep.cpp` (https://github.com/ServeurpersoCom/acestep.cpp) into this fork's `engine/`.
@@ -145,7 +149,7 @@ Post-sync validation checklist:
 - [ ] Switch models mid-session
 - [ ] All solvers/schedulers/guidance modes selectable in the UI — **ask the user to eyeball this; do not use a browser agent**
 - [ ] **Keep every generated validation track** — do NOT delete audio outputs on your own quality judgment; the user verifies by ear. Report output paths/song IDs so the user can A/B them against pre-sync generations (a subtle sampler/VAE regression is exactly what these exist to catch).
-- [ ] Newest `logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log` shows a **`[DiT] Guidance:` line**. This is the definitive runtime proof the HOT-Step sampler is active — upstream's sampler never prints it. (A bare `[DiT] Solver:` line is NOT proof: upstream also prints one at the upstream clone's *own* `src/dit-sampler.h:397` — NOT the fork's stale copy at `engine/src/dit-sampler.h`, which predates that feature and contains no such line. The HOT-Step version additionally includes the scheduler name — format `Solver: <name> (<scheduler>, N NFE/step, order N)` from `hot-step-sampler.h:503`.)
+- [ ] Newest `<data root>/logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log` shows a **`[DiT] Guidance:` line**. This is the definitive runtime proof the HOT-Step sampler is active — upstream's sampler never prints it. (A bare `[DiT] Solver:` line is NOT proof: upstream also prints one at the upstream clone's *own* `src/dit-sampler.h:397` — NOT the fork's stale copy at `engine/src/dit-sampler.h`, which predates that feature and contains no such line. The HOT-Step version additionally includes the scheduler name — format `Solver: <name> (<scheduler>, N NFE/step, order N)` from `hot-step-sampler.h:503`.)
 
 ### Phase 6 — Record marker, commit, tag (do NOT push)
 

@@ -7,9 +7,11 @@
 //   - Plugin metadata + param schema extraction
 //   - Wrapper functions matching C solver/scheduler/guidance signatures
 
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <functional>
@@ -162,6 +164,19 @@ static int lua_math_randomseed(lua_State * L) {
 
 static const char * LUA_RAND_KEY = "hot_step.rand_state";
 
+// Independent stream with the same seed mapping as math.randomseed(seed, 0).
+// Keep uint64_t arithmetic in C++ rather than LuaJIT's 32-bit Lua operators.
+static int lua_math_randomstream(lua_State * L) {
+    const double seed = luaL_checknumber(L, 1);
+    luaL_argcheck(L, std::isfinite(seed) && seed >= -9007199254740991.0 &&
+                     seed <= 9007199254740991.0, 1, "seed must be a finite safe integer");
+    luaL_argcheck(L, std::floor(seed) == seed, 1, "seed must be an integer");
+    LuaRandState * st = (LuaRandState *) lua_newuserdata(L, sizeof(LuaRandState));
+    lua_rand_seed(st, (uint64_t) (int64_t) seed, 0);
+    lua_pushcclosure(L, lua_math_random, 1);
+    return 1;
+}
+
 static void lua_register_random(lua_State * L) {
     LuaRandState * st = (LuaRandState *) lua_newuserdata(L, sizeof(LuaRandState));
     lua_rand_seed(st, (uint64_t) time(nullptr), (uint64_t) (size_t) L);
@@ -174,6 +189,8 @@ static void lua_register_random(lua_State * L) {
     lua_pushvalue(L, -2);
     lua_pushcclosure(L, lua_math_randomseed, 1);
     lua_setfield(L, -2, "randomseed");
+    lua_pushcfunction(L, lua_math_randomstream);
+    lua_setfield(L, -2, "randomstream");
     lua_pop(L, 2);
 }
 
@@ -240,6 +257,7 @@ struct LuaPlugin {
 
     // Guidance-specific
     bool has_post_step = false;  // guidance plugin declares post_step()
+    bool has_guide     = false;  // guidance plugin declares guide()
 
     // Lua VM state
     lua_State * L = nullptr;
@@ -256,7 +274,7 @@ struct LuaPlugin {
           filepath(std::move(o.filepath)), params(std::move(o.params)),
           nfe(o.nfe), order(o.order), needs_model(o.needs_model),
           stateful(o.stateful), stochastic(o.stochastic), owns_loop(o.owns_loop),
-          has_post_step(o.has_post_step), L(o.L) {
+          has_post_step(o.has_post_step), has_guide(o.has_guide), L(o.L) {
         o.L = nullptr;
     }
     LuaPlugin & operator=(LuaPlugin &&) = delete;
@@ -347,6 +365,29 @@ static int lua_get_int(lua_State * L, int idx, const char * field, int def = 0) 
     return v;
 }
 
+// JS String(number) (ECMAScript Number::toString), so the UI's string compare
+// matches: 1e-5 -> "0.00001", 1e21 -> "1e+21", -0 -> "0", 2.5 -> "2.5".
+static std::string lua_js_number_string(double v) {
+    if (std::isnan(v)) return "NaN";
+    if (v == 0) return "0";
+    if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";
+    std::string sign = v < 0 ? "-" : "";
+    v = std::fabs(v);
+    // shortest round-trip digits: "d.ddde+N"
+    char e[40];
+    *std::to_chars(e, e + sizeof(e) - 1, v, std::chars_format::scientific).ptr = '\0';
+    std::string digits;
+    const char * c = e;
+    for (; *c != 'e'; c++) if (*c != '.') digits += *c;
+    int n = std::atoi(c + 1) + 1;  // decimal point position
+    int k = (int) digits.size();
+    if (k <= n && n <= 21) return sign + digits + std::string(n - k, '0');
+    if (0 < n && n <= 21)  return sign + digits.substr(0, n) + "." + digits.substr(n);
+    if (-6 < n && n <= 0)  return sign + "0." + std::string(-n, '0') + digits;
+    std::string exp = (n - 1 < 0 ? "-" : "+") + std::to_string(std::abs(n - 1));
+    return sign + digits.substr(0, 1) + (k > 1 ? "." + digits.substr(1) : "") + "e" + exp;
+}
+
 static ParamSchema lua_extract_param(lua_State * L, int idx) {
     ParamSchema p;
     p.key   = lua_get_string(L, idx, "key");
@@ -404,6 +445,15 @@ static ParamSchema lua_extract_param(lua_State * L, int idx) {
         p.visible_when.active = true;
         p.visible_when.key    = lua_get_string(L, -1, "key");
         p.visible_when.equals = lua_get_string(L, -1, "equals");
+        // Accept equals = true/false and numbers too; format to match the
+        // UI's String(value) comparison ("true", "2", "2.5").
+        lua_getfield(L, -1, "equals");
+        if (lua_isboolean(L, -1)) {
+            p.visible_when.equals = lua_toboolean(L, -1) ? "true" : "false";
+        } else if (lua_type(L, -1) == LUA_TNUMBER) {
+            p.visible_when.equals = lua_js_number_string(lua_tonumber(L, -1));
+        }
+        lua_pop(L, 1);
     }
     lua_pop(L, 1);
 
@@ -491,10 +541,17 @@ static bool lua_load_plugin(LuaPlugin & plugin, const char * filepath, const cha
                 plugin.owns_loop   = lua_get_bool(L, tbl, "owns_loop", false);
             }
 
-            // Detect post_step() for guidance plugins
+            // Detect post_step() / guide() for guidance plugins. A plugin may
+            // ship post_step() only (e.g. a manifold-projection hook with no
+            // per-pred blend) -- has_guide lets callers skip the guide() path
+            // entirely instead of hitting the "no guide()" error every step.
             if (plugin.type == PluginType::Guidance) {
                 lua_getglobal(L, "post_step");
                 plugin.has_post_step = lua_isfunction(L, -1);
+                lua_pop(L, 1);
+
+                lua_getglobal(L, "guide");
+                plugin.has_guide = lua_isfunction(L, -1);
                 lua_pop(L, 1);
             }
 
@@ -568,12 +625,85 @@ static void lua_inject_params(lua_State * L,
 // The `or 48000` fallback keeps every existing plugin working unchanged on
 // ACE. Only plugins that want to be model-aware need to read it.
 
+// YuE2 plan metadata (HOT-Step). Filled only on the YuE2 NAR plugin path and
+// exposed as model_context.yue2; every other backend leaves the pointer null
+// and the table is simply absent.
+struct LuaYue2Section {
+    std::string name;
+    int64_t     start_bar = 0, end_bar = 0;  // vocal-bar index, end exclusive
+    double      start_s = 0.0, end_s = 0.0;
+};
+struct LuaYue2Plan {
+    double      tempo = 0.0;          // quarter-note bpm from Q:, 0 if absent
+    std::string meter;                // M: text, e.g. "4/4" ("" if absent)
+    int         beats_per_bar = 4;
+    int64_t     bars = 0;             // vocal-voice bars (Z<n> counts n)
+    int64_t     vocal_bars = 0;       // of those, bars holding at least one note
+    double      total_s = 0.0;        // bars * beats * 60 / tempo, 0 without tempo
+    std::vector<LuaYue2Section> sections;  // from "% name" comment markers
+    double      frame_rate = 25.0;    // NAR latent frames per second
+    int         song = 0;             // batch song index
+    int         chunk_index = 0;      // 0-based chunk index within the song
+    int         chunk_count = 1;
+    int64_t     chunk_start_frame = 0, chunk_end_frame = 0;  // end exclusive
+    int64_t     song_frames = 0;
+};
+
 struct LuaModelContext {
     int          native_sr       = 48000;  // audio sample rate (48000 ACE, 44100 MM3/SA3)
     int          latent_fps      = 25;     // latent frames per second
     int          latent_channels = 64;     // Oc (64 ACE, 128 MM3, 256 SA3)
-    const char * model_id        = "ace";  // "ace", "mm3", "sa3"
+    const char * model_id        = "ace";  // "ace", "mm3", "sa3", "yue2"
+    // Measured RMS of this model's clean latent -- the number every
+    // rms_target / latent-pressure servo should default to. A plugin tuned
+    // against ACE's ~2.0 that is dropped onto SA3 (measured 0.685 on a 24-step
+    // native render) spends every step inflating the latent to 3x its natural
+    // magnitude. Plugins read it as `model_context.latent_rms` and fall back
+    // to 2.0 when absent, so ACE behaviour is unchanged. (HOT-Step)
+    float        latent_rms      = 2.0f;
+    // True when the backend re-noises the latent after every solver step
+    // itself (SA3 pingpong); stochastic solvers should skip their own noise
+    // injection when set. (HOT-Step)
+    bool         engine_renoise  = false;
+    // YuE2 plan metadata; null everywhere except the YuE2 NAR path.
+    const LuaYue2Plan * yue2     = nullptr;
 };
+
+static void lua_inject_yue2_plan(lua_State * L, const LuaYue2Plan & p) {
+    const double fr = p.frame_rate > 0.0 ? p.frame_rate : 25.0;
+    lua_newtable(L);
+    lua_pushnumber(L, p.tempo);                        lua_setfield(L, -2, "tempo");
+    lua_pushstring(L, p.meter.c_str());                lua_setfield(L, -2, "meter");
+    lua_pushinteger(L, p.beats_per_bar);               lua_setfield(L, -2, "beats_per_bar");
+    lua_pushinteger(L, (lua_Integer) p.bars);          lua_setfield(L, -2, "bars");
+    lua_pushinteger(L, (lua_Integer) p.vocal_bars);    lua_setfield(L, -2, "vocal_bars");
+    lua_pushnumber(L, p.bars > 0 ? 100.0 * (double) p.vocal_bars / (double) p.bars : 0.0);
+    lua_setfield(L, -2, "vocal_pct");
+    lua_pushnumber(L, p.total_s);                      lua_setfield(L, -2, "total_s");
+    lua_pushnumber(L, fr);                             lua_setfield(L, -2, "frame_rate");
+    lua_pushinteger(L, (lua_Integer) p.song_frames);   lua_setfield(L, -2, "song_frames");
+    lua_pushinteger(L, p.song);                        lua_setfield(L, -2, "song");
+    lua_newtable(L);
+    for (size_t i = 0; i < p.sections.size(); i++) {
+        const LuaYue2Section & s = p.sections[i];
+        lua_newtable(L);
+        lua_pushstring(L, s.name.c_str());               lua_setfield(L, -2, "name");
+        lua_pushnumber(L, s.start_s);                    lua_setfield(L, -2, "start_s");
+        lua_pushnumber(L, s.end_s);                      lua_setfield(L, -2, "end_s");
+        lua_pushinteger(L, (lua_Integer) s.start_bar);   lua_setfield(L, -2, "start_bar");
+        lua_pushinteger(L, (lua_Integer) s.end_bar);     lua_setfield(L, -2, "end_bar");
+        lua_rawseti(L, -2, (lua_Integer) i + 1);
+    }
+    lua_setfield(L, -2, "sections");
+    lua_newtable(L);
+    lua_pushinteger(L, p.chunk_index);                    lua_setfield(L, -2, "index");
+    lua_pushinteger(L, p.chunk_count);                    lua_setfield(L, -2, "count");
+    lua_pushinteger(L, (lua_Integer) p.chunk_start_frame); lua_setfield(L, -2, "start_frame");
+    lua_pushinteger(L, (lua_Integer) p.chunk_end_frame);   lua_setfield(L, -2, "end_frame");
+    lua_pushnumber(L, (double) p.chunk_start_frame / fr);  lua_setfield(L, -2, "start_s");
+    lua_pushnumber(L, (double) p.chunk_end_frame / fr);    lua_setfield(L, -2, "end_s");
+    lua_setfield(L, -2, "chunk");
+}
 
 static void lua_inject_model_context(lua_State * L, const LuaModelContext & ctx) {
     lua_newtable(L);
@@ -581,6 +711,12 @@ static void lua_inject_model_context(lua_State * L, const LuaModelContext & ctx)
     lua_pushinteger(L, ctx.latent_fps);      lua_setfield(L, -2, "latent_fps");
     lua_pushinteger(L, ctx.latent_channels); lua_setfield(L, -2, "latent_channels");
     lua_pushstring(L, ctx.model_id);         lua_setfield(L, -2, "model_id");
+    lua_pushnumber(L, ctx.latent_rms);       lua_setfield(L, -2, "latent_rms");
+    lua_pushboolean(L, ctx.engine_renoise);  lua_setfield(L, -2, "engine_renoise");
+    if (ctx.yue2) {
+        lua_inject_yue2_plan(L, *ctx.yue2);
+        lua_setfield(L, -2, "yue2");
+    }
     lua_setglobal(L, "model_context");
 }
 
@@ -636,6 +772,10 @@ static void lua_call_solver_step(LuaPlugin & plugin,
     lua_setglobal(L, "n_per");
     lua_pushinteger(L, (lua_Integer) job_seed);
     lua_setglobal(L, "seed");
+    lua_pushinteger(L, (lua_Integer) state.seed_b);
+    lua_setglobal(L, "seed_b");
+    lua_pushnumber(L, (double) state.seed_blend);
+    lua_setglobal(L, "seed_blend");
 
     // Push step function
     lua_getglobal(L, "step");
@@ -708,7 +848,9 @@ static int lua_on_step_closure(lua_State * L) {
 }
 
 // Call a full-loop Lua solver's sample(xt, vt_buf, schedule, n, model_fn)
-static void lua_call_solver_loop(
+// Returns false when sample() is missing or raises a Lua error. A cancel via
+// on_step is not an error: sample() returns normally and this returns true.
+static bool lua_call_solver_loop(
     LuaPlugin &  plugin,
     float *      xt,
     float *      vt,
@@ -725,7 +867,7 @@ static void lua_call_solver_loop(
     int64_t      seed = 0)
 {
     lua_State * L = plugin.L;
-    if (!L) return;
+    if (!L) return false;
 
     lua_inject_params(L, params, plugin.name);
     lua_inject_model_context(L, model_ctx);
@@ -750,7 +892,7 @@ static void lua_call_solver_loop(
         fprintf(stderr, "[Plugins] ERROR: full-loop solver '%s' has no sample() function\n",
                 plugin.name.c_str());
         lua_pop(L, 1);
-        return;
+        return false;
     }
 
     // Arg 1: xt (FloatArray, mutable)
@@ -782,13 +924,16 @@ static void lua_call_solver_loop(
     }, 1);
 
     // 5 args: xt, vt_buf, schedule, n, model_fn
+    bool ok = true;
     if (lua_pcall(L, 5, 0, 0) != LUA_OK) {
         fprintf(stderr, "[Plugins] ERROR in full-loop solver '%s' sample(): %s\n",
                 plugin.name.c_str(), lua_tostring(L, -1));
         lua_pop(L, 1);
+        ok = false;
     }
 
     delete mfn_ptr;
+    return ok;
 }
 
 
@@ -1003,25 +1148,29 @@ static void lua_call_post_step(LuaPlugin & plugin,
 // ═══════════════════════════════════════════════════════════════════════════
 
 // VAE decode callback type for postprocess plugins:
-//   decode_fn(latent_data, T_latent) → (audio_data, T_audio)
-// latent_data is float* [T_latent, 64] time-major, audio_data is float* [2, T_audio]
+//   decode_fn(latent_data, T_latent, audio_out, max_T_audio) → T_audio
+// latent_data is float* [T_latent, C_lat] time-major. audio_out is planar at
+// capacity stride: ch0 in [0, T_audio), ch1 in [max_T_audio, max_T_audio + T_audio).
+// A decoder that packs ch1 at T_audio (vae_ggml_decode_tiled) must move it.
 using PostprocessVaeDecodeFn = std::function<int(const float * latent, int T_latent, float * audio_out, int max_T_audio)>;
 
 // Call a Lua postprocess plugin's process() function.
 // latents: [B * T * 64] time-major flat array (B batch items × T frames × 64 channels)
 // For each batch item, calls process() which internally calls vae_decode_fn.
-// Returns decoded audio via audio_out (caller-allocated [2 * T_audio_max] per batch item).
+// Returns decoded audio via audio_out (caller-allocated [2 * max_T_audio] per batch item),
+// planar at capacity stride like decode_fn: ch1 starts at audio_out + max_T_audio.
 static int lua_call_postprocess(
     LuaPlugin &   plugin,
     const float * latents,     // [T * 64] time-major for one batch item
     int           T_latent,    // number of latent frames
     int           C_lat,       // latent channels (64)
     int           C_aud,       // audio channels (2)
-    float *       audio_out,   // output: [2 * T_audio] interleaved by channel
+    float *       audio_out,   // output: [2 * max_T_audio], ch1 at max_T_audio
     int           max_T_audio,
     PostprocessVaeDecodeFn vae_decode_fn,
     const std::unordered_map<std::string, std::string> & params,
-    const LuaModelContext & model_ctx = LuaModelContext{})
+    const LuaModelContext & model_ctx = LuaModelContext{},
+    int samples_per_frame = 1920)
 {
     lua_State * L = plugin.L;
     if (!L) return -1;
@@ -1038,7 +1187,7 @@ static int lua_call_postprocess(
         return -1;
     }
 
-    int upscale  = 1920;
+    int upscale  = samples_per_frame;
     int final_samples = T_latent * upscale;
 
     // Arg 1: latents as Lua table (1-indexed, channel-major [C_lat, T_latent])
@@ -1076,14 +1225,20 @@ static int lua_call_postprocess(
     // Captures the C++ decode function via light userdata.
     // Lua signature: vae_decode_fn(latent_table, T_latent) → audio_table, T_audio
     auto * fn_ptr = new PostprocessVaeDecodeFn(std::move(vae_decode_fn));
+    int samples_per_frame_capture = samples_per_frame;
+    int c_lat_capture = C_lat;
     lua_pushlightuserdata(L, fn_ptr);
+    lua_pushinteger(L, samples_per_frame_capture);
+    lua_pushinteger(L, c_lat_capture);
     lua_pushcclosure(L, [](lua_State * Ls) -> int {
         auto * fn = (PostprocessVaeDecodeFn *) lua_touserdata(Ls, lua_upvalueindex(1));
+        int samples_per_frame_u = (int) lua_tointeger(Ls, lua_upvalueindex(2));
+        int c_lat_u = (int) lua_tointeger(Ls, lua_upvalueindex(3));
 
         // Read latent table from Lua (arg 1) — 1-indexed, channel-major [C, T]
         luaL_checktype(Ls, 1, LUA_TTABLE);
         int T_lat = (int) luaL_checkinteger(Ls, 2);
-        int C_l   = 64;
+        int C_l   = c_lat_u;
         int n_lat = T_lat * C_l;
 
         // Read channel-major [C, T] from Lua and transpose to time-major [T, C] for C++
@@ -1099,7 +1254,7 @@ static int lua_call_postprocess(
         }
 
         // Decode
-        int max_T = T_lat * 1920;
+        int max_T = T_lat * samples_per_frame_u;
         std::vector<float> aud_buf(2 * max_T);
         int T_audio = (*fn)(lat_buf.data(), T_lat, aud_buf.data(), max_T);
 
@@ -1109,17 +1264,22 @@ static int lua_call_postprocess(
             return 2;
         }
 
-        // Return audio as Lua table (1-indexed, [B * C_aud * T_audio])
+        // Return audio as Lua table (1-indexed, [B * C_aud * T_audio], contiguous
+        // per channel: ch0 at [1, T_audio], ch1 at [T_audio+1, 2*T_audio]).
+        // Source aud_buf is planar at capacity stride max_T (the decode_fn
+        // contract above), so ch1 is read from max_T even when T_audio is short.
         lua_newtable(Ls);
-        int total = 2 * T_audio;
-        for (int i = 0; i < total; i++) {
-            lua_pushinteger(Ls, i + 1);
-            lua_pushnumber(Ls, (double) aud_buf[i]);
-            lua_settable(Ls, -3);
+        for (int c = 0; c < 2; c++) {
+            for (int i = 0; i < T_audio; i++) {
+                int lua_idx = c * T_audio + i + 1;
+                lua_pushinteger(Ls, lua_idx);
+                lua_pushnumber(Ls, (double) aud_buf[(size_t) c * max_T + i]);
+                lua_settable(Ls, -3);
+            }
         }
         lua_pushinteger(Ls, T_audio);
         return 2;
-    }, 1);
+    }, 3);
 
     // 8 args: latents, B, C_lat, W, C_aud, final_samples, upscale_factor, vae_decode_fn
     // Returns: audio_table, T_audio
@@ -1141,17 +1301,24 @@ static int lua_call_postprocess(
         return -1;
     }
 
-    // Copy audio from Lua table to output buffer (1-indexed)
-    int total = 2 * T_audio;
+    // Copy audio from Lua table to output buffer (1-indexed).
+    // process() returns its table packed at the count it returns: ch0 in
+    // [1, T], ch1 in [T+1, 2T]. The shipped tiled plugins return T =
+    // final_samples; a pass-through returning vae_decode_fn's result returns
+    // the decoder's own (possibly shorter) count. Read at that stride, before
+    // clamping, and write audio_out at capacity stride.
+    const int T_lua = T_audio;
     if (T_audio > max_T_audio) {
         T_audio = max_T_audio;
-        total   = 2 * T_audio;
     }
-    for (int i = 0; i < total; i++) {
-        lua_pushinteger(L, i + 1);
-        lua_gettable(L, -3);
-        audio_out[i] = (float) lua_tonumber(L, -1);
-        lua_pop(L, 1);
+    for (int c = 0; c < 2; c++) {
+        for (int i = 0; i < T_audio; i++) {
+            int lua_idx = c * T_lua + i + 1;
+            lua_pushinteger(L, lua_idx);
+            lua_gettable(L, -3);
+            audio_out[(size_t) c * max_T_audio + i] = (float) lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
     }
 
     lua_pop(L, 2);

@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query';
+import { localOptions } from '../../queries/global-models/options';
 // Mm3LmAdapterDropdown.tsx — Adapters cluster for a backend whose adapters are
 // RUNTIME LM LoRAs rather than ACE's DiT adapter stack.
 //
@@ -23,7 +25,7 @@
 // persists (hs-backendParams@<backendId> — the bag is per backend), which is
 // why a pick survives a reload.
 
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, ChevronDown, ChevronRight, RotateCcw } from 'lucide-react';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
@@ -88,23 +90,8 @@ const FALLBACK_SCALES: Mm3LmAdapterScales = {
 
 /** Fetched once per mount; the list only changes when files are installed. */
 function useMm3LmAdapters() {
-  const [data, setData] = useState<Mm3LmAdapterCatalogue | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/mm3/lm-adapters')
-      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((d: Mm3LmAdapterCatalogue) => { if (!cancelled) setData(d); })
-      .catch(err => {
-        // Advisory: an unreachable catalogue means "no picker", not a broken
-        // generation — the adapter is optional by construction.
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      });
-    return () => { cancelled = true; };
-  }, []);
-
-  return { data, error };
+  const query = useQuery(localOptions<Mm3LmAdapterCatalogue>('mm3-adapters', '/mm3/lm-adapters'));
+  return { data: query.data ?? null, error: query.error?.message ?? null };
 }
 
 export const Mm3LmAdapterDropdown: React.FC = () => {

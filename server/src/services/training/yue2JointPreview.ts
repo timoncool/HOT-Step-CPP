@@ -11,11 +11,12 @@ import type { Yue2JointPreviewOptions } from './types.js';
 import { aceClient } from '../aceClient.js';
 import { getFFmpegPath } from '../../config.js';
 import { yue2PersistedSelection, type Yue2PersistedSelection } from '../backends/yue2/index.js';
+import { yue2LmOverrides } from '../backends/yue2/generate.js';
 import { yue2SelectModel, yue2Synth, yue2Warm, yue2Unload, yue2FinalDetail, splitMultipartMixed, type Yue2Selection } from '../backends/yue2/client.js';
 import { classifyYue2Score, yue2PlanUsable, yue2PickPlan, yue2StyleNormsForRun, type Yue2ScoreLegibility } from '../backends/yue2/scoreHealth.js';
 
 export const YUE2_JOINT_PREVIEW_DEFAULTS: Yue2JointPreviewOptions = {
-  enabled: false, everySteps: 0, seconds: 90, seed: 424242,
+  enabled: false, everySteps: 0, seconds: 90, seed: 424242, arScale: 0.6,
   previewMaxFrames: 2250, baseline: false, control: false,
 };
 
@@ -68,6 +69,25 @@ export class Yue2PreviewCleanupError extends Error { readonly code = 'PREVIEW_CL
 const MAX_RECORDS = 256;
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 
+/** Keys the preview sampler snapshot may carry (the Create panel's YuE2 LM tab). */
+const SAMPLER_KEY = /^yue2(Plan|Sem|End)[A-Za-z]+$|^yue2CfgScale$/;
+
+export function parseYue2PreviewSampler(raw: unknown): Record<string, number | string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, number | string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (SAMPLER_KEY.test(k) && ((typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.length <= 32))) out[k] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** The wire fields a preview request gets from the sampler snapshot. */
+function previewSamplerFields(sampler: Record<string, number | string> | undefined): Record<string, number> {
+  if (!sampler) return {};
+  const cfg = Number(String(sampler.yue2CfgScale ?? '').trim() || NaN);
+  return { ...yue2LmOverrides(sampler), ...(Number.isFinite(cfg) && cfg > 0 ? { cfg_scale: cfg } : {}) };
+}
+
 export function parseYue2JointPreviewOptions(raw: unknown, everySteps: number): Yue2JointPreviewOptions {
   const b = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
   const integer = (key: string, fallback: number, lo: number, hi: number): number => {
@@ -84,6 +104,7 @@ export function parseYue2JointPreviewOptions(raw: unknown, everySteps: number): 
   };
   return {
     enabled,
+    arScale: typeof b.arScale === 'number' && Number.isFinite(b.arScale) && b.arScale >= 0 ? b.arScale : YUE2_JOINT_PREVIEW_DEFAULTS.arScale,
     everySteps: integer('everySteps', everySteps, 0, 100000),
     seconds: integer('seconds', 90, 8, 360),
     ...(integer('takes', 1, 1, 4) > 1 ? { takes: integer('takes', 1, 1, 4) } : {}),
@@ -98,6 +119,7 @@ export function parseYue2JointPreviewOptions(raw: unknown, everySteps: number): 
     ...(text('lyrics') ? { lyrics: text('lyrics') } : {}),
     ...(b.lyricsSource === 'dataset' ? { lyricsSource: 'dataset' as const } : {}),
     ...(text('previewSongId') ? { previewSongId: text('previewSongId') } : {}),
+    ...(parseYue2PreviewSampler(b.sampler) ? { sampler: parseYue2PreviewSampler(b.sampler) } : {}),
   };
 }
 
@@ -217,6 +239,8 @@ export async function renderYue2JointPreview(input: {
     poll: aceClient.pollJob.bind(aceClient), result: aceClient.getJobResult.bind(aceClient), cancel: aceClient.cancelJob.bind(aceClient), unload: yue2Unload };
   let activeJob: string | undefined;
   let activeTerminal = true;
+  // The user's planner/composer sampler settings, on every request below.
+  const sampler = previewSamplerFields(input.options.sampler);
   // Plans are judged against the dataset's own sheets: checks they fail are the style.
   const norms = yue2StyleNormsForRun(input.output, input.dataset);
   let caption = input.options.caption || '';
@@ -262,7 +286,7 @@ export async function renderYue2JointPreview(input: {
       if (input.signal?.aborted) throw new Error('preview cancelled');
       const unity = { global: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1 };
       const selected: Yue2Selection = { lm: base.lm, lm_adapter: kind === 'baseline' ? [] : [
-        { path: input.arAdapter, scales: unity }, { path: input.narAdapter, scales: unity },
+        { path: input.arAdapter, scales: { ...unity, global: input.options.arScale ?? YUE2_JOINT_PREVIEW_DEFAULTS.arScale! } }, { path: input.narAdapter, scales: unity },
       ], vae_variant: base.vae_variant === 'legacy' ? 'legacy' : 'standard' };
       await api.select(selected);
       await api.warm({ vae_variant: selected.vae_variant });
@@ -282,7 +306,7 @@ export async function renderYue2JointPreview(input: {
           // Fixed re-plan seeds: every rung draws the same sequence, so rungs
           // differ by their weights, not by luck.
           const planSeed = seeds[0] + 7919 * (a - 1);
-          const planSub = await api.synth({ style: caption, lyrics, cot: 'full', seed: planSeed, plan_only: true });
+          const planSub = await api.synth({ style: caption, lyrics, cot: 'full', seed: planSeed, plan_only: true, ...sampler });
           activeJob = planSub.job_id; activeTerminal = false;
           const planDeadline = Date.now() + 10 * 60_000;
           for (;;) {
@@ -329,9 +353,9 @@ export async function renderYue2JointPreview(input: {
       const draft = { ...(input.options.odeSteps ? { ode_steps: input.options.odeSteps } : {}),
         ...(input.options.narCacheRatio !== undefined ? { nar_cache_ratio: input.options.narCacheRatio } : {}) };
       const sub = shared && supplied
-        ? await api.synth({ cot: 'full', semantic_retries: PREVIEW_REPLAN_ATTEMPTS, ...draft,
+        ? await api.synth({ cot: 'full', semantic_retries: PREVIEW_REPLAN_ATTEMPTS, ...draft, ...sampler,
             songs: records.map((_, i) => ({ style: caption, lyrics, abc: takeAbc[i]!, seed: requested[i] })) } as Parameters<typeof api.synth>[0])
-        : await api.synth({ style: kind === 'control' ? 'downtempo electronic, calm and spacious' : caption, lyrics: kind === 'control' ? '' : lyrics, cot: 'full', seed: requested[0],
+        : await api.synth({ style: kind === 'control' ? 'downtempo electronic, calm and spacious' : caption, lyrics: kind === 'control' ? '' : lyrics, cot: 'full', seed: requested[0], ...sampler,
         ...(supplied ? { abc: supplied.abc, semantic_retries: PREVIEW_REPLAN_ATTEMPTS } : { preview_max_frames: input.options.previewMaxFrames }),
         ...(input.options.odeSteps ? { ode_steps: input.options.odeSteps } : {}),
         ...(input.options.narCacheRatio !== undefined ? { nar_cache_ratio: input.options.narCacheRatio } : {}) });

@@ -14,14 +14,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5.104.3",
     "abcjs": "^6.7.0",
     "audiomotion-analyzer": "^4.5.4",
+    "axios": "^1.20.0",
+    "fflate": "^0.8.3",
     "i18next": "^26.0.10",
     "i18next-browser-languagedetector": "^8.2.1",
     "lucide-react": "^1.8.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-i18next": "^17.0.7",
+    "react-toastify": "^11.1.0",
     "wavesurfer.js": "^7.12.6",
     "zustand": "^5.0.12"
   },
@@ -36,6 +40,7 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.4.0",
+    "linkedom": "^0.18.13",
     "postcss": "^8.5.10",
     "tailwindcss": "^3.4.19",
     "typescript": "~6.0.2",

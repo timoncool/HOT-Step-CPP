@@ -18,11 +18,14 @@
 //     That is a weaker claim than "the recipe it was trained with" and reads as
 //     one.
 
-import React, { useCallback, useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, History, Loader2, PlayCircle, RefreshCw } from 'lucide-react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useReload } from '../../queries/training-runs/hooks';
+import { runQueries } from '../../queries/training-runs/queries';
 
-import { listMm3Runs, type Mm3RunSummary } from '../../services/trainingApi';
+import { type Mm3RunSummary } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
@@ -55,31 +58,19 @@ export const Mm3RunsPanel: React.FC<{ datasetId: string }> = ({ datasetId }) => 
   const { t } = useTranslation();
   const resumeMm3TrainLm = useTrainingStore(s => s.resumeMm3TrainLm);
   const activeJob = useTrainingStore(s => s.activeJob);
-  const jobRunning = activeJob?.status === 'queued' || activeJob?.status === 'running';
 
-  const [runs, setRuns] = useState<Mm3RunSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const jobRunning = activeJob?.status === 'queued' || activeJob?.status === 'running';
+  const query = useQuery(runQueries.mm3Runs(datasetId));
+  const runs = query.data?.runs ?? null;
+  const error = query.error?.message ?? null;
   const [open, setOpen] = useState<string | null>(null);
   const [addSteps, setAddSteps] = useState(250);
   const [mode, setMode] = useState<'steps' | 'loss'>('steps');
   const [targetLoss, setTargetLoss] = useState(0.4);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    try {
-      const r = await listMm3Runs(datasetId);
-      setRuns(r.runs);
-      setError(null);
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-      setRuns([]);
-    }
-  }, [datasetId]);
-
-  // Reloaded when a job ends as well as on mount: the run that just finished is
-  // the one most likely to be continued, and it would otherwise be missing from
-  // a list fetched before it existed.
-  useEffect(() => { void load(); }, [load, jobRunning]);
+  const load = () => query.refetch();
+  useReload(runQueries.mm3Runs(datasetId).queryKey, activeJob ? `${activeJob.id}:${activeJob.status}` : undefined);
 
   if (runs !== null && runs.length === 0 && !error) return null;
 

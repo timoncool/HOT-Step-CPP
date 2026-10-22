@@ -3,21 +3,41 @@ import { config as dotenvConfig, parse as dotenvParse } from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+// Must stay the first local import: it picks (and if needed moves) the release
+// data folder before anything below reads a path.
+import { RUNTIME } from './dataroot/bootstrap.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Portable mode detection ─────────────────────────────────────────
-// When HOT_STEP_ROOT is set (by the release launcher), all paths resolve
-// from the distribution root. Otherwise, fall back to __dirname-based
-// resolution for development mode.
-export const PORTABLE_MODE = !!process.env.HOT_STEP_ROOT;
-export const PROJECT_ROOT = process.env.HOT_STEP_ROOT
-  ? path.resolve(process.env.HOT_STEP_ROOT)
-  : path.resolve(__dirname, '../..');  // two levels up from server/src/
+// When HOT_STEP_ROOT is set (by the release launcher), app files resolve
+// from the distribution root and user data from the data folder RUNTIME
+// chose (dataroot/bootstrap.ts). Otherwise app files resolve from the
+// checkout, and user data from the checkout too unless Settings gave this
+// checkout a data folder (its dev pointer).
+export const PORTABLE_MODE = RUNTIME.mode === 'release';
+export const PROJECT_ROOT = RUNTIME.appRoot ?? path.resolve(__dirname, '../..');  // two levels up from server/src/
+/** Data folder (null in a dev checkout that has none). */
+export const DATA_ROOT = RUNTIME.dataRoot;
+export const LOGS_DIR = RUNTIME.logsDir ?? path.join(PROJECT_ROOT, 'logs');
+export const RESTART_MARKER_PATH = RUNTIME.restartMarkerPath ?? path.join(PROJECT_ROOT, '.restart-requested');
 
-// Load .env from project root (optional — smart defaults work without it)
-// On first launch, bootstrap .env from .env.example so settings are writable.
-const ENV_PATH = path.join(PROJECT_ROOT, '.env');
+/** A DATA_DIR-style value: resolved against the data folder when there is
+ *  one, otherwise against server/ as dev always has. */
+function resolveDataDir(v: string | undefined): string {
+  if (RUNTIME.dataRoot) return v ? path.resolve(RUNTIME.dataRoot, v) : RUNTIME.libraryDir!;
+  return path.resolve(__dirname, '..', v || './data');
+}
+/** Other path values: relative ones resolve against the data folder when there is one. */
+function resolveDataPath(v: string): string {
+  return RUNTIME.dataRoot && v ? path.resolve(RUNTIME.dataRoot, v) : v;
+}
+
+// Load .env (optional — smart defaults work without it). Dev: project root.
+// With a data folder: <data>/settings/.env. On first launch, bootstrap it from
+// .env.example so settings are writable; a data folder drops the example's
+// DATA_DIR line, which belonged to the old in-app layout.
+const ENV_PATH = RUNTIME.envPath ?? path.join(PROJECT_ROOT, '.env');
 
 /** The release tag, from the VERSION file the release workflow writes at the
  *  package root; a git checkout has none and reports "dev" (#185). */
@@ -28,7 +48,12 @@ export const APP_VERSION: string = (() => {
 const ENV_EXAMPLE_PATH = path.join(PROJECT_ROOT, '.env.example');
 if (!fs.existsSync(ENV_PATH) && fs.existsSync(ENV_EXAMPLE_PATH)) {
   try {
-    fs.copyFileSync(ENV_EXAMPLE_PATH, ENV_PATH);
+    if (DATA_ROOT) {
+      fs.mkdirSync(path.dirname(ENV_PATH), { recursive: true });
+      fs.writeFileSync(ENV_PATH, fs.readFileSync(ENV_EXAMPLE_PATH, 'utf-8').replace(/^DATA_DIR=.*$/m, '# DATA_DIR='), 'utf-8');
+    } else {
+      fs.copyFileSync(ENV_EXAMPLE_PATH, ENV_PATH);
+    }
     console.log('[Config] Created .env from .env.example (first launch)');
   } catch (e: any) {
     console.warn('[Config] Could not create .env:', e.message);
@@ -65,8 +90,21 @@ const EXE_CANDIDATES = [
   path.join(BUILD_DIR, 'Debug', `ace-server${BIN_EXT}`),      // VS Debug build
 ];
 const DEFAULT_EXE = EXE_CANDIDATES.find(p => fs.existsSync(p)) || EXE_CANDIDATES[0];
-const DEFAULT_MODELS = path.join(PROJECT_ROOT, 'models');
-const DEFAULT_ADAPTERS = path.join(PROJECT_ROOT, 'adapters');
+const DEFAULT_MODELS = RUNTIME.modelsDir ?? path.join(PROJECT_ROOT, 'models');
+const DEFAULT_ADAPTERS = RUNTIME.adaptersDir ?? path.join(PROJECT_ROOT, 'adapters');
+/** Model Manager `role: runtime` DLLs: the data folder in a release, beside ace-server in dev. */
+export const RUNTIME_LIB_DIR = RUNTIME.runtimeLibDir;
+/** User plugin overlay (release only); the engine scans it after the shipped plugins. */
+export const USER_PLUGINS_DIR = RUNTIME.userPluginsDir;
+
+// Downloaded runtime libraries (CUDA, cuDNN, TRT) used to sit beside the
+// engine binaries; in a release they are in the data folder, so put that on
+// the library search path every child process inherits.
+if (RUNTIME_LIB_DIR) {
+  const key = process.platform === 'win32' ? (Object.keys(process.env).find(k => k.toUpperCase() === 'PATH') ?? 'PATH')
+    : 'LD_LIBRARY_PATH';
+  process.env[key] = process.env[key] ? `${RUNTIME_LIB_DIR}${path.delimiter}${process.env[key]}` : RUNTIME_LIB_DIR;
+}
 const DEFAULT_NOISE_SAMPLES = path.join(PROJECT_ROOT, 'noise_samples');
 
 // ── FFmpeg path resolution ──────────────────────────────────────────
@@ -117,12 +155,18 @@ export function withFfmpegOnPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 
+/** UNSLOTH_KEYLESS is on only for an explicit '1'; unset, empty and anything else are off
+ *  (Settings writes '1'/'0'), so startup and hot reload agree. */
+export function parseUnslothKeyless(v: string | undefined): boolean {
+  return v === '1';
+}
+
 export const config = {
   // ace-server configuration
   aceServer: {
     exe: process.env.ACESTEPCPP_EXE || DEFAULT_EXE,
-    models: process.env.ACESTEPCPP_MODELS || DEFAULT_MODELS,
-    adapters: process.env.ACESTEPCPP_ADAPTERS || DEFAULT_ADAPTERS,
+    models: resolveDataPath(process.env.ACESTEPCPP_MODELS || '') || DEFAULT_MODELS,
+    adapters: resolveDataPath(process.env.ACESTEPCPP_ADAPTERS || '') || DEFAULT_ADAPTERS,
     port: parseInt(process.env.ACESTEPCPP_PORT || '8085', 10),
     host: process.env.ACESTEPCPP_HOST || '127.0.0.1',
     vaeChunk: parseInt(process.env.ACESTEPCPP_VAE_CHUNK || '1024', 10),
@@ -171,7 +215,7 @@ export const config = {
      *  the warm and the render hit the same LoKr-delta cache key. */
     warmAdapterScale: parseFloat(process.env.ACESTEPCPP_WARM_ADAPTER_SCALE || '1.0'),
     /** TensorRT runtime DLL directory — auto-detected or TENSORRT_LIBS env override */
-    trtLibs: process.env.TENSORRT_LIBS || (() => {
+    trtLibs: resolveDataPath(process.env.TENSORRT_LIBS || '') || RUNTIME.runtimeLibDir || (() => {
       // Auto-detect from engine/deps/tensorrt_libs/ (downloaded by Model Manager)
       const depsDir = path.join(ENGINE_DIR, 'deps', 'tensorrt_libs');
       if (fs.existsSync(path.join(depsDir, 'nvinfer_10.dll')) ||
@@ -225,7 +269,9 @@ export const config = {
 
   // Data paths
   data: {
-    dir: path.resolve(__dirname, '..', process.env.DATA_DIR || './data'),
+    dir: resolveDataDir(process.env.DATA_DIR),
+    /** Where /api/download/:id/save writes; '' = browser download only. */
+    downloadDir: resolveDataPath(process.env.DOWNLOAD_DIR || ''),
     get dbPath() {
       return path.join(this.dir, 'hotstep.db');
     },
@@ -253,10 +299,15 @@ export const config = {
     unslothBaseUrl: process.env.UNSLOTH_BASE_URL || 'http://127.0.0.1:8888',
     unslothUsername: process.env.UNSLOTH_USERNAME || '',
     unslothPassword: process.env.UNSLOTH_PASSWORD || '',
+    // Opt-in for a local Studio running with its "keyless API access" setting
+    // enabled (off by default in Studio): /v1 then needs no username/password.
+    // Must be set explicitly — the loopback default URL alone must never make
+    // the provider look installed on a fresh checkout.
+    unslothKeyless: parseUnslothKeyless(process.env.UNSLOTH_KEYLESS),
     defaultProvider: process.env.DEFAULT_LLM_PROVIDER || 'gemini',
     geminiModel: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
     openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-3-5-haiku-20241022',
+    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5-20251001',
     ollamaModel: process.env.OLLAMA_MODEL || 'llama3',
     lmstudioModel: process.env.LMSTUDIO_MODEL || '',
     unslothModel: process.env.UNSLOTH_MODEL || '',
@@ -274,9 +325,7 @@ export const config = {
     get dbPath() {
       return path.join(config.data.dir, 'lireek.db');
     },
-    exportDir: process.env.LYRICS_EXPORT_DIR || path.join(
-      path.resolve(__dirname, '..', process.env.DATA_DIR || './data'), 'lyrics'
-    ),
+    exportDir: resolveDataPath(process.env.LYRICS_EXPORT_DIR || '') || path.join(resolveDataDir(process.env.DATA_DIR), 'lyrics'),
   },
 
   // VST3 Post-Processing
@@ -303,7 +352,7 @@ export const config = {
   // settings, and exposing a key without a matching apply() line in
   // reloadEnvConfig() is the classic silent-no-op bug.
   training: {
-    dir: process.env.TRAINING_DIR || path.resolve(__dirname, '..', process.env.DATA_DIR || './data', 'training'),
+    dir: resolveDataPath(process.env.TRAINING_DIR || '') || path.join(resolveDataDir(process.env.DATA_DIR), 'training'),
     understandTimeoutMs: parseInt(process.env.TRAINING_UNDERSTAND_TIMEOUT_MS || '1200000', 10), // 20 min/file
     maxScanFiles: parseInt(process.env.TRAINING_MAX_SCAN_FILES || '5000', 10),
   },
@@ -320,15 +369,27 @@ export const config = {
 
   // Whisper speech-to-text (lyrics transcription)
   whisper: {
-    exe: process.env.WHISPER_EXE || path.join(PROJECT_ROOT, 'tools', 'whisper', `whisper-cli${BIN_EXT}`),
-    modelsDir: process.env.WHISPER_MODELS_DIR || path.join(process.env.ACESTEPCPP_MODELS || DEFAULT_MODELS, 'whisper'),
+    exe: resolveDataPath(process.env.WHISPER_EXE || '') || path.join(RUNTIME.whisperDir ?? path.join(PROJECT_ROOT, 'tools', 'whisper'), `whisper-cli${BIN_EXT}`),
+    modelsDir: resolveDataPath(process.env.WHISPER_MODELS_DIR || '') || path.join(resolveDataPath(process.env.ACESTEPCPP_MODELS || '') || DEFAULT_MODELS, 'whisper'),
   },
 };
 
 // ── .env hot-reload infrastructure ──────────────────────────────────
 
 /** Absolute path to the project .env file */
-export const ENV_FILE_PATH = path.join(PROJECT_ROOT, '.env');
+export const ENV_FILE_PATH = ENV_PATH;
+
+/** Write one .env value so dotenv reads back exactly `v` (a bare `#` would start a comment). */
+export function formatEnvValue(v: string): string {
+  if (!/[#'"`]|^\s|\s$/.test(v)) return v;
+  if (v.includes('`')) throw new Error('Value cannot contain a backtick');
+  return `\`${v}\``; // backticks are the one dotenv quote with no escape processing
+}
+
+/** Inverse of formatEnvValue for the raw text after `KEY=`. */
+export function parseEnvValue(raw: string): string {
+  return dotenvParse(`K=${raw}`).K ?? '';
+}
 
 /** Keys exposed to the Settings UI (whitelist — nothing else leaks) */
 export const EXPOSED_ENV_KEYS = [
@@ -347,7 +408,7 @@ export const EXPOSED_ENV_KEYS = [
   'OLLAMA_MODEL', 'LMSTUDIO_MODEL', 'UNSLOTH_MODEL',
   // LLM endpoints
   'OLLAMA_BASE_URL', 'LMSTUDIO_BASE_URL', 'LMSTUDIO_API_KEY',
-  'UNSLOTH_BASE_URL', 'UNSLOTH_USERNAME', 'UNSLOTH_PASSWORD',
+  'UNSLOTH_BASE_URL', 'UNSLOTH_USERNAME', 'UNSLOTH_PASSWORD', 'UNSLOTH_KEYLESS',
   'LLAMACPP_BASE_URL', 'LLAMACPP_MODEL',
   'OPENAI_COMPAT_BASE_URL', 'OPENAI_COMPAT_API_KEY', 'OPENAI_COMPAT_MODEL', 'OPENAI_COMPAT_NAME',
   'OPENAI_COMPAT_REASONING_EFFORT',
@@ -356,7 +417,7 @@ export const EXPOSED_ENV_KEYS = [
   'LABEL_GENIUS_CONCURRENCY', 'LABEL_GENIUS_MIN_INTERVAL_MS',
   'LABEL_CAPTION_CONCURRENCY', 'LABEL_CAPTION_MIN_INTERVAL_MS',
   // Paths
-  'LYRICS_EXPORT_DIR', 'MUSCRIPTOR_MODELS_DIR',
+  'LYRICS_EXPORT_DIR', 'MUSCRIPTOR_MODELS_DIR', 'DOWNLOAD_DIR',
   // Training workers
   'TRAINING_WORKERS', 'TRAINING_WORKER_TOKEN', 'WORKER_TOKEN',
 ] as const;
@@ -383,26 +444,28 @@ export const RESTART_REQUIRED_KEYS = new Set([
  * Re-read the .env file and hot-patch the live config object.
  * Returns a list of keys that actually changed.
  */
-export function reloadEnvConfig(): string[] {
-  const envContent = fs.existsSync(ENV_FILE_PATH)
+export function reloadEnvConfig(envText?: string): string[] {
+  const envContent = envText ?? (fs.existsSync(ENV_FILE_PATH)
     ? fs.readFileSync(ENV_FILE_PATH, 'utf-8')
-    : '';
+    : '');
   const parsed = dotenvParse(envContent);
   const changed: string[] = [];
 
-  // Helper: update a config property if the env value changed
+  // Helper: update a config property if the env value changed. Compare the
+  // RESOLVED values before/after applying, not raw .env text against the live
+  // config — setters transform (resolveDataPath, parseInt, defaults), so a
+  // raw-vs-resolved compare reports every empty/default key as "changed" on
+  // every reload and makes the UI demand a restart that isn't needed.
   const apply = (envKey: string, setter: (val: string) => void, getter: () => string) => {
-    const newVal = parsed[envKey] ?? '';
-    if (newVal !== getter()) {
-      setter(newVal);
-      changed.push(envKey);
-    }
+    const before = getter();
+    setter(parsed[envKey] ?? '');
+    if (getter() !== before) changed.push(envKey);
   };
 
   // ── Engine (values stored but won't affect running child process) ──
-  apply('ACESTEPCPP_MODELS', v => { config.aceServer.models = v || DEFAULT_MODELS; },
+  apply('ACESTEPCPP_MODELS', v => { config.aceServer.models = resolveDataPath(v) || DEFAULT_MODELS; },
     () => config.aceServer.models);
-  apply('ACESTEPCPP_ADAPTERS', v => { config.aceServer.adapters = v || DEFAULT_ADAPTERS; },
+  apply('ACESTEPCPP_ADAPTERS', v => { config.aceServer.adapters = resolveDataPath(v) || DEFAULT_ADAPTERS; },
     () => config.aceServer.adapters);
   apply('ACESTEPCPP_PORT', v => { config.aceServer.port = parseInt(v || '8085', 10); },
     () => String(config.aceServer.port));
@@ -421,7 +484,7 @@ export function reloadEnvConfig(): string[] {
   apply('SERVER_PORT', v => { config.server.port = parseInt(v || '3001', 10); },
     () => String(config.server.port));
   apply('DATA_DIR', v => {
-    config.data.dir = path.resolve(__dirname, '..', v || './data');
+    config.data.dir = resolveDataDir(v);
   }, () => config.data.dir);
 
   // ── Lireek / LLM (hot-reloaded — takes effect immediately) ──
@@ -447,13 +510,15 @@ export function reloadEnvConfig(): string[] {
     () => config.lireek.unslothUsername);
   apply('UNSLOTH_PASSWORD', v => { config.lireek.unslothPassword = v; },
     () => config.lireek.unslothPassword);
+  apply('UNSLOTH_KEYLESS', v => { config.lireek.unslothKeyless = parseUnslothKeyless(v); },
+    () => (config.lireek.unslothKeyless ? '1' : '0'));
   apply('DEFAULT_LLM_PROVIDER', v => { config.lireek.defaultProvider = v || 'gemini'; },
     () => config.lireek.defaultProvider);
   apply('GEMINI_MODEL', v => { config.lireek.geminiModel = v || 'gemini-2.5-flash'; },
     () => config.lireek.geminiModel);
   apply('OPENAI_MODEL', v => { config.lireek.openaiModel = v || 'gpt-4o-mini'; },
     () => config.lireek.openaiModel);
-  apply('ANTHROPIC_MODEL', v => { config.lireek.anthropicModel = v || 'claude-3-5-haiku-20241022'; },
+  apply('ANTHROPIC_MODEL', v => { config.lireek.anthropicModel = v || 'claude-haiku-4-5-20251001'; },
     () => config.lireek.anthropicModel);
   apply('OLLAMA_MODEL', v => { config.lireek.ollamaModel = v || 'llama3'; },
     () => config.lireek.ollamaModel);
@@ -478,8 +543,10 @@ export function reloadEnvConfig(): string[] {
   apply('TRAINING_WORKERS', v => { config.workers.list = v; }, () => config.workers.list);
   apply('TRAINING_WORKER_TOKEN', v => { config.workers.token = v; }, () => config.workers.token);
   apply('WORKER_TOKEN', v => { config.workers.acceptToken = v; }, () => config.workers.acceptToken);
+  apply('DOWNLOAD_DIR', v => { config.data.downloadDir = resolveDataPath(v); },
+    () => config.data.downloadDir);
   apply('LYRICS_EXPORT_DIR', v => {
-    config.lireek.exportDir = v || path.join(config.data.dir, 'lyrics');
+    config.lireek.exportDir = resolveDataPath(v) || path.join(config.data.dir, 'lyrics');
   }, () => config.lireek.exportDir);
 
   // ── Labeling throughput ──

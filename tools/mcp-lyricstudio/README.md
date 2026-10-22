@@ -7,6 +7,17 @@ remain active. It does not launch additional model sessions.
 
 ## Activate in the existing clients
 
+The music database follows the app's configured data folder through the shared
+`server/src/dataroot/locate.ts` resolver, including its library path overrides.
+`HOTSTEP_DB`, when set, takes precedence as an explicit database-file override.
+Remove a stale `HOTSTEP_DB` entry from your MCP client configuration to follow
+the app's data folder automatically, then reconnect the MCP server.
+
+Without that override, an unreadable pointer or pending data-folder operation
+stops MCP startup until corrected or completed in the app. The MCP never runs
+data transfers. A missing database always stops startup with its path and source;
+it never creates an empty database.
+
 If both clients already run `src/index.ts` as the `lyricstudio` MCP server, no
 configuration change is needed. Reconnect that MCP server in each client to
 discover the `collab_*` and `work_*` tools. An already running process keeps its old
@@ -690,11 +701,19 @@ result, never in public snapshots or the browser.
 Hold `app-server` in `use` mode while generation needs it alive. A restart or
 engine rebuild claims `app-server`, `gpu` and `engine-build` exclusively. Git
 index mutation uses `git-index`. For foreground commands, let the runner acquire
-the reservations itself rather than first claiming them manually:
+the reservations itself rather than first claiming them manually. `dev-rebuild.bat`
+runs without the work channel by default, even if `data/collaboration.db` exists.
+To opt in for one rebuild from PowerShell, run:
 
 ```powershell
-.\tools\mcp-lyricstudio\work-run.ps1 --channel HOT-Step --name Codex --resource app-server --resource gpu --resource engine-build --reason "Rebuild requested change" -- .\dev-rebuild.bat
+$env:HOTSTEP_WORK_CHANNEL = '1'
+& (Join-Path (Get-Location).Path 'dev-rebuild.bat')
+Remove-Item Env:HOTSTEP_WORK_CHANNEL
 ```
+
+This asks `dev-rebuild.bat` to run `work-run.ps1` and hold the three reservations
+until the rebuild exits. An explicit `work-run.ps1` wrapper also works; its guarded
+child validates that all three resources were reserved.
 
 The Windows launcher selects Node 22 with matching SQLite dependencies, preferring
 the dedicated collaboration runtime. It never rebuilds shared dependencies.

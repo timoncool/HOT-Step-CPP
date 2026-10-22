@@ -1,88 +1,49 @@
-// VramIndicator.tsx — GPU VRAM usage display + manual model-unload dropdown
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useVram } from '../../queries/global-models/hooks';
+import { loadedModelsOptions } from '../../queries/global-models/options';
+import { apiClient } from '../../services/httpClient';
+import { sharedKeys } from '../../queries/keys';
+import { queryManager } from '../../queries/invalidation';
+// VramIndicator.tsx — GPU VRAM usage badge (top of the Terminal box) +
+// manual model-unload dropdown
 //
-// Polls /api/logs/vram every 5 seconds for the used/total bar. On hover it
+// Polls the shared /api/logs/vram query every 1.5 seconds for the used/total bar. On hover it
 // opens a dropdown listing the GPU modules currently resident in the engine
 // (LM / DiT / VAE / encoders …) with a per-module unload button — a manual
 // fallback to free VRAM at any time. In-use modules are disabled; under
 // keep-loaded an unloaded module simply reloads on next use, so it's safe.
 //
 // The dropdown is rendered via a portal to document.body so it escapes the
-// GlobalParamBar's (z-40) stacking context and paints above the terminal etc.
+// right column's stacking context, left-aligned under the badge.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { Cpu, X, Loader2 } from 'lucide-react';
 
-interface VramInfo {
-  used_mb: number;
-  total_mb: number;
-  free_mb: number;
-}
-
-interface LoadedModel {
-  label: string;
-  mb: number;
-  in_use: boolean;
-}
-
-interface VramIndicatorProps {
-  /** Polling interval in ms (default 5000) */
-  pollInterval?: number;
-  /** Compact mode — hides the label and uses smaller text */
-  compact?: boolean;
-}
-
-export const VramIndicator: React.FC<VramIndicatorProps> = ({
-  pollInterval = 5000,
-  compact = false,
-}) => {
-  const [vram, setVram] = useState<VramInfo | null>(null);
+export const VramIndicator: React.FC = () => {
+  const { data: vram } = useVram();
+  const client = useQueryClient();
   const [open, setOpen] = useState(false);
-  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
-  const [loaded, setLoaded] = useState<LoadedModel[] | null>(null);
+  const [pos, setPos] = useState<{ top?: number; bottom?: number; left: number } | null>(null);
+  const loadedQuery = useQuery({ ...loadedModelsOptions(), enabled: open });
+  const loaded = loadedQuery.data?.loaded ?? null;
   const [unloading, setUnloading] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    const fetchVram = async () => {
-      try {
-        const res = await fetch('/api/logs/vram');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.total_mb > 0) setVram(data);
-        }
-      } catch { /* ignore */ }
-    };
-    fetchVram();
-    const interval = setInterval(fetchVram, pollInterval);
-    return () => clearInterval(interval);
-  }, [pollInterval]);
-
-  const fetchLoaded = useCallback(async () => {
-    try {
-      const res = await fetch('/api/logs/models-loaded');
-      if (res.ok) {
-        const d = await res.json();
-        setLoaded(Array.isArray(d.loaded) ? d.loaded : []);
-      } else setLoaded([]);
-    } catch { setLoaded([]); }
-  }, []);
-
-  // While the dropdown is open, fetch the resident-model list and refresh it.
-  useEffect(() => {
-    if (!open) return;
-    fetchLoaded();
-    const iv = setInterval(fetchLoaded, 2000);
-    return () => clearInterval(iv);
-  }, [open, fetchLoaded]);
 
   useEffect(() => () => { if (closeTimer.current) clearTimeout(closeTimer.current); }, []);
 
   const openMenu = useCallback(() => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
     const r = wrapRef.current?.getBoundingClientRect();
-    if (r) setPos({ top: r.bottom + 6, right: Math.max(8, window.innerWidth - r.right) });
+    // 240 px wide (w-60): keep it on screen when the badge sits near the right
+    // edge, and open upwards when the Terminal sits low in the window.
+    if (r) {
+      const left = Math.max(8, Math.min(r.left, window.innerWidth - 248));
+      setPos(window.innerHeight - r.bottom < 280
+        ? { bottom: window.innerHeight - r.top + 6, left }
+        : { top: r.bottom + 6, left });
+    }
     setOpen(true);
   }, []);
 
@@ -96,16 +57,12 @@ export const VramIndicator: React.FC<VramIndicatorProps> = ({
   const unload = useCallback(async (label: string) => {
     setUnloading(label);
     try {
-      await fetch('/api/logs/models-unload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label }),
-      });
-      await fetchLoaded();
+      await apiClient.post('/logs/models-unload', { label });
+      await queryManager.keys(client, sharedKeys.loadedModels(), sharedKeys.vram());
     } catch { /* ignore */ } finally {
       setUnloading(null);
     }
-  }, [fetchLoaded]);
+  }, [client]);
 
   if (!vram || vram.total_mb <= 0) return null;
 
@@ -115,14 +72,14 @@ export const VramIndicator: React.FC<VramIndicatorProps> = ({
 
   return (
     <div ref={wrapRef} className="relative" onMouseEnter={openMenu} onMouseLeave={scheduleClose}>
-      <div className="flex items-center gap-1.5 cursor-default">
-        <Cpu size={compact ? 10 : 11} className="text-zinc-500 flex-shrink-0" />
+      <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-zinc-100/80 dark:bg-zinc-800/80 border border-zinc-200 dark:border-white/5 cursor-default">
+        <Cpu size={11} className="text-zinc-500 flex-shrink-0" />
         <div className="flex items-center gap-1">
-          {!compact && <span className="text-[10px] text-zinc-500">VRAM</span>}
+          <span className="text-[10px] text-zinc-500">VRAM</span>
           <span className={`text-[10px] font-mono font-medium ${colorText}`}>
-            {(vram.used_mb / 1024).toFixed(1)}/{(vram.total_mb / 1024).toFixed(1)}
+            {(vram.used_mb / 1024).toFixed(1)} / {(vram.total_mb / 1024).toFixed(1)} GB
           </span>
-          <div className="w-10 h-1 rounded-full bg-zinc-200 dark:bg-zinc-700 overflow-hidden">
+          <div className="w-12 h-1 rounded-full bg-zinc-200 dark:bg-zinc-700 overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-500 ${colorBg}`}
               style={{ width: `${percent}%` }}
@@ -135,7 +92,7 @@ export const VramIndicator: React.FC<VramIndicatorProps> = ({
         <div
           data-portal-layer
           className="fixed z-[9999] w-60 rounded-lg border border-white/10 bg-white dark:bg-zinc-900 shadow-2xl p-2"
-          style={{ top: pos.top, right: pos.right }}
+          style={pos}
           onMouseEnter={openMenu}
           onMouseLeave={scheduleClose}
         >

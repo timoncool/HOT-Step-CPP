@@ -75,3 +75,15 @@ export function transposeKey(keyStr: string, semitones: number): string {
   const quality = parts.slice(1).join(' ');
   return quality ? `${NOTE_NAMES[newIndex]} ${quality}` : NOTE_NAMES[newIndex];
 }
+
+// ── YuE2 cover content ──────────────────────────────────────────────────
+/** What a YuE2 cover still needs before it can render, or null when ready.
+ *  The style caption is required: with it empty, an instrumental sends YuE2
+ *  only "Instrumental, no vocals, ..." and the model invents a voice anyway
+ *  (gate renders 6e90dbed, 6f78f660). Covers on other backends keep their
+ *  own rules. */
+export function yue2CoverContentMissing(p: { caption: string; lyrics: string; instrumental: boolean }): string | null {
+  if (!p.caption.trim()) return 'Write a YuE2 style caption';
+  if (!p.instrumental && !p.lyrics.trim()) return 'Enter lyrics or enable Instrumental mode';
+  return null;
+}

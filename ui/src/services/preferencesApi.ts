@@ -1,0 +1,59 @@
+// preferencesApi.ts — client for /api/preferences (server/src/routes/preferences.ts).
+//
+// No auth token: every family here is installation-scoped (no user id in any
+// source browser key), same as /api/vst/chain. Throws ApiError on a non-2xx
+// response, carrying currentRevision for a 409 and 'name-conflict' results
+// come back inline (not an error) so a batch import can report per-item
+// outcomes.
+import type {
+  AiContinuePresetBody, AiContinueTemplateBody, ImportPreferenceItem, ImportPreferenceResult,
+  StormTuningBody, VstChainPresetBody, Yue2JointPresetBody,
+  ResolveYue2PresetResult,
+} from '../../../server/src/contracts/preferences';
+import type { TypedDocument } from '../../../server/src/contracts/workflow';
+import { apiClient, type ReadOptions } from './httpClient';
+
+export type { ImportPreferenceItem, ImportPreferenceResult };
+export type PresetFamily = 'vst-chain' | 'ai-continue-style' | 'ai-continue-lyric' | 'yue2-joint';
+export type SettingsFamily = 'ai-continue-template' | 'storm-tuning';
+
+async function request<T>(url: string, method = 'GET', body?: unknown, opts: ReadOptions = {}): Promise<T> {
+  return apiClient.request<T>(method, url.replace(/^\/api/, ''), body, opts);
+}
+
+const id = (v: string) => encodeURIComponent(v);
+
+/** Browser-safe sha256 of a serialized value, in the `sha256:<hex>` form the
+ *  server expects (same hashing as ui/src/components/lyric-studio/playlistStore.ts). */
+export async function hashImportValue(raw: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+  return `sha256:${Array.from(new Uint8Array(digest), n => n.toString(16).padStart(2, '0')).join('')}`;
+}
+
+export const preferencesApi = {
+  presets: {
+    resolveYue2Joint: <T extends object>(preset: { name: string; version?: 1 | 2; settings: object }, currentForm: T, lyricTiming: boolean) =>
+      request<{ result: Omit<ResolveYue2PresetResult, 'effectiveForm'> & { effectiveForm: T } }>(
+        '/api/preferences/presets/yue2-joint/resolve', 'POST', { preset, currentForm, lyricTiming }),
+    list: <T>(family: PresetFamily, opts?: ReadOptions) =>
+      request<{ documents: TypedDocument<T>[] }>(`/api/preferences/presets/${family}`, 'GET', undefined, opts),
+    create: <T>(family: PresetFamily, body: T) => request<{ document: TypedDocument<T> }>(`/api/preferences/presets/${family}`, 'POST', { body }),
+    update: <T>(family: PresetFamily, docId: string, expectedRevision: number, body: T) =>
+      request<{ document: TypedDocument<T> }>(`/api/preferences/presets/${family}/${id(docId)}`, 'PUT', { expectedRevision, body }),
+    remove: (family: PresetFamily, docId: string, expectedRevision: number) =>
+      request<{ removed: true }>(`/api/preferences/presets/${family}/${id(docId)}?expectedRevision=${expectedRevision}`, 'DELETE'),
+    import: (family: PresetFamily, items: ImportPreferenceItem[]) =>
+      request<{ results: ImportPreferenceResult[] }>(`/api/preferences/presets/${family}/import`, 'POST', { items }),
+  },
+  settings: {
+    get: <T>(family: SettingsFamily, opts?: ReadOptions) =>
+      request<{ document: TypedDocument<T> | null }>(`/api/preferences/settings/${family}`, 'GET', undefined, opts),
+    upsert: <T>(family: SettingsFamily, expectedRevision: number | undefined, body: T) =>
+      request<{ document: TypedDocument<T> }>(`/api/preferences/settings/${family}`, 'PUT', { expectedRevision, body }),
+    import: (family: SettingsFamily, item: ImportPreferenceItem) =>
+      request<{ results: ImportPreferenceResult[] }>(`/api/preferences/settings/${family}/import`, 'POST', { items: [item] })
+        .then(({ results }) => results[0]!),
+  },
+};
+
+export type { VstChainPresetBody, AiContinuePresetBody, AiContinueTemplateBody, Yue2JointPresetBody, StormTuningBody };

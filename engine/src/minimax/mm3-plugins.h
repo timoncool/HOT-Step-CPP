@@ -167,6 +167,12 @@ struct MM3PluginRun {
         LuaModelContext c;
         c.native_sr = 44100;   // MM3 renders at 44.1 kHz, not ACE's 48 kHz
         c.model_id  = "mm3";
+        // Measured 2026-09-06: Q4_K_M, 30 steps, cfg_flow 1.70, seed 12345,
+        // 15 s, 5 captions / 17 windows. final latent rms median 2.35,
+        // range [1.76 .. 3.14], per-channel [0.86 .. 13.97]. MM3 swings far
+        // more with the caption (means 1.88..3.05) than with seed or quant, so
+        // treat this as a scale reference, not a target to normalise to.
+        c.latent_rms = 2.35f;
         return c;
     }();
 

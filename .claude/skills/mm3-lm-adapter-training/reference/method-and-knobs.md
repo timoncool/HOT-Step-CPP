@@ -1,5 +1,9 @@
 # Adapter method, knobs and axes
 
+Resolve runtime paths first using [Finding the data folder](../../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 > Reference for the `mm3-lm-adapter-training` skill. Read only when the task needs it.
 
 ## HOT-PiZZA is the default method since 2026-09-06 (Rob)
@@ -41,7 +45,7 @@ checkpoint at r128, half of it the frozen A0/B0 pair (the base weight's own
 top-128 singular directions), which is the SAME bytes in every adapter
 trained on the same base. Since 2026-09-09 that half ships once:
 
-- `models/mm3/mm3-lm-q8_0.pissa-r128.safetensors` (0.7 GB, F16; registry id
+- `<data root>/models/mm3/mm3-lm-q8_0.pissa-r128.safetensors` (0.7 GB, F16; registry id
   `mm3-lm-q8_0-pissa-r128`, in the Q8_0 / Balanced / Training packs; format in
   `engine/src/pissa-residual.h`). The trainer reads it at init when rank, SVD
   parameters and the base's byte size match, else falls back to the SVD cache

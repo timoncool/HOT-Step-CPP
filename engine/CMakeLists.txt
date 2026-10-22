@@ -548,6 +548,182 @@ if(GGML_CUDA AND CUDAToolkit_FOUND)
     target_link_libraries(convrot-graph-probe PRIVATE CUDA::cublas CUDA::cudart)
 endif()
 
+
+
+# yue2-convrot8-cpu-numeric-test: numeric correctness gate for
+# engine/patches/zzzz-yue2-convrot8-cpu.patch -- runs the real CPU
+# GGML_OP_CONVROT8{,_BACK} kernels and diffs them, bit for bit, against
+# tools/yue2-aitk-reference/convrot_cpu.h's validated scalar oracle.
+add_executable(yue2-convrot8-cpu-numeric-test tools/yue2-convrot8-cpu-numeric-test.cpp)
+link_ggml_backends(yue2-convrot8-cpu-numeric-test)
+
+# yue2-bf16-round-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real
+# GGML_UNARY_OP_BF16_ROUND forward+backward graph on both the CPU and Metal
+# backends and diffs them, bit for bit (docs/plans/yue2-joint-training-metal-port.md
+# Phase 3, kernel #1). Skips cleanly if no Metal device is present.
+add_executable(yue2-bf16-round-metal-numeric-test tools/yue2-bf16-round-metal-numeric-test.cpp)
+link_ggml_backends(yue2-bf16-round-metal-numeric-test)
+
+# yue2-silu-back-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real GGML_OP_SILU_BACK
+# kernel on both the CPU and Metal backends and diffs them with a tolerance
+# (this op involves exp(), so bit-exactness is not the right bar -- see the
+# test's own top comment) (docs/plans/yue2-joint-training-metal-port.md
+# Phase 3, kernel #2). Skips cleanly if no Metal device is present.
+add_executable(yue2-silu-back-metal-numeric-test tools/yue2-silu-back-metal-numeric-test.cpp)
+link_ggml_backends(yue2-silu-back-metal-numeric-test)
+
+# yue2-repeat-back-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real GGML_OP_REPEAT_BACK
+# kernel on both the CPU and Metal backends and diffs them bit for bit (the
+# kernel's summation order matches the CPU oracle exactly, so this is the
+# same bar as BF16_ROUND, not a tolerance)
+# (docs/plans/yue2-joint-training-metal-port.md Phase 3, kernel #3). Skips
+# cleanly if no Metal device is present.
+add_executable(yue2-repeat-back-metal-numeric-test tools/yue2-repeat-back-metal-numeric-test.cpp)
+link_ggml_backends(yue2-repeat-back-metal-numeric-test)
+
+# yue2-rms-norm-back-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real
+# GGML_OP_RMS_NORM_BACK kernel on both the CPU and Metal backends and
+# compares with a tolerance (CPU's ggml_float reduction is double precision;
+# Apple GPUs have no double support, so the Metal kernel reduces in float32
+# instead, the same choice ggml-cuda's own rms_norm_back_f32 already makes --
+# see the test file's header for the full derivation)
+# (docs/plans/yue2-joint-training-metal-port.md Phase 3, kernel #4). Skips
+# cleanly if no Metal device is present.
+add_executable(yue2-rms-norm-back-metal-numeric-test tools/yue2-rms-norm-back-metal-numeric-test.cpp)
+link_ggml_backends(yue2-rms-norm-back-metal-numeric-test)
+
+# yue2-convrot8-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real GGML_OP_CONVROT8 /
+# GGML_OP_CONVROT8_BACK kernels on both the CPU and Metal backends and
+# compares with a tolerance (the forward int8 dot product and the backward
+# gradient's sequential accumulation order are both still exact/matched --
+# see the test file's header -- but the Hadamard rotation's float add/sub
+# butterflies can be reassociated under Metal's runtime library compile,
+# which leaves MTLCompileOptions.fastMathEnabled at its default true;
+# confirmed empirically: every case with use_bf16=false showed ~1 ULP
+# diffs, every case with use_bf16=true passed exactly since bf16's ~1/128
+# rounding step absorbs that noise)
+# (docs/plans/yue2-joint-training-metal-port.md Phase 3, kernel #5). Skips
+# cleanly if no Metal device is present.
+add_executable(yue2-convrot8-metal-numeric-test tools/yue2-convrot8-metal-numeric-test.cpp)
+link_ggml_backends(yue2-convrot8-metal-numeric-test)
+
+# yue2-convrot8-metal-tiled-test: equivalence + timing gate for the tiled
+# Metal CONVROT8/_BACK kernels (GGML_METAL_CONVROT8_TILED): legacy vs tiled
+# on the same Metal backend (forward bit-exact), small shapes also vs CPU,
+# real block/LM-head shapes timed. Skips cleanly without a Metal device.
+add_executable(yue2-convrot8-metal-tiled-test tools/yue2-convrot8-metal-tiled-test.cpp)
+link_ggml_backends(yue2-convrot8-metal-tiled-test)
+
+# yue2-out-prod-metal-numeric-test: numeric correctness gate for
+# engine/patches/zzzzz-metal-training-kernels.patch -- runs the real GGML_OP_OUT_PROD
+# kernel (F32-only; this project's LoRA/adapter matmul gradients never
+# produce the quantized/F16 src0 variants ggml-cpu's reference also
+# implements) on both the CPU and Metal backends and diffs them bit for bit
+# (single sequential per-thread accumulation, no cross-thread reduction --
+# same bar as REPEAT_BACK, attempted first before falling back to a
+# tolerance the way kernel #5 (CONVROT8) had to -- see the test file's
+# header)
+# (docs/plans/yue2-joint-training-metal-port.md Phase 3, kernel #6). Skips
+# cleanly if no Metal device is present.
+add_executable(yue2-out-prod-metal-numeric-test tools/yue2-out-prod-metal-numeric-test.cpp)
+link_ggml_backends(yue2-out-prod-metal-numeric-test)
+
+# yue2-out-prod-metal-tiled-test: equivalence (tolerance, NOT bit-exact --
+# see the test file's own header) + timing gate for the tiled Metal
+# OUT_PROD kernel (GGML_METAL_OUT_PROD_TILED). Skips cleanly without Metal.
+add_executable(yue2-out-prod-metal-tiled-test tools/yue2-out-prod-metal-tiled-test.cpp)
+link_ggml_backends(yue2-out-prod-metal-tiled-test)
+
+# yue2-mul-mat-k32-metal-test: tolerance + timing gate for the f32 K = 32 (LoRA rank)
+# mul_mat kernel (GGML_METAL_MM_K32). Skips cleanly without Metal.
+add_executable(yue2-mul-mat-k32-metal-test tools/yue2-mul-mat-k32-metal-test.cpp)
+link_ggml_backends(yue2-mul-mat-k32-metal-test)
+
+# yue2-nar-op-bench: TFLOPS of the generic ggml Metal mul_mat (q8_0/f16 weights) and
+# flash_attn_ext at the YuE2 NAR generation shapes. No model needed.
+add_executable(yue2-nar-op-bench tools/yue2-nar-op-bench.cpp)
+link_ggml_backends(yue2-nar-op-bench)
+
+# yue2-acc-metal-test: isolates GGML_OP_ACC (autodiff of a view) at real sequence
+# lengths, Metal vs CPU -- the op the NaN bisect blamed. Skips without Metal.
+add_executable(yue2-acc-metal-test tools/yue2-acc-metal-test.cpp)
+link_ggml_backends(yue2-acc-metal-test)
+
+
+
+# yue2-bf16-round-fuse-metal-test: bit-exactness gate for the new BF16_ROUND
+# epilogue fusion in kernel_bin_fuse (ADD/SUB/MUL immediately followed by a
+# single-consumer ggml_bf16_round() now execute as one Metal kernel dispatch
+# instead of two). Pure execution-scheduling change -- compares fused-Metal
+# output against CPU, covering single ops, an ADD chain (n_fuse>1 + round
+# together), the row-broadcast dispatch path, and a multi-consumer case that
+# must correctly fall back to the unfused path. Skips cleanly without Metal.
+add_executable(yue2-bf16-round-fuse-metal-test tools/yue2-bf16-round-fuse-metal-test.cpp)
+link_ggml_backends(yue2-bf16-round-fuse-metal-test)
+
+# yue2-rms-double-round-test: confirms removing the redundant outer
+# ggml_bf16_round() in yue2-aitk-graph.h's rms() (the one wrapping
+# ggml_rms_norm's output, made redundant by mul_bf16's own internal
+# round() of its first argument) is a bit-exact no-op change, since
+# bf16_round_cast is idempotent. See engine/tools/yue2-rms-double-round-test.cpp.
+add_executable(yue2-rms-double-round-test tools/yue2-rms-double-round-test.cpp)
+link_ggml_backends(yue2-rms-double-round-test)
+
+# yue2-linear-lora-round-test: checks whether removing the seemingly
+# redundant round(ctx, x) in yue2-aitk-graph.h's linear() (LoRA branch)
+# is actually a bit-exact no-op like the rms() fix was -- unlike that
+# case, x here has two consumers (base + LoRA branch), so this checks
+# forward AND backward (grad_p/grad_a/grad_b), not just forward.
+# See engine/tools/yue2-linear-lora-round-test.cpp.
+add_executable(yue2-linear-lora-round-test tools/yue2-linear-lora-round-test.cpp)
+link_ggml_backends(yue2-linear-lora-round-test)
+
+# yue2-train-gemm-precision-test: S2a gate for the YuE2 trainer's BF16
+# tensor-core GEMMs. Runs yue2_aitk_graph::linear() and the head-loss GEMMs
+# at YuE2 shapes, forward and backward, on the BF16 path and the strict-F32
+# rollback (YUE2_AITK_PRECISION=strict-f32) and checks they agree within the
+# frozen limits. See engine/tools/yue2-train-gemm-precision-test.cpp.
+add_executable(yue2-train-gemm-precision-test tools/yue2-train-gemm-precision-test.cpp)
+link_ggml_backends(yue2-train-gemm-precision-test)
+
+# yue2-clip-non-finite-test: S2d-1 gate 3 (RESEARCH/YUE2_S2D_TOLERANCES.md) --
+# a gradient with one non-finite value must still fail
+# Yue2AitkTrainState::clip_gradients() on both the device sum-of-squares path
+# (default) and the host rollback (YUE2_AITK_CLIP_HOST=1) on the CPU backend,
+# and on a CUDA build also the CUDA clip kernels on the GPU. No checkpoint
+# needed. See engine/tools/yue2-clip-non-finite-test.cpp.
+add_executable(yue2-clip-non-finite-test tools/yue2-clip-non-finite-test.cpp)
+target_include_directories(yue2-clip-non-finite-test PRIVATE src)
+target_link_libraries(yue2-clip-non-finite-test PRIVATE yyjson)
+link_ggml_backends(yue2-clip-non-finite-test)
+
+# yue2-head-loss-device-test: the head CE/KL device mode (rows already on the
+# backend, as the joint step's Yue2AitkArHeadRows feeds it) must match the host
+# mode (YUE2_AITK_HEAD_HOST=1) bit for bit. CPU backend only, no checkpoint
+# needed. See engine/tools/yue2-head-loss-device-test.cpp.
+add_executable(yue2-head-loss-device-test tools/yue2-head-loss-device-test.cpp)
+target_include_directories(yue2-head-loss-device-test PRIVATE src)
+link_ggml_backends(yue2-head-loss-device-test)
+
+# yue2-mul-bf16-dispatch-profile: diagnostic tool (no PASS/FAIL) that
+# measures the real wall-clock cost of mul_bf16()'s 3-dispatch pattern
+# (round(a), round(b), mul+round-epilogue) vs a proxy for a fully fused
+# 1-dispatch version, at the exact call shapes and count one transformer
+# block makes per forward pass -- used to decide whether a BF16_ROUND
+# prologue fusion is worth building before building it.
+# See engine/tools/yue2-mul-bf16-dispatch-profile.cpp.
+add_executable(yue2-mul-bf16-dispatch-profile tools/yue2-mul-bf16-dispatch-profile.cpp)
+link_ggml_backends(yue2-mul-bf16-dispatch-profile)
+
+
+
+
+
 # moss-ggml-test: parity tests for the MOSS-Music captioning port vs fp32
 # fixtures (engine/tools/moss-numpy-ref.py documents the same maths in numpy).
 add_executable(moss-ggml-test tools/moss-ggml-test.cpp)
@@ -569,6 +745,9 @@ link_ggml_backends(ace-caption)
 # docs/plans/yue2/06-engine-port-plan.md milestone M0. Header-only loader
 # (no acestep-core dependency), same posture as moss-ggml-test.
 add_executable(yue2-probe tools/yue2-probe.cpp)
+add_executable(yue2-vae-lifetime-test tests/test-yue2-vae-lifetime.cpp)
+target_link_libraries(yue2-vae-lifetime-test PRIVATE yyjson)
+link_ggml_backends(yue2-vae-lifetime-test)
 # yue2-nar-graph.h also contains the optional Lua sampler dispatch. The probe
 # includes that header for parity fixtures even though it uses native midpoint.
 target_link_libraries(yue2-probe PRIVATE yyjson luajit)
@@ -587,6 +766,8 @@ link_ggml_backends(mdx23c-test)
 # docs/plans/muscriptor-cpp-port.md). Standalone tool, no acestep-core needed.
 add_executable(ace-midi tools/ace-midi.cpp)
 link_ggml_backends(ace-midi)
+# --abc-out renders through SheetSage2's notation headers, whose event code uses yyjson
+target_link_libraries(ace-midi PRIVATE yyjson)
 
 # ace-train: training toolchain (phase 2: dataset tensor preprocessing —
 # docs/plans/2026-07-27-preprocess-implementation.md). Standalone tool: every
@@ -782,4 +963,64 @@ add_dependencies(vst-host version)
 # macOS: vst-host also needs Apple frameworks
 if(APPLE)
     target_link_libraries(vst-host PRIVATE ${COCOA_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK})
+endif()
+
+# Embed the long-path manifest in every engine executable, so training and
+# adapter paths past 260 characters open when Windows long paths are enabled.
+if(MSVC)
+    get_property(_hs_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_hs_target IN LISTS _hs_targets)
+        get_target_property(_hs_type ${_hs_target} TYPE)
+        if(_hs_type STREQUAL "EXECUTABLE")
+            target_sources(${_hs_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/long-paths.manifest)
+        endif()
+    endforeach()
+endif()
+
+# Monitor chain unit test (no VST plugins needed). Off by default so it is not
+# part of the ALL build; configure with -DBUILD_TESTING=ON to build and run it.
+option(BUILD_TESTING "Build the engine unit tests" OFF)
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(test-monitor-chain tests/test-monitor-chain.cpp)
+    add_test(NAME monitor-chain COMMAND test-monitor-chain)
+
+    # DoRA norm-refresh freeze fixture (dora-common.h vs the pre-extraction
+    # graphs). GGML_BACKEND picks the device; see the test's header.
+    add_executable(dora-common-test tests/test-dora-common.cpp)
+    link_ggml_backends(dora-common-test)
+    add_test(NAME dora-common COMMAND dora-common-test)
+
+    add_executable(dora-runtime-test tests/test-dora-runtime.cpp)
+    link_ggml_backends(dora-runtime-test)
+    target_link_libraries(dora-runtime-test PRIVATE yyjson)
+    add_test(NAME dora-runtime COMMAND dora-runtime-test)
+
+    # MM3 flow-DiT DoRA trainer/merge parity and the MM3 LM DoRA dial switch.
+    # luajit only for its include path: mm3-model.h reaches lua-plugin.h, as
+    # ace-train's comment explains.
+    add_executable(mm3-dit-dora-test tests/test-mm3-dit-dora.cpp)
+    link_ggml_backends(mm3-dit-dora-test)
+    target_link_libraries(mm3-dit-dora-test PRIVATE yyjson luajit)
+    add_test(NAME mm3-dit-dora COMMAND mm3-dit-dora-test)
+
+    add_executable(sa3-dora-load-test tests/test-sa3-dora-load.cpp)
+    link_ggml_backends(sa3-dora-load-test)
+    target_link_libraries(sa3-dora-load-test PRIVATE yyjson)
+    add_test(NAME sa3-dora-load COMMAND sa3-dora-load-test)
+    set_tests_properties(sa3-dora-load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    # YuE2 joint/AITK DoRA graph fixture: LoRA identity at m == nrm, rescale
+    # forward/backward, exact vs expanded row norms.
+    add_executable(yue2-aitk-dora-test tests/test-yue2-aitk-dora.cpp)
+    link_ggml_backends(yue2-aitk-dora-test)
+    target_link_libraries(yue2-aitk-dora-test PRIVATE yyjson)
+    add_test(NAME yue2-aitk-dora COMMAND yue2-aitk-dora-test)
+
+    # A semantic redraw keeps the supplied score (#234). No GPU, no models.
+    add_executable(yue2-recompose-test tools/yue2-recompose-test.cpp)
+    target_include_directories(yue2-recompose-test PRIVATE src)
+    target_link_libraries(yue2-recompose-test PRIVATE yyjson luajit)
+    link_ggml_backends(yue2-recompose-test)
+    add_test(NAME yue2-recompose COMMAND yue2-recompose-test)
 endif()

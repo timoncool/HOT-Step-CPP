@@ -76,19 +76,17 @@ inline bool publish_no_replace(const std::string &temporary, const char *path) {
 
 } // namespace yue2_aitk_adapter_io_detail
 
-// Write a complete reference-compatible fused adapter. The caller owns every
-// data pointer for the duration of this call. Output is refused if it exists.
-inline bool yue2_aitk_write_fused_lora(
-    const std::vector<Yue2AitkF32Matrix> &factors,
-    int64_t                              rank,
-    float                                alpha,
-    int64_t                              steps,
-    const char *                         output_path) {
-    using namespace yue2_aitk_adapter_io_detail;
+namespace yue2_aitk_adapter_io_detail {
 
+// Shared body of the LoRA and DoRA fused writers. DoRA adds a third tensor per
+// site, `.lora_magnitude_vector.weight` (F32 [out] in the file, rows=1 in the
+// slot inventory), so the expected inventory grows from 448 to 672.
+inline bool write_fused(const std::vector<Yue2AitkF32Matrix> &factors, int64_t rank,
+                        float alpha, int64_t steps, const char *output_path, bool dora) {
     constexpr int kLayers = 28;
     constexpr int kSites = 4;
-    constexpr size_t kTensorCount = 2u * kLayers * kSites * 2u;
+    const size_t per_site = dora ? 3u : 2u;
+    const size_t kTensorCount = 2u * kLayers * kSites * per_site;
     if (!output_path || !*output_path || output_exists(output_path) ||
         factors.size() != kTensorCount || rank <= 0 || rank > 65536 ||
         steps < 0 || !std::isfinite(alpha) || alpha <= 0.0f) {
@@ -106,7 +104,9 @@ inline bool yue2_aitk_write_fused_lora(
                                      "mlp.gate_up_proj", "mlp.down_proj"}) {
                 const std::string prefix = std::string(expert) + ".model.layers." +
                                             std::to_string(layer) + "." + site + ".lora_";
-                for (const char *factor : {"A.weight", "B.weight"}) {
+                for (const char *factor : {"A.weight", "B.weight", "magnitude_vector.weight"}) {
+                    const bool is_m = factor[0] == 'm';
+                    if (is_m && !dora) continue;
                     const std::string name = prefix + factor;
                     size_t found = factors.size();
                     for (size_t i = 0; i < factors.size(); ++i) {
@@ -121,25 +121,34 @@ inline bool yue2_aitk_write_fused_lora(
                     int64_t site_input = 0;
                     int64_t site_output = 0;
                     if (!site_dims(site, &site_input, &site_output)) return false;
-                    const int64_t expected_rows = is_a ? rank : site_output;
-                    const int64_t expected_cols = is_a ? site_input : rank;
+                    const int64_t expected_rows = is_m ? 1 : is_a ? rank : site_output;
+                    const int64_t expected_cols = is_m ? site_output : is_a ? site_input : rank;
                     if (src.rows != expected_rows || src.cols != expected_cols ||
                         src.rows <= 0 || src.cols <= 0 || !src.data) {
                         return false;
                     }
-                    tensors.push_back({src.name, {src.rows, src.cols}, src.data, -1});
+                    if (is_m) {
+                        for (int64_t i = 0; i < src.cols; ++i) if (!std::isfinite(src.data[i])) return false;
+                        tensors.push_back({src.name, {src.cols}, src.data, STW_F32});
+                    } else {
+                        tensors.push_back({src.name, {src.rows, src.cols}, src.data, -1});
+                    }
                 }
             }
         }
     }
 
     if (seen.size() != kTensorCount || tensors.size() != kTensorCount) return false;
-    const std::vector<std::pair<std::string, std::string>> metadata = {
-        {"format", "yue2-aitk-fused-lora-v1"},
+    std::vector<std::pair<std::string, std::string>> metadata = {
+        {"format", dora ? "yue2-aitk-fused-dora-v1" : "yue2-aitk-fused-lora-v1"},
         {"rank", std::to_string(rank)},
         {"alpha", alpha_string(alpha)},
         {"steps", std::to_string(steps)},
     };
+    if (dora) {
+        metadata.push_back({"use_dora", "true"});
+        metadata.push_back({"dora_scaling", alpha_string(alpha / static_cast<float>(rank))});
+    }
     const std::string temporary = unique_sibling(output_path);
     if (!st_write_file(temporary.c_str(), tensors, metadata, STW_BF16)) {
         hs_remove(temporary);
@@ -148,6 +157,31 @@ inline bool yue2_aitk_write_fused_lora(
     const bool published = publish_no_replace(temporary, output_path);
     if (!published) hs_remove(temporary);
     return published;
+}
+
+} // namespace yue2_aitk_adapter_io_detail
+
+// Write a complete reference-compatible fused adapter. The caller owns every
+// data pointer for the duration of this call. Output is refused if it exists.
+inline bool yue2_aitk_write_fused_lora(
+    const std::vector<Yue2AitkF32Matrix> &factors,
+    int64_t                              rank,
+    float                                alpha,
+    int64_t                              steps,
+    const char *                         output_path) {
+    return yue2_aitk_adapter_io_detail::write_fused(factors, rank, alpha, steps, output_path, false);
+}
+
+// DoRA twin: 672 factors (A, B, magnitude per site). A/B stay BF16; the
+// magnitude is written F32 as 1-D [out]. Metadata adds use_dora and
+// dora_scaling = alpha/rank.
+inline bool yue2_aitk_write_fused_dora(
+    const std::vector<Yue2AitkF32Matrix> &factors,
+    int64_t                              rank,
+    float                                alpha,
+    int64_t                              steps,
+    const char *                         output_path) {
+    return yue2_aitk_adapter_io_detail::write_fused(factors, rank, alpha, steps, output_path, true);
 }
 
 // The LoKr twin. No reference trainer defines a fused LoKr layout, so this

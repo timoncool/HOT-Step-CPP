@@ -142,6 +142,8 @@
     "settings.ai.unslothUsernameDesc": "Имя пользователя для аутентификации Unsloth.",
     "settings.ai.unslothPassword": "Пароль Unsloth",
     "settings.ai.unslothPasswordDesc": "Пароль для аутентификации Unsloth.",
+    "settings.ai.unslothKeyless": "Локальный Studio без ключа",
+    "settings.ai.unslothKeylessDesc": "Включите, если ваш локальный Unsloth Studio запущен с включённой настройкой «keyless API access» — тогда имя пользователя и пароль не нужны. В противном случае оставьте выключенным; провайдер останется скрытым, пока не включено это или не заданы оба пароля.",
     "settings.ai.llamacppUrl": "URL llama.cpp",
     "settings.ai.llamacppUrlDesc": "Базовый URL сервера llama.cpp (llama-server).",
     "settings.ai.openaiCompatUrl": "URL совместимого эндпоинта",

@@ -609,10 +609,18 @@ static int dit_trt_generate(DitTrt *              trt,
             return false;
         };
 
-        lua_call_solver_loop(*solver_plugin, xt.data(), vt.data(), schedule, num_steps,
+        const bool lua_ok = lua_call_solver_loop(*solver_plugin, xt.data(), vt.data(), schedule, num_steps,
             n_total, N, T, Oc, loop_model_fn, loop_on_step,
             g_hotstep_params.plugin_params, LuaModelContext{},
             solver_state.seeds ? solver_state.seeds[0] : 0);
+
+        if (!lua_ok) {
+            fprintf(stderr, "[DiT-TRT] FATAL: full-loop solver '%s' failed (Lua error or missing sample())\n",
+                    solver_plugin->name.c_str());
+            cudaFree(d_input); cudaFree(d_enc); cudaFree(d_vel);
+            cudaFree(d_t); cudaFree(d_t_r);
+            return -1;
+        }
 
         memcpy(output, xt.data(), n_total * sizeof(float));
 

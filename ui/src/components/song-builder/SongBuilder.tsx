@@ -1,3 +1,8 @@
+import { getSessionEpoch } from '../../queries/keys';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { projectsOptions, projectOptions } from '../../queries/studios/resources';
+import { queryManager } from '../../queries/invalidation';
+import { keysPlan, writeAndInvalidate } from '../../queries/writes';
 // SongBuilder.tsx — Udio-style section-by-section song assembly
 //
 // Build a song one section at a time. Each section generates N candidate
@@ -18,8 +23,12 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useGlobalParamsStore } from '../../context/GlobalParamsContext';
-import { generateApi, builderApi } from '../../services/api';
+import { builderApi } from '../../services/api';
 import type { BuilderProject, BuilderSection, BuilderDirection } from '../../services/api';
+import { ApiError } from '../../services/apiError';
+import { followSection as followSectionJob } from './followSection';
+import { useBackendStore } from '../../stores/backendStore';
+import { getGenerationTimeoutMinutes } from '../../utils/generationTimer';
 import { play, playFromList, togglePlay, usePlaybackSelector, songToTrack } from '../../stores/playbackStore';
 import type { Song } from '../../types';
 import { StyledSelect } from '../shared/StyledSelect';
@@ -51,7 +60,9 @@ const BAR_PRESETS = [2, 4, 6, 8, 12, 16, 24, 32];
 // ── Main studio ──────────────────────────────────────────────────────────────
 
 export const SongBuilder: React.FC = () => {
-  const { token } = useAuth();
+  const { token, sessionEpoch } = useAuth();
+  void sessionEpoch;
+  const client = useQueryClient();
   const gp = useGlobalParamsStore();
 
   // Previews route through the global play bar (full scrub/transport for free).
@@ -70,9 +81,12 @@ export const SongBuilder: React.FC = () => {
   }, [playingTrackId]);
 
   // Project list / current project
-  const [projects, setProjects] = useState<BuilderProject[]>([]);
-  const [project, setProject] = useState<BuilderProject | null>(null);
-  const [sections, setSections] = useState<BuilderSection[]>([]);
+  const projectsQuery = useQuery({ ...projectsOptions(), enabled: !!token });
+  const projects = projectsQuery.data?.projects ?? [];
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const projectQuery = useQuery({ ...projectOptions(activeProjectId || ''), enabled: !!token && !!activeProjectId });
+  const project = projectQuery.data?.project ?? null;
+  const sections = projectQuery.data?.sections ?? [];
   const [, setLoading] = useState(false);
   const [toast, setToast] = useState('');
 
@@ -113,12 +127,34 @@ export const SongBuilder: React.FC = () => {
 
   // Generation tracking
   const [isGenerating, setIsGenerating] = useState(false);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [genProgress, setGenProgress] = useState(0);
   const [genStage, setGenStage] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // One job per variant (so options stream in as each finishes) — tracked for cancel.
-  const activeJobIdsRef = useRef<string[]>([]);
+  // The section job being followed (its renders run on the server either way).
+  const followRef = useRef<AbortController | null>(null);
+  // The open project's id, set when it is opened, created or left. Async
+  // callbacks read this, never a render's `project`, which is stale (or null,
+  // right after opening from the list) by the time they run.
+  const projectIdRef = useRef<string | null>(null);
+
+  // Project snapshots stay in Query. Local fields above are composer drafts.
+  const setProjects = (update: (previous: BuilderProject[]) => BuilderProject[]) => {
+    if (getSessionEpoch() !== sessionEpoch) return;
+    client.setQueryData(projectsOptions().queryKey,
+      (previous: { projects: BuilderProject[] } | undefined) => ({ projects: update(previous?.projects ?? []) }));
+  };
+  const setProject = (value: BuilderProject | null | ((previous: BuilderProject | null) => BuilderProject | null)) => {
+    if (getSessionEpoch() !== sessionEpoch) return;
+    const next = typeof value === 'function' ? value(project) : value;
+    setActiveProjectId(next?.id ?? null);
+    if (next) client.setQueryData(projectOptions(next.id).queryKey,
+      (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => ({ project: next, sections: previous?.sections ?? [] }));
+  };
+  const setSections = (next: BuilderSection[]) => {
+    if (getSessionEpoch() !== sessionEpoch) return;
+    const id = projectIdRef.current;
+    if (id) client.setQueryData(projectOptions(id).queryKey,
+      (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => previous && ({ ...previous, sections: next }));
+  };
 
   // Per-section lyric editing (correct the sheet fed forward when the DiT alters lines)
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null);
@@ -160,12 +196,6 @@ export const SongBuilder: React.FC = () => {
     [chosenSections],
   );
 
-  // ── Load project list on mount ──
-  useEffect(() => {
-    if (!token) return;
-    builderApi.listProjects(token).then(r => setProjects(r.projects)).catch(() => {});
-  }, [token]);
-
   // When no head exists, the only valid direction is 'first'
   useEffect(() => {
     if (!headSong && direction !== 'first') setDirection('first');
@@ -176,29 +206,75 @@ export const SongBuilder: React.FC = () => {
   // it whenever either changes so a stale point can't leak into a new extension.
   useEffect(() => { setClipPoint(null); setSeedSectionId(null); }, [head?.id, direction]);
 
+  const loadView = useCallback(async (projectId: string) => {
+    const options = projectOptions(projectId);
+    await client.cancelQueries({ queryKey: options.queryKey });
+    return client.query(options);
+  }, [client]);
+
+  // Follow a section job: each variant event reloads the project, so its
+  // candidates appear as they land.
+  const followSection = useCallback((projectId: string, jobId: string) => {
+    if (!token) return;
+    followRef.current?.abort();
+    const ctl = new AbortController();
+    followRef.current = ctl;
+    setIsGenerating(true);
+    void followSectionJob(projectId, jobId, {
+      load: loadView,
+      isCurrent: id => projectIdRef.current === id,
+      onView: v => { setProject(v.project); setSections(v.sections); },
+      onProgress: ({ finished, landed, total }) => {
+        setGenProgress(Math.round((finished / total) * 100));
+        setGenStage(`Generated ${landed} of ${total}…`);
+      },
+      onEnd: (status, landed) => {
+        followRef.current = null;
+        setIsGenerating(false); setGenProgress(0);
+        setGenStage(landed ? 'Pick a variant' : '');
+        if (status === 'succeeded' && !landed) showToast('All variants failed');
+        else if (status === 'interrupted') showToast('The server restarted during this section; keep what landed or generate again');
+      },
+      onError: e => {
+        followRef.current = null;
+        setIsGenerating(false);
+        showToast(`Lost the section job: ${e.message}`);
+      },
+    }, ctl.signal);
+  }, [token, loadView]);
+
   // ── Project open / create / delete ──
   const openProject = useCallback(async (id: string) => {
     if (!token) return;
     setLoading(true);
+    projectIdRef.current = id;
     try {
-      const { project: p, sections: secs } = await builderApi.getProject(id, token);
+      const { project: p, sections: secs } = await loadView(id);
+      if (projectIdRef.current !== id) return;
+      followRef.current?.abort(); followRef.current = null;
+      projectIdRef.current = p.id;
       setProject(p); setSections(secs); setNewStyle(p.style);
+      setIsGenerating(false); setGenProgress(0); setGenStage('');
+      // Reopened while a section was rendering: pick its job back up.
+      const running = secs.find(s => s.status === 'generating' && s.job_id);
+      if (running?.job_id) followSection(p.id, running.job_id);
     } catch (e: any) { showToast(`Failed to open: ${e.message}`); }
     finally { setLoading(false); }
-  }, [token]);
+  }, [token, followSection]);
 
   const createProject = useCallback(async () => {
     if (!token) return;
     try {
-      const { project: p } = await builderApi.createProject(
+      const { project: p } = await writeAndInvalidate(client, () => builderApi.createProject(
         {
           title: newTitle || 'Untitled Song', style: newStyle,
           bpm: newBpm || 0, keyScale: newKey, timeSignature: newTimeSig,
           variantCount: 4, sectionLength: 30,
-        }, token);
+        }), keysPlan(projectsOptions().queryKey));
+      projectIdRef.current = p.id;
       setProject(p); setSections([]); setNewTitle('');
       setProjects(prev => [p, ...prev]);
-    } catch (e: any) { showToast(`Create failed: ${e.message}`); }
+    } catch { /* transport failure already toasted by the global handler */ }
   }, [token, newTitle, newStyle, newBpm, newKey, newTimeSig]);
 
   // Persist a project field change (optimistic local update + background PATCH).
@@ -210,20 +286,42 @@ export const SongBuilder: React.FC = () => {
     if ('keyScale' in patch) local.key_scale = patch.keyScale;
     if ('timeSignature' in patch) local.time_signature = patch.timeSignature;
     setProject(prev => prev ? { ...prev, ...local } : prev);
-    try { await builderApi.updateProject(project.id, patch, token); } catch { /* non-fatal */ }
+    try {
+      const { project: saved } = await builderApi.updateProject(project.id, patch);
+      if (getSessionEpoch() !== sessionEpoch) return;
+      client.setQueryData(projectOptions(saved.id).queryKey,
+        (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => previous && ({ ...previous, project: saved }));
+      void queryManager.keys(client, projectsOptions().queryKey);
+    } catch { /* non-fatal — transport failure already toasted by the global handler */ }
   }, [project, token]);
 
+  const deleteProject = async (id: string) => {
+    if (!token) return;
+    const listKey = projectsOptions().queryKey;
+    const detailKey = projectOptions(id).queryKey;
+    try {
+      await Promise.all([client.cancelQueries({ queryKey: listKey }), client.cancelQueries({ queryKey: detailKey })]);
+      await builderApi.deleteProject(id);
+      await Promise.all([client.cancelQueries({ queryKey: listKey }), client.cancelQueries({ queryKey: detailKey })]);
+      client.setQueryData(listKey, (previous: { projects: BuilderProject[] } | undefined) => previous && ({ projects: previous.projects.filter(project => project.id !== id) }));
+      client.removeQueries({ queryKey: detailKey });
+    } catch { /* transport failure already toasted by the global handler */ }
+    finally { await queryManager.keys(client, listKey); }
+  };
+
   const backToList = useCallback(() => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    setProject(null); setSections([]); setIsGenerating(false); setActiveJobId(null);
-    if (token) builderApi.listProjects(token).then(r => setProjects(r.projects)).catch(() => {});
+    followRef.current?.abort(); followRef.current = null;
+    projectIdRef.current = null;
+    setProject(null); setSections([]); setIsGenerating(false);
+    if (token) void queryManager.keys(client, projectsOptions().queryKey);
   }, [token]);
 
   const refresh = useCallback(async () => {
-    if (!project || !token) return;
-    const { project: p, sections: secs } = await builderApi.getProject(project.id, token);
-    setProject(p); setSections(secs);
-  }, [project, token]);
+    const id = projectIdRef.current;
+    if (!id || !token) return;
+    const { project: p, sections: secs } = await loadView(id);
+    if (projectIdRef.current === id) { setProject(p); setSections(secs); }
+  }, [token, loadView]);
 
   // ── Build the cumulative lyric sheet for the section about to be generated ──
   const cumulativeLyrics = useMemo(() => {
@@ -243,8 +341,6 @@ export const SongBuilder: React.FC = () => {
     () => (bpm > 0 ? Math.max(1, Math.round((nextBars * beatsPerBar * 60) / bpm)) : 0),
     [bpm, beatsPerBar, nextBars],
   );
-  // Effective seconds handed to generation (bars mode needs a real BPM).
-  const effectiveLength = (lengthMode === 'bars' && bpm > 0) ? barsSeconds : nextLength;
   // Sung-line count for the estimate — excludes blank lines and [structure] tags.
   const lyricLineCount = useMemo(
     () => nextLyrics.split('\n').map(l => l.trim()).filter(l => l && !/^\[.*\]$/.test(l)).length,
@@ -271,7 +367,34 @@ export const SongBuilder: React.FC = () => {
     return secs > 0 ? `${Math.round(secs)}s` : `${Math.round(Number(s.chosen?.duration) || 0)}s`;
   }, [bpm, beatsPerBar]);
 
+  const applyView = useCallback((v: { project: BuilderProject; sections: BuilderSection[] }) => {
+    if (projectIdRef.current !== v.project.id) return;  // the user moved on
+    setProject(v.project); setSections(v.sections);
+  }, []);
+
+  /** Run a section edit. A 409 (changed in another tab, or a candidate that
+   *  is no longer there) reloads the project rather than overwriting it. */
+  const runOp = useCallback(async (op: () => Promise<{ project: BuilderProject; sections: BuilderSection[] }>, what: string) => {
+    try { applyView(await op()); return true; }
+    catch (e: any) {
+      if (e instanceof ApiError && e.status === 409) {
+        showToast(`${e.message} Reloaded.`);
+        await refresh().catch(() => {});
+      } else showToast(`${what}: ${e.message}`);
+      return false;
+    }
+  }, [applyView, refresh]);
+
+  const stopFollowing = useCallback(() => {
+    followRef.current?.abort(); followRef.current = null;
+    setIsGenerating(false); setGenProgress(0); setGenStage('');
+  }, []);
+
+  useEffect(() => () => followRef.current?.abort(), []);
+
   // ── Generate the next section ──
+  // Node works out the geometry, request and variants from the stored project
+  // plus this captured composer state (server/src/services/songBuilder/sectionOps.ts).
   const handleGenerate = useCallback(async () => {
     if (!token || !project) return;
     if (direction !== 'first' && !headSong) { showToast('Choose a section first to extend from'); return; }
@@ -279,237 +402,69 @@ export const SongBuilder: React.FC = () => {
     setIsGenerating(true);
     setGenProgress(0);
     setGenStage('Queued…');
+    const engineParams: Record<string, unknown> = { ...gp.getGlobalParams() };
+    if (typeof engineParams.generationTimeoutMinutes !== 'number') engineParams.generationTimeoutMinutes = getGenerationTimeoutMinutes();
+    // "Keep Models in VRAM" is respected, never forced (see sectionOps.ts).
+    const coResident = (() => {
+      try { return JSON.parse(localStorage.getItem('ace-settings') || '{}').coResident === true; }
+      catch { return false; }
+    })();
     try {
-      const engineParams = gp.getGlobalParams();
-      const params: Record<string, any> = {
-        ...engineParams,
-        customMode: true,
-        source: 'builder',
-        title: `${project.title} — ${nextLabel || direction}`,
-        style: project.style || (engineParams as any).style || '',
-        lyrics: cumulativeLyrics,
-        batchSize: 1,        // one variant per job → options stream in progressively
-        randomSeed: true,    // fresh seed per job, so the variants differ
-      };
-
-      // ── Builder pipeline tuning ──────────────────────────────────────────
-      // 1. Respect the user's "Keep Models in VRAM" setting — do NOT force it.
-      //    Forcing keep-loaded (engine EVICT_NEVER) made models accumulate across
-      //    sections and model/sampler changes (the LM stays resident after the
-      //    text2music first section even though repaints don't need it), climbing
-      //    VRAM until exhaustion → paging → severe slowdown. With the setting off
-      //    (default) the engine uses EVICT_STRICT: one GPU module at a time, low
-      //    VRAM, load/unload like acestep.cpp.
-      params.coResident = (() => {
-        try { return JSON.parse(localStorage.getItem('ace-settings') || '{}').coResident === true; }
-        catch { return false; }
-      })();
-      // Free the one-shot LM once past the text2music first section — repaint
-      // sections never use it, so under keep-loaded it shouldn't hog VRAM. Only
-      // Song Builder sets this; other generation modes are unaffected.
-      params.evictLm = direction !== 'first';
-      // Low-VRAM (Song Builder only): smaller VAE tiles cut the decode peak
-      // (measured ~7GB -> ~2GB) at negligible cost. (Split-CFG was tested and
-      // dropped — it didn't reduce DiT memory under STORM/post-step guidance but
-      // ~2x'd DiT time. The batch_cfg override stays wired for other configs.)
-      params.vaeChunk = 256;
-      // 2. Bypass the whole cosmetic post-processing chain for intermediate
-      //    sections — mastering/PP-VAE/spectral/LUFS run only on the finished
-      //    track (or when the user opts into a per-section preview). The timbre
-      //    reference is loaded in the synth phase regardless, so it still feeds
-      //    the DiT as generation conditioning.
-      if (!previewMastering) {
-        params.postProcessingEnabled = false;
-        params.masteringEnabled = false;
-        params.ppVaeReencode = false;
-        params.stableStepOn = false;
-        params.spectralLifterEnabled = false;
-        params.lufsEnabled = false;
-      }
-      // These enrichment steps are never useful mid-build — always skip them.
-      params.coverArtEnabled = false;
-      params.parallelCoverArt = false;
-      params.whisperLyricsEnabled = false;
-      params.qualityEvalEnabled = false;
-      params.parallelQualityEval = false;
-      params.autoTrimEnabled = false;
-      params.skipLrc = true;
-      if (project.bpm) params.bpm = project.bpm;
-      if (project.key_scale) params.keyScale = project.key_scale;
-      if (project.time_signature) params.timeSignature = project.time_signature;
-      if (project.vocal_language) params.vocalLanguage = project.vocal_language;
-
-      if (direction === 'first') {
-        params.duration = effectiveLength;
-      } else {
-        // Overwrite `overlap` seconds at the seam so the prior section's clean
-        // resolution (append) or song-start (prepend) is regenerated as a
-        // transition rather than preserved verbatim. Clamp so we never overwrite
-        // the whole source or more than the new section is long.
-        const overlap = Math.max(0, Math.min(transitionOverlap, effHeadDuration - 1, effectiveLength));
-        params.taskType = 'repaint';
-        params.duration = 0; // engine derives from source canvas
-        if (direction === 'prepend') {
-          // connect-at point: content before it (the unwanted head) is regenerated
-          // as part of the intro lead-in. Default 0 = overwrite only the seam.
-          const at = clipPoint ?? 0;
-          params.repaintingStart = -effectiveLength;     // pad/generate before the song
-          params.repaintingEnd = at + overlap;           // overwrite [0, at+overlap]
-        } else {
-          // extend-from point: content after it (the unwanted tail) is fully inside
-          // the regenerated region and gets discarded. Default = the very end.
-          const from = clipPoint ?? effHeadDuration;
-          params.repaintingStart = from - overlap;       // overwrite back from the attach point
-          // Ensure the whole tail past `from` is regenerated (never preserve a
-          // sliver of old tail beyond the new content when the user trims).
-          params.repaintingEnd = Math.max(from + effectiveLength, effHeadDuration);
-        }
-        params.repaintInjectionRatio = 0.5;
-        params.repaintCrossfadeFrames = 10;
-        const latent = (headSong as any).latentUrl || (headSong as any).latent_url;
-        const audio = (headSong as any).audioUrl || (headSong as any).audio_url;
-        if (latent) params.sourceLatentUrl = latent;
-        if (audio) params.sourceAudioUrl = audio;
-
-        // Structural seed: bias this section toward an earlier section's chords.
-        if (seedSectionId && seedStrength > 0) {
-          const seedSec = timeline.find(s => s.id === seedSectionId);
-          const seedLatent = (seedSec?.chosen as any)?.latentUrl || (seedSec?.chosen as any)?.latent_url;
-          if (seedSec && seedLatent) {
-            params.seedLatentUrl = seedLatent;
-            params.seedSeconds = seedSec.section_length;
-            params.seedStrength = seedStrength;
-          }
-        }
-      }
-
-      const n = Math.max(1, project.variant_count || 4);
-
-      // Create the section up-front so streaming candidates have a home and a
-      // refresh/reload survives the in-flight jobs.
-      const { section } = await builderApi.createSection(project.id, {
-        label: nextLabel,
-        lyrics: nextLyrics,
-        direction,
-        sectionLength: effectiveLength,
-        status: 'generating',
-      }, token);
-      setSections(prev => [...prev, section]);
-
-      // One job per variant — the single GPU worker runs them in order, so each
-      // option becomes audible as it finishes instead of waiting for the batch.
-      const jobIds: string[] = [];
-      for (let i = 0; i < n; i++) {
-        const { jobId } = await generateApi.submit(params as any, token);
-        jobIds.push(jobId);
-      }
-      activeJobIdsRef.current = jobIds;
-      setActiveJobId(jobIds[0]);
-      pollVariantJobs(jobIds, section.id);
+      const v = await builderApi.generateSection(project.id, {
+        idempotencyKey: crypto.randomUUID(),
+        expectedRevision: project.revision,
+        expectedBackend: useBackendStore.getState().activeBackendId,
+        direction, label: nextLabel, lyrics: nextLyrics,
+        length: lengthMode === 'bars' && bpm > 0 ? { bars: nextBars } : { seconds: nextLength },
+        overlap: transitionOverlap, clipPoint, seedSectionId, seedStrength, previewMastering, coResident,
+        headDuration: effHeadDuration > 0 ? effHeadDuration : undefined,
+        engineParams,
+      });
+      applyView(v);
+      followSection(project.id, v.jobId);
     } catch (e: any) {
-      showToast(`Generation failed: ${e.message}`);
-      setIsGenerating(false);
+      setIsGenerating(false); setGenStage('');
+      if (e instanceof ApiError && e.status === 409) {
+        showToast(`${e.message} Reloaded.`);
+        await refresh().catch(() => {});
+      } else showToast(`Generation failed: ${e.message}`);
     }
-  }, [token, project, direction, headSong, effHeadDuration, gp, nextLabel, nextLyrics, effectiveLength, cumulativeLyrics, previewMastering, transitionOverlap, clipPoint, seedSectionId, seedStrength, timeline]);
-
-  // Poll all variant jobs; append each finished song to the section's candidate
-  // list as it lands (streaming), then mark 'ready' when the last one finishes.
-  const pollVariantJobs = useCallback((jobIds: string[], sectionId: string) => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    const pending = new Set(jobIds);
-    const collected: string[] = [];
-    pollRef.current = setInterval(async () => {
-      for (const jobId of Array.from(pending)) {
-        let s: any;
-        try { s = await generateApi.status(jobId); } catch { continue; }
-        if (s.status === 'succeeded') {
-          pending.delete(jobId);
-          collected.push(...((s.result?.songIds as string[]) || []));
-          await builderApi.updateSection(sectionId, { candidateSongIds: [...collected] }, token!).catch(() => {});
-          await refresh();
-        } else if (s.status === 'failed' || s.status === 'cancelled') {
-          pending.delete(jobId);
-        }
-      }
-      setGenProgress(Math.round(((jobIds.length - pending.size) / jobIds.length) * 100));
-      setGenStage(`Generated ${collected.length} of ${jobIds.length}…`);
-
-      if (pending.size === 0) {
-        if (pollRef.current) clearInterval(pollRef.current);
-        activeJobIdsRef.current = [];
-        await builderApi.updateSection(sectionId, {
-          candidateSongIds: [...collected],
-          status: collected.length ? 'ready' : 'failed',
-        }, token!).catch(() => {});
-        setIsGenerating(false);
-        setActiveJobId(null);
-        setGenStage(collected.length ? 'Pick a variant' : '');
-        if (!collected.length) showToast('All variants failed');
-        await refresh();
-      }
-    }, 2000);
-  }, [token, refresh]);
-
-  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+  }, [token, project, direction, headSong, effHeadDuration, gp, nextLabel, nextLyrics, lengthMode, bpm, nextBars, nextLength, previewMastering, transitionOverlap, clipPoint, seedSectionId, seedStrength, applyView, followSection, refresh]);
 
   // ── Choose a variant for a section ──
+  // The server stops the section's remaining variants and fills the project's
+  // auto BPM/key from the pick, so later sections inherit a real tempo.
   const chooseVariant = useCallback(async (sectionId: string, song: Song) => {
-    if (!token) return;
-    // Got our pick — stop polling and cancel any still-running variant jobs.
-    if (pollRef.current) clearInterval(pollRef.current);
-    for (const jid of activeJobIdsRef.current) generateApi.cancel(jid).catch(() => {});
-    activeJobIdsRef.current = [];
-    setIsGenerating(false); setActiveJobId(null); setGenStage(''); setGenProgress(0);
-    try {
-      await builderApi.updateSection(sectionId, { chosenSongId: song.id, status: 'chosen' }, token);
-      // Backfill auto'd musical params from the first concrete section so later
-      // sections inherit a real BPM/key (and bars-mode lights up).
-      if (project && (!project.bpm || !project.key_scale)) {
-        const patch: Record<string, any> = {};
-        if (!project.bpm && song.bpm) patch.bpm = Math.round(song.bpm);
-        if (!project.key_scale && song.key_scale) patch.keyScale = song.key_scale;
-        if (Object.keys(patch).length) saveProjectFields(patch);
-      }
+    if (!token || !project) return;
+    if (sectionId === activeSection?.id) stopFollowing();
+    if (await runOp(() => builderApi.chooseCandidate(sectionId, song.id, project.revision), 'Could not select')) {
       // Advance composer: default to appending the next section.
       setDirection('append');
       setNextLabel('Verse');
       setNextLyrics('');
-      await refresh();
-    } catch (e: any) { showToast(`Could not select: ${e.message}`); }
-  }, [token, refresh, project, saveProjectFields]);
+    }
+  }, [token, project, activeSection, stopFollowing, runOp]);
 
   const deleteSection = useCallback(async (sectionId: string) => {
-    if (!token) return;
-    // If discarding the section that's mid-generation, stop its jobs too.
-    if (sectionId === activeSection?.id) {
-      if (pollRef.current) clearInterval(pollRef.current);
-      for (const jid of activeJobIdsRef.current) generateApi.cancel(jid).catch(() => {});
-      activeJobIdsRef.current = [];
-      setIsGenerating(false); setActiveJobId(null); setGenStage(''); setGenProgress(0);
-    }
-    await builderApi.deleteSection(sectionId, token).catch(() => {});
-    await refresh();
-  }, [token, refresh, activeSection]);
+    if (!token || !project) return;
+    // Deleting the section mid-generation stops its renders too (server side).
+    if (sectionId === activeSection?.id) stopFollowing();
+    await runOp(() => builderApi.deleteSection(sectionId, project.revision), 'Delete failed');
+  }, [token, project, activeSection, stopFollowing, runOp]);
 
-  const cancelGen = useCallback(async () => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    for (const jid of activeJobIdsRef.current) generateApi.cancel(jid).catch(() => {});
-    if (activeJobId) generateApi.cancel(activeJobId).catch(() => {});
-    activeJobIdsRef.current = [];
-    setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage('');
-  }, [activeJobId]);
-
-  // Stop the remaining variant jobs but keep the options that already finished,
+  // Stop the remaining variants but keep the options that already finished,
   // finalizing the section so the user can pick from what arrived.
   const stopGenerating = useCallback(async (sectionId: string) => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    for (const jid of activeJobIdsRef.current) generateApi.cancel(jid).catch(() => {});
-    activeJobIdsRef.current = [];
-    setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage('');
-    const sec = sections.find(s => s.id === sectionId);
-    await builderApi.updateSection(sectionId, { status: (sec?.candidates.length ?? 0) > 0 ? 'ready' : 'failed' }, token!).catch(() => {});
-    await refresh();
-  }, [token, refresh, sections]);
+    if (!token || !project) return;
+    stopFollowing();
+    await runOp(() => builderApi.stopSection(sectionId, project.revision), 'Stop failed');
+  }, [token, project, stopFollowing, runOp]);
+
+  // The composer's Cancel: the same as Stop on the section being generated.
+  const cancelGen = useCallback(() => {
+    if (activeSection?.status === 'generating') void stopGenerating(activeSection.id);
+    else stopFollowing();
+  }, [activeSection, stopGenerating, stopFollowing]);
 
   // ── Edit a committed section's lyrics (e.g. correct lines the DiT altered) ──
   const openLyricEditor = useCallback((s: BuilderSection) => {
@@ -518,11 +473,11 @@ export const SongBuilder: React.FC = () => {
     setEditLyrics(s.lyrics || '');
   }, []);
   const saveLyricEdit = useCallback(async () => {
-    if (!token || !editingSectionId) return;
-    await builderApi.updateSection(editingSectionId, { label: editLabel, lyrics: editLyrics }, token).catch(() => {});
-    setEditingSectionId(null);
-    await refresh();
-  }, [token, editingSectionId, editLabel, editLyrics, refresh]);
+    if (!token || !project || !editingSectionId) return;
+    if (await runOp(() => builderApi.editSection(editingSectionId, { label: editLabel, lyrics: editLyrics }, project.revision), 'Save failed')) {
+      setEditingSectionId(null);
+    }
+  }, [token, project, editingSectionId, editLabel, editLyrics, runOp]);
 
   // ── Render: project list (no project open) ──
   if (!project) {
@@ -609,6 +564,7 @@ export const SongBuilder: React.FC = () => {
 
           {/* Existing projects */}
           <h2 className="text-sm font-semibold text-zinc-400 mb-2">Your songs</h2>
+          {projectsQuery.error && <div role="alert" className="text-sm text-red-500">{projectsQuery.error.message}</div>}
           {projects.length === 0 ? (
             <p className="text-xs text-zinc-600 py-6 text-center">No songs yet — start one above.</p>
           ) : (
@@ -626,7 +582,7 @@ export const SongBuilder: React.FC = () => {
                   <span className="text-[11px] text-zinc-600">{p.section_count ?? 0} section{(p.section_count ?? 0) === 1 ? '' : 's'}</span>
                   <Trash2
                     size={14} className="text-zinc-600 hover:text-red-400"
-                    onClick={async (e) => { e.stopPropagation(); if (token) { await builderApi.deleteProject(p.id, token); setProjects(prev => prev.filter(x => x.id !== p.id)); } }}
+                    onClick={e => { e.stopPropagation(); void deleteProject(p.id); }}
                   />
                 </button>
               ))}
@@ -641,6 +597,7 @@ export const SongBuilder: React.FC = () => {
   const canPrepend = !!headSong;
   return (
     <div className="flex flex-col w-full h-full bg-zinc-50 dark:bg-suno overflow-hidden">
+      {(projectsQuery.error || projectQuery.error) && <div role="alert" className="text-sm text-red-500">{(projectsQuery.error || projectQuery.error)?.message}</div>}
       {toast && <Toast msg={toast} />}
 
       {/* Header */}

@@ -17,6 +17,19 @@ export function yue2JointOutputDirectory(adaptersRoot: string, trigger: string, 
   return path.join(adaptersRoot, 'yue2-joint-adapters', `${name}_${runStamp(when)}`);
 }
 
+/** A joint checkpoint's AR or NAR weights: `<trigger>_yue2_joint_<half>_step<N>.safetensors`
+ *  (yue2-aitk-runtime.cpp, joint_weight_name), or the fixed `native-<half>.safetensors`
+ *  runs trained before it wrote. */
+export function yue2JointWeight(dir: string, half: 'ar' | 'nar'): string | undefined {
+  const legacy = path.join(dir, `native-${half}.safetensors`);
+  if (fs.existsSync(legacy)) return legacy;
+  const named = new RegExp(`(?:^|_)yue2_joint_${half}_step\\d+\\.safetensors$`);
+  try {
+    const hit = fs.readdirSync(dir, { withFileTypes: true }).find(e => e.isFile() && named.test(e.name));
+    return hit ? path.join(dir, hit.name) : undefined;
+  } catch { return undefined; }
+}
+
 /** One chain of work per run, so a mirror pass, a cleanup and a folder move
  *  of the same run never interleave: a move mid-pass would let the pass
  *  recreate the old folder and point the index back at it. In-process only.
@@ -225,7 +238,7 @@ export function checkpointRecords(output: string): Yue2AitkCheckpointRecord[] {
       ...(meters.planner_frozen === true ? { frozen: true } : {}),
       ...(meters.kl_rung === true ? { rung: true } : {}),
       adapterPath: file('adapter.safetensors'), optimizerPath: file('optimizer.resume'),
-      arPath: file('native-ar.safetensors'), narPath: file('native-nar.safetensors'),
+      arPath: yue2JointWeight(dir, 'ar'), narPath: yue2JointWeight(dir, 'nar'),
     });
    }
   }
@@ -442,7 +455,7 @@ export function findYue2JointAdaptersFor(rows: Array<{ id: string; slug: string 
     const ls = (dir: string) => { try { return fs.readdirSync(dir).map(n => path.join(dir, n)); } catch { return []; } };
     const bases = [r.output, ...ls(path.join(r.output, 'segments'))];
     const dir = bases.flatMap(ls).filter(d => /[\\/]checkpoint-step\d+$/.test(d)).find(d =>
-      fs.existsSync(path.join(d, 'native-ar.safetensors')) && fs.existsSync(path.join(d, 'native-nar.safetensors')));
+      yue2JointWeight(d, 'ar') && yue2JointWeight(d, 'nar'));
     if (dir) out.set(id, { dir, trainedAt: new Date(r.updatedAt).toISOString() });
   }
   return out;
@@ -527,15 +540,21 @@ function assignBlindLabels(run: Yue2AitkRunRecord, checkpoints: Yue2AitkCheckpoi
   return true;
 }
 
-/** A base-matched run (2026-09-27) has no KL rungs: its ladder is every
- *  complete checkpoint, so each one is flagged as a rung for the Review page,
- *  the best-rung pick and the ladder cards. Other runs keep meters.json's flag. */
+/** A base-matched (2026-09-27) or fixed-recipe run has no KL rungs: its
+ *  ladder is every complete checkpoint, picked by ear, with no NAR follow-up. */
+export function isCheckpointLadder(options: { method?: unknown } | undefined): boolean {
+  return options?.method === 'base-matched' || options?.method === 'fixed-recipe';
+}
+
+/** A checkpoint-ladder run's complete checkpoints are each flagged as a rung
+ *  for the Review page, the best-rung pick and the ladder cards. Other runs
+ *  keep meters.json's flag. */
 function rungsOf(run: Yue2AitkRunRecord, checkpoints: Yue2AitkCheckpointRecord[]): Yue2AitkCheckpointRecord[] {
   const o = run.options as Record<string, unknown> | undefined;
   // Legacy saving every KL step: past the freeze the decoder-phase saves are
   // the rungs (they get the previews), since the KL no longer moves.
   if (Number(o?.klCheckpointEvery) > 0 && o?.refinePlanner !== true) return checkpoints.map(c => c.frozen ? { ...c, rung: true } : c);
-  if (o?.method !== 'base-matched') return checkpoints;
+  if (!isCheckpointLadder(o)) return checkpoints;
   return checkpoints.map(c => c.arPath && c.narPath ? { ...c, rung: true } : c);
 }
 
@@ -552,9 +571,9 @@ export function listAllYue2AitkRuns(): Yue2AitkRunRecord[] {
 
 /** Resolve only paths present in the durable joint catalogue. This is shared by
  * the model picker, prompt builder and caption-source route. */
-export function jointRunForAdapter(adapterPath: string): Yue2AitkRunRecord | undefined {
+export function jointRunForAdapter(adapterPath: string, runs?: Yue2AitkRunRecord[]): Yue2AitkRunRecord | undefined {
   if (!adapterPath) return undefined;
   const wanted = path.resolve(adapterPath).toLowerCase();
-  return listAllYue2AitkRuns().find(run => run.checkpoints.some(checkpoint =>
+  return (runs ?? listAllYue2AitkRuns()).find(run => run.checkpoints.some(checkpoint =>
     [checkpoint.arPath, checkpoint.narPath].some(ref => ref && path.resolve(ref).toLowerCase() === wanted)));
 }

@@ -75,8 +75,9 @@ from the album sidebar. See [Bulk operations](#bulk-operations) below.
 | LLM providers (Profile / Generate / Refine rows) | Independent provider+model choice for each of the three LLM roles. See [LLM providers](#llm-providers) below. |
 | Filename Prepend | Text prepended to downloaded audio filenames for songs from this artist. |
 | LLM Duration | When on, uses the LLM's own estimated song duration; when off, calculates duration from the lyrics and BPM instead, which tends to undershoot less than an LLM's guess. |
-| Randomize Timbre | Picks a random track from the reference folder as the timbre conditioner on each render, instead of the album preset's one fixed reference track. |
-| Use LM Adapter | Off by default. When on, Send-to-Custom-Gen also applies the album preset's planner-LM adapter alongside the DiT adapter. |
+| Master to Album Track | Off by default. When on, every Lyric Studio render is mastered to a random track from the album's training dataset, a different one each time, with Mastering turned on and the VST chain skipped for those renders. Your post-processing settings are not changed. An album with no training dataset keeps the mastering reference as set. |
+| Randomize Timbre | Picks a random track from the reference folder as the timbre conditioner on each render, instead of the album preset's one fixed reference track. ACE-Step only; hidden on the other backends. |
+| Use LM Adapter | Off by default. When on, Send-to-Custom-Gen also applies the album preset's planner-LM adapter alongside the DiT adapter. ACE-Step only; hidden on the other backends. |
 | Bulk Operations | Opens the queue panel described below. |
 
 ### Bulk operations
@@ -90,6 +91,21 @@ a fixed count), **Generate Audio** (queue audio rendering for already-written
 songs, per album, with newest/oldest ordering and a filter to skip songs
 already rendered or already kept), and **Assign Presets** (bulk-apply an
 adapter and reference-track preset across multiple albums at once).
+
+Profile builds, lyric writing, refinement, bulk lyric fetches and bulk audio
+renders run as server jobs. Closing the panel does not stop a submitted job;
+the lyric queue reconnects to unfinished jobs when Lyric Studio opens again.
+Each batch reports which items succeeded or failed, with the reason next to a
+failed item in the queue. One lyric batch takes up to 1000 queue entries and
+10000 songs in total. **Artists at once** (Build Profiles and Generate Lyrics,
+remembered per browser) sets how many artists a run works on at the same time,
+1 to 16. One artist's songs always run in order, so each still avoids the
+subjects, keys and titles its predecessors picked. Raise it for a cloud
+provider; it sends that many requests at once, which counts against the
+provider's rate limits. The live output pane follows one song at a time. Stop on a bulk fetch
+requests cancellation. A server restart marks an active job interrupted; it
+does not silently rerun. Form changes after submission apply to the
+next job; the current job uses its captured provider, model and render settings.
 
 ### LLM providers
 
@@ -127,12 +143,18 @@ albums) is present in the UI but its backend endpoint is not implemented yet.
 Expect it to fail.
 
 MM3 and YuE2 caption source pickers (nearest tempo / named track / custom)
-only appear when the album's own dataset carries per-track captions, which
+follow the active engine's capability manifest and appear when the album's own
+dataset carries per-track captions, which
 normally means the album was exported from Training Studio rather than typed
 in or fetched from Genius. Those captions, and the YuE2 caption examples the
 caption writer imitates, are re-read from the dataset's sidecar files every
 time the set is loaded, including by the MCP tools, so a re-captioned dataset
 shows up without re-exporting.
+
+Returning to an artist or album reuses recent catalogue results. Saving
+profiles, presets or drafts refreshes their saved lists while unsaved lyric
+text stays in the editor. Reconnecting a workflow stream refreshes its status
+without repeating the render command.
 
 ## Related
 

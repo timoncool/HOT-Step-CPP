@@ -5,8 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { Readable } from 'node:stream';
 import { PROJECT_ROOT } from '../../config.js';
-import { changedSteps, currentCommit, getUpdate, ggmlPointerChanged, runUpdatePlan, startUpdate, updateGgml } from './workerUpdate.js';
+import { changedSteps, command, currentCommit, getUpdate, ggmlPointerChanged, platformCommands, receiveUpdate, runUpdatePlan, startUpdate, updateGgml, workerUpdateGate } from './workerUpdate.js';
 import { workerStatus } from './trainingWorkers.js';
 
 const git = (...args: string[]) => execFileSync('git', args, { cwd: PROJECT_ROOT, encoding: 'utf8' }).trim();
@@ -206,4 +207,53 @@ test('mocked worker with an active job refuses update before bundle creation', a
     assert.equal(update?.status, 'failed');
     assert.match(update?.error ?? '', /active or queued/);
   } finally { server.close(); }
+});
+
+test('platform commands: Windows forms are unchanged, macOS uses pwsh, npm and build-mac.sh', () => {
+  const win = platformCommands('win32', 'R');
+  assert.deepEqual(win.hooks, ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join('R', 'engine', 'verify-hooks.ps1')]]);
+  assert.deepEqual(win.npm('ci'), ['cmd.exe', ['/d', '/c', 'npm ci']]);
+  assert.deepEqual(win.npm('run', 'build'), ['cmd.exe', ['/d', '/c', 'npm run build']]);
+  assert.deepEqual(win.engineBuild, ['cmd.exe', ['/d', '/c', path.join('R', 'engine', 'build.cmd')]]);
+  const mac = platformCommands('darwin', 'R');
+  assert.deepEqual(mac.hooks, ['pwsh', ['-NoProfile', '-File', path.join('R', 'engine', 'verify-hooks.ps1')]]);
+  assert.deepEqual(mac.npm('ci'), ['npm', ['ci']]);
+  assert.deepEqual(mac.npm('run', 'build'), ['npm', ['run', 'build']]);
+  assert.deepEqual(mac.engineBuild, ['bash', [path.join('R', 'engine', 'build-mac.sh')]]);
+});
+
+function gateStatus(method: string): number | 'next' {
+  let out: number | 'next' = 'next';
+  const res = { status: (code: number) => { out = code; return { json: () => {} }; } };
+  workerUpdateGate({ method } as any, res as any, () => {});
+  return out;
+}
+
+test('failure before reset releases the write gate; failure after reset keeps it locked with no restart', async () => {
+  const base = 'a'.repeat(40), target = 'b'.repeat(40);
+  const record: string[] = [];
+  const deps = (over: Parameters<typeof receiveUpdate>[4] = {}) => ({
+    commit: () => base,
+    idle: () => {},
+    prepare: async () => ({ files: ['ui/src/App.tsx'], pointerChanged: false }),
+    ...over,
+    ops: { advance: () => true, reset: async () => { record.push('reset'); }, restart: () => { record.push('restart'); }, ...over.ops },
+  });
+  await assert.rejects(receiveUpdate(Readable.from(['x']), base, target, () => {}, deps({ prepare: async () => { throw new Error('bad bundle'); } })), /bad bundle/);
+  assert.equal(gateStatus('POST'), 'next');
+  assert.deepEqual(record, []);
+  await assert.rejects(receiveUpdate(Readable.from(['x']), base, target, () => {}, deps({ ops: { uiBuild: async () => { throw new Error('build failed'); } } })), /build failed/);
+  assert.deepEqual(record, ['reset']);
+  assert.equal(gateStatus('POST'), 409);
+  assert.equal(gateStatus('GET'), 'next');
+  assert.equal(gateStatus('HEAD'), 'next');
+  await assert.rejects(receiveUpdate(Readable.from(['x']), base, target, () => {}, deps()), /already running/);
+});
+
+test('command: spawn failure and nonzero exit reject, output is logged', async () => {
+  const lines: string[] = [];
+  await command(process.execPath, ['-e', 'console.log("out"); console.error("err")'], PROJECT_ROOT, l => lines.push(l));
+  assert.deepEqual(lines.sort(), ['err', 'out']);
+  await assert.rejects(command(process.execPath, ['-e', 'process.exit(3)'], PROJECT_ROOT, () => {}), /exited 3/);
+  await assert.rejects(command('hotstep-no-such-binary', [], PROJECT_ROOT, () => {}), /ENOENT/);
 });

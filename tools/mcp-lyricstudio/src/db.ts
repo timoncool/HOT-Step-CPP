@@ -4,30 +4,48 @@
 // Query functions mirror those in server/src/db/lireekDb.ts.
 
 import Database from 'better-sqlite3';
+import { existsSync } from 'node:fs';
 import path from 'path';
 // Canonical key spelling, shared with the in-app path via the re-exported
 // prompts module (server/src/services/lireek/prompts.ts).
 import { normalizeKeyScale } from './prompts.js';
 import { refreshSidecarCaptions } from '../../../server/src/services/lireek/mm3CaptionSync.js';
+import { locateData } from '../../../server/src/dataroot/locate.js';
 
 let db: Database.Database;
 
 /**
- * Resolve the database path from environment or default.
- * Priority: HOTSTEP_DB env > default relative path.
+ * Resolve without running app startup or applying pending data moves.
+ * HOTSTEP_DB is an explicit override; otherwise use the app's shared resolver.
  */
-function resolveDbPath(): string {
-  if (process.env.HOTSTEP_DB) {
-    return path.resolve(process.env.HOTSTEP_DB);
+export function resolveDbPath(env: NodeJS.ProcessEnv = process.env): { dbPath: string; source: string } {
+  if (env.HOTSTEP_DB) {
+    return { dbPath: path.resolve(env.HOTSTEP_DB), source: 'HOTSTEP_DB override' };
   }
-  // Default: relative to this package's location in tools/mcp-lyricstudio/
-  return path.resolve(import.meta.dirname, '..', '..', 'server', 'data', 'hotstep.db');
+  const report = locateData({ env });
+  if (report.pointerError) {
+    throw new Error(`[mcp-lyricstudio] Cannot read data-folder pointer ${report.pointerPath}: ${report.pointerError}`);
+  }
+  if (report.pendingMove) {
+    const move = report.pendingMove;
+    throw new Error(`[mcp-lyricstudio] Pending data-folder ${move.kind} to ${move.destination} in ${report.pointerPath}. Finish the operation in HOT-Step before connecting.${move.error ? ` Reason: ${move.error}` : ''}`);
+  }
+  if (!report.children) {
+    throw new Error(`[mcp-lyricstudio] No database location resolved from ${report.pointerPath}. Configure the data folder in HOT-Step or set HOTSTEP_DB.`);
+  }
+  return {
+    dbPath: report.children.db,
+    source: `${report.source} (${report.pointerPath}; settings: ${report.children.envFile})`,
+  };
 }
 
 export function initDb(): void {
-  const dbPath = resolveDbPath();
-  console.error(`[mcp-lyricstudio] Opening database: ${dbPath}`);
-  db = new Database(dbPath);
+  const { dbPath, source } = resolveDbPath();
+  console.error(`[mcp-lyricstudio] Opening database: ${dbPath} from ${source}`);
+  if (!existsSync(dbPath)) {
+    throw new Error(`[mcp-lyricstudio] Database not found: ${dbPath} from ${source}. Check the configured data folder or set HOTSTEP_DB to the existing hotstep.db file.`);
+  }
+  db = new Database(dbPath, { fileMustExist: true });
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 }

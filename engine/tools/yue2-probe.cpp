@@ -118,6 +118,7 @@ static void usage() {
             "       yue2-probe --nar-parity <fixture-root-dir> --models <dir>\n"
             "       yue2-probe --vae-parity <fixture-root-dir> --models <dir> [--variant standard|legacy]\n"
             "       yue2-probe --encode-parity <fixture-dir> --models <dir> [--vae standard|legacy]\n"
+            "       yue2-probe --vae-roundtrip <in.f32> <out.f32> --models <dir> [--vae standard|legacy]\n"
             "       yue2-probe --tok-head-parity <stages-30s-dir> --models <dir> [--tok-gguf <file>] [--tf32]\n"
             "       (--tok-gguf pins one yue2-tok-*.gguf; discovery ranks f16 above f32, so name the\n"
             "        f32 file explicitly to bisect without storage rounding in the way)\n"
@@ -5319,6 +5320,55 @@ static int run_mmsfa_emit(const std::string & gguf_path, const std::string & inp
     return ok ? 0 : 1;
 }
 
+// --vae-roundtrip <in.f32> <out.f32>: planar [2, S] 48 kHz audio -> VAE
+// encode (posterior mean) -> VAE decode, with the same tiling generation
+// uses. Separates what the VAE loses from what the LM/NAR never produce:
+// listen to (or diff the spectrum of) <out.f32> against <in.f32>.
+static int run_vae_roundtrip(const std::string & models_dir, const std::string & in_path,
+                             const std::string & out_path, Yue2VaeVariant variant) {
+    Yue2Model m;
+    yue2_discover(&m, models_dir.c_str(), nullptr);
+    std::string err;
+    if (!m.vae_file[variant].found ||
+        !yue2_load_parts(&m, /*want_lm=*/false, /*want_vae=*/true, variant, /*want_encoder=*/true, &err)) {
+        fprintf(stderr, "FATAL: VAE (%s) load failed: %s\n", YUE2_VAE_VARIANT_NAME[variant], err.c_str());
+        yue2_unload(&m);
+        return 1;
+    }
+    const int64_t      AC = m.vae_cfg.audio_channels;
+    std::vector<float> audio;
+    if (!yue2_read_f32_bin(in_path, &audio) || audio.size() % (size_t) AC != 0) {
+        fprintf(stderr, "FATAL: cannot read planar [%lld, S] f32 from %s\n", (long long) AC, in_path.c_str());
+        yue2_unload(&m);
+        return 1;
+    }
+    const int64_t      S = (int64_t) audio.size() / AC;
+    std::vector<float> lat, out;
+    int64_t            T = 0, samples = 0;
+    const int64_t      core = std::min<int64_t>((int64_t) m.vae_cfg.decode_core_frames, 512);
+    if (!yue2_vae_encode_tiled(m, audio.data(), S, YUE2_VAE_ENC_DEFAULT_CORE_SAMPLES,
+                               YUE2_VAE_ENC_DEFAULT_HALO_SAMPLES, &lat, &T, nullptr, &err) ||
+        !yue2_vae_decode_tiled(m, lat.data(), T, core, (int64_t) m.vae_cfg.decode_halo_frames, &out, &samples,
+                               nullptr, &err)) {
+        fprintf(stderr, "FATAL: round-trip failed: %s\n", err.c_str());
+        yue2_unload(&m);
+        return 1;
+    }
+    yue2_unload(&m);
+    FILE * f = fopen(out_path.c_str(), "wb");
+    if (!f || fwrite(out.data(), sizeof(float), out.size(), f) != out.size()) {
+        fprintf(stderr, "FATAL: cannot write %s\n", out_path.c_str());
+        if (f) {
+            fclose(f);
+        }
+        return 1;
+    }
+    fclose(f);
+    printf("vae-roundtrip (%s): S=%lld -> T=%lld -> %lld samples/ch, TF32 %s\n", YUE2_VAE_VARIANT_NAME[variant],
+           (long long) S, (long long) T, (long long) samples, yue2_vae_enc_tf32_disabled() ? "off" : "on");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // ── mmsfa-*: positional subcommands, dispatched ahead of the flag parser ─
     //
@@ -5396,6 +5446,7 @@ int main(int argc, char ** argv) {
     std::string     vae_parity_dir;
     std::string     vae_parity_variant;
     std::string     encode_parity_dir;
+    std::string     roundtrip_in, roundtrip_out;
     std::string     tok_head_parity_dir;
     std::string     tok_head_gguf;
     bool            tok_head_keep_tf32 = false;
@@ -5455,6 +5506,9 @@ int main(int argc, char ** argv) {
             nar_parity_dir = argv[++i];
         } else if (!strcmp(argv[i], "--vae-parity") && i + 1 < argc) {
             vae_parity_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--vae-roundtrip") && i + 2 < argc) {
+            roundtrip_in  = argv[++i];
+            roundtrip_out = argv[++i];
         } else if (!strcmp(argv[i], "--encode-parity") && i + 1 < argc) {
             encode_parity_dir = argv[++i];
         } else if (!strcmp(argv[i], "--tok-head-parity") && i + 1 < argc) {
@@ -5509,8 +5563,10 @@ int main(int argc, char ** argv) {
                 variant = YUE2_VAE_STANDARD;
             } else if (v == "legacy") {
                 variant = YUE2_VAE_LEGACY;
+            } else if (v == "dec2x") {
+                variant = YUE2_VAE_DEC2X;
             } else {
-                fprintf(stderr, "--vae must be 'standard' or 'legacy', got '%s'\n", v.c_str());
+                fprintf(stderr, "--vae must be 'standard', 'legacy' or 'dec2x', got '%s'\n", v.c_str());
                 return 2;
             }
         } else if (!strcmp(argv[i], "--adapter") && i + 1 < argc) {
@@ -5641,6 +5697,13 @@ int main(int argc, char ** argv) {
             return 2;
         }
         return run_vae_parity(models_dir, vae_parity_dir, vae_parity_variant);
+    }
+    if (!roundtrip_in.empty()) {
+        if (models_dir.empty()) {
+            fprintf(stderr, "--vae-roundtrip requires --models <dir>\n");
+            return 2;
+        }
+        return run_vae_roundtrip(models_dir, roundtrip_in, roundtrip_out, variant);
     }
     if (!encode_parity_dir.empty()) {
         if (models_dir.empty()) {

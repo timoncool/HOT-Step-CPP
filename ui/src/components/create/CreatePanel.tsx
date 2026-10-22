@@ -5,6 +5,7 @@
 // per-song content and metadata.
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Zap, ListPlus, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { usePersistedState } from '../../hooks/usePersistedState';
@@ -13,11 +14,16 @@ import { useAuth } from '../../context/AuthContext';
 import { generateApi } from '../../services/api';
 import { Yue2ScorePreviewModal, type Yue2ScorePreviewData } from './Yue2ScorePreviewModal';
 import { ContentSection } from './ContentSection';
+import { Fold } from '../shared/Fold';
 import { MetadataSection } from './MetadataSection';
 import { LatentImport } from '../shared/LatentImport';
 import { CoverArtSubjectSection } from '../shared/CoverArtSubjectSection';
 import { AiGenerateModal, type AiGenerateResult } from './AiGenerateModal';
 import { Mm3ComposeButton } from './Mm3ComposeButton';
+import { TrainingDraftBar } from './TrainingDraftBar';
+import { applyCreateDraft, createContentParams, liveBackendRefusal } from './createContent';
+import { useStudioDraftMirror } from '../../services/studioDraftMirror';
+import { StudioDraftPicker } from '../shared/StudioDraftPicker';
 import { useBackendStore } from '../../stores/backendStore';
 import { expandWildcards, hasWildcards, randomWildcardSeed } from '../../utils/wildcardUtils';
 import {
@@ -34,22 +40,29 @@ import {
   yue2TrackBpm,
   type Yue2CaptionSelection, type Yue2SourceTrack,
 } from '../../utils/yue2CaptionSource';
-import { listDatasets, type TrainingDatasetSummary } from '../../services/trainingApi';
+import { getTrainingWorker, type TrainingDatasetSummary } from '../../services/trainingApi';
+// training-data's worker-scoped dataset list, read through its options so
+// Create and Training Studio share one cache entry per worker.
+import { trainingQueries } from '../../queries/training-data/queries';
 import { extractCaptionTags } from '../../utils/captionTags';
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
 import { writePersistedState } from '../../hooks/usePersistedState';
 import type { GenerationParams, Song } from '../../types';
+import type { CreateIntent } from '../../../../server/src/contracts/resolution';
+
+const NO_DATASETS: TrainingDatasetSummary[] = [];
 
 interface CreatePanelProps {
-  onGenerate: (params: Partial<GenerationParams>) => void;
+  onGenerate: (params: Partial<GenerationParams>, intent?: CreateIntent) => void;
   activeJobCount: number;
   reuseData?: { song: Song; timestamp: number } | null;
 }
 
 export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobCount, reuseData }) => {
   const { t } = useTranslation();
-  const mm3Mode = useBackendStore(s => s.activeBackendId) === 'minimax-m3';
+  const mm3Mode = useBackendStore(s => s.activeBackendId === 'minimax-m3'
+    && (s.capabilities[s.activeBackendId]?.core.captionSource ?? 'mm3-tracks') === 'mm3-tracks');
 
   // ── AI Generate modal ──
   const [aiModalOpen, setAiModalOpen] = useState(false);
@@ -66,17 +79,6 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   const [introBars, setIntroBars] = usePersistedState('hs-intro-bars', 2);
   const [autoExpand, setAutoExpand] = usePersistedState('hs-main-auto-expand', false);
 
-  // LoRA trigger word prepended, beat intro/outro request appended
-  const buildCaption = useCallback((base: string) => {
-    const trigger = loraTrigger.trim();
-    const start = base.trimStart();
-    const hasTrigger = trigger.length > 0
-      && start.slice(0, trigger.length).toLowerCase() === trigger.toLowerCase()
-      && (start.length === trigger.length || /[,\s]/.test(start[trigger.length]));
-    const loraText = trigger && !hasTrigger ? `${trigger}, ` : '';
-    const beatText = beatIntro ? `, with a clean ${introBars}-bar percussive intro and outro for DJ mixing` : '';
-    return `${loraText}${base}${beatText}`;
-  }, [loraTrigger, beatIntro, introBars]);
 
   // ── Song Info (optional, auto-populated from Lyric Studio Send to Create) ──
   const [title, setTitle] = usePersistedState('hs-title', '');
@@ -147,7 +149,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   // dropdown below — and when it is empty this falls back to whatever dataset
   // the engine's resident adapter was trained on, without writing that guess
   // back, so a later handoff still wins outright.
-  const yue2Mode = useBackendStore(s => s.activeBackendId) === YUE2_BACKEND_ID;
+  const yue2Mode = useBackendStore(s => s.activeBackendId === YUE2_BACKEND_ID
+    && (s.capabilities[s.activeBackendId]?.core.captionSource ?? 'yue2-dataset') === 'yue2-dataset');
   const yue2AdapterPath = useBackendStore(
     s => yue2CaptionAdapterPath(s.models[YUE2_BACKEND_ID]?.defaults as Record<string, unknown> | undefined));
   const yue2HasCatalogue = useBackendStore(s => !!s.models[YUE2_BACKEND_ID]);
@@ -156,7 +159,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     { datasetId: '', datasetName: '', tracks: [] });
   const [yue2SourcePending, setYue2SourcePending] = useState(false);
   const [yue2DatasetChoice, setYue2DatasetChoice] = useState<string>(() => readYue2CaptionDataset());
-  const [yue2DatasetOptions, setYue2DatasetOptions] = useState<TrainingDatasetSummary[]>([]);
+  const yue2DatasetsQuery = useQuery({ ...trainingQueries.datasets(getTrainingWorker()), enabled: yue2Mode });
+  const yue2DatasetOptions: TrainingDatasetSummary[] = yue2DatasetsQuery.data ?? NO_DATASETS;
   const [yue2Selection, setYue2Selection] = useState<Yue2CaptionSelection>({ mode: 'custom' });
   const yue2ResolveSeq = useRef(0);
   // The caption as it stands right now, for the effect below — which must not
@@ -176,13 +180,6 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   // The catalogue for the Dataset dropdown — every dataset, not just the ones
   // with a YuE2 adapter, since the block is meant to be reachable even for a
   // base-model render whose dataset just happens to carry captions too.
-  useEffect(() => {
-    if (!yue2Mode) return;
-    let live = true;
-    void listDatasets().then(ds => { if (live) setYue2DatasetOptions(ds); }).catch(() => {});
-    return () => { live = false; };
-  }, [yue2Mode]);
-
   const resolveYue2Dataset = useCallback(async () => {
     const seq = ++yue2ResolveSeq.current;
     if (!yue2Mode) {
@@ -333,6 +330,27 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   // plans the lead sheet first, shows it, and only enqueues the render once
   // the user says Continue — with THAT score and THAT seed pinned.
   const { token } = useAuth();
+  // The form and its caption choices, mirrored into this browser's server draft.
+  const activeBackendId = useBackendStore(s => s.activeBackendId);
+  const draft = useStudioDraftMirror('create', token, {
+    'hs-caption': caption, 'hs-lyrics': lyrics, 'hs-negative-prompt': negativePrompt, 'hs-instrumental': instrumental,
+    'hs-lora-trigger': loraTrigger, 'hs-beat-intro': beatIntro, 'hs-intro-bars': introBars,
+    'hs-title': title, 'hs-artist': artist, 'hs-subject': subject, 'hs-bpm': bpm, 'hs-keyScale': keyScale,
+    'hs-timeSignature': timeSignature, 'hs-duration': duration, 'hs-vocalLanguage': vocalLanguage,
+    'hs-vocalGender': vocalGender, 'hs-sourceLatentUrl': sourceLatentUrl,
+    'hs-mm3CaptionSources': mm3Sources, 'hs-yue2CaptionDataset': yue2DatasetChoice,
+    ...(yue2Ds.datasetId ? { [`hs-yue2CaptionSource:ds:${yue2Ds.datasetId}`]: yue2Selection } : {}),
+  }, activeBackendId ? { backendId: activeBackendId } : {});
+  // A loaded draft goes through the same persisted keys the form reads, so
+  // every field and caption choice updates as if typed. Nothing is generated.
+  // Read from the store when the check runs (after the draft's fetch), not from this render.
+  const refuseDraft = useMemo(() => liveBackendRefusal(() => useBackendStore.getState().activeBackendId,
+    id => useBackendStore.getState().backends.find(b => b.id === id)?.displayName ?? id), []);
+  const applyDraft = useCallback((body: { fields: Record<string, unknown> }) => {
+    applyCreateDraft(body, writePersistedState);
+    const selection = yue2Ds.datasetId ? body.fields[`hs-yue2CaptionSource:ds:${yue2Ds.datasetId}`] : undefined;
+    if (selection && typeof selection === 'object') setYue2Selection(selection as Yue2CaptionSelection);
+  }, [yue2Ds.datasetId]);
   const yue2PreviewScore = useGlobalParamsStore((s: any) => !!s.backendParams?.yue2PreviewScore);
   const yue2AbcSupplied = useGlobalParamsStore((s: any) => typeof s.backendParams?.yue2Abc === 'string' && !!s.backendParams.yue2Abc.trim());
   const [scorePreview, setScorePreview] = useState<{ open: boolean; params: Partial<GenerationParams> | null; data: Yue2ScorePreviewData | null; error: string | null }>(
@@ -347,7 +365,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
       const seedParams = freshSeed
         ? { ...params, randomSeed: true, seed: -1 }
         : { ...params, randomSeed: gp.randomSeed, seed: gp.seed };
-      const data = await generateApi.yue2Plan(seedParams, token);
+      const data = await generateApi.yue2Plan(seedParams);
       setScorePreview(prev => (prev.open ? { ...prev, data } : prev));
     } catch (err) {
       setScorePreview(prev => (prev.open ? { ...prev, error: err instanceof Error ? err.message : String(err) } : prev));
@@ -381,7 +399,10 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     if (gpData.cfgCutoffRatio !== undefined) gp.setCfgCutoffRatio(gpData.cfgCutoffRatio);
     if (gpData.lmCfgCutoffRatio !== undefined) gp.setLmCfgCutoffRatio(gpData.lmCfgCutoffRatio);
     if (gpData.cacheRatio !== undefined) gp.setCacheRatio(gpData.cacheRatio);
-    if (gpData.seed !== undefined) gp.setSeed(gpData.seed);
+    // baseSeed (the typed seed) over the rendered one, so reusing variation
+    // 2.1 does not shift the base by one and re-roll the wildcard expansion.
+    if (gpData.baseSeed !== undefined) gp.setSeed(gpData.baseSeed);
+    else if (gpData.seed !== undefined) gp.setSeed(gpData.seed);
     if (gpData.randomSeed !== undefined) gp.setRandomSeed(gpData.randomSeed);
     if (gpData.lmSeed !== undefined) gp.setLmSeed(gpData.lmSeed);
     if (gpData.lmSeedFollowsDit !== undefined) gp.setLmSeedFollowsDit(gpData.lmSeedFollowsDit);
@@ -427,51 +448,153 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     setInstrumental(false);
   }, [setCaption, setLyrics, setTitle, setSubject, setBpm, setKeyScale, setTimeSignature, setDuration, setVocalLanguage, setInstrumental]);
 
+  // YuE2 hides auto-expand, the LoRA trigger and Beat I/O (its adapters
+  // carry their trigger), so stored values must not ride along unseen.
+  const yue2Ui = activeBackendId === YUE2_BACKEND_ID;
+  const compose = yue2Ui
+    ? { autoExpand: false, loraTrigger: '', beatIntro: false, introBars }
+    : { autoExpand, loraTrigger, beatIntro, introBars };
+
   const handleGenerate = () => {
     // Wildcard auto-expand: reproducible from the DiT seed when it's locked,
     // fresh randomness when the seed is random anyway
     const wcSeed = gp.randomSeed ? randomWildcardSeed() : gp.seed;
-    const resolvedCaption = autoExpand && hasWildcards(caption)
+    const resolvedCaption = compose.autoExpand && hasWildcards(caption)
       ? expandWildcards(caption, wcSeed, 0) : caption;
-    const resolvedLyrics = autoExpand && hasWildcards(lyrics)
+    const resolvedLyrics = compose.autoExpand && hasWildcards(lyrics)
       ? expandWildcards(lyrics, wcSeed, 0) : lyrics;
 
-    const params: Partial<GenerationParams> = {
-      caption: buildCaption(resolvedCaption),
-      lyrics: instrumental ? '[Instrumental]' : resolvedLyrics,
-      ...(negativePrompt.trim() ? { negative_prompt: negativePrompt.trim() } : {}),
-      instrumental,
-      bpm, keyScale, timeSignature, vocalLanguage,
-      // MM3 has no length input — a duration there is a frame cap that can only
-      // truncate the planner's own ending, so every MM3 render is auto. The
-      // control is hidden in MM3 mode (MetadataSection), and this stops the
-      // persisted ACE value riding along behind it. The backend enforces the
-      // same thing, so a stale row or a direct API call cannot reinstate a cap.
-      duration: mm3Mode ? -1 : duration,
-      // vocalGender is deliberately NOT sent: neither backend has a wire field
-      // for it. It reaches the model only by being written into the caption's
-      // Vocal Details section by Mm3ComposeButton, and the caption is what
-      // travels. Adding it to the request would create another dead knob.
-      taskType: 'text2music',
-    };
-    // Optional song info fields — only include if populated
-    if (title.trim()) params.title = title.trim();
-    if (artist.trim()) params.artist = artist.trim();
-    if (subject.trim()) params.subject = subject.trim();
-    if (sourceLatentUrl) params.sourceLatentUrl = sourceLatentUrl;
+    const params = createContentParams({
+      caption, lyrics, negativePrompt, instrumental, loraTrigger: compose.loraTrigger, beatIntro: compose.beatIntro, introBars,
+      title, artist, subject, bpm, keyScale, timeSignature, duration, vocalLanguage, sourceLatentUrl,
+    }, { mm3Mode, yue2Active: activeBackendId === YUE2_BACKEND_ID, resolvedCaption, resolvedLyrics });
     // A pasted lead sheet (#181) is the score; previewing would plan a new one
     // and throw it away.
     if (yue2Mode && yue2PreviewScore && !yue2AbcSupplied) {
       void planScore(params, false);
       return;
     }
-    onGenerate(params);
+    onGenerate(params, createIntent(params));
   };
 
+  const createIntent = (legacyParams: Partial<GenerationParams>): CreateIntent => ({
+    kind: 'create',
+    params: { ...legacyParams, caption, lyrics },
+    compose,
+    ...(mm3SourcesActive ? { captionSource: {
+      engine: 'minimax-m3' as const,
+      customCaption: mm3Sources!.customCaption,
+      selection: { mode: mm3Sources!.mode, selectedTitle: mm3Sources!.selectedTitle },
+      tracks: mm3Sources!.tracks,
+    } } : yue2SourcesActive ? { captionSource: {
+      engine: 'yue2' as const,
+      datasetId: yue2Ds.datasetId,
+      adapterInForce: !!yue2AdapterPath,
+      selection: { mode: yue2Selection.mode, selectedName: yue2Selection.selectedName },
+    } } : {}),
+  });
+
+  // YuE2: dataset, caption source and tag chips, folded under the Style
+  // Description (ContentSection's afterStyle slot).
+  const yue2DatasetFold = yue2DatasetBlockVisible ? (
+    <Fold title={t('createPanel.yue2DatasetCaptionOptions', 'Dataset Caption Options')} storageKey="hs-create-fold-datasetCaption" defaultOpen>
+      <div className="space-y-1">
+        <ParamLabel
+          label={t('createPanel.yue2Dataset', 'Dataset')}
+          className="text-xs font-medium text-zinc-500 uppercase tracking-wider block"
+          info={t('createPanel.yue2DatasetInfo', "Picks which training dataset's captions the Caption source picker below offers. Defaults to the dataset the active YuE2 adapter was trained on. None turns the picker off and leaves the caption box as plain free text.")}
+        />
+        <StyledSelect
+          value={yue2DatasetChoice}
+          onChange={setYue2DatasetPick}
+          accent="pink"
+          size="sm"
+          placeholder={t('createPanel.yue2DatasetNone', 'None')}
+          options={[
+            { value: '', label: t('createPanel.yue2DatasetNone', 'None') },
+            ...yue2DatasetOptions.map(d => ({
+              value: d.id, label: d.name || d.albumName || d.slug, hint: d.slug,
+            })),
+          ]}
+        />
+
+        {!!yue2AdapterPath && !yue2Ds.datasetId && !yue2SourcePending && (
+          <p className="text-[11px] text-zinc-500">
+            {t('createPanel.yue2NoLinkedCaptions', 'This adapter has no linked training captions.')}
+          </p>
+        )}
+
+        {yue2SourcesActive && yue2Resolved && (
+          <>
+            <ParamLabel
+              label={t('createPanel.yue2CaptionSource', 'Caption source')}
+              className="text-xs font-medium text-zinc-500 uppercase tracking-wider block pt-1"
+              info={t('createPanel.yue2CaptionSourceInfo', "Chooses which caption this song actually sends to YuE2. Custom uses the caption typed in the Style Description box above. Automatic from dataset picks the dataset track whose BPM is closest to this song's and uses that track's own caption. A named Track locks in that specific track's caption instead — every dataset caption is one the adapter actually trained on, so picking one steers towards that track rather than the album's average.")}
+            />
+            <StyledSelect
+              accent="pink"
+              size="sm"
+              className="w-full"
+              value={yue2Resolved.mode === 'track' && yue2Resolved.fromName ? `track:${yue2Resolved.fromName}` : yue2Resolved.mode}
+              onChange={setYue2CaptionMode}
+              options={[
+                { value: 'custom', label: t('createPanel.yue2CaptionCustom', 'Custom (the caption above)') },
+                {
+                  value: 'auto',
+                  label: `${t('createPanel.yue2CaptionAuto', 'Automatic from dataset')}${(() => {
+                    const auto = pickNearestYue2Track(yue2Tracks, bpm);
+                    return auto ? ` (${t('createPanel.yue2CaptionNearestTempo', 'nearest tempo')}: ${auto.name})` : '';
+                  })()}`,
+                },
+                ...yue2Tracks.map(track => ({
+                  value: `track:${track.name}`,
+                  label: `${t('createPanel.yue2CaptionTrack', 'Track')}: ${track.name}${yue2TrackBpm(track) ? ` · ${yue2TrackBpm(track)} BPM` : ''}`,
+                })),
+              ]}
+            />
+            {!yue2SourcePending && yue2CaptionTags.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                <ParamLabel
+                  label={t('createPanel.yue2TagsFrom', { source: yue2TagSourceName, defaultValue: 'Tags from {{source}}' })}
+                  className="text-xs font-medium text-zinc-500 uppercase tracking-wider block"
+                  info={t('createPanel.yue2TagsInfo', 'These phrases come from the selected training dataset. Click a tag to add it to your Custom caption; click it again to remove it.')}
+                />
+                <div className="flex flex-wrap gap-1.5 max-h-[7.75rem] overflow-y-auto pr-1">
+                  {yue2CaptionTags.map(phrase => {
+                    const selected = hasCaptionTag(phrase);
+                    return (
+                      <button
+                        key={phrase.toLocaleLowerCase()}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => toggleCaptionTag(phrase)}
+                        className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors ${selected
+                          ? 'border-pink-400/60 bg-pink-500/20 text-pink-200'
+                          : 'border-pink-500/25 bg-pink-500/5 text-zinc-400 hover:border-pink-400/50 hover:text-pink-200'}`}
+                      >
+                        {phrase}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            {yue2CaptionLocked && (
+              <p className="text-[10px] text-emerald-400/70">
+                {t('createPanel.yue2CaptionFromTrack', 'From dataset track')}: {yue2Resolved.fromName}
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </Fold>
+  ) : null;
+
   return (
-    <div className="h-full flex flex-col bg-zinc-50 dark:bg-suno">
+    <div className="h-full min-w-0 flex flex-col bg-zinc-50 dark:bg-suno">
+      <TrainingDraftBar />
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-200 dark:border-white/5">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-zinc-200 dark:border-white/5">
         <h2 className="text-lg font-bold text-zinc-900 dark:text-white">{t('createPanel.title')}</h2>
         <div className="flex items-center gap-2">
           <button
@@ -486,7 +609,12 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
       </div>
 
       {/* Scrollable body — now much slimmer */}
-      <div className="flex-1 overflow-y-auto hide-scrollbar px-4 py-3 space-y-1">
+      {/* overflow-x-hidden alone still lets focus/shift-wheel set scrollLeft, which slides the
+          form's left edge out of view (looks like it is under the sidebar rail). Pin it to 0. */}
+      <div
+        className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden hide-scrollbar px-4 py-3 space-y-1"
+        onScroll={(e) => { if (e.currentTarget.scrollLeft !== 0) e.currentTarget.scrollLeft = 0; }}
+      >
         <ContentSection
           caption={caption} onCaptionChange={setCaption}
           lyrics={lyrics} onLyricsChange={setLyrics}
@@ -501,6 +629,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
           autoExpand={autoExpand} onAutoExpandChange={setAutoExpand}
           wildcardSeed={gp.randomSeed ? undefined : gp.seed}
           captionReadOnly={mm3CaptionLocked || yue2CaptionLocked}
+          yue2Mode={yue2Ui}
+          afterStyle={yue2DatasetFold}
         />
 
         {/* MM3 only, and only for a song sent here from Lyric Studio: which
@@ -564,98 +694,6 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
             The Dataset row is always reachable in YuE2 mode, even before any
             dataset is chosen, so switching backends never hides the control
             below the fold the way #163 did for the caption source itself. */}
-        {yue2DatasetBlockVisible && (
-          <div className="pt-2 space-y-1">
-            <ParamLabel
-              label={t('createPanel.yue2Dataset', 'Dataset')}
-              className="text-xs font-medium text-zinc-500 uppercase tracking-wider block"
-              info={t('createPanel.yue2DatasetInfo', "Picks which training dataset's captions the Caption source picker below offers. Defaults to the dataset the active YuE2 adapter was trained on. None turns the picker off and leaves the caption box as plain free text.")}
-            />
-            <StyledSelect
-              value={yue2DatasetChoice}
-              onChange={setYue2DatasetPick}
-              accent="pink"
-              size="sm"
-              placeholder={t('createPanel.yue2DatasetNone', 'None')}
-              options={[
-                { value: '', label: t('createPanel.yue2DatasetNone', 'None') },
-                ...yue2DatasetOptions.map(d => ({
-                  value: d.id, label: d.name || d.albumName || d.slug, hint: d.slug,
-                })),
-              ]}
-            />
-
-            {!!yue2AdapterPath && !yue2Ds.datasetId && !yue2SourcePending && (
-              <p className="text-[11px] text-zinc-500">
-                {t('createPanel.yue2NoLinkedCaptions', 'This adapter has no linked training captions.')}
-              </p>
-            )}
-
-            {yue2SourcesActive && yue2Resolved && (
-              <>
-                <ParamLabel
-                  label={t('createPanel.yue2CaptionSource', 'Caption source')}
-                  className="text-xs font-medium text-zinc-500 uppercase tracking-wider block pt-1"
-                  info={t('createPanel.yue2CaptionSourceInfo', "Chooses which caption this song actually sends to YuE2. Custom uses the caption typed in the Style Description box above. Automatic from dataset picks the dataset track whose BPM is closest to this song's and uses that track's own caption. A named Track locks in that specific track's caption instead — every dataset caption is one the adapter actually trained on, so picking one steers towards that track rather than the album's average.")}
-                />
-                <StyledSelect
-                  accent="pink"
-                  size="sm"
-                  className="w-full"
-                  value={yue2Resolved.mode === 'track' && yue2Resolved.fromName ? `track:${yue2Resolved.fromName}` : yue2Resolved.mode}
-                  onChange={setYue2CaptionMode}
-                  options={[
-                    { value: 'custom', label: t('createPanel.yue2CaptionCustom', 'Custom (the caption above)') },
-                    {
-                      value: 'auto',
-                      label: `${t('createPanel.yue2CaptionAuto', 'Automatic from dataset')}${(() => {
-                        const auto = pickNearestYue2Track(yue2Tracks, bpm);
-                        return auto ? ` (${t('createPanel.yue2CaptionNearestTempo', 'nearest tempo')}: ${auto.name})` : '';
-                      })()}`,
-                    },
-                    ...yue2Tracks.map(track => ({
-                      value: `track:${track.name}`,
-                      label: `${t('createPanel.yue2CaptionTrack', 'Track')}: ${track.name}${yue2TrackBpm(track) ? ` · ${yue2TrackBpm(track)} BPM` : ''}`,
-                    })),
-                  ]}
-                />
-                {!yue2SourcePending && yue2CaptionTags.length > 0 && (
-                  <div className="space-y-1.5 pt-1">
-                    <ParamLabel
-                      label={t('createPanel.yue2TagsFrom', { source: yue2TagSourceName, defaultValue: 'Tags from {{source}}' })}
-                      className="text-xs font-medium text-zinc-500 uppercase tracking-wider block"
-                      info={t('createPanel.yue2TagsInfo', 'These phrases come from the selected training dataset. Click a tag to add it to your Custom caption; click it again to remove it.')}
-                    />
-                    <div className="flex flex-wrap gap-1.5">
-                      {yue2CaptionTags.map(phrase => {
-                        const selected = hasCaptionTag(phrase);
-                        return (
-                          <button
-                            key={phrase.toLocaleLowerCase()}
-                            type="button"
-                            aria-pressed={selected}
-                            onClick={() => toggleCaptionTag(phrase)}
-                            className={`rounded-full border px-2.5 py-1 text-[11px] transition-colors ${selected
-                              ? 'border-pink-400/60 bg-pink-500/20 text-pink-200'
-                              : 'border-pink-500/25 bg-pink-500/5 text-zinc-400 hover:border-pink-400/50 hover:text-pink-200'}`}
-                          >
-                            {phrase}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-                {yue2CaptionLocked && (
-                  <p className="text-[10px] text-emerald-400/70">
-                    {t('createPanel.yue2CaptionFromTrack', 'From dataset track')}: {yue2Resolved.fromName}
-                  </p>
-                )}
-              </>
-            )}
-          </div>
-        )}
-
         {/* MM3 only: turn the plain-English caption into a Structured Caption.
             Hidden while a dataset caption is locked in — composing would only
             overwrite a box the user cannot edit. */}
@@ -678,8 +716,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
           vocalGender={vocalGender} onVocalGenderChange={setVocalGender}
         />
 
-        {/* Latent import */}
-        <LatentImport
+        {/* Latent import — only ACE-Step reads a source latent */}
+        {activeBackendId === 'ace' && <LatentImport
           latentUrl={sourceLatentUrl}
           onLatentLoaded={(url, meta) => {
             setSourceLatentUrl(url);
@@ -689,7 +727,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
             if (meta.caption) setCaption(meta.caption);
           }}
           onClear={() => setSourceLatentUrl('')}
-        />
+        />}
 
         {/* Cover Art prompt override (only when enabled) */}
         <CoverArtSubjectSection />
@@ -717,6 +755,9 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
             </>
           )}
         </button>
+        <Fold title={t('studioDrafts.title', 'Drafts')} storageKey="hs-create-fold-drafts">
+          <StudioDraftPicker control={draft} textKey="hs-title" apply={applyDraft} refuse={refuseDraft} namedSave={yue2Ui} inline />
+        </Fold>
       </div>
 
       {/* AI Generate Modal */}
@@ -738,7 +779,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
           const { params, data } = scorePreview;
           setScorePreview({ open: false, params: null, data: null, error: null });
           if (!params || !data) return;
-          onGenerate({ ...params, yue2Abc: data.abc, seed: data.seed, randomSeed: false } as Partial<GenerationParams>);
+          const approved = { ...params, yue2Abc: data.abc, seed: data.seed, randomSeed: false } as Partial<GenerationParams>;
+          onGenerate(approved, createIntent(approved));
         }}
       />
     </div>

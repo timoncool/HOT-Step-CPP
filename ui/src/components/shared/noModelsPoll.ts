@@ -1,0 +1,8 @@
+// The engine's ready flag is set right after spawn, before the model scan, so a
+// health read can say ready=true and the next one noModels=true. Never stop
+// polling on ready: the banner has to catch that later transition.
+import { pollWhile } from '../../queries/contract';
+import type { HealthResponse } from '../../../../server/src/contracts/health';
+
+export const NO_MODELS_POLL_MS = 5000;
+export const noModelsRefetchInterval = pollWhile<HealthResponse>(() => true, NO_MODELS_POLL_MS);

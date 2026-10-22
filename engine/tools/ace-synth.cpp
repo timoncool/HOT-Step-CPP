@@ -252,6 +252,78 @@ static int run_kron_selftest() {
     return fails ? 1 : 0;
 }
 
+// ─── Output sanity check (--check) ───────────────────────────────────────────
+// Runs on the raw float buffer, before audio_write: the WAV encoder turns
+// NaN/Inf into 0 and clamps to [-1,1], so a broken render would otherwise
+// reach disk as quiet, legal-looking audio. Prints the measured values and
+// returns false if any check fails. Thresholds: any non-finite or subnormal
+// sample (a denormal tail stalls DSP downstream); peak
+// below -60 dBFS (digital silence); |mean| above 0.02 on either channel (DC);
+// more than 0.1% of samples past full scale (clipping on write).
+// HOTSTEP_CHECK_INJECT is a comma list, one entry per batch track
+// (none|nan|subnormal|silence|dc|clip), that corrupts the buffer first to prove each
+// check can fail (tools/engine-smoke.mjs --self-test).
+static bool check_audio(int b, AceAudio & a) {
+    const int64_t n       = a.n_samples;
+    std::string   inj_s;
+    if (const char * env = std::getenv("HOTSTEP_CHECK_INJECT")) {
+        std::string list = std::string(env) + ",";
+        for (int k = 0, pos = 0; pos < (int) list.size(); k++) {
+            int next = (int) list.find(',', pos);
+            if (k == b) { inj_s = list.substr(pos, next - pos); break; }
+            pos = next + 1;
+        }
+    }
+    if (!inj_s.empty() && inj_s != "none") {
+        const char * inj = inj_s.c_str();
+        fprintf(stderr, "[Check Batch%d] injecting '%s'\n", b, inj);
+        for (int64_t i = 0; i < 2 * n; i++) {
+            float & x = a.samples[i];
+            if (!strcmp(inj, "nan") && i == n / 2) x = NAN;
+            if (!strcmp(inj, "subnormal") && i == n / 2) x = 1e-40f;
+            if (!strcmp(inj, "silence")) x = 0.0f;
+            if (!strcmp(inj, "dc")) x = x * 0.5f + 0.1f;
+            if (!strcmp(inj, "clip")) x = x * 1000.0f;
+        }
+    }
+    int64_t       nonfin  = 0, subn = 0, over = 0;
+    double        sum[2]  = { 0.0, 0.0 }, sq = 0.0;
+    float         peak    = 0.0f;
+    for (int c = 0; c < 2; c++) {
+        for (int64_t i = 0; i < n; i++) {
+            float x = a.samples[c * n + i];
+            if (!std::isfinite(x)) { nonfin++; continue; }
+            if (std::fpclassify(x) == FP_SUBNORMAL) subn++;
+            float ax = fabsf(x);
+            if (ax > peak) peak = ax;
+            if (ax > 1.0f) over++;
+            sum[c] += x;
+            sq += (double) x * x;
+        }
+    }
+    const double total    = n > 0 ? 2.0 * (double) n : 1.0;
+    const double dc_l     = n > 0 ? sum[0] / (double) n : 0.0;
+    const double dc_r     = n > 0 ? sum[1] / (double) n : 0.0;
+    const double rms      = sqrt(sq / total);
+    const double over_pct = 100.0 * (double) over / total;
+    const double peak_db  = peak > 0.0f ? 20.0 * log10((double) peak) : -999.0;
+
+    const bool f_nan  = nonfin > 0;
+    const bool f_subn = subn > 0;
+    const bool f_sil  = n == 0 || peak_db < -60.0;
+    const bool f_dc   = fabs(dc_l) > 0.02 || fabs(dc_r) > 0.02;
+    const bool f_clip = over_pct > 0.1;
+    const bool ok     = !(f_nan || f_subn || f_sil || f_dc || f_clip);
+    fprintf(stderr,
+            "[Check Batch%d] %s samples=%lld nonfinite=%lld%s subnormal=%lld%s peak=%.4f (%.1f dBFS)%s rms=%.5f "
+            "dc_l=%+.5f dc_r=%+.5f%s over_fs=%lld (%.4f%%)%s\n",
+            b, ok ? "PASS" : "FAIL", (long long) n, (long long) nonfin, f_nan ? " [FAIL]" : "", (long long) subn,
+            f_subn ? " [FAIL]" : "", peak, peak_db,
+            f_sil ? " [FAIL silence]" : "", rms, dc_l, dc_r, f_dc ? " [FAIL dc]" : "", (long long) over, over_pct,
+            f_clip ? " [FAIL clip]" : "");
+    return ok;
+}
+
 static void usage(const char * prog) {
     AceSynthParams d;
     ace_synth_default_params(&d);
@@ -279,7 +351,9 @@ static void usage(const char * prog) {
             "  --no-fa                 Disable flash attention\n"
             "  --no-batch-cfg          Split DiT CFG into two separate forwards\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
-            "  --dump <dir>            Dump intermediate tensors\n",
+            "  --dump <dir>            Dump intermediate tensors\n"
+            "  --check                 Check output for NaN/Inf, silence, DC and clipping;\n"
+            "                          exit 2 if any track fails\n",
             prog, d.vae_chunk, d.vae_overlap);
 }
 
@@ -335,6 +409,7 @@ int main(int argc, char ** argv) {
     int                       vae_chunk      = params.vae_chunk;
     int                       vae_overlap    = params.vae_overlap;
     int                       mp3_kbps       = 128;
+    bool                      check          = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--request")) {
@@ -356,6 +431,8 @@ int main(int argc, char ** argv) {
             use_fa = false;
         } else if (!strcmp(argv[i], "--no-batch-cfg")) {
             use_batch_cfg = false;
+        } else if (!strcmp(argv[i], "--check")) {
+            check = true;
         } else if (!strcmp(argv[i], "--clamp-fp16")) {
             clamp_fp16 = true;
         } else if (!strcmp(argv[i], "--vae-chunk") && i + 1 < argc) {
@@ -575,6 +652,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < sbs; i++) {
             AceRequest r = reqs[ri];
             r.seed       = base_seed + i;
+            if (r.seed_b >= 0) r.seed_b += i;
             groups[0].push_back(r);
             all_basenames[off + i]     = basenames[ri];
             all_synth_indices[off + i] = i;
@@ -605,15 +683,22 @@ int main(int argc, char ** argv) {
     }
 
     // Write output files
+    bool check_failed = false, write_failed = false;
     for (int b = 0; b < (int) all_audio.size(); b++) {
         if (!all_audio[b].samples) {
+            fprintf(stderr, "[Ace-Synth Batch%d] FATAL: no audio produced\n", b);
+            write_failed = true;
             continue;
+        }
+        if (check && !check_audio(b, all_audio[b])) {
+            check_failed = true;
         }
         const char * ext = is_mp3 ? ".mp3" : ".wav";
         char         out_path[1024];
         snprintf(out_path, sizeof(out_path), "%s%d%s", all_basenames[b].c_str(), all_synth_indices[b], ext);
         if (!audio_write(out_path, all_audio[b].samples, all_audio[b].n_samples, 48000, mp3_kbps, wav_fmt)) {
             fprintf(stderr, "[Ace-Synth Batch%d] FATAL: failed to write %s\n", b, out_path);
+            write_failed = true;
         }
         ace_audio_free(&all_audio[b]);
     }
@@ -622,6 +707,13 @@ int main(int argc, char ** argv) {
     free(ref_interleaved);
     ace_synth_free(ctx);
     store_free(store);
+    if (write_failed) {
+        return 1;
+    }
+    if (check_failed) {
+        fprintf(stderr, "[Ace-Synth] CHECK FAILED\n");
+        return 2;
+    }
     fprintf(stderr, "[Ace-Synth] All done\n");
     return 0;
 }

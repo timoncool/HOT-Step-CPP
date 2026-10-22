@@ -1,7 +1,8 @@
+import { useQueries } from '@tanstack/react-query';
+import { changed, snapshotOptions } from '../../queries/cover-lyrics/reads';
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Loader2, Sparkles, ChevronDown, ChevronRight, Check, Disc3, FileText, CheckSquare, Square } from 'lucide-react';
-import { lireekApi } from '../../services/lireekApi';
 import type { LyricsSet, SongLyric, Profile } from '../../services/lireekApi';
 import { loadSelections } from './ProviderSelector';
 
@@ -44,26 +45,11 @@ export const CuratedProfileModal: React.FC<CuratedProfileModalProps> = ({
     }
   }, [isOpen]);
 
-  const [fullAlbums, setFullAlbums] = useState<LyricsSet[]>([]);
-  const [loadingAlbums, setLoadingAlbums] = useState(false);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const load = async () => {
-      setLoadingAlbums(true);
-      try {
-        const results = await Promise.all(
-          albums.map(a => lireekApi.getLyricsSet(a.id))
-        );
-        setFullAlbums(results);
-      } catch (err) {
-        console.error('Failed to load album details:', err);
-      } finally {
-        setLoadingAlbums(false);
-      }
-    };
-    load();
-  }, [isOpen, albums]);
+  const albumQueries = useQueries({ queries: albums.map(album => ({
+    ...snapshotOptions<LyricsSet>('lireek', `/lireek/lyrics-sets/${album.id}`), enabled: isOpen,
+  })) });
+  const fullAlbums = albumQueries.flatMap(query => query.data ? [query.data] : []);
+  const loadingAlbums = albumQueries.some(query => query.isPending);
 
   const toggleSong = useCallback((albumId: number, songIdx: number) => {
     setSelections(prev => {
@@ -149,6 +135,7 @@ export const CuratedProfileModal: React.FC<CuratedProfileModalProps> = ({
                   } else if (parsed.result) {
                     setBuilding(false);
                     showToast('Curated profile built successfully!');
+                    await changed('lireek');
                     onComplete(parsed.result.lyrics_set, parsed.result.profile);
                     onClose();
                     return;
@@ -165,6 +152,7 @@ export const CuratedProfileModal: React.FC<CuratedProfileModalProps> = ({
         const data = await res.json();
         setBuilding(false);
         showToast('Curated profile built successfully!');
+        await changed('lireek');
         onComplete(data.lyrics_set, data.profile);
         onClose();
       }

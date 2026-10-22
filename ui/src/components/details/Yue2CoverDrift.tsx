@@ -14,8 +14,8 @@ function expectedSpan(value: { start: number | null; end: number }): string {
 }
 
 const unscoredText: Record<NonNullable<Yue2CoverDriftResult['sections'][number]['unscoredReason']>, string> = {
-  no_matching_lyric_tag: 'No matching sung tag',
-  no_vocal_note: 'No vocal note',
+  no_matching_lyric_tag: 'Instrumental / N/A: no lyrics',
+  no_vocal_note: 'Instrumental / N/A: no vocal note',
   no_aligned_words: 'No aligned words',
   low_word_confidence: 'Low word confidence',
   mix_stem_disagreement: 'Mix/stem disagreement',
@@ -32,19 +32,25 @@ const Yue2CoverDriftBody: React.FC<{ song: Song }> = ({ song }) => {
   const { token } = useAuth();
   const params = song.generationParams || song.generation_params || {};
   const cached = params.yue2CoverDrift as Yue2CoverDriftResult | undefined;
-  const saved = cached?.metricVersion === 4 ? cached : undefined;
-  const [result, setResult] = React.useState<Yue2CoverDriftResult | null>(measuredThisSession.get(song.id) ?? saved ?? null);
+  const saved = cached?.metricVersion === 5 ? cached : undefined;
+  const session = measuredThisSession.get(song.id);
+  const [result, setResult] = React.useState<Yue2CoverDriftResult | null>(
+    (session?.metricVersion === 5 ? session : undefined) ?? saved ?? null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState('');
 
   if (!params.yue2Cover || !params.yue2Abc) return null;
+
+  const skipped = (section: Yue2CoverDriftResult['sections'][number]) =>
+    section.unscoredReason === 'no_vocal_note' || section.unscoredReason === 'no_matching_lyric_tag';
+  const skippedCount = result?.sections.filter(skipped).length ?? 0;
 
   const measure = async () => {
     if (!token) return;
     setBusy(true);
     setError('');
     try {
-      const measured = await yue2CoverApi.measureDrift(song.id, token);
+      const measured = await yue2CoverApi.measureDrift(song.id);
       measuredThisSession.set(song.id, measured);
       setResult(measured);
     }
@@ -71,7 +77,8 @@ const Yue2CoverDriftBody: React.FC<{ song: Song }> = ({ song }) => {
           ? 'Source tempo fallback: rendered score had free tempo' : 'Rendered score tempo'}
       </p>
       <p className="text-zinc-500">{result.stemChecked ? 'Mix and vocal stem compared' : 'Mix only; vocal stem not checked'}
-        {' · '}{result.sections.filter(section => section.offsetBars !== null).length}/{result.sections.length} sections scored
+        {' · '}{result.sections.filter(section => section.offsetBars !== null).length}/{result.sections.length - skippedCount} vocal sections scored
+        {skippedCount > 0 && <> · {skippedCount} instrumental / N/A</>}
       </p>
       {result.sectionWarning && <p className="text-amber-700 dark:text-amber-300">{result.sectionWarning}</p>}
       {result.unmatchedLyricBlocks.length > 0 && <p className="text-amber-700 dark:text-amber-300">
@@ -87,7 +94,7 @@ const Yue2CoverDriftBody: React.FC<{ song: Song }> = ({ song }) => {
             <td className="py-1 pr-2">{section.scoreLabel} · {section.startBar}–{section.endBar}{section.lyricTag && section.lyricTag.toLowerCase() !== section.scoreLabel.toLowerCase() ? ` / [${section.lyricTag}]` : ''}</td>
             <td className="pr-2">{expectedSpan(section.expected)}</td>
             <td className="pr-2">{span(section.boundary)}</td>
-            <td className="pr-2">{span(section.sung)}</td>
+            <td className="pr-2">{skipped(section) ? 'N/A' : span(section.sung)}</td>
             <td>{section.offsetBars === null
               ? section.unscoredReason ? unscoredText[section.unscoredReason] : 'Unscored'
               : `${section.offsetBars >= 0 ? '+' : ''}${section.offsetBars.toFixed(2)} bars`}</td>

@@ -1,5 +1,5 @@
 import abcjs from 'abcjs';
-import { barsIn, isVocalVoice, scoreBarSegments } from './scoreHealth.js';
+import { barsIn, isScoreVocalVoice, scoreBarSegments, vocalVoiceIds } from './scoreHealth.js';
 
 export interface ScoreClockBar {
   start: number;
@@ -13,6 +13,7 @@ export interface ScoreClockBar {
 
 /** Walk the active SheetSage M:/Q: fields over Vocal bars. */
 export function scoreBarClock(abc: string): ScoreClockBar[] {
+  const vocalIds = vocalVoiceIds(abc);
   const bars: ScoreClockBar[] = [];
   let meter = '';
   let meterWholeNotes = 0;
@@ -40,7 +41,7 @@ export function scoreBarClock(abc: string): ScoreClockBar[] {
       bpm = Number(match[3]);
       continue;
     }
-    if (line.startsWith('V:')) { inVocal = isVocalVoice(line); continue; }
+    if (line.startsWith('V:')) { inVocal = isScoreVocalVoice(line, vocalIds); continue; }
     if (/^[A-Za-z]:/.test(line) || !inVocal) continue;
     if (!meterWholeNotes || !bpm || !beatWholeNotes) throw new Error('Vocal score lacks an active M: meter or Q: tempo.');
     for (const segment of scoreBarSegments(line)) {

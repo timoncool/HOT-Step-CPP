@@ -5,6 +5,10 @@ description: Maps every HOT-Step CPP feature to its route file, service, UI fold
 
 # Project Map & Navigation — HOT-Step CPP
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 HOT-Step CPP is a desktop app for local AI music generation (caption + lyrics in, stereo 48 kHz audio out). It is a heavily-extended fork of acestep.cpp, a C++/GGML port of ACE-Step 1.5. Three tiers:
 
 1. **Engine** — C++17/CUDA/GGML in `engine/`. Pipeline: **LM** (Qwen3 language model that emits `audio_codes`) → **DiT** (Diffusion Transformer, the flow-matching synth stage) → **VAE** (decodes latents to audio).
@@ -37,8 +41,8 @@ dev.bat (agents — run detached, app at http://localhost:3000)
   (LAUNCH.bat = end-user prod launcher; agents don't use it)
   └─ Node server  server/src/index.ts → Express :3001 (host 0.0.0.0, config.ts:186-187)
        ├─ serves prebuilt ui/dist/ with SPA fallback (index.ts:123-140)
-       ├─ /api/* routes → SQLite server/data/hotstep.db
-       ├─ /audio → server/data/audio/, /references → server/data/references/ (index.ts:98-121)
+       ├─ /api/* routes → SQLite <data root>/library/hotstep.db
+       ├─ /audio → <data root>/library/audio/, /references → <data root>/library/references/ (index.ts:98-121)
        └─ spawns child: ace-server.exe (C++ engine) on 127.0.0.1:8085 (config.ts:102-103)
 Dev mode adds Vite on :3000 (HMR); vite.config.ts proxies /api, /audio, /references → 127.0.0.1:3001.
 tsx watch auto-restarts the Node server on server-code changes.
@@ -110,10 +114,10 @@ API mounts are all registered in `server/src/index.ts:72-95`. Route files in `se
 
 ## Data layer
 
-- **The live data root is `server/data/`, NOT repo-root `data/`.** `DATA_DIR` in `.env` resolves relative to `server/` (`config.ts:192`: `path.resolve(__dirname, '..', DATA_DIR)`). A stale legacy `data/` directory exists at repo root with a plausible-looking but outdated `hotstep.db` — do not trust it, and do not delete it without asking.
-- SQLite: `server/data/hotstep.db` (better-sqlite3). Tables (`server/src/db/database.ts:39-191`): users, songs, playlists, playlist_songs, artists, lyrics_sets, profiles, generations, settings, album_presets, audio_generations, builder_projects, builder_sections. **Lireek tables are unified into hotstep.db** (`index.ts:20`) — `config.lireek.dbPath` pointing at `lireek.db` (`config.ts:225-227`) is vestigial; don't trust it.
-- Files (all under `server/data/`): `audio/` (outputs), `references/` (mastering refs), `stems/<jobId>/`, `vst/{states,chain.json}`, `lyrics/` (exports). **Never delete generated audio outputs or experiment artifacts on your own judgment — the user verifies results by ear; ask first.**
-- Logs: `logs/YYYY-MM-DD_HH-MM-SS/{ace_engine.log, node_console.log, generations/gen_<uuid>_<task>.log}`. Newest folder = current session. Generation failure → matching `gen_*.log` first, then cross-ref the other two.
+- **The live data root is `<data root>/library/`, NOT repo-root `data/`.** `DATA_DIR` in `.env` resolves relative to `server/` (`config.ts:192`: `path.resolve(__dirname, '..', DATA_DIR)`). A stale legacy `data/` directory exists at repo root with a plausible-looking but outdated `hotstep.db` — do not trust it, and do not delete it without asking.
+- SQLite: `<data root>/library/hotstep.db` (better-sqlite3). Tables (`server/src/db/database.ts:39-191`): users, songs, playlists, playlist_songs, artists, lyrics_sets, profiles, generations, settings, album_presets, audio_generations, builder_projects, builder_sections. **Lireek tables are unified into hotstep.db** (`index.ts:20`) — `config.lireek.dbPath` pointing at `lireek.db` (`config.ts:225-227`) is vestigial; don't trust it.
+- Files (all under `<data root>/library/`): `audio/` (outputs), `references/` (mastering refs), `stems/<jobId>/`, `vst/{states,chain.json}`, `lyrics/` (exports). **Never delete generated audio outputs or experiment artifacts on your own judgment — the user verifies results by ear; ask first.**
+- Logs: `<data root>/logs/YYYY-MM-DD_HH-MM-SS/{ace_engine.log, node_console.log, generations/gen_<uuid>_<task>.log}`. Newest folder = current session. Generation failure → matching `gen_*.log` first, then cross-ref the other two.
 
 ## Exact commands (PowerShell)
 
@@ -132,7 +136,7 @@ powershell -File engine\verify-hooks.ps1   # After any upstream sync
 
 | Symptom | Cause | Fix / first file |
 |---|---|---|
-| `[ace-server] Restarting in 3 seconds... (crash N/3)` then giving up | Missing DLL next to ace-server.exe or bad model | `logs/<newest>/ace_engine.log`; respawn logic `index.ts:284-308` |
+| `[ace-server] Restarting in 3 seconds... (crash N/3)` then giving up | Missing DLL next to ace-server.exe or bad model | `<data root>/logs/<newest>/ace_engine.log`; respawn logic `index.ts:284-308` |
 | Solver/scheduler/guidance UI options silently do nothing | Upstream sync overwrote the `hot-step-sampler.h` include in `engine/src/pipeline-synth-ops.cpp:9`. **Compiles fine — silent.** | Run `engine\verify-hooks.ps1`; restore the include |
 | Compile error in model-store.h / dit.h after sync | Lost `hot-step-params.h` include (`model-store.h:53`) or `adapter-merge.h`+`adapter-runtime.h` (`dit.h:11,13`) | Restore includes; `verify-hooks.ps1` confirms |
 | Generation stuck ~2 min then fails "stalled" | `pollUntilDone` stall watchdog (`generate.ts:107,128`) | Check `gen_*.log` for last engine phase; `adapter_precompute` ~17 s LoKr cold-start is normal |

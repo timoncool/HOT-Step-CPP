@@ -10,13 +10,39 @@ import fs from 'fs';
 import {
   ENV_FILE_PATH,
   EXPOSED_ENV_KEYS,
+  formatEnvValue,
+  parseEnvValue,
   RESTART_REQUIRED_KEYS,
   reloadEnvConfig,
   config,
 } from '../config.js';
 import { listGpus } from '../services/gpuDevices.js';
+import { validateDownloadDir } from '../services/downloadSave.js';
+import type { EnvResponse, EnvUpdateResponse, GpusResponse } from '../contracts/settings.js';
+import { getDataLocation, getBusyBlockers, previewOperation, scheduleOperation, cancelPending, registerBusyCheck } from '../dataroot/pointer.js';
+import { listJobs } from '../services/training/labelingQueue.js';
+import { gpuLaneBusy, gpuLaneDepth } from '../services/generation/gpuLane.js';
+import { createDataFolderHandlers } from './settingsDataFolder.js';
+import { requestWorkerRestart } from './shutdown.js';
 
 const router = Router();
+
+registerBusyCheck('training', () => listJobs().filter(j => j.status === 'queued' || j.status === 'running')
+  .map(j => `Training ${j.id}: ${j.status}`));
+registerBusyCheck('gpu-lane', () => gpuLaneBusy() || gpuLaneDepth() > 0 ? ['GPU work is running or queued'] : []);
+
+const dataFolder = createDataFolderHandlers({
+  location: getDataLocation,
+  blockers: getBusyBlockers,
+  preview: (kind, target) => previewOperation(kind, target, config.data.dbPath),
+  schedule: (kind, target) => scheduleOperation(kind, target, config.data.dbPath),
+  cancel: cancelPending,
+  restart: requestWorkerRestart,
+});
+router.get('/data-folder', dataFolder.location);
+router.post('/data-folder/preview', dataFolder.preview);
+router.post('/data-folder/schedule', dataFolder.schedule);
+router.post('/data-folder/cancel', dataFolder.cancel);
 
 /** Set of exposed keys for fast lookup */
 const exposedSet = new Set<string>(EXPOSED_ENV_KEYS);
@@ -87,14 +113,14 @@ router.get('/env', (_req, res) => {
     // Override with explicit .env values
     for (const line of lines) {
       if (line.key && exposedSet.has(line.key)) {
-        values[line.key] = line.value ?? '';
+        values[line.key] = parseEnvValue(line.value ?? '');
       }
     }
 
     res.json({
       values,
       restartKeys: [...RESTART_REQUIRED_KEYS],
-    });
+    } satisfies EnvResponse);
   } catch (err: any) {
     console.error('[Settings] Failed to read .env:', err.message);
     res.status(500).json({ error: err.message });
@@ -124,8 +150,16 @@ router.post('/env', (req, res) => {
     }
 
     if (Object.keys(safeUpdates).length === 0) {
-      res.json({ updated: [], restartRequired: false });
+      res.json({ updated: [], restartRequired: false } satisfies EnvUpdateResponse);
       return;
+    }
+
+    // A bad download folder is refused here, not discovered at the first download.
+    if (safeUpdates.DOWNLOAD_DIR?.trim()) {
+      try { validateDownloadDir(safeUpdates.DOWNLOAD_DIR.trim()); } catch (err: any) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
     }
 
     // Read current .env
@@ -140,7 +174,7 @@ router.post('/env', (req, res) => {
     const newLines = lines.map((line) => {
       if (line.key && line.key in safeUpdates) {
         updatedKeys.add(line.key);
-        return { ...line, raw: `${line.key}=${safeUpdates[line.key]}` };
+        return { ...line, raw: `${line.key}=${formatEnvValue(safeUpdates[line.key])}` };
       }
       return line;
     });
@@ -148,7 +182,7 @@ router.post('/env', (req, res) => {
     // Append any keys that weren't already in the file
     for (const [key, value] of Object.entries(safeUpdates)) {
       if (!updatedKeys.has(key)) {
-        newLines.push({ key, value, raw: `${key}=${value}` });
+        newLines.push({ key, value, raw: `${key}=${formatEnvValue(value)}` });
         updatedKeys.add(key);
       }
     }
@@ -167,7 +201,7 @@ router.post('/env', (req, res) => {
     res.json({
       updated: [...updatedKeys],
       restartRequired,
-    });
+    } satisfies EnvUpdateResponse);
   } catch (err: any) {
     console.error('[Settings] Failed to update .env:', err.message);
     res.status(500).json({ error: err.message });
@@ -188,7 +222,7 @@ router.post('/env', (req, res) => {
  * (issue #153). UUIDs have no ordering to get wrong.
  */
 router.get('/gpus', async (_req, res) => {
-  res.json({ gpus: await listGpus() });
+  res.json({ gpus: await listGpus() } satisfies GpusResponse);
 });
 
 export default router;

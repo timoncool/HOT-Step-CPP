@@ -24,7 +24,7 @@ import type { AudioQueueItem } from '../../stores/audioGenQueueStore';
 import { usePlaylist } from './playlistStore';
 import type { Song } from '../../types';
 import { downloadTrack } from '../../utils/downloadTrack';
-import { play as pbPlay, audioQueueItemToTrack, usePlaybackSelector } from '../../stores/playbackStore';
+import { play as pbPlay, togglePlay, audioQueueItemToTrack, usePlaybackSelector } from '../../stores/playbackStore';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { ToggleSwitch } from '../global-bar/BarSection';
 import { Mm3StreamStatus } from '../player/Mm3StreamStatus';
@@ -80,8 +80,10 @@ export const InlineAudioQueue: React.FC = () => {
 
   const handlePlay = useCallback((item: AudioQueueItem) => {
     if (!item.audioUrl) return;
+    // The current track pauses/resumes in place; reloading it would restart it.
+    if (isPlaying(item)) { togglePlay(); return; }
     pbPlay(audioQueueItemToTrack(item));
-  }, []);
+  }, [isPlaying]);
 
   const handleDownload = useCallback((item: AudioQueueItem) => {
     if (!item.audioUrl) return;

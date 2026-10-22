@@ -14,6 +14,17 @@ code and this page disagree, the code wins; fix the page.
 
 ## Request JSON reference
 
+`adapter_runtime_dora` is an optional boolean shared by ACE-Step and MiniMax-Music3
+generation requests. It defaults to false, preserving legacy runtime DiT behavior.
+True enables DoRA magnitude rescaling, including runtime paths forced by adapter
+windows or sections. Merge and LM adapter behavior is unchanged. The Node/UI field
+is `adapterRuntimeDora`; false and absent values omit the wire key.
+
+For MM3 flow-DiT training, `ace-train mm3-train-dit --dora` sets `MM3TrainArgs.dora`.
+The trainer takes the same `--cache`, `--models` and `--out` arguments as LoRA and
+requires the outputs of both `mm3-preprocess` and `mm3-condition`. This trainer
+remains CLI-only; it is not an app training job or a DiT adapter capability.
+
 The ACE-Step request (`AceRequest`, `engine/src/request.h`) is one JSON object. It
 is read by `ace-lm`, `ace-synth` and `ace-understand`, and by ace-server's `/lm`,
 `/synth`, `/understand`, `/vae` and `/codes-decode`. Missing fields keep their
@@ -126,6 +137,25 @@ means no specific language, any other code is used as given.
 
 **`seed`** (int64, `-1` = random). Seed for the DiT's Philox noise; the low 32 bits
 are used. Resolved once per input request.
+
+**`seed_b`** (int64, `-1` = off) and **`seed_blend`** (float 0 to 1, default 0). Seed
+breeding: the initial DiT noise is a slerp from the `seed` noise toward the `seed_b`
+noise (each batch item treated as one vector, normalized lerp when nearly parallel).
+`0` gives `seed` exactly, `1` gives `seed_b` exactly. Synth batch items offset
+`seed_b` by the same `+i` as `seed`. Ignored by the streaming path. API field names
+on `/api/generate`: `seedB`, `seedBlend`.
+
+**`seed_blend_end`** (float 0 to 1, default `-1` = off). Seed morph: when set with
+`seed_b`, the blend varies along the latent time axis. The noise is `[T, C]`
+time-major; frame `f` is slerped on its own (per-frame vector across channels) at
+`w(f) = seed_blend + (seed_blend_end - seed_blend) * smoothstep(f / (T-1))`, so a
+song can start as one seed and end as the other. API field: `seedBlendEnd`.
+Per-frame morph is not the same as whole-item breeding even at a constant blend (each frame is slerped on its own), so when `seed_blend_end` equals `seed_blend` the engine uses the whole-item breeding path.
+
+SA3 seed breeding: `/sa3-synth` accepts `seed_b` (int64, `-1` = off) and `seed_blend`
+(float 0 to 1, default 0) as form/query params. The whole pure-noise latent is slerped
+from the `seed` noise toward the `seed_b` noise (same std::mt19937_64 gaussian at
+`seed_b`); `0` gives `seed` exactly, `1` gives `seed_b`. No effect on `/sa3-refine`.
 
 **`lm_seed`** (int64, `-1` = unset). Seed for the LM sampler. On ace-server `/lm`, an
 unset `lm_seed` follows `seed`, and a random value is drawn if both are unset. Batch
@@ -413,13 +443,35 @@ Parsed by `yue2_parse_request` in `engine/src/yue2/yue2-request.h`.
 | `nar_chunk_frames` | 0 | NAR chunk cap in frames (25 per second). 0 renders a normal song in one chunk |
 | `end_threshold` | 0.0 | 0 to 1. Stop the semantic stage when the sampler puts this much probability on the end token |
 | `end_bias`, `end_bias_from_sec`, `end_bias_ramp_sec` | 0.0 | Additive end-token bias (-50 to 50), when it starts, and its ramp |
-| `codec_ids` | none | Semantic codes (0 to 32767) to render instead of sampling. Single song, single variation |
+| `codec_ids` | none | Semantic codes (0 to 32767) to render instead of sampling. Without continuation, single song and single variation only |
+| `continue_codec_ids` | false | Treat `codec_ids` as a shared prefix for 1 to 4 songs and keep sampling after it, at any `cfg_scale`. No `semantic_retries` |
 | `preview_max_frames` | 0 | Bound on semantic frames, 0 to 9000 (training previews) |
-| `vae_variant` | `"standard"` | `standard` or `legacy` |
+| `render_from_frame` | 0 | 0 to 9000. The NAR and VAE start at this codec frame (clamped to the stream), so the audio covers only the frames from it to the end. The composer still reads every frame. Section takes send their lead-in |
+| `vae_variant` | `"standard"` | `standard`, `legacy`, or `dec2x` (a local fine-tuned decoder; only when `yue2-vae-dec2x-*.gguf` is present) |
 | `noise_source`, `noise_fixture_path` | `"native"` | Validation only: `fixture` reads NAR noise from a raw f32 file |
 | `id` | `"yue2"` | Request label |
 
 Progress and results for `/yue2/synth` use the shared `GET /job`.
+
+For resumed batches, send `songs: [{style, lyrics, abc, seed}, ...]` with
+`codec_ids`, `continue_codec_ids: true` and optionally `preview_max_frames`.
+Each song needs its own explicit seed to identify its take; its `noise_seed`
+defaults to that seed. Cover Studio uses one synthesis variation per song and
+submits up to four songs at a time, so ten section takes use chunks of 4, 4 and 2.
+The prefix, frame caps, repetition history and CFG state apply to every row.
+Distinct prompts prefill separately; matching prompts copy the prefix KV rows
+and logits. A lyric schedule replays the prefix in a batched decode.
+
+Completed job status includes `tracks`, with one entry per audio part in part
+order. Each entry has `song`, `variation`, `seed`, `noise_seed`, `frames`,
+`audio_from` (the codec frame its audio starts at, 0 unless `render_from_frame` was set),
+`end_reason` and `semantic_ids`. The audio result is a WAV for one track or
+`multipart/mixed` for several tracks. Pair each part with its metadata, then
+map by `song` and `seed`: a dropped song leaves a gap in the song indices.
+Section takes reject the entire chunk if an expected track is missing or its
+seed does not match. A row failure, including a prefix mismatch, fails the
+whole engine job with one error. Seeds reproduce only at the same batch width;
+song 0 at batch 4 can differ from the same seed at batch 1.
 
 Under `--keep-loaded` the request's render half (NAR and VAE) runs on a second thread with
 its own backend instance (`yue2-job.h`, the NAR lane) once the AR half has composed and
@@ -548,7 +600,18 @@ Debug:
   --no-batch-cfg          Split DiT CFG into two separate forwards
   --clamp-fp16            Clamp hidden states to FP16 range
   --dump <dir>            Dump intermediate tensors
+  --check                 Check output for NaN/Inf, silence, DC and clipping;
+                          exit 2 if any track fails
 ```
+
+`--check` measures each track's raw float buffer before it is encoded (the WAV and
+MP3 writers replace NaN/Inf with 0 and clamp to full scale, which would hide a
+broken render) and prints one `[Check BatchN] PASS|FAIL` line with the values. A
+track fails on any non-finite or subnormal sample, a peak below -60 dBFS, a per-channel mean
+above 0.02, or more than 0.1% of samples past full scale. The env var
+`HOTSTEP_CHECK_INJECT` (a comma list, one of `none`, `nan`, `subnormal`, `silence`,
+`dc`, `clip` per track) corrupts tracks before the check so the checks themselves can be tested. ace-synth exits 1 when a
+track produces no audio or its file fails to write, and 2 when a `--check` fails.
 
 The first request picks the models: `synth_model` for the DiT (empty takes the first),
 `adapter` or `adapters` from `--adapters`, and `output_format` for the output. The
@@ -623,6 +686,9 @@ Required:
 Adapter:
   --adapters <dir>        Directory of adapters
 
+Plugins:
+  --user-plugins <dir>    Extra plugin root, scanned after the shipped plugins
+
 Memory control:
   --keep-loaded           Keep models in VRAM between requests
   --vae-chunk <N>         Latent frames per tile (default: 256)
@@ -657,6 +723,10 @@ Notes the usage text does not cover:
 - `--max-batch` is clamped to 1..9.
 - `--models` is scanned at startup, and its `onnx/` subfolder too. `--adapters` is
   scanned for DiT adapters and its `lm/` subfolder for planner-LM adapters.
+- `--user-plugins <dir>` is a plugin root with the same `solvers/`, `schedulers/`,
+  `guidance/` and `postprocess/` subfolders as `engine/plugins/`. It is scanned last,
+  and a user file that declares a shipped plugin's name replaces it. The release
+  app passes `<data folder>/plugins`; dev passes nothing.
 - The app starts ace-server on port 8085.
 
 | Pipeline | Needs | Enables |
@@ -716,6 +786,8 @@ POST /job?id=N&drop_songs=MASK   YuE2 batch: take songs out (bit b = song b);
 GET  /jobs                       Every job in the table.
 
 GET  /health                     {"status":"ok"}
+GET  /worker-drain               {"status":"ok"} once everything queued on the
+                                 worker before it has finished.
 GET  /props                      version, models (lm, embedding, dit, vae),
                                  adapters, lm_adapters, cli (max_batch,
                                  mp3_bitrate), default (full AceRequest), presets
@@ -806,6 +878,13 @@ The job table holds 32 entries; finished jobs are evicted oldest first and runni
 jobs never are. Each job has its own cancel flag, and a cancel during adapter
 precompute takes effect between deltas.
 
+`/sa3-synth` and `/sa3-refine` have no job id. They cancel when the client closes
+the connection: both sampling loops check before every step, and a full-loop Lua
+solver sees it as `on_step` returning true. A client that drops one of these calls
+awaits `GET /worker-drain` to know the engine has stopped. Limits: a Lua `sample()`
+that ignores `on_step`'s return runs to its last step, and model load, encode and
+decode are not checked, so the drain waits for them.
+
 By default the model store keeps one module in VRAM at a time. `--keep-loaded`
 keeps everything resident for the life of the process; `?keep_loaded=1` does the
 same from a request, until `POST /models/restore-policy`.
@@ -872,6 +951,26 @@ Usage: mp3-codec -i <input> -o <output> [options]
 mp3-codec -i song.wav -o song.mp3 -b 192
 mp3-codec -i song.mp3 -o song.wav --format wav32
 ```
+
+## ace-train YuE2 preparation reference
+
+`ace-train yue2-prepare-aitk` builds native joint-training caches from a Legacy
+manifest. See [training internals](../../docs/dev/training-internals.md) for the
+full preparation command and workflow.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--trigger <text>` | empty | Inject a trigger into full captions. With a non-empty caption, the style becomes `<text>, in the style of <text>. <caption>`; with an empty caption, it is just `<text>` |
+| `--caption-dropout-trigger <text>` | `--trigger`, or empty | Exact style text for the caption-dropout prefixes, with no wrapper. One line, at most 128 bytes; CR, LF and NUL are rejected |
+
+The fallback dropout style is also bare trigger text. Preparation tokenizes the
+dropout prefixes with the same lyrics and sheet conditioning as the full-caption
+prefixes. `ace-train yue2-joint-train --caption-dropout <p>` selects them during
+training; `--caption-dropout-trigger` belongs on the preparation command.
+
+HOT-Approved, the Fixed recipe preset, passes `--caption-dropout-trigger` with
+the trigger, or the dataset slug if no trigger is set. Older prepared datasets
+need re-preparing; the server invalidates the old Fixed recipe preparation cache.
 
 ## fattn-train-test reference
 

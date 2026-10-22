@@ -118,6 +118,22 @@ test('a new worker run appears here as an ordinary local run, under the worker j
   } finally { fake.close(); }
 });
 
+test('trigger-named checkpoint weights mirror like the fixed names (#220)', async () => {
+  const run = ladder('job-named', 'named_2026-10-11_00-00-00');
+  delete run.files['checkpoint-step10/native-ar.safetensors'];
+  delete run.files['checkpoint-step10/native-nar.safetensors'];
+  run.files['checkpoint-step10/named_yue2_joint_ar_step10.safetensors'] = file('AR-10');
+  run.files['checkpoint-step10/named_yue2_joint_nar_step10.safetensors'] = file('NAR-10');
+  const fake = await fakeWorker([run]);
+  try {
+    const status = await sync('NamedW', fake);
+    assert.equal(status.lastError, null);
+    const ckpt = localRun('NamedW', 'job-named')!.checkpoints.find(c => c.step === 10)!;
+    assert.equal(fs.readFileSync(ckpt.arPath!, 'utf8'), 'AR-10');
+    assert.equal(fs.readFileSync(ckpt.narPath!, 'utf8'), 'NAR-10');
+  } finally { fake.close(); }
+});
+
 test('a growing train.jsonl is fetched again; a finished checkpoint is fetched once', async () => {
   const run = ladder('job-grow', 'album_grow');
   const fake = await fakeWorker([run]);

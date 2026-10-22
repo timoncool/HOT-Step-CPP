@@ -289,10 +289,22 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
     // the accumulator pattern below can hand it a persistent grad buffer.
     ggml_set_param(t_h);
     ggml_set_input(t_h);
-    ggml_tensor * t_gacc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, K);
+    // The accumulator gets its own buffer on the training backend. Left as a
+    // scheduler-allocated input it is parked on CPU, while the in-place ADD
+    // the backward accumulates with runs on the GPU through a view of it:
+    // Metal rejects the host pointer ("buffer is nil") and dL/dh reads back
+    // as exactly zero. Pre-allocated, the scheduler pins it and the view.
+    ggml_init_params gip  = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context *   gctx = ggml_init(gip);
+    ggml_tensor * t_gacc = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, H, K);
     ggml_set_name(t_gacc, "depth.h_grad");
-    ggml_set_input(t_gacc);
     ggml_set_output(t_gacc);
+    ggml_backend_buffer_t gbuf = ggml_backend_alloc_ctx_tensors(gctx, d.backend);
+    if (!gbuf) {
+        ggml_free(gctx);
+        ggml_free(ctx);
+        return false;
+    }
     ggml_tensor * t_one = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
     ggml_set_name(t_one, "depth.one");
     ggml_set_input(t_one);
@@ -412,6 +424,8 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
 
     ggml_backend_sched_reset(r.sched);
     if (!ggml_backend_sched_alloc_graph(r.sched, gf)) {
+        ggml_backend_buffer_free(gbuf);
+        ggml_free(gctx);
         ggml_free(ctx);
         return false;
     }
@@ -420,8 +434,7 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
     {
         const float one = 1.0f;
         ggml_backend_tensor_set(t_one, &one, 0, sizeof(float));
-        std::vector<float> gz((size_t) (H * K), 0.0f);
-        ggml_backend_tensor_set(t_gacc, gz.data(), 0, gz.size() * sizeof(float));
+        ggml_backend_buffer_clear(gbuf, 0);
     }
     ggml_backend_tensor_set(t_h, h_host.data(), 0, h_host.size() * sizeof(float));
     ggml_backend_tensor_set(t_sem, sem_ids.data(), 0, sem_ids.size() * sizeof(int32_t));
@@ -454,6 +467,8 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
 
     if (ggml_backend_sched_graph_compute(r.sched, gf) != GGML_STATUS_SUCCESS) {
         ggml_backend_sched_reset(r.sched);
+        ggml_backend_buffer_free(gbuf);
+        ggml_free(gctx);
         ggml_free(ctx);
         return false;
     }
@@ -482,6 +497,8 @@ static bool mm3_depth_train_head(LmCkptRun & r, const LmSample & s, void * user)
         ggml_backend_tensor_set(t_G, col.data(), off, (size_t) H * sizeof(float));
     }
     ggml_backend_sched_reset(r.sched);
+    ggml_backend_buffer_free(gbuf);
+    ggml_free(gctx);
     ggml_free(ctx);
     return true;
 }

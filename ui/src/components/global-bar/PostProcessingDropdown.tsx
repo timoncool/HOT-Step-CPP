@@ -1,3 +1,7 @@
+import { useQuery } from '@tanstack/react-query';
+import { localOptions } from '../../queries/global-models/options';
+import { usePluginRegistry } from '../../hooks/usePluginRegistry';
+import { useReferences } from '../../queries/global-models/hooks';
 // PostProcessingDropdown.tsx — Unified post-processing panel for the global bar
 //
 // Four collapsible accordion sections:
@@ -116,11 +120,6 @@ const Accordion: React.FC<AccordionProps> = ({
 // ── Mastering Content ───────────────────────────────────────────
 // (Extracted from MasteringDropdown — reference track management)
 
-interface ReferenceTrack {
-  name: string;
-  size: number;
-  url: string;
-}
 
 const formatFileSize = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`;
@@ -128,47 +127,41 @@ const formatFileSize = (bytes: number): string => {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-const MasteringContent: React.FC = () => {
+/** timbreOk: only ACE-Step reads a timbre reference, so the toggle hides elsewhere. */
+const MasteringContent: React.FC<{ timbreOk: boolean }> = ({ timbreOk }) => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
   const { token } = useAuth();
-  const [references, setReferences] = useState<ReferenceTrack[]>([]);
+  const { references: references, refresh: refreshReferences } = useReferences();
   const [uploading, setUploading] = useState(false);
 
-  useEffect(() => {
-    masteringApi.listReferences()
-      .then(data => setReferences(data.references))
-      .catch(() => {});
-  }, []);
 
   const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !token) return;
     try {
       setUploading(true);
-      const result = await masteringApi.uploadReference(file, token);
+      const result = await masteringApi.uploadReference(file);
       gp.setMasteringReference(result.name);
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
+      await refreshReferences();
     } catch (err) {
       console.error('[Mastering] Upload failed:', err);
     } finally {
       setUploading(false);
       e.target.value = '';
     }
-  }, [token, gp]);
+  }, [token, gp, refreshReferences]);
 
   const handleDelete = useCallback(async (name: string) => {
     if (!token) return;
     try {
-      await masteringApi.deleteReference(name, token);
+      await masteringApi.deleteReference(name);
       if (gp.masteringReference === name) gp.setMasteringReference('');
-      const data = await masteringApi.listReferences();
-      setReferences(data.references);
+      await refreshReferences();
     } catch (err) {
       console.error('[Mastering] Delete failed:', err);
     }
-  }, [token, gp]);
+  }, [token, gp, refreshReferences]);
 
   if (!gp.masteringEnabled) {
     return (
@@ -246,7 +239,7 @@ const MasteringContent: React.FC = () => {
       </div>
 
       {/* Timbre reference toggle */}
-      {gp.masteringReference && (
+      {timbreOk && gp.masteringReference && (
         gp.timbreAudioPath ? (
           <div className="flex items-center gap-1.5 mt-1 px-2 py-1.5 rounded-lg bg-teal-500/5 border border-teal-500/10">
             <Music2 size={14} className="text-teal-400" />
@@ -298,44 +291,16 @@ export const PostProcessingDropdown: React.FC = () => {
   // is a second model and a second forward over the whole track.
   const alignOk = !!capabilities?.features.forcedAlignment;
 
-  // PP-VAE availability — auto-detect from models directory
-  const [ppVaeAvailable, setPpVaeAvailable] = useState(false);
-  useEffect(() => {
-    fetch('/api/models/pp-vae')
-      .then(r => r.json())
-      .then(data => setPpVaeAvailable(!!data.available))
-      .catch(() => setPpVaeAvailable(false));
-  }, []);
-
-  // StableStep (SA3) availability — GGML weights plus the tokenizer.
-  const [stableStepBackends, setStableStepBackends] = useState<{ gguf: boolean }>({ gguf: false });
-  const [stableStepAvailable, setStableStepAvailable] = useState(false);
-  // Why it is unavailable, not just that it is. The GGML weights (5.8 GB) and
-  // the T5Gemma tokenizer (34 MB, under onnx/sa3)
-  // go missing independently, and "not installed" next to a full models folder
-  // sends you looking in the wrong place.
-  const [stableStepParts, setStableStepParts] = useState<{ tokenizer: boolean; ggufWeights: boolean }>(
-    { tokenizer: true, ggufWeights: true });
-  useEffect(() => {
-    fetch('/api/models/stablestep')
-      .then(r => r.json())
-      .then(data => {
-        setStableStepAvailable(!!data.available);
-        setStableStepBackends({ gguf: !!data.backends?.gguf });
-        setStableStepParts({ tokenizer: !!data.tokenizer, ggufWeights: !!data.ggufWeights });
-      })
-      .catch(() => { setStableStepAvailable(false); setStableStepBackends({ gguf: false }); });
-  }, []);
-
-  // StableStep DoRA adapters (models/sa3-adapters/*.gguf) — merged into the
-  // SA3 DiT at refine time with per-adapter strength. GGML backend only.
-  const [stableStepAdapterList, setStableStepAdapterList] = useState<Array<{ name: string; sizeMb: number }>>([]);
-  useEffect(() => {
-    fetch('/api/models/stablestep/adapters')
-      .then(r => r.json())
-      .then(data => setStableStepAdapterList(Array.isArray(data.adapters) ? data.adapters : []))
-      .catch(() => setStableStepAdapterList([]));
-  }, []);
+  const ppVae = useQuery(localOptions<{ available: boolean }>('pp-vae', '/models/pp-vae'));
+  const ppVaeAvailable = !!ppVae.data?.available;
+  const stableStep = useQuery(localOptions<{
+    available: boolean; backends?: { gguf: boolean }; tokenizer: boolean; ggufWeights: boolean;
+  }>('stablestep', '/models/stablestep'));
+  const stableStepAvailable = !!stableStep.data?.available;
+  const stableStepBackends = { gguf: !!stableStep.data?.backends?.gguf };
+  const stableStepParts = { tokenizer: stableStep.data?.tokenizer ?? true, ggufWeights: stableStep.data?.ggufWeights ?? true };
+  const sa3Adapters = useQuery(localOptions<{ adapters: Array<{ name: string; sizeMb: number }> }>('sa3-adapters', '/models/stablestep/adapters'));
+  const stableStepAdapterList = sa3Adapters.data?.adapters ?? [];
   const ssAdapterState = (name: string) =>
     (gp.stableStepAdapters ?? []).find((a: any) => a.name === name);
   const setSsAdapter = (name: string, patch: { enabled?: boolean; scale?: number }) => {
@@ -351,21 +316,15 @@ export const PostProcessingDropdown: React.FC = () => {
     .filter((a: any) => a.enabled && a.scale !== 0 && stableStepAdapterList.some(l => l.name === a.name))
     .length;
 
-  // Postprocess plugin availability — fetch from /api/plugins
-  const [postprocessPlugins, setPostprocessPlugins] = useState<any[]>([]);
+  const { registry } = usePluginRegistry();
+  const postprocessPlugins = registry.postprocess ?? [];
   useEffect(() => {
-    fetch('/api/plugins')
-      .then(r => r.json())
-      .then(data => {
-        const pp = data.postprocess || [];
-        setPostprocessPlugins(pp);
-        // Auto-select first plugin if none selected
-        if (pp.length > 0 && !gp.postprocessPlugin) {
-          gp.setPostprocessPlugin(pp[0].name);
-        }
-      })
-      .catch(() => setPostprocessPlugins([]));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // Auto-select first plugin if none selected; prefer V2.1 for ideal defaults
+    if (postprocessPlugins.length && !gp.postprocessPlugin) {
+      const preferred = postprocessPlugins.find((p: any) => p.name === 'md_audio_tiled V2.1') || postprocessPlugins[0];
+      gp.setPostprocessPlugin(preferred.name);
+    }
+  }, [postprocessPlugins, gp.postprocessPlugin, gp.setPostprocessPlugin]);
 
   const selectedPostprocessPlugin = postprocessPlugins.find((p: any) => p.name === gp.postprocessPlugin) || postprocessPlugins[0] || null;
 
@@ -1141,7 +1100,7 @@ export const PostProcessingDropdown: React.FC = () => {
           </span>
         ) : undefined}
       >
-        <MasteringContent />
+        <MasteringContent timbreOk={aceCoupledOk} />
       </Accordion>
 
       {/* 3.5. Final Normalizer — the last audio-modifying stage, independent

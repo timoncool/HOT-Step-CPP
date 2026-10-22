@@ -1,5 +1,9 @@
 # Engine Performance & TensorRT — Reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Deep detail supporting [SKILL.md](SKILL.md). Line references verified 2026-07-02 against the working tree; they will drift — re-verify with Grep before editing code from them.
 
 ## 1. Native TRT DiT internals (`engine/src/dit-trt.h`, ~767 lines)
@@ -57,7 +61,7 @@ Mirrors the GGML sampler (`hot-step-sampler.h`); only the forward pass differs. 
 
 ## 5. TRT-LLM Executor (`engine/src/lm-trtllm.h`, ~544 lines) — DEAD on native Windows
 
-`engine/CMakeLists.txt:342-371`: separate from `HOT_STEP_TRT`; **STATUS: DISABLED (2026-06-02). "Native Windows TRT-LLM is not viable"** — TRT version mismatch between Docker-built engines (10.14) and the Windows SDK (10.16); ONNX-rebuilt engines lack TRT-LLM tensor bindings (`kv_cache_block_offsets` etc.). Code kept behind `#ifdef HOT_STEP_TRTLLM`; re-enable with `-DHOT_STEP_TRTLLM_ENABLE=ON` (intended for WSL2/cross-platform later). The built `trtllm-engine-RTX5090/` in `models/onnx/lm-4B/` is inert.
+`engine/CMakeLists.txt:342-371`: separate from `HOT_STEP_TRT`; **STATUS: DISABLED (2026-06-02). "Native Windows TRT-LLM is not viable"** — TRT version mismatch between Docker-built engines (10.14) and the Windows SDK (10.16); ONNX-rebuilt engines lack TRT-LLM tensor bindings (`kv_cache_block_offsets` etc.). Code kept behind `#ifdef HOT_STEP_TRTLLM`; re-enable with `-DHOT_STEP_TRTLLM_ENABLE=ON` (intended for WSL2/cross-platform later). The built `trtllm-engine-RTX5090/` in `<data root>/models/onnx/lm-4B/` is inert.
 
 ## 6. ORT + TRT-EP wrappers (VAE, PP-VAE, text/cond encoders)
 
@@ -65,8 +69,8 @@ Files: `engine/src/vae-ort.h`, `vae-enc-ort.h`, `text-enc-ort.h`, `cond-enc-ort.
 
 - Legacy **V1 TRT EP via C API** (`vae-ort.h:78`), fp16, engine cache written next to the ONNX, CUDA EP appended as fallback.
 - **Blackwell (sm_120) gotcha:** ORT-TRT VAE can segfault on RTX 50xx (Myelin fusion bug). Known workaround `builder_optimization_level=1` **cannot be expressed** through the V1 EP options (`vae-ort.h:95` NOTE) — fixing requires the V2 EP API.
-- The large `TensorrtExecutionProvider_TRTKernel_*.engine` files scattered under `models/onnx/*` are ORT EP caches — safe to delete, will rebuild.
-- Mixed mode is supported: GGUF DiT + ONNX text encoder (`pipeline-synth.cpp` ~:294). When the DiT itself is ONNX and `text_encoder.onnx` + `cond_encoder.onnx` sit beside it, `ctx->is_onnx_pipeline` is set (~:284-325). PP-VAE auto-discovers `models/onnx/pp-vae/pp-vae_{encoder,decoder}.onnx` (`hot-step-server.cpp:2947` new layout, flat-file fallback).
+- The large `TensorrtExecutionProvider_TRTKernel_*.engine` files scattered under `<data root>/models/onnx/*` are ORT EP caches — safe to delete, will rebuild.
+- Mixed mode is supported: GGUF DiT + ONNX text encoder (`pipeline-synth.cpp` ~:294). When the DiT itself is ONNX and `text_encoder.onnx` + `cond_encoder.onnx` sit beside it, `ctx->is_onnx_pipeline` is set (~:284-325). PP-VAE auto-discovers `<data root>/models/onnx/pp-vae/pp-vae_{encoder,decoder}.onnx` (`hot-step-server.cpp:2947` new layout, flat-file fallback).
 
 ## 7. Streaming pipeline (`engine/src/stream-pipeline.h`)
 
@@ -75,7 +79,7 @@ DEMON-style ring buffer: N in-flight slots at staggered denoising stages; one **
 ## 8. On-disk model layout (as found 2026-07-02 on Rob's machine — machine-specific)
 
 ```
-models/onnx/
+<data root>/models/onnx/
   dit-fp8/     dit_fp8.onnx (+~8GB .onnx_data), text_encoder.onnx(.data), cond_encoder.onnx(.data),
                null_condition_emb.bin, embed_tokens.bin, ORT-TRT EP kernel caches
                NOTE: no dit_fp8.engine — first native-TRT use = full 5-30 min build

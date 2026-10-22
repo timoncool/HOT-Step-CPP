@@ -57,6 +57,10 @@ struct SolverState {
 
     // ── SDE: per-batch seeds for Philox re-noising ───────────────
     const int64_t * seeds    = nullptr;
+    // Seed breeding (SA3 /sa3-synth): exposed to Lua solvers as globals
+    // seed_b / seed_blend so stochastic solvers can mix a lockstep B stream.
+    int64_t         seed_b     = -1;
+    float           seed_blend = 0.0f;
     int             batch_n  = 1;
     int             n_per    = 0;  // elements per batch item (T * Oc)
 

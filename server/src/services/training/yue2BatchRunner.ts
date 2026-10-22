@@ -20,15 +20,16 @@ import { config } from '../../config.js';
 import * as repo from './datasetsRepo.js';
 import * as queue from './labelingQueue.js';
 import { trainingBaseDir } from './paths.js';
-import { listYue2AitkRuns, type Yue2AitkRunRecord } from './yue2AitkRuns.js';
+import { isCheckpointLadder, listYue2AitkRuns, type Yue2AitkRunRecord } from './yue2AitkRuns.js';
 import { autoRefineRequest } from './yue2JointTrainRunner.js';
-import { yue2LoudnessForMethod } from './yue2Train.js';
+import { YUE2_CACHE_LUFS } from './yue2Train.js';
 import { listPreparedCaches } from './preparedDataReset.js';
 import { samplesMissingYue2Caption } from './yue2CaptionJob.js';
 import { bestScoredRung } from './yue2BestRung.js';
 import { listYue2RungScores } from './yue2RungScores.js';
 import { runYue2Cleanup } from './yue2Cleanup.js';
 import { refreshYue2PresetsForJointCheckpoint } from './lyricStudioExport.js';
+import { hasActivePipeline } from './pipelineRunner.js';
 
 export type Yue2BatchStage = 'captions' | 'cache' | 'codes' | 'sheet' | 'stems' | 'align' | 'train' | 'refine' | 'nar' | 'finish';
 export type Yue2BatchStatus = 'running' | 'paused' | 'done' | 'failed' | 'cancelled';
@@ -94,7 +95,7 @@ const MAX_LISTED = 20;
 /** Body fields that belong to one dataset, never to a recipe. */
 /** The KL-rung refinement belongs to the tuned recipe; a base-matched run
  *  ends at its update count and is picked by ear from its own ladder. */
-const wantsRefine = (recipe: Record<string, unknown>) => recipe.autoRefine !== false && recipe.method !== 'base-matched';
+const wantsRefine = (recipe: Record<string, unknown>) => recipe.autoRefine !== false && recipe.method !== 'base-matched' && recipe.method !== 'fixed-recipe';
 const RECIPE_STRIP = new Set(['dataset', 'output', 'resume', 'resumeRunId', 'resumeStep', 'preparation', 'checkpoint', 'autoPrepare']);
 
 const batches = new Map<string, BatchState>();
@@ -169,6 +170,8 @@ export function getBatch(id: string): Yue2BatchSummary | undefined {
 
 export function startBatch(input: { datasetIds: string[]; lyricTiming: boolean; clearCache?: boolean; recipe: Record<string, unknown> }): Yue2BatchSummary | { error: string } {
   if (hasActiveBatch()) return { error: 'A YuE2 batch is already running' };
+  // A captured YuE2 preparation may not have queued a job yet, so check it too.
+  if (hasActivePipeline()) return { error: 'A training pipeline or YuE2 preparation is already running' };
   const items: Yue2BatchItem[] = [];
   for (const id of input.datasetIds) {
     const ds = repo.getDataset(id);
@@ -204,18 +207,39 @@ export function appendToBatch(id: string, datasetIds: string[]): Yue2BatchSummar
   return toSummary(state);
 }
 
+/** Why `step` of `runId` cannot be finished from, or null when it can: the
+ *  run must be one of this dataset's and hold a complete (AR + NAR)
+ *  checkpoint at that step. Exported for a direct unit test. */
+export function pickedCheckpointError(runs: Array<Pick<Yue2AitkRunRecord, 'jobId' | 'checkpoints'>>, runId: string, step: number): string | null {
+  const run = runs.find(r => r.jobId === runId);
+  if (!run) return `Run ${runId} is not one of this dataset's runs`;
+  const ckpt = run.checkpoints.find(c => c.step === step);
+  if (!ckpt) return `No checkpoint at step ${step} of run ${runId}`;
+  if (!ckpt.arPath || !ckpt.narPath) return `No complete checkpoint at step ${step} of run ${runId}`;
+  return null;
+}
+
 /** Finish scored ladders the way "Use this rung" does on the Refine tab:
- *  NAR further training from the best-scored rung, then link the result to
- *  the album preset and clean up with the default choices. Queued on the end
- *  of the running batch when there is one, else run as a batch of its own. */
-export function finishScoredLadders(entries: Array<{ datasetId: string; refineRun: string }>, opts: { knee?: boolean } = {}): Yue2BatchSummary | { error: string } {
+ *  NAR further training from the chosen rung, then link the result to the
+ *  album preset and clean up with the default choices. Queued on the end of
+ *  the running batch when there is one, else run as a batch of its own.
+ *  `pickStep` is the rung the user accepted, captured now and used as is: a
+ *  score edited later cannot move it. Without it (legacy callers) the
+ *  best-scored rung is chosen when the NAR stage starts. */
+export function finishScoredLadders(entries: Array<{ datasetId: string; refineRun: string; pickStep?: number }>, opts: { knee?: boolean } = {}): Yue2BatchSummary | { error: string } {
   const items: Yue2BatchItem[] = [];
   for (const e of entries) {
     const ds = repo.getDataset(e.datasetId);
     if (!ds) return { error: `Dataset not found: ${e.datasetId}` };
-    // A base-matched ladder is picked as it is: no decoder follow-up.
-    const baseMatched = (listYue2AitkRuns(ds.id, ds.slug).find(r => r.jobId === e.refineRun)?.options as Record<string, unknown> | undefined)?.method === 'base-matched';
-    items.push({ datasetId: ds.id, name: ds.name || ds.slug, refineRun: e.refineRun, narKnee: opts.knee !== false, status: 'pending', currentStage: null, error: null,
+    const runs = listYue2AitkRuns(ds.id, ds.slug);
+    if (e.pickStep !== undefined) {
+      const bad = pickedCheckpointError(runs, e.refineRun, e.pickStep);
+      if (bad) return { error: bad };
+    }
+    // A checkpoint ladder is picked as it is: no decoder follow-up.
+    const baseMatched = isCheckpointLadder(runs.find(r => r.jobId === e.refineRun)?.options);
+    items.push({ datasetId: ds.id, name: ds.name || ds.slug, refineRun: e.refineRun, ...(e.pickStep !== undefined ? { pickStep: e.pickStep } : {}),
+      narKnee: opts.knee !== false, status: 'pending', currentStage: null, error: null,
       stages: (baseMatched ? ['finish'] as const : ['nar', 'finish'] as const).map(stage => ({ stage, jobId: '', status: 'pending' as const, error: null, startedAt: null, finishedAt: null })) });
   }
   if (!items.length) return { error: 'Nothing to finish' };
@@ -225,6 +249,7 @@ export function finishScoredLadders(entries: Array<{ datasetId: string; refineRu
     persist(live);
     return toSummary(live);
   }
+  if (hasActivePipeline()) return { error: 'A training pipeline or YuE2 preparation is already running' };
   const state: BatchState = { id: randomUUID(), status: 'running', items, currentDatasetId: null, lyricTiming: true, recipe: {},
     createdAt: Date.now(), finishedAt: null, pauseRequested: false, cancelRequested: false };
   batches.set(state.id, state);
@@ -306,7 +331,7 @@ export function resumeBatch(id: string): 'ok' | 'not_found' | 'busy' {
   if (live && live.status === 'paused') { live.pauseRequested = false; live.status = 'running'; persist(live); return 'ok'; }
   const snap = getBatch(id);
   if (!snap) return 'not_found';
-  if (hasActiveBatch()) return 'busy';
+  if (hasActiveBatch() || hasActivePipeline()) return 'busy';
   for (const item of snap.items) {
     if (item.status === 'done') continue;
     item.status = 'pending'; item.currentStage = null; item.error = null;
@@ -457,10 +482,20 @@ async function stageRequest(state: BatchState, item: Yue2BatchItem, result: Yue2
   }
   if (stage === 'nar') {
     const ds = repo.getDataset(item.datasetId);
-    const best = item.refineRun ? bestScoredRung(item.datasetId, item.refineRun, ds?.slug) : null;
-    if (!best) throw new Error('No rung of this ladder has both a likeness and a corruption score');
-    item.pickStep = best.step; persist(state);
-    const run = listYue2AitkRuns(item.datasetId, ds?.slug).find(r => r.jobId === item.refineRun);
+    const runs = listYue2AitkRuns(item.datasetId, ds?.slug);
+    let step = item.pickStep;
+    if (step === undefined) {
+      // Legacy item, no captured pick: the best-scored rung, recorded once.
+      const best = item.refineRun ? bestScoredRung(item.datasetId, item.refineRun, ds?.slug) : null;
+      if (!best) throw new Error('No rung of this ladder has both a likeness and a corruption score');
+      step = best.step;
+      item.pickStep = step; persist(state);
+    } else {
+      // The captured pick, checked again: the run may have changed since.
+      const bad = pickedCheckpointError(runs, item.refineRun ?? '', step);
+      if (bad) throw new Error(bad);
+    }
+    const run = runs.find(r => r.jobId === item.refineRun);
     // A decoder-only follow-up legitimately gets no second one (nothing to
     // reject — this stage is correctly "done"). A mirrored run is a different
     // case: NAR further training resumes from the rung's optimizer.resume and
@@ -469,7 +504,7 @@ async function stageRequest(state: BatchState, item: Yue2BatchItem, result: Yue2
     // done when it never ran.
     if (run?.origin) throw new Error(`NAR further training needs the optimizer state, which stays on ${run.origin.worker}; this batch item needs manual handling.`);
     if (skipNarFurther(run)) return null;
-    return narFurtherRequest(item.refineRun!, best.step, item.narKnee !== false);
+    return narFurtherRequest(item.refineRun!, step, item.narKnee !== false);
   }
   if (stage === 'finish') { await finishLadder(item); return null; }
   if (stage === 'captions') {
@@ -484,10 +519,10 @@ async function stageRequest(state: BatchState, item: Yue2BatchItem, result: Yue2
   const st = await readStatus(item.datasetId);
   switch (stage) {
     case 'cache': {
-      // The method decides the loudness the cache is cut at (-14 tuned, 0
-      // base-matched). A cache at the other level is re-cut: the key changes,
-      // so codes, sheet and alignment are dropped and their stages run again.
-      const lufs = yue2LoudnessForMethod(state.recipe.method);
+      // Every method trains on a -14 LUFS cache. A cache at another level is
+      // re-cut: the key changes, so codes, sheet and alignment are dropped and
+      // their stages run again.
+      const lufs = YUE2_CACHE_LUFS;
       const p = st.stages.preprocess;
       const cut = p.done && p.captionModeOk !== false && !p.captionsStale && p.loudnessLufs === lufs;
       return cut ? null : { captionMode: 'yue2', loudnessLufs: lufs };

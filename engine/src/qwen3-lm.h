@@ -90,6 +90,7 @@ struct Qwen3LM {
     ggml_backend_sched_t sched;
     bool                 use_flash_attn;
     bool                 clamp_fp16;  // clamp hidden state on sub-Ampere CUDA (FP16 accumulation overflow)
+    float                ffn_down_scale;  // qwen3_build_mlp down_scale: 1/16 on Metal, else 1
 
     // KV cache: per-set, per-layer [D, max_seq, Nkv] f16
     struct ggml_context * kv_ctx;
@@ -240,6 +241,9 @@ static void qw3lm_init_backend(Qwen3LM * m) {
     m->sched          = backend_sched_new(bp, 8192);
     m->use_flash_attn = bp.has_gpu;
     m->clamp_fp16     = false;
+    // Power of two, so the scaling itself is exact in f32. 1/16 leaves about
+    // 13x headroom over the largest SwiGLU value measured.
+    m->ffn_down_scale = strncmp(ggml_backend_name(m->backend), "MTL", 3) == 0 ? 1.0f / 16.0f : 1.0f;
 }
 
 // Allocate KV cache
@@ -703,7 +707,7 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int 
 
         // Post-attention norm + MLP
         norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, n_tokens);
+        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, n_tokens, m->ffn_down_scale);
         hidden                   = ggml_add(ctx, hidden, mlp);
         // Concept steering on the layer output. Applied before the fp16 clamp so
         // the clamp bounds the steered value too. [H] broadcasts over tokens.
@@ -853,7 +857,7 @@ static void qw3lm_forward_verify(Qwen3LM * m, const int * token_ids, int n_token
         }
 
         norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, n_tokens);
+        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, n_tokens, m->ffn_down_scale);
         hidden                   = ggml_add(ctx, hidden, mlp);
         // Steering applies here too so the verify path stays bit-comparable with
         // the production forward instead of diverging whenever steering is on.
@@ -1127,7 +1131,7 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
 
             // Batched FFN
             norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-            struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, N);
+            struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, N, m->ffn_down_scale);
             hidden                   = ggml_add(ctx, hidden, mlp);
             // Concept steering (see qw3lm_forward). Must be applied on the
             // batched path too — phase-1/phase-2 generation runs through here,

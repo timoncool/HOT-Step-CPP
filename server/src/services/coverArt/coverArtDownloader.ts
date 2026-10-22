@@ -19,6 +19,7 @@ import http from 'http';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { getCoverArtDir, REQUIRED_FILES } from './coverArtService.js';
+import { registerBusyCheck } from '../../dataroot/pointer.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -120,6 +121,7 @@ class CoverArtDownloader extends EventEmitter {
   private abortControllers: Map<string, AbortController> = new Map();
   private speedSamples: Map<string, { time: number; bytes: number }[]> = new Map();
   private _downloading = false;
+  get downloading(): boolean { return this._downloading; }
 
   /** Get overall download/installation status */
   getStatus(): OverallStatus {
@@ -661,3 +663,4 @@ class CoverArtDownloader extends EventEmitter {
 }
 
 export const coverArtDownloader = new CoverArtDownloader();
+registerBusyCheck('cover-art-download', () => coverArtDownloader.downloading ? ['downloading cover-art models'] : []);

@@ -271,21 +271,21 @@ solver = {
             key     = "rms_target_min",
             type    = "slider",
             label   = "RMS Target Min",
-            default = 1.2,
-            min     = 0.1,
+            default = 0,
+            min     = 0.0,
             max     = 3.0,
             step    = 0.05,
-            hint    = "RMS ceiling at low sigma (late/detail steps). ACE-Step latents ~2.0 RMS at x0. Start at 1.2-1.8 and observe results.",
+            hint    = "RMS ceiling at low sigma (late/detail steps). 0 = auto (1.2, scaled to the active model's latent RMS -- ACE ~2.0, SA3 ~0.685).",
         },
         {
             key     = "rms_target_max",
             type    = "slider",
             label   = "RMS Target Max",
-            default = 2.5,
-            min     = 0.5,
+            default = 0,
+            min     = 0.0,
             max     = 5.0,
             step    = 0.05,
-            hint    = "RMS ceiling at high sigma (early/structure steps). Should be >= target_min. ACE-Step early sigma ~2.5-3.5. Servo only fires downward.",
+            hint    = "RMS ceiling at high sigma (early/structure steps). Should be >= target_min. 0 = auto (2.5, scaled to the active model's latent RMS). Servo only fires downward.",
         },
         {
             key     = "rms_servo_gain",
@@ -309,11 +309,11 @@ solver = {
             key     = "pressure_target_rms",
             type    = "slider",
             label   = "Pressure Target RMS",
-            default = 2.0,
-            min     = 0.5,
+            default = 0,
+            min     = 0.0,
             max     = 4.0,
             step    = 0.1,
-            hint    = "RMS component of pressure target. ACE-Step ~2.0. Correction direction flips if current entropy×RMS is above target.",
+            hint    = "RMS component of pressure target. 0 = auto (2.0, scaled to the active model's latent RMS). Correction direction flips if current entropy×RMS is above target.",
         },
         {
             key     = "pressure_target_entropy",
@@ -438,6 +438,7 @@ local function num_param(p, key, default)
     return tonumber(p[key]) or default
 end
 
+
 local function rms(a, n)
     local s = 0.0
     for i = 0, n - 1 do s = s + a[i] * a[i] end
@@ -521,11 +522,11 @@ function step(xt, vt, t_curr, t_prev, n)
     local lb_lambda     = num_param(params, "look_back_lambda", 0.15)
     local lb_snr_power  = num_param(params, "look_back_snr_power", 1.3)
     local f_rms         = bool_param(params, "rms_servo", false)
-    local rms_tgt_min   = num_param(params, "rms_target_min", 1.2)
-    local rms_tgt_max   = num_param(params, "rms_target_max", 2.5)
+    local rms_tgt_min   = C.rms_scaled(params, "rms_target_min", 1.2)
+    local rms_tgt_max   = C.rms_scaled(params, "rms_target_max", 2.5)
     local rms_gain      = num_param(params, "rms_servo_gain", 0.6)
     local f_pressure    = bool_param(params, "latent_pressure", false)
-    local p_tgt_rms     = num_param(params, "pressure_target_rms", 2.0)
+    local p_tgt_rms     = C.rms_scaled(params, "pressure_target_rms", 2.0)
     local p_tgt_entropy = num_param(params, "pressure_target_entropy", 7.5)
     local eta           = num_param(params, "eta", 0.0)
     local seed          = math.floor(num_param(params, "seed", 42))

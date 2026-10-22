@@ -5,6 +5,10 @@ description: Explains how model files, checkpoints, GGUF quantization, and the M
 
 # Model Management — Models, Checkpoints & Quantization
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 All paths are repo-relative to the repo root (`d:\Ace-Step-Latest\hot-step-cpp`). All commands are Windows PowerShell (use `;` to chain, never `&&`).
 
 ## Terminology (read first)
@@ -16,7 +20,7 @@ All paths are repo-relative to the repo root (`d:\Ace-Step-Latest\hot-step-cpp`)
 - **PP-VAE** — optional post-processing VAE ("polish" re-encode pass). Files: `pp-vae-*.gguf`.
 - **GGUF** — the GGML binary weight format the C++ engine loads (mmap'd). Each GGUF declares its role in the header key `general.architecture`.
 - **Quant** — reduced-precision weight encoding (Q4_K_M, Q8_0, MXFP4, ...) to shrink VRAM/disk. Produced from BF16 GGUFs by `engine/tools/quantize.cpp`.
-- **Adapter** — LoRA/LoKr fine-tune delta (`.safetensors`), lives in `adapters/`, not `models/`.
+- **Adapter** — LoRA/LoKr fine-tune delta (`.safetensors`), lives in `<data root>/adapters/`, not `<data root>/models/`.
 - **Model Manager** — the "Get More Models" modal in the UI + Node download service that fetches curated files from HuggingFace.
 
 ## When to use this skill
@@ -32,14 +36,14 @@ All paths are repo-relative to the repo root (`d:\Ace-Step-Latest\hot-step-cpp`)
 3. **Never hand-edit or hand-build a GGUF's tensor set for a recognized architecture.** A recognized-arch GGUF with a missing tensor kills the whole ace-server process: `gf_load_tensor()` prints `[GGUF] FATAL: tensor 'x' not found` and calls `exit(1)` (`engine/src/gguf-weights.h:164-168`). Node respawns it, so a bad model file mid-request looks like a random engine crash-loop.
 4. **Quantize from BF16 sources only, and never quantize the VAE.** `quantize.exe` reads BF16 GGUF input; VAE-arch tensors and small/critical tensors (`silence_latent`, `scale_shift_table`, `null_condition_emb`, 1-D tensors, text-enc `embed_tokens`) are deliberately never quantized (`engine/tools/quantize.cpp:89-109`). WHY: quantizing these destroys audio quality or breaks generation outright.
 5. **Rebuild rules apply here too:** any change to `engine/src/model-registry.h`, `model-store.h`, `gguf-weights.h`, etc. means rebuild via `dev-rebuild.bat` at repo root — never `engine/build.cmd` directly (you cannot reliably tell whether the app is running; Node auto-respawns ace-server, and killing it uncleanly causes an infinite respawn + file-lock loop). Never `cmake --clean-first` (20+ min CUDA recompile).
-6. **Runtime DLLs do not go in `models/`.** Catalogue entries with `role: "runtime"` (cuBLAS, cudart, ONNX Runtime, cuDNN) install **next to `ace-server.exe`** (`modelDownloadService.ts:110-118`). WHY: missing DLLs there are the #1 cause of the "crashed 3 times within 30s — giving up" loop.
+6. **Runtime DLLs do not go in `<data root>/models/`.** Catalogue entries with `role: "runtime"` (cuBLAS, cudart, ONNX Runtime, cuDNN) install **next to `ace-server.exe`** (`modelDownloadService.ts:110-118`). WHY: missing DLLs there are the #1 cause of the "crashed 3 times within 30s — giving up" loop.
 7. **A model that only exists on this machine does not exist.** Adding a model the app resolves at runtime is a three-part act: upload the weights to Hugging Face, add the entry to `server/src/data/model-registry.json`, and put it in a pack if a feature requires it. Do all three or none — a feature gated on a file that was never uploaded looks fine here and is dead for every user. Verify with `node server/scripts/check-release-prereqs.mjs`. WHY: MM3 training shipped in v1.3 demanding `mm3-rvq-*.gguf` and `mm3-enc-*.gguf` that had never left the dev box (#137, fixed 96d442fb).
 8. **Model/adapters directory paths are restart-required config.** `ACESTEPCPP_MODELS` / `ACESTEPCPP_ADAPTERS` env vars override defaults `<repo>/models` and `<repo>/adapters` (`server/src/config.ts:53-54,100-101`); the engine gets them as spawn-time `--models`/`--adapters` flags.
 
 ## Directory layout (expected)
 
 ```
-models/                                  # config.aceServer.models (default <repo>/models)
+<data root>/models/                                  # config.aceServer.models (default <repo>/models)
   acestep-v15-*.gguf                     # DiT (arch "acestep-dit"): base/sft/turbo/merge x BF16/Q8_0/Q6_K/Q5_K_M/Q4_K_M/MXFP4/NVFP4...
   acestep-5Hz-lm-{0.6B,1.7B,4B}-*.gguf   # LM (arch "acestep-lm")
   Qwen3-Embedding-0.6B-*.gguf            # Text encoder (arch "acestep-text-enc")
@@ -52,7 +56,7 @@ models/                                  # config.aceServer.models (default <rep
   onnx/                                 # ONNX Runtime / TensorRT model dirs (config.aceServer.onnxDir)
   supersep/*.onnx                       # stem-separation nets (Cover/Stem Studio)
   whisper/ggml-*.bin                    # whisper.cpp models (config.ts:253-255)
-adapters/                                # config.aceServer.adapters
+<data root>/adapters/                                # config.aceServer.adapters
   <name>.safetensors                    # ComfyUI single-file LoRA (alpha baked in)
   <name>/adapter_model.safetensors      # PEFT directory format
 ```
@@ -68,9 +72,9 @@ Verified in `engine/src/model-store.h:68-81` (ModelKind comments):
 | Cond-enc + DiT + FSQ tok/detok | the **same** `acestep-v15-*.gguf` | Self-contained; also holds `silence_latent` + `null_condition_emb` (`model-store.h:112-118`) |
 | VAE encode + decode | `vae*.gguf` (has `encoder.*` and `decoder.*`) | |
 | PP-VAE polish | `pp-vae-*.gguf` | Request flag `pp_vae_reencode` (`engine/src/request.h:146`); availability = `GET /api/models/pp-vae` scans for `pp-vae*.gguf` (`server/src/routes/models.ts:50-65`) |
-| ORT/TRT acceleration | `models/onnx/` subdirs | `MODEL_*_ORT` kinds |
-| SuperSep stems | `models/supersep/*.onnx` | + ONNX Runtime/cuDNN DLLs beside ace-server.exe |
-| Whisper transcription | `models/whisper/ggml-*.bin` | + `tools/whisper/whisper-cli.exe` (`config.ts:254-255`) |
+| ORT/TRT acceleration | `<data root>/models/onnx/` subdirs | `MODEL_*_ORT` kinds |
+| SuperSep stems | `<data root>/models/supersep/*.onnx` | + ONNX Runtime/cuDNN DLLs beside ace-server.exe |
+| Whisper transcription | `<data root>/models/whisper/ggml-*.bin` | + `tools/whisper/whisper-cli.exe` (`config.ts:254-255`) |
 
 **Synth pipeline needs DiT + Text-Enc + VAE simultaneously.** Missing any one → `/synth unavailable` warning (server stays up LM-only if an LM exists), or exit 1 if no LM either (`engine/tools/hot-step-server.cpp:2600-2616` — the compiled server; the same block exists in the UNCOMPILED reference copy ace-server.cpp:1686-1711). Request-level selection: `synth_model`, `lm_model`, `vae` are **filenames** resolved against the engine's scanned registry; empty string = first matching entry (`engine/src/request.h:125-142`).
 
@@ -80,26 +84,26 @@ Verified in `engine/src/model-store.h:68-81` (ModelKind comments):
 # From repo root. Binary lives at engine\build\Release\quantize.exe
 .\engine\build\Release\quantize.exe <input-BF16.gguf> <output.gguf> <TYPE>
 # Example:
-.\engine\build\Release\quantize.exe models\acestep-v15-turbo-BF16.gguf models\acestep-v15-turbo-Q4_K_M.gguf Q4_K_M
+.\engine\build\Release\quantize.exe <data root>/models\acestep-v15-turbo-BF16.gguf <data root>/models\acestep-v15-turbo-Q4_K_M.gguf Q4_K_M
 ```
 
 - Valid TYPEs (case-insensitive, `quantize.cpp:8`): `Q2_K Q3_K_S Q3_K_M Q3_K_L Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K Q8_0 NVFP4 MXFP4`. IQ3/IQ4 quants seen on disk are **not** producible by this tool.
 - Mixed-precision policy mirrors llama-quantize: "important" tensors (`v_proj`, `down_proj`; L variants add `o_proj`) bumped one tier; `embed_tokens` always Q6_K (Q8_0 for Q8_0/NVFP4/MXFP4) (`quantize.cpp:40-54,74-86`).
 - Streaming write, low memory. Prints `Quantized N/M tensors` + compression ratio.
-- Output goes straight into `models\` root → picked up on next engine restart.
+- Output goes straight into `<data root>/models\` root → picked up on next engine restart.
 
 ## Procedure: convert HF safetensors → BF16 GGUF (`engine/convert.py`)
 
-- **No CLI args.** Hardcoded: reads checkpoint dirs from `engine/checkpoints/`, writes GGUFs to `engine/models/` (`convert.py:14-16`). **Neither directory exists in this working tree** — create `engine\checkpoints\`, put the HF checkpoint dir inside, run it, then move the output GGUF to repo-root `models\`.
+- **No CLI args.** Hardcoded: reads checkpoint dirs from `engine/checkpoints/`, writes GGUFs to `engine/models/` (`convert.py:14-16`). **Neither directory exists in this working tree** — create `engine\checkpoints\`, put the HF checkpoint dir inside, run it, then move the output GGUF to repo-root `<data root>/models\`.
 - Classification is by checkpoint **directory name**: `acestep-5Hz-lm*` → LM, `acestep-v15*` → DiT, `Qwen3-Embedding*` → text-enc, and exactly `vae` → VAE (`convert.py:55-64`). Skips outputs that already exist.
-- Alternative: the engine loads safetensors checkpoint dirs **directly** (drop `<name>/` with `config.json` + `model.safetensors` into `models/`) — conversion is optional. Sharded (`model.safetensors.index.json`) and diffusers (`diffusion_pytorch_model.safetensors`) layouts supported (`engine/src/weight-source.h`, `engine/src/model-registry.h:328-375`).
+- Alternative: the engine loads safetensors checkpoint dirs **directly** (drop `<name>/` with `config.json` + `model.safetensors` into `<data root>/models/`) — conversion is optional. Sharded (`model.safetensors.index.json`) and diffusers (`diffusion_pytorch_model.safetensors`) layouts supported (`engine/src/weight-source.h`, `engine/src/model-registry.h:328-375`).
 
 ## Procedure: convert ComfyUI int8 DiT safetensors → Q8_0 GGUF (`engine/convert-comfy-int8.py`)
 
 For ComfyUI `comfy_quant` int8 DiT checkpoints (int8 `.weight` + F32 `.weight_scale` scalar or per-row + `.comfy_quant` JSON tensor per layer), including **ConvRot** files (`"convrot": true` + `convrot_groupsize`). Per-tensor and per-row int8 grids are exactly representable in Q8_0 (block scale = tensor/row scale), so weights are **repacked bit-faithfully** — no dequant/requant round trip. Needs a **donor GGUF** of the same architecture (any convert.py-produced `acestep-v15-*.gguf`) to supply `silence_latent` and the `acestep.*` config KVs, which ComfyUI files lack. Aborts on any tensor-shape mismatch vs the donor.
 
 ```powershell
-python engine\convert-comfy-int8.py <comfy.safetensors> models\<matching-donor>-BF16.gguf models\<out>-Q8_0.gguf --name <general.name>
+python engine\convert-comfy-int8.py <comfy.safetensors> <data root>/models\<matching-donor>-BF16.gguf <data root>/models\<out>-Q8_0.gguf --name <general.name>
 ```
 
 ConvRot handling: rotated `decoder.*` weights stay rotated and are recorded in GGUF KV `acestep.convrot_map` (`name:group;...`); the engine applies the matching group-wise Hadamard rotation to that linear's activations at inference (`dit.h` load + `dit-graph.h`/`dit-alignment-graph.h`, commit 182faef). Rotated encoder/tokenizer/detokenizer weights are dequantized + **unrotated** to BF16 offline (run once per generation — not worth graph wiring). `--no-runtime-rotation` builds an all-BF16 unrotated reference GGUF of the same quantized model, used for same-seed A/B validation of the engine rotation path. **Adapter merge mode is refused on ConvRot models** (deltas are unrotated); runtime adapter mode works (deltas consume raw activations).
@@ -113,9 +117,9 @@ First applied 2026-07-15: hrktxz xl_sft_turbo (plain int8) → `acestep-v15-xl-s
 
 ## Procedure: add a model manually
 
-1. Copy the `.gguf` into `models\` **root** (not a subfolder — golden rule 2).
+1. Copy the `.gguf` into `<data root>/models\` **root** (not a subfolder — golden rule 2).
 2. Restart the engine (`dev-rebuild.bat` restarts everything, or restart the app). The scan runs only at ace-server startup.
-3. Check the newest `logs\<session>\ace_engine.log` for `[Registry] <file> -> DiT` (or LM/VAE/...). A `WARNING: skipping X (unknown architecture)` means the GGUF header lacks a recognized `general.architecture` (`acestep-lm|acestep-dit|acestep-text-enc|acestep-vae|pp-vae`, `model-registry.h:99-130`).
+3. Check the newest `<data root>/logs\<session>\ace_engine.log` for `[Registry] <file> -> DiT` (or LM/VAE/...). A `WARNING: skipping X (unknown architecture)` means the GGUF header lacks a recognized `general.architecture` (`acestep-lm|acestep-dit|acestep-text-enc|acestep-vae|pp-vae`, `model-registry.h:99-130`).
 4. The file now appears in `GET /api/models` (Node proxies engine `/props`; buckets `lm`, `embedding`, `dit`, `vae` — `hot-step-server.cpp:2326-2329` — the compiled server, not the uncompiled ace-server.cpp).
 
 ## Procedure: publish a new model so users can get it
@@ -129,7 +133,7 @@ the model does not exist for anyone but you.
 
    ```python
    from huggingface_hub import HfApi
-   HfApi().upload_file(path_or_fileobj='models/mm3/<file>.gguf', path_in_repo='<file>.gguf',
+   HfApi().upload_file(path_or_fileobj='<data root>/models/mm3/<file>.gguf', path_in_repo='<file>.gguf',
                        repo_id='scragnog/<repo>', repo_type='model',
                        commit_message='Add <file>')
    ```
@@ -204,7 +208,7 @@ Download mechanics: HuggingFace URL `https://huggingface.co/{repo}/resolve/main/
 ## Institutional knowledge
 
 - **VALIDATED (production incident, 2026-08-31):** the registry and Hugging Face
-  are the distribution boundary, not `models/`. MM3 training in v1.3 required
+  are the distribution boundary, not `<data root>/models/`. MM3 training in v1.3 required
   `mm3-rvq-*.gguf` + `mm3-enc-*.gguf`, which existed only on the dev machine and
   in neither the catalogue nor any HF repo, so the Training Studio asked every
   user for files that could not be obtained (#137). Fixed 96d442fb by publishing
@@ -235,3 +239,7 @@ Download mechanics: HuggingFace URL `https://huggingface.co/{repo}/resolve/main/
 - `engine/docs/ARCHITECTURE.md` — engine internals, request JSON, generation modes (committed).
 - `README.md` — install/build; states safetensors DiT/LM/Text-Enc/VAE all loadable and BF16 safetensors bit-perfect vs BF16 GGUF.
 - `docs/plans/2026-05-03-model-manager-design.md` — original Model Manager design (**gitignored, local-only, may be absent**; code has drifted from it — trust code).
+
+## Release data folder
+
+Release models and adapters default to the shared data folder; downloaded runtime libraries go in `tools/runtime/`. Bundled engine binaries and `<data root>/library/` catalogues stay with the app. Route new writable release paths through the data-root resolver. See [Configuration](../../../docs/dev/config.md#release-data-folder).

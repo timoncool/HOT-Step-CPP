@@ -1,3 +1,5 @@
+import { useQueryClient } from '@tanstack/react-query';
+import { invalidateModels } from '../../queries/global-models/options';
 // ModelManagerModal.tsx — Full-screen model manager modal
 //
 // Entry point for browsing, downloading, and managing GGUF models.
@@ -40,16 +42,15 @@ function getStoredHfToken(): string | undefined {
 
 export const ModelManagerModal: React.FC<Props> = ({ onClose }) => {
   const { t } = useTranslation();
-  const { registry, loading, error, silentRefresh, getPackFiles, installedFiles } = useModelRegistry();
+  const client = useQueryClient();
+  const { registry, loading, error, getPackFiles, installedFiles } = useModelRegistry();
 
   // Selected family tab (ACE-Step 1.5 / MiniMax-Music3 / YuE2 / Shared) —
   // owned here (not inside ModelCatalogueTab) so the Starter Packs section
   // above the catalogue can filter to the same family.
   const [activeFamily, setActiveFamily] = usePersistedState<FamilyTab>('hs-modelManagerFamily', 'as1.5');
 
-  const { jobs, hasActiveDownloads } = useDownloadStream({
-    onComplete: silentRefresh,
-  });
+  const { jobs, hasActiveDownloads } = useDownloadStream();
 
   // ── Actions ─────────────────────────────────────────────────
 
@@ -90,11 +91,11 @@ export const ModelManagerModal: React.FC<Props> = ({ onClose }) => {
   const handleDelete = useCallback(async (filename: string) => {
     try {
       await modelManagerApi.deleteFile(filename);
-      silentRefresh();
+      await invalidateModels(client);
     } catch (err: any) {
       console.error('[ModelManager] Delete failed:', err);
     }
-  }, [silentRefresh]);
+  }, [client]);
 
   // ── Computed ────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ export const ModelManagerModal: React.FC<Props> = ({ onClose }) => {
   // ── Render ──────────────────────────────────────────────────
 
   return createPortal(
-    <div data-portal-layer className="fixed inset-0 z-50 flex items-start justify-center">
+    <div data-portal-layer className="fixed inset-0 z-[70] flex items-start justify-center">
       {/* Backdrop — does NOT close on click; only the X button closes the modal */}
       <div className="absolute inset-0 bg-black/20 dark:bg-black/40 dark:bg-black/70 backdrop-blur-sm" />
 

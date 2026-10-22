@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query';
+import { assistantProvidersOptions } from '../../queries/studios/resources';
 // AssistantPanel.tsx — AI Assistant sidebar with streaming chat
 //
 // Follows the same sidebar pattern as TerminalPanel.tsx. Streams LLM
@@ -18,10 +20,8 @@ import {
   stripActionBlocks,
   stripThinkingBlocks,
   extractThinkingAndResponse,
-  getProviders,
   type ChatMessage,
   type AssistantAction,
-  type AssistantProvider,
 } from '../../services/assistantApi';
 import './AssistantPanel.css';
 
@@ -43,7 +43,8 @@ let messageIdCounter = 0;
 
 export const AssistantPanel: React.FC<AssistantPanelProps> = ({ onClose, activeView }) => {
   // ── Provider state ──
-  const [providers, setProviders] = useState<AssistantProvider[]>([]);
+  const providersQuery = useQuery(assistantProvidersOptions());
+  const providers = providersQuery.data ?? [];
   const [selectedProvider, setSelectedProvider] = usePersistedState('hs-assistant-provider', '');
   const [selectedModel, setSelectedModel] = usePersistedState('hs-assistant-model', '');
 
@@ -64,20 +65,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({ onClose, activeV
 
   // ── Load providers on mount ──
   useEffect(() => {
-    getProviders()
-      .then((p) => {
-        setProviders(p);
-        // Auto-select first available provider if none persisted
-        if (!selectedProvider) {
-          const first = p.find(pr => pr.available);
-          if (first) {
-            setSelectedProvider(first.id);
-            setSelectedModel(first.default_model);
-          }
-        }
-      })
-      .catch(err => console.error('[Assistant] Failed to load providers:', err));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!selectedProvider) {
+      const first = providersQuery.data?.find(provider => provider.available);
+      if (first) { setSelectedProvider(first.id); setSelectedModel(first.default_model); }
+    }
+  }, [providersQuery.data, selectedProvider, setSelectedProvider, setSelectedModel]);
 
   // ── Auto-scroll ──
   useEffect(() => {
@@ -239,6 +231,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({ onClose, activeV
   // ── Render ──
   return (
     <div className="assistant-panel">
+      {(providersQuery.error) && <div role="alert" className="text-sm text-red-500">{(providersQuery.error)?.message}</div>}
       {/* Header */}
       <div className="assistant-header">
         <div className="assistant-header-left">

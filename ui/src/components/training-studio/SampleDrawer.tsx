@@ -4,12 +4,14 @@
 // element is local to the drawer: preview never touches the global playback
 // store because these files are not library songs.
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo } from 'react';
 import { ChevronLeft, ChevronRight, Headphones, Loader2, X, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { getSampleMm3, getSampleYue2, sampleAudioUrl, saveSampleMm3, saveSampleYue2 } from '../../services/trainingApi';
+import { sampleAudioUrl, saveSampleMm3, saveSampleYue2 } from '../../services/trainingApi';
+import { trainingQueries as tq } from '../../queries/training-data/queries';
 import { mergedSample, useTrainingStore } from '../../stores/trainingStore';
 import { AuditionPlayer } from './AuditionPlayer';
+import { useCaptionFile } from './useCaptionFile';
 import { ParamLabel } from '../shared/ParamLabel';
 import { Toggle } from '../shared/Toggle';
 
@@ -40,47 +42,25 @@ export const SampleDrawer: React.FC<SampleDrawerProps> = ({ sampleId }) => {
   // MM3 Structured Caption — a separate file (<stem>.mm3.txt), not a sidecar
   // field, so it does not ride the store's optimistic edit path. Fetched when
   // the drawer opens on a sample; saved on blur; Escape reverts to last saved.
-  const [mm3, setMm3] = useState<string | null>(null);
-  const [mm3Error, setMm3Error] = useState<string | null>(null);
-  const mm3SavedRef = useRef('');
-  useEffect(() => {
-    let stale = false;
-    setMm3(null);
-    setMm3Error(null);
-    if (!datasetId || !sampleId) return;
-    getSampleMm3(datasetId, sampleId)
-      .then(({ text }) => { if (!stale) { mm3SavedRef.current = text; setMm3(text); } })
-      .catch((err: Error) => { if (!stale) { setMm3(''); setMm3Error(err.message); } });
-    return () => { stale = true; };
-  }, [datasetId, sampleId]);
+  // YuE2's planner caption (<stem>.yue2.txt) works the same way.
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const enabled = !!datasetId && !!sampleId;
+  const mm3File = useCaptionFile(tq.sampleMm3(worker, datasetId ?? '', sampleId), enabled);
+  const yue2File = useCaptionFile(tq.sampleYue2(worker, datasetId ?? '', sampleId), enabled);
+  const { text: mm3, setText: setMm3, error: mm3Error, setError: setMm3Error, savedRef: mm3SavedRef } = mm3File;
+  const { text: yue2, setText: setYue2, error: yue2Error, setError: setYue2Error, savedRef: yue2SavedRef } = yue2File;
   const flushMm3 = () => {
     if (!datasetId || mm3 === null || mm3 === mm3SavedRef.current) return;
     const text = mm3;
-    saveSampleMm3(datasetId, sampleId, text)
-      .then(() => { mm3SavedRef.current = text; setMm3Error(null); })
+    saveSampleMm3(datasetId, sampleId, text, { worker })
+      .then(saved => { mm3File.saved(saved.text ?? text); setMm3Error(null); })
       .catch((err: Error) => setMm3Error(err.message));
   };
-
-  // YuE2 planner caption — the third format, same file-not-field arrangement
-  // as MM3 (<stem>.yue2.txt), so the same fetch-on-open / save-on-blur path.
-  const [yue2, setYue2] = useState<string | null>(null);
-  const [yue2Error, setYue2Error] = useState<string | null>(null);
-  const yue2SavedRef = useRef('');
-  useEffect(() => {
-    let stale = false;
-    setYue2(null);
-    setYue2Error(null);
-    if (!datasetId || !sampleId) return;
-    getSampleYue2(datasetId, sampleId)
-      .then(({ text }) => { if (!stale) { yue2SavedRef.current = text; setYue2(text); } })
-      .catch((err: Error) => { if (!stale) { setYue2(''); setYue2Error(err.message); } });
-    return () => { stale = true; };
-  }, [datasetId, sampleId]);
   const flushYue2 = () => {
     if (!datasetId || yue2 === null || yue2 === yue2SavedRef.current) return;
     const text = yue2;
-    saveSampleYue2(datasetId, sampleId, text)
-      .then(() => { yue2SavedRef.current = text; setYue2Error(null); })
+    saveSampleYue2(datasetId, sampleId, text, { worker })
+      .then(saved => { yue2File.saved(saved.text ?? text); setYue2Error(null); })
       .catch((err: Error) => setYue2Error(err.message));
   };
 

@@ -107,6 +107,11 @@ interface Props<T extends string | number> {
   id?: string;
   title?: string;
   'aria-label'?: string;
+  /** A fixed trigger label (e.g. "Presets") instead of the selected option;
+   *  the trigger then sizes to its label rather than filling its row. */
+  triggerLabel?: React.ReactNode;
+  /** Minimum panel width in px, right-aligned to the trigger when wider. */
+  panelWidth?: number;
 }
 
 /** Where the floating panel goes, in viewport coordinates. */
@@ -135,6 +140,8 @@ export function StyledSelect<T extends string | number>({
   id,
   title,
   'aria-label': ariaLabel,
+  triggerLabel,
+  panelWidth,
 }: Props<T>) {
   const [open, setOpen] = useState(false);
   const [focusIdx, setFocusIdx] = useState(-1);
@@ -182,13 +189,14 @@ export function StyledSelect<T extends string | number>({
     // Prefer below; flip only when below is genuinely cramped AND above is
     // roomier, so a dropdown near the bottom of a long form stays readable.
     const flip = below < 200 && above > below;
+    const width = Math.max(r.width, panelWidth ?? 0);
     setPos({
-      left: r.left,
-      width: r.width,
+      left: Math.max(8, width > r.width ? r.right - width : r.left),
+      width,
       ...(flip ? { bottom: window.innerHeight - r.top + 4 } : { top: r.bottom + 4 }),
       maxHeight: Math.max(140, Math.min(320, flip ? above : below)),
     });
-  }, []);
+  }, [panelWidth]);
 
   useLayoutEffect(() => {
     if (!panelOpen) return;
@@ -299,7 +307,7 @@ export function StyledSelect<T extends string | number>({
         title={title ?? selected?.label}
         onClick={() => (panelOpen ? closePanel() : openPanel())}
         onKeyDown={onTriggerKeyDown}
-        className={`w-full flex items-center gap-2 rounded-xl ${s.trigger}
+        className={`${triggerLabel ? '' : 'w-full '}flex items-center gap-2 rounded-xl ${s.trigger}
                     bg-zinc-100 dark:bg-zinc-800
                     border border-zinc-300 dark:border-white/10
                     text-zinc-800 dark:text-zinc-200
@@ -309,9 +317,11 @@ export function StyledSelect<T extends string | number>({
                     disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-zinc-300
                     dark:disabled:hover:border-white/10 ${className}`}
       >
-        <span className={`truncate flex-1 text-left${selected ? '' : ' text-zinc-400'}`}>
-          {selected ? selected.label : placeholder}
-        </span>
+        {triggerLabel ? <span className="truncate text-left">{triggerLabel}</span> : (
+          <span className={`truncate flex-1 text-left${selected ? '' : ' text-zinc-400'}`}>
+            {selected ? selected.label : placeholder}
+          </span>
+        )}
         <ChevronDown
           size={s.chevron}
           className={`shrink-0 text-zinc-400 transition-transform duration-150 ${panelOpen ? 'rotate-180' : ''}`}

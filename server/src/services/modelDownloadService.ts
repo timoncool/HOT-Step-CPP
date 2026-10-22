@@ -13,7 +13,9 @@ import https from 'https';
 import http from 'http';
 import { createHash, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
-import { config, PORTABLE_MODE, PROJECT_ROOT } from '../config.js';
+import { config, PORTABLE_MODE, PROJECT_ROOT, RUNTIME_LIB_DIR } from '../config.js';
+import { registerBusyCheck } from '../dataroot/pointer.js';
+import type { RegistryFileEntry as RegistryFile, ModelRegistryResponse, DownloadStatus, DownloadJob } from '../contracts/modelManager.js';
 
 // Load registry - resolve path based on mode:
 // - Dev mode: relative to source file (../data/model-registry.json from services/)
@@ -111,19 +113,9 @@ function isWindowsOnlyFile(f: { filename?: string }): boolean {
 const CUDA_ONLY_PACKS = ['cuda-runtime', 'cuda12-runtime', 'supersep-runtime', 'blackwell'];
 
 // ── Types ───────────────────────────────────────────────────
-
-export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed' | 'cancelled';
-
-export interface DownloadJob {
-  jobId: string;
-  fileId: string;
-  filename: string;
-  status: DownloadStatus;
-  bytesDownloaded: number;
-  totalBytes: number;
-  speed: number;        // bytes/sec rolling average
-  error?: string;
-}
+// DownloadStatus and DownloadJob are shared with the client — imported above
+// from contracts/modelManager.ts — so this service's job shape can't drift
+// from what GET /api/model-manager/downloads actually streams.
 
 interface InternalJob extends DownloadJob {
   abortController?: AbortController;
@@ -131,45 +123,9 @@ interface InternalJob extends DownloadJob {
   hfToken?: string;   // Optional Hugging Face token for gated repos
 }
 
-/** A small non-model file (license, readme, ...) that should land next to its
- *  parent once the parent finishes downloading. Not tracked as its own job —
- *  no progress/resume, best-effort, generic (not tied to any one model). */
-interface RegistryCompanion {
-  filename: string;
-  repoPath?: string;   // Path within the HuggingFace repo; defaults to filename
-}
-
-interface RegistryFile {
-  id: string;
-  filename: string;
-  role: string;
-  subdir?: string;
-  repoPath?: string;     // Path within the HuggingFace repo (e.g. "runtime/cublas64_13.dll")
-  displayName: string;
-  scale: string | null;
-  variant: string | null;
-  quant: string;
-  sizeBytes: number;
-  /** Optional sha256 of the published file, lowercase hex.
-   *
-   *  Declare it on any entry whose CONTENT can change under a reused
-   *  filename -- a model that gets retrained and republished at the same
-   *  name. Without it the only staleness check is the file's existence, so
-   *  an install that already holds the old bytes keeps them forever while
-   *  fresh installs get the new ones. See _matchesRegistry. */
-  sha256?: string;
-  repo: string;
-  description: string;
-  tags: string[];
-  companions?: RegistryCompanion[];
-  /** TensorRT builder-resource entries only — see ui/src/types.ts RegistryFile
-   *  for the matching UI-side field. */
-  sm?: number;
-  /** Which generation backend (or "shared" across several) this file belongs
-   *  to. Optional — absent on entries added before this field existed; the UI
-   *  falls back to a role→family mapping in that case. */
-  family?: 'as1.5' | 'mm3' | 'yue2' | 'shared';
-}
+// RegistryFile (the catalogue entry, before installed-status enrichment) and
+// RegistryCompanion are imported from contracts/modelManager.ts — that file
+// also documents the companion-file behavior this interface used to.
 
 // ── Service ─────────────────────────────────────────────────
 
@@ -181,9 +137,10 @@ class ModelDownloadService extends EventEmitter {
     return config.aceServer.models;
   }
 
-  /** Get the engine directory (where ace-server.exe lives) for runtime DLLs */
+  /** Where runtime DLLs go: the data folder's tools/runtime in a release
+   *  (on the engine's PATH via trtLibs), beside ace-server in dev. */
   get engineDir(): string {
-    return path.dirname(config.aceServer.exe);
+    return RUNTIME_LIB_DIR ?? path.dirname(config.aceServer.exe);
   }
 
   /** Resolve the target directory for a registry file */
@@ -199,7 +156,7 @@ class ModelDownloadService extends EventEmitter {
 
   /** Get all files in the registry, enriched with installed status.
    *  Filters out CUDA-specific entries for non-CUDA engine variants. */
-  getRegistry(): { packs: any[]; files: (RegistryFile & { installed: boolean; outdated: boolean })[]; modelsDir: string; variant: string; cudaMajor: number } {
+  getRegistry(): ModelRegistryResponse {
     const installed = this.getInstalledFiles();
     const isCuda = ENGINE_VARIANT === 'cuda';
     const wrongCudaTag = CUDA_MAJOR <= 12 ? 'cuda13' : 'cuda12';
@@ -354,9 +311,10 @@ class ModelDownloadService extends EventEmitter {
       }
     }
 
-    // Scan engine directory for runtime DLLs
-    const engDir = this.engineDir;
-    if (fs.existsSync(engDir)) {
+    // Scan for runtime DLLs: the download folder, and beside ace-server, where
+    // a release ships some and older versions downloaded them
+    for (const engDir of new Set([this.engineDir, path.dirname(config.aceServer.exe)])) {
+      if (!fs.existsSync(engDir)) continue;
       for (const f of fs.readdirSync(engDir)) {
         if (f.endsWith('.dll')) files.add(f);
       }
@@ -913,3 +871,8 @@ class ModelDownloadService extends EventEmitter {
 }
 
 export const modelDownloadService = new ModelDownloadService();
+
+// A data-folder move must not start under a download writing into models/.
+registerBusyCheck('model-downloads', () => modelDownloadService.getJobs()
+  .filter(j => j.status === 'downloading' || j.status === 'queued')
+  .map(j => `downloading ${j.filename}`));

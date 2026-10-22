@@ -2,10 +2,12 @@
 // Displayed between the waveform and transport controls when playing.
 // Ported from hot-step-9000.
 
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { ChevronDown, ChevronUp, Music } from 'lucide-react';
 import { parseLrc, type LrcLine } from '../../utils/lrcUtils';
-import { fetchLyricsJson, findCurrentLineIndex, findActiveWordIndex, sidecarUrl, type LyricsJson } from '../../utils/wordLrcUtils';
+import { findCurrentLineIndex, findActiveWordIndex } from '../../utils/wordLrcUtils';
+import { lrcOptions, lyricsJsonOptions } from '../../queries/shell-queue/lyrics';
 import { WordHighlighter } from './WordHighlighter';
 
 interface LyricsBarProps {
@@ -30,40 +32,13 @@ function findCurrentIndex(lines: LrcLine[], time: number): number {
 }
 
 export const LyricsBar: React.FC<LyricsBarProps> = ({ audioUrl, currentTime }) => {
-    const [fetchedLrc, setFetchedLrc] = useState<string | null>(null);
-    const [wordData, setWordData] = useState<LyricsJson | null>(null);
     const [expanded, setExpanded] = useState(true);
 
-    // Fetch lyrics — try .lyrics.json first (word-level), fall back to .lrc
-    useEffect(() => {
-        if (!audioUrl) { setFetchedLrc(null); setWordData(null); return; }
-        let cancelled = false;
-
-        (async () => {
-            // Try word-level lyrics first
-            const json = await fetchLyricsJson(audioUrl);
-            if (cancelled) return;
-            if (json) {
-                setWordData(json);
-                setFetchedLrc(null); // Clear LRC — word data takes priority
-                return;
-            }
-
-            // Fall back to .lrc
-            setWordData(null);
-            try {
-                const lrcUrl = sidecarUrl(audioUrl, '.lrc');
-                const res = await fetch(lrcUrl);
-                if (!res.ok) throw new Error('No LRC');
-                const text = await res.text();
-                if (!cancelled && text.includes('[')) setFetchedLrc(text);
-            } catch {
-                if (!cancelled) setFetchedLrc(null);
-            }
-        })();
-
-        return () => { cancelled = true; };
-    }, [audioUrl]);
+    // Word-level .lyrics.json takes priority; .lrc is the fallback. Both are
+    // shared sidecar queries, joined with SectionMarkers' reads of the same track.
+    const wordData = useQuery(lyricsJsonOptions(audioUrl ?? '')).data ?? null;
+    const lrc = useQuery(lrcOptions(audioUrl ?? '')).data ?? null;
+    const fetchedLrc = wordData ? null : lrc;
 
     const lines = useMemo(() => fetchedLrc ? parseLrc(fetchedLrc) : [], [fetchedLrc]);
     const currentIdx = findCurrentIndex(lines, currentTime);

@@ -1,6 +1,27 @@
 @echo off
-REM HOT-Step engine build (all backends: CPU variants + CUDA + Vulkan)
+setlocal
+REM HOT-Step engine build. Optional argument: all (default), cuda, vulkan, cpu.
 REM Uses vswhere to find any Visual Studio edition automatically.
+
+set "BUILD_BACKEND=%~1"
+if not defined BUILD_BACKEND set "BUILD_BACKEND=all"
+set "BUILD_CUDA=OFF"
+set "BUILD_VULKAN=OFF"
+if /i "%BUILD_BACKEND%"=="all" goto :all
+if /i "%BUILD_BACKEND%"=="cuda" goto :cuda
+if /i "%BUILD_BACKEND%"=="vulkan" goto :vulkan
+if /i "%BUILD_BACKEND%"=="cpu" goto :setup
+echo ERROR: Unknown backend "%BUILD_BACKEND%". Use all, cuda, vulkan or cpu.
+exit /b 1
+:all
+set "BUILD_VULKAN=ON"
+:cuda
+set "BUILD_CUDA=ON"
+goto :setup
+:vulkan
+set "BUILD_VULKAN=ON"
+:setup
+echo HOT-Step engine build: %BUILD_BACKEND%
 
 REM Skip vcvars if already sourced (prevents PATH overflow on repeated runs)
 if defined VSCMD_VER goto :deps
@@ -26,16 +47,22 @@ if not defined VCVARS (
 
 echo Using: %VCVARS%
 call "%VCVARS%"
+if errorlevel 1 exit /b %errorlevel%
 
 :deps
 :build
 cd /d "%~dp0"
+if errorlevel 1 exit /b %errorlevel%
 rem rd /s /q build 2>nul
 mkdir build 2>nul
 cd build
+if errorlevel 1 exit /b %errorlevel%
 
-REM Build all backends
-cmake .. -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_BACKEND_DL=ON %RELEASE_CMAKE_EXTRA%
+REM CUDA uses the installed toolkit; this does not select a CI CUDA version.
+cmake .. -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=%BUILD_CUDA% -DGGML_VULKAN=%BUILD_VULKAN% -DGGML_BACKEND_DL=ON %RELEASE_CMAKE_EXTRA%
+if errorlevel 1 exit /b %errorlevel%
 cmake --build . --config Release -j %NUMBER_OF_PROCESSORS%
+if errorlevel 1 exit /b %errorlevel%
 
 cd ..
+exit /b 0

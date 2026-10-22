@@ -5,7 +5,7 @@ MD Audio VAE Tiled Decoder — Core Math Engine
 © 2026 Alexander Allan (MDMAchine) | A&E Concepts
 GPL v3 — Public version.
 
-Version: 3.0.1
+Version: 3.1.0 (adds build_auto_schedule / auto_single_tile; 3.0.1 behaviour unchanged when off)
 PARITY: Algorithmic parity with md_audio_tiled_core.py v3.0.1
         All coefficients, thresholds, and control flow identical.
 
@@ -152,6 +152,59 @@ function M.build_fixed_schedule(W, tile_size, overlap, start_offset)
         local e = math.min(W, cursor + tile_size)
         table.insert(schedule, {start = cursor, end_ = e, overlap = overlap})
         cursor = cursor + hop
+    end
+    return schedule
+end
+
+-- Default ceiling for auto single tile, in latent frames.
+-- 6000 = 240 s at 25 fps (ACE). GPU VRAM is flat because vae_decode_fn
+-- already runs the native chunked decode (chunk 1024 / overlap 64), so
+-- the engine sees the same footprint regardless of how many frames the
+-- plugin tile covers. The real cost of a larger tile is host RAM for the
+-- Lua number arrays: each array is ~16 B/value; one tile holds
+-- frames * 1920 samples/frame * 2 ch values; chunk + write_chunk +
+-- audio_out = ~3 arrays => 6000 * 1920 * 2 * 3 * 16 B ~ 1.1 GB.
+M.AUTO_MAX_SINGLE_TILE = 6000
+
+---Auto schedule: ONE tile when W fits in max_single, else the fewest
+---equal-length tiles (each <= max_single) with `overlap` frames of crossfade.
+---Always covers exactly [0, W). Robust to NaN/0/negative params.
+---@param W integer  total latent frames
+---@param max_single integer  largest tile allowed (latent frames)
+---@param overlap integer  crossfade frames between tiles (multi-tile only)
+---@return table[]  list of {start, end_, overlap}
+function M.build_auto_schedule(W, max_single, overlap)
+    local function sane(v, fallback)
+        v = tonumber(v)
+        if v == nil or v ~= v or v == math.huge or v == -math.huge then return fallback end
+        return math.floor(v)
+    end
+    W = sane(W, 0)
+    if W <= 0 then return {} end
+    max_single = sane(max_single, M.AUTO_MAX_SINGLE_TILE)
+    if max_single < 16 then max_single = M.AUTO_MAX_SINGLE_TILE end
+    if W <= max_single then
+        return { {start = 0, end_ = W, overlap = 0} }
+    end
+    overlap = sane(overlap, 0)
+    if overlap < 0 then overlap = 0 end
+    -- overlap >= tile would never advance; cap it at a quarter tile
+    overlap = math.min(overlap, math.floor(max_single / 4))
+    local n     = math.ceil((W - overlap) / (max_single - overlap))
+    -- Distribute remainder evenly so tile lengths differ by at most 1.
+    -- total_extent = W + (n-1)*overlap is how many frames are "spent"
+    -- across all tile starts (hops) plus one final tile length.
+    local total = W + (n - 1) * overlap
+    local base  = math.floor(total / n)
+    local rem   = total - base * n   -- 0 to n-1 tiles get base+1
+    local schedule = {}
+    local cursor = 0
+    for i = 0, n - 1 do
+        local this_len = base + (i < rem and 1 or 0)
+        local s = cursor
+        local e = (i == n - 1) and W or math.min(W, s + this_len)
+        table.insert(schedule, {start = s, end_ = e, overlap = overlap})
+        cursor = cursor + this_len - overlap
     end
     return schedule
 end
@@ -676,7 +729,21 @@ function M.execute_tiled_decode(vae_decode_fn, latents, B, C_lat, W,
     end
 
     -- ── Tile schedules ────────────────────────────────────────────────────────
-    local sched_a = M.build_fixed_schedule(W, tile_size, overlap, 0)
+    local sched_a
+    if params.auto_single_tile then
+        -- Auto: one seamless tile when it fits; otherwise equal tiles. Dual
+        -- pass is skipped for a single tile (its offset pass would add the
+        -- very seam we are avoiding) and uses the equal tile length otherwise.
+        sched_a = M.build_auto_schedule(W, params.max_single_tile, overlap)
+        if #sched_a <= 1 then
+            dual_pass = false
+        else
+            tile_size = sched_a[1].end_ - sched_a[1].start
+            overlap   = sched_a[1].overlap
+        end
+    else
+        sched_a = M.build_fixed_schedule(W, tile_size, overlap, 0)
+    end
     local sched_b = dual_pass
                     and M.build_fixed_schedule(W, tile_size, overlap,
                                                math.floor(tile_size / 2))

@@ -411,6 +411,9 @@ input[type="range"]::-webkit-slider-thumb:hover {
    ======================================== */
 
 /* Wrapper: establishes stacking context for glow ring + scale pulse */
+/* In @layer components so utilities like max-[1023px]:hidden can override
+   display:flex (unlayered, it won and kept "hidden" panels visible). */
+@layer components {
 .disco-wrapper {
   position: relative;
   isolation: isolate;
@@ -419,6 +422,7 @@ input[type="range"]::-webkit-slider-thumb:hover {
   will-change: transform;
   transform-origin: center center;
   transition: transform 0.06s ease-out;
+}
 }
 
 /* Glow ring: spinning gradient masked to a border frame.

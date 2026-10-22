@@ -27,6 +27,14 @@
 // NOT made by this patch (see APPLY.md).
 #include <string>
 
+// sa3_weights_present lives in its own header (sa3-families.h) rather than
+// riding a hook include the way mm3_weights_present and yue2_weights_present
+// do: SA3 has no "sa3-server.h" subtree hook in hot-step-server.cpp for this
+// header to rely on having been included earlier in the TU (see sa3-families.h's
+// own comment for why), so it is safe — and necessary — to include directly
+// here instead of forward-declaring it.
+#include "sa3-families.h"
+
 struct HotStepFamily {
     const char * name;                                  // for the two [Server] log lines only
     // nullptr = "handled by the ACE registry scan itself" (reserved for a
@@ -53,6 +61,7 @@ inline constexpr HotStepFamily g_hot_step_families[] = {
                                         // table — not the two call sites — is the map of "who can serve".
     { "MiniMax-Music3", mm3_weights_present },
     { "YuE2", yue2_weights_present },
+    { "StableAudio3", sa3_weights_present },
 };
 
 inline bool hot_step_any_family_weights_present(const char * models_dir) {

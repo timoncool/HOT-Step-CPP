@@ -1,7 +1,7 @@
 # release/build-release.ps1 — Build a complete portable release of HOT-Step CPP
 #
 # Usage:
-#   .\release\build-release.ps1 [-Version "1.5.0"] [-SkipEngine] [-SkipUI] [-Variant cuda]
+#   .\release\build-release.ps1 [-Version "1.5.0"] [-SkipEngine] [-SkipUI] [-Variant cuda] [-BuildBackend all]
 #
 # Produces:
 #   release/out/HOT-Step-CPP-v{version}-win-x64-{variant}.zip
@@ -16,11 +16,20 @@ param(
     [string]$Version = "0.0.0",
     [switch]$SkipEngine,
     [switch]$SkipUI,
-    [string]$Variant = "cuda",       # cuda, vulkan, cpu
+    [ValidateSet("cuda", "vulkan", "cpu")]
+    [string]$Variant = "cuda",       # Packaged backend
+    [ValidateSet("all", "cuda", "vulkan", "cpu")]
+    [string]$BuildBackend = "all",   # Backends to compile
     [string]$NodeVersion = "24.18.0" # Node.js LTS version to bundle
 )
 
 $ErrorActionPreference = "Stop"
+# Reject mismatches before downloads, staging cleanup or builds, including SkipEngine.
+if ($BuildBackend -ne "all" -and $BuildBackend -ne $Variant) {
+    throw "BuildBackend '$BuildBackend' must match Variant '$Variant', or use BuildBackend 'all'."
+}
+$buildCuda = if ($BuildBackend -in @("all", "cuda")) { "ON" } else { "OFF" }
+$buildVulkan = if ($BuildBackend -in @("all", "vulkan")) { "ON" } else { "OFF" }
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ReleaseDir = Join-Path $ProjectRoot "release"
 $StagingDir = Join-Path $ReleaseDir "staging"
@@ -79,10 +88,7 @@ if (-not $SkipEngine) {
     # Use buildall.cmd for multi-arch release builds
     $buildScript = Join-Path $engineDir "buildall.cmd"
 
-    # For release builds, we want static MSVC runtime and multi-arch CUDA
-    # buildall.cmd already does multi-arch + Vulkan.
-    # We modify the cmake flags by setting them before calling the script.
-    Write-Host "  Running buildall.cmd with static runtime..."
+    Write-Host "  Running buildall.cmd ($BuildBackend) with static runtime..."
 
     # Smart CMake cache handling: only clear if build flags have changed.
     # Deleting CMakeCache.txt forces a full reconfigure -> full rebuild of ALL
@@ -96,12 +102,13 @@ if (-not $SkipEngine) {
         $cacheContent = Get-Content $cacheFile -Raw
         $requiredFlags = @{
             "HOT_STEP_STATIC_RUNTIME:BOOL=ON" = "Static runtime (/MT)"
-            "GGML_CUDA:BOOL=ON"               = "CUDA backend"
-            "GGML_VULKAN:BOOL=ON"             = "Vulkan backend"
+            "GGML_CUDA:BOOL=$buildCuda"        = "CUDA backend"
+            "GGML_VULKAN:BOOL=$buildVulkan"    = "Vulkan backend"
+            "GGML_BACKEND_DL:BOOL=ON"         = "Dynamic backend loading"
             "GGML_CPU_ALL_VARIANTS:BOOL=ON"   = "CPU all variants"
         }
         foreach ($flag in $requiredFlags.Keys) {
-            if ($cacheContent -notmatch [regex]::Escape($flag)) {
+            if ($cacheContent -notmatch ("(?m)^" + [regex]::Escape($flag) + "\r?$")) {
                 Write-Host "  Cache mismatch: $($requiredFlags[$flag]) ($flag)" -ForegroundColor Yellow
                 $needsCacheClear = $true
             }
@@ -118,14 +125,16 @@ if (-not $SkipEngine) {
 
     # Set cmake flags for the build
     # buildall.cmd runs cmake with its own flags, so we override via env
+    $previousCmakeExtra = $env:RELEASE_CMAKE_EXTRA
     $env:RELEASE_CMAKE_EXTRA = "-DHOT_STEP_STATIC_RUNTIME=ON"
 
     Push-Location $engineDir
     try {
-        # buildall.cmd handles vcvars, ORT download, and multi-config build
-        cmd /c "buildall.cmd"
+        # Use the absolute path even when current-directory executable lookup is disabled.
+        & $buildScript $BuildBackend
         if ($LASTEXITCODE -ne 0) { throw "Engine build failed (exit code $LASTEXITCODE)" }
     } finally {
+        $env:RELEASE_CMAKE_EXTRA = $previousCmakeExtra
         Pop-Location
     }
 
@@ -252,7 +261,7 @@ New-Item -ItemType Directory -Force $engineOut | Out-Null
 $buildRelease = Join-Path (Join-Path $ProjectRoot "engine") "build\Release"
 
 $engineFiles = @(
-    "ace-server.exe", "mastering.exe", "mp3-codec.exe",
+    "ace-server.exe", "ace-train.exe", "ace-midi.exe", "ace-caption.exe", "mastering.exe", "mp3-codec.exe",
     "neural-codec.exe", "vst-host.exe", "quantize.exe",
     "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"
 )
@@ -269,7 +278,7 @@ foreach ($file in $engineFiles) {
     if (Test-Path $src) {
         Copy-Item $src (Join-Path $engineOut $file)
     } else {
-        Write-Warning "  Missing engine file: $file"
+        throw "Missing required engine file: $file"
     }
 }
 
@@ -357,8 +366,12 @@ if (Test-Path $ffmpegSrc) {
 # Copy data files (model-registry.json, assistant-knowledge.md)
 $dataOut = Join-Path $serverOut "data"
 New-Item -ItemType Directory -Force $dataOut | Out-Null
-Copy-Item (Join-Path (Join-Path (Join-Path $ProjectRoot "server") "src\data") "model-registry.json") (Join-Path $dataOut "model-registry.json")
-Copy-Item (Join-Path (Join-Path (Join-Path $ProjectRoot "server") "src\data") "assistant-knowledge.md") (Join-Path $dataOut "assistant-knowledge.md")
+Copy-Item (Join-Path $ProjectRoot "server/src/data/*") $dataOut -Recurse -Force
+
+# Gate: the bundle must boot before anything is zipped; runs after the addon and its deps are staged (a bad bundle once shipped with exit 13).
+Write-Host "  Boot-testing server.mjs with the portable runtime..."
+& $NodeExe (Join-Path $ReleaseDir "smoke-boot.mjs") (Join-Path $StagingDir "server\server.mjs")
+if ($LASTEXITCODE -ne 0) { throw "Server bundle failed its boot test - not releasing" }
 
 # UI: pre-built dist
 Write-Host "  Copying UI..."
@@ -384,14 +397,14 @@ if (Test-Path $noiseSrc) {
     Copy-Item -Recurse $noiseSrc (Join-Path $dist "noise_samples")
 }
 
-# Empty directories for user content
-New-Item -ItemType Directory -Force (Join-Path $dist "models") | Out-Null
-New-Item -ItemType Directory -Force (Join-Path $dist "adapters") | Out-Null
+# Mutable data folders are initialized beside the app at first boot.
 
 # Config and docs
-Copy-Item (Join-Path $ProjectRoot ".env.example") (Join-Path $dist ".env.example")
+Copy-Item (Join-Path $ReleaseDir ".env.example") (Join-Path $dist ".env.example")
+Copy-Item (Join-Path $ReleaseDir "profile-path.mjs") (Join-Path $dist "profile-path.mjs")
 Copy-Item (Join-Path $ReleaseDir "HOT-Step.bat") (Join-Path $dist "HOT-Step.bat")
 Copy-Item (Join-Path $ReleaseDir "README.txt") (Join-Path $dist "README.txt")
+Copy-Item (Join-Path $ProjectRoot "open-browser-if-needed.mjs") (Join-Path $dist "open-browser-if-needed.mjs")
 
 Write-Host "  Assembly complete" -ForegroundColor Green
 

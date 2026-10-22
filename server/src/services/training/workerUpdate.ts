@@ -17,7 +17,7 @@ import { stopAceServer } from '../aceEngineProcess.js';
 import { gpuLaneBusy, gpuLaneDepth } from '../generation/gpuLane.js';
 
 const git = (args: string[], cwd = PROJECT_ROOT) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 15000, windowsHide: true }).trim();
+  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000, windowsHide: true }).trim();
 export const startupCommit = (() => { try { return git(['rev-parse', 'HEAD']); } catch { return ''; } })();
 export const currentCommit = () => git(['rev-parse', 'HEAD']);
 export const dirtyCheckout = () => { try { return !!git(['status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=none']); } catch { return false; } };
@@ -89,7 +89,7 @@ function assertIdle(): void {
   if (job) throw Object.assign(new Error(`Worker has an active or queued ${job.kind} job`), { status: 409 });
 }
 
-async function command(file: string, args: string[], cwd: string, log: (line: string) => void): Promise<void> {
+export async function command(file: string, args: string[], cwd: string, log: (line: string) => void): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const child = spawn(file, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let tail = '';
@@ -104,9 +104,24 @@ async function command(file: string, args: string[], cwd: string, log: (line: st
   });
 }
 
+/** Per-platform commands. Windows keeps its cmd.exe/powershell.exe/build.cmd forms; macOS uses pwsh, plain npm and build-mac.sh. */
+export function platformCommands(platform: NodeJS.Platform, root: string) {
+  const mac = platform === 'darwin';
+  return {
+    hooks: mac
+      ? ['pwsh', ['-NoProfile', '-File', path.join(root, 'engine', 'verify-hooks.ps1')]] as const
+      : ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'engine', 'verify-hooks.ps1')]] as const,
+    npm: (...args: string[]) => (mac ? ['npm', args] : ['cmd.exe', ['/d', '/c', `npm ${args.join(' ')}`]]) as readonly [string, string[]],
+    engineBuild: mac
+      ? ['bash', [path.join(root, 'engine', 'build-mac.sh')]] as const
+      : ['cmd.exe', ['/d', '/c', path.join(root, 'engine', 'build.cmd')]] as const,
+  };
+}
+
 async function verifyGgmlHooks(root: string, log: (line: string) => void): Promise<void> {
   let hookFailed = false;
-  await command('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'engine', 'verify-hooks.ps1')], root, line => {
+  const [hookFile, hookArgs] = platformCommands(process.platform, root).hooks;
+  await command(hookFile, [...hookArgs], root, line => {
     if (line.includes('[FAIL]')) hookFailed = true;
     log(line);
   });
@@ -121,47 +136,58 @@ export async function updateGgml(root: string, log: (line: string) => void, veri
   await verify(root, log);
 }
 
-export async function receiveUpdate(body: NodeJS.ReadableStream, base: string, target: string, log: (line: string, phase?: string) => void): Promise<void> {
+type UpdateOps = Parameters<typeof runUpdatePlan>[2];
+/** Test seam: replace the git-bound preparation and any plan step. `reset` still marks the gate locked. */
+export interface ReceiveDeps { idle?: () => void; commit?: () => string; prepare?: () => Promise<{ files: string[]; pointerChanged: boolean }>; ops?: Partial<UpdateOps> }
+
+export async function receiveUpdate(body: NodeJS.ReadableStream, base: string, target: string, log: (line: string, phase?: string) => void, deps: ReceiveDeps = {}): Promise<void> {
+  const idle = deps.idle ?? assertIdle;
   if (applying) throw Object.assign(new Error('Worker update already running'), { status: 409 });
-  assertIdle();
+  idle();
   if (!/^[a-f0-9]{40}$/i.test(base) || !/^[a-f0-9]{40}$/i.test(target)) throw Object.assign(new Error('Invalid commit'), { status: 400 });
-  if (currentCommit() !== base) throw Object.assign(new Error('Worker commit changed; refresh status'), { status: 409 });
+  if ((deps.commit ?? currentCommit)() !== base) throw Object.assign(new Error('Worker commit changed; refresh status'), { status: 409 });
   applying = true;
   const bundle = path.join(os.tmpdir(), `hotstep-worker-${randomUUID()}.bundle`);
   let resetStarted = false;
   let bundlePresent = true;
+  const cmds = platformCommands(process.platform, PROJECT_ROOT);
+  const npm = (args: string[], cwd: string, log: (line: string) => void) => { const [f, a] = cmds.npm(...args); return command(f, a, cwd, log); };
   try {
     await pipeline(body, fs.createWriteStream(bundle));
-    assertIdle();
+    idle();
     log('Verifying bundle', 'verifying');
+    const { files, pointerChanged } = deps.prepare ? await deps.prepare() : await (async () => {
     await command('git', ['bundle', 'verify', bundle], PROJECT_ROOT, line => log(line));
     // The bundle carries no submodule objects; recursing would fetch ggml from its remote here.
     await command('git', ['fetch', '--no-tags', '--no-recurse-submodules', bundle, 'master'], PROJECT_ROOT, line => log(line));
     if (git(['rev-parse', 'FETCH_HEAD']) !== target) throw new Error('Bundle target did not match requested commit');
     const files = git(['diff', '--name-only', `${base}..${target}`]).split(/\r?\n/).filter(Boolean).map(f => f.replaceAll('\\', '/'));
-    const pointerChanged = ggmlPointerChanged(base, target);
+    return { files, pointerChanged: ggmlPointerChanged(base, target) };
+    })();
+    const resetStep = async () => {
+      log(`Resetting to ${target.slice(0, 8)}; discarding worker checkout changes`, 'resetting');
+      resetStarted = true;
+      if (deps.ops?.reset) return deps.ops.reset();
+      await command('git', ['-c', 'submodule.recurse=false', 'reset', '--hard', target], PROJECT_ROOT, line => log(line));
+    };
     await runUpdatePlan(files, pointerChanged, {
       advance: () => classifyCommit(base, target).relation === 'behind' && currentCommit() === base,
-      idle: assertIdle,
-      reset: async () => {
-        log(`Resetting to ${target.slice(0, 8)}; discarding worker checkout changes`, 'resetting');
-        resetStarted = true;
-        await command('git', ['-c', 'submodule.recurse=false', 'reset', '--hard', target], PROJECT_ROOT, line => log(line));
-      },
+      idle,
       recoverGgml: async () => {
         log('Updating committed ggml submodule', 'engine-submodule');
         await updateGgml(PROJECT_ROOT, line => log(line));
       },
-      serverInstall: async () => { log('Installing server dependencies', 'server-install'); await command('cmd.exe', ['/d', '/c', 'npm ci'], path.join(PROJECT_ROOT, 'server'), line => log(line)); },
-      uiInstall: async () => { log('Installing UI dependencies', 'ui-install'); await command('cmd.exe', ['/d', '/c', 'npm ci'], path.join(PROJECT_ROOT, 'ui'), line => log(line)); },
-      uiBuild: async () => { log('Building UI', 'ui-build'); await command('cmd.exe', ['/d', '/c', 'npm run build'], path.join(PROJECT_ROOT, 'ui'), line => log(line)); },
+      serverInstall: async () => { log('Installing server dependencies', 'server-install'); await npm(['ci'], path.join(PROJECT_ROOT, 'server'), line => log(line)); },
+      uiInstall: async () => { log('Installing UI dependencies', 'ui-install'); await npm(['ci'], path.join(PROJECT_ROOT, 'ui'), line => log(line)); },
+      uiBuild: async () => { log('Building UI', 'ui-build'); await npm(['run', 'build'], path.join(PROJECT_ROOT, 'ui'), line => log(line)); },
       engineBuild: async () => {
         log('Stopping engine for rebuild', 'engine-build');
         // ace-server holds the ggml DLLs open; the linker cannot replace them while it runs.
         if (!await stopAceServer('Worker engine rebuild')) throw new Error('ace-server did not stop before the engine build');
         log('Building engine', 'engine-build');
-        await command('cmd.exe', ['/d', '/c', path.join(PROJECT_ROOT, 'engine', 'build.cmd')], path.join(PROJECT_ROOT, 'engine'), line => log(line)); },
+        await command(cmds.engineBuild[0], [...cmds.engineBuild[1]], path.join(PROJECT_ROOT, 'engine'), line => log(line)); },
       restart: () => { log('Build complete; requesting restart', 'restarting'); fs.unlinkSync(bundle); bundlePresent = false; requestWorkerRestart(); },
+      ...deps.ops, reset: resetStep,
     });
   } finally {
     if (bundlePresent) try { fs.unlinkSync(bundle); } catch { /* temp bundle is disposable */ }

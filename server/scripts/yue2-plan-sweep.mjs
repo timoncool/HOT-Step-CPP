@@ -31,7 +31,8 @@ try {
     for (const step of a.steps) {
       const seeds = Array.from({ length: cfg.plans }, (_, i) => cfg.seed + i).filter(s => !done.has(`${step}:${s}`));
       if (!seeds.length) continue;
-      await select(step > 0 ? path.join(a.runDir, `checkpoint-step${step}`, 'native-ar.safetensors') : '');
+      const ckpt = path.join(a.runDir, `checkpoint-step${step}`);
+      await select(step > 0 ? path.join(ckpt, fs.readdirSync(ckpt).find(n => n === 'native-ar.safetensors' || n.endsWith(`yue2_joint_ar_step${step}.safetensors`))) : '');
       let kl = null;
       try { kl = JSON.parse(fs.readFileSync(path.join(a.runDir, `checkpoint-step${step}`, 'meters.json'), 'utf8')).ar_kl_mean20 ?? null; } catch {}
       for (const seed of seeds) {

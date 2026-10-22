@@ -1,4 +1,5 @@
 // YuE2 cover transcription boundary. The existing training queue owns the job.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { config } from '../config.js';
@@ -13,14 +14,17 @@ import { getDataset } from './training/datasetsRepo.js';
 import { patchLabel } from './training/labelStore.js';
 import { readSidecar, writeSidecar } from './training/sidecarIO.js';
 import { loadSidecarMetadata } from './training/datasetScan.js';
-import { createHash } from 'node:crypto';
+import { createCoverStemCache } from './coverStemCache.js';
 import { NoVocalsError, separateOne, YUE2_STEMS_DEFAULT_LEVEL } from './training/yue2Stems.js';
 import { yue2Align } from './backends/yue2/client.js';
 import type { Yue2AlignWord } from './backends/yue2/align.js';
-import { matchSectionsToScore } from './backends/yue2/sectionMatch.js';
+import { matchSectionsToScore, planScoreFromLyrics, suggestionLyrics, suggestSections } from './backends/yue2/sectionMatch.js';
+import { prepareV2Problem, structureHash, type PrepareV2 } from '../contracts/yue2Prepare.js';
 import { sidecarPathFor } from './training/paths.js';
-import { readAbcSidecar } from './training/abcSidecar.js';
+import { readAbcSidecar, writeAbcSidecar } from './training/abcSidecar.js';
+import { hasSoundingVocalBar } from './backends/yue2/scoreHealth.js';
 import { lintScoreSections, scoreSections } from './backends/yue2/scoreSections.js';
+import { cachedMp3 } from './audioConvert.js';
 
 const MAX_AUDIO_BYTES = 100 * 1024 * 1024;
 const MAX_AUDIO_SECONDS = 10 * 60;
@@ -31,7 +35,9 @@ export class CoverRequestError extends Error {
   constructor(message: string, public readonly status = 400) { super(message); }
 }
 
-export interface CoverSource { sourceId: string; sourceLabel: string; audioPath: string }
+// audioPath is the chosen file, for dataset matching; workPath is what the
+// models read, a cached MP3 when the file is over MAX_AUDIO_BYTES.
+export interface CoverSource { sourceId: string; sourceLabel: string; audioPath: string; workPath: string }
 type SavedSource = Pick<CoverSource, 'sourceId' | 'sourceLabel'> & { userId: string; name: string };
 type CoverInput = { sourceAudioUrl?: unknown; songId?: unknown; sourceLabel?: unknown; abc?: unknown; force?: unknown };
 
@@ -45,19 +51,14 @@ export function createYue2CoverService(deps = {
   model: resolveYue2SheetModel,
   run: runYue2CoverSheetJob,
   datasetMatch: resolveCoverDatasetSource,
-  // The source's vocal stem, separated once and cached by path, size and
-  // mtime: MMS_FA places words reliably on a stem, not on the full mix.
-  vocalStem: async (audioPath: string): Promise<string> => {
-    const stat = fs.statSync(audioPath);
-    const key = createHash('sha256').update(JSON.stringify([audioPath, stat.size, stat.mtimeMs])).digest('hex').slice(0, 32);
-    const out = path.join(config.data.dir, 'tmp', 'cover-vocals', `${key}.wav`);
-    if (!fs.existsSync(out)) {
-      // Renamed into place so a separation cut short is never cached.
-      await separateOne(audioPath, `${out}.part`, YUE2_STEMS_DEFAULT_LEVEL, () => {});
-      fs.renameSync(`${out}.part`, out);
-    }
-    return out;
-  },
+  toMp3: (file: string) => cachedMp3(file, path.join(config.data.dir, 'tmp', 'cover-mp3')),
+  // The source's vocal stem, separated once per audio content: MMS_FA places
+  // words reliably on a stem, not on the full mix.
+  vocalStem: createCoverStemCache({
+    root: path.join(config.data.dir, 'tmp', 'cover-vocals'),
+    level: YUE2_STEMS_DEFAULT_LEVEL,
+    separate: (src, out, level) => separateOne(src, out, level, () => {}),
+  }).vocalStem,
   align: (audio: Buffer, lyrics: string): Promise<{ words: Yue2AlignWord[] }> => yue2Align(audio, lyrics),
   // The same merged read as a sample edit, so split caption/lyrics files
   // are folded into <stem>.txt rather than shadowing the new lyrics. Like a
@@ -67,6 +68,8 @@ export function createYue2CoverService(deps = {
     const slug = getDataset(matched.datasetId)?.slug;
     if (slug) patchLabel(slug, matched.sampleId, { sources: Object.fromEntries(Object.keys(fields).map(field => [field, 'user' as const])) });
   },
+  // Keeps the score it replaces, like saveDetails does for the .txt.
+  saveAbc: (matched: CoverDatasetSource, abc: string) => writeAbcSidecar(matched.audioPath, abc, { keepBackups: true }),
   song: (id: string, userId: string) => getDb().prepare('SELECT audio_url, title FROM songs WHERE id = ? AND user_id = ?').get(id, userId) as { audio_url: string; title: string } | undefined,
 }) {
   function readiness() {
@@ -117,14 +120,19 @@ export function createYue2CoverService(deps = {
       stat = fs.lstatSync(audioPath);
       if (!stat.isFile()) throw new Error('not a file');
     } catch { throw new CoverRequestError('Audio source not found. Re-upload or choose another library song.', 404); }
-    if (stat.size === 0 || stat.size > MAX_AUDIO_BYTES) throw new CoverRequestError('Audio source must be between 1 byte and 100 MB.');
-    const duration = await deps.duration(audioPath);
+    if (stat.size === 0) throw new CoverRequestError('Audio source is empty.');
+    let workPath = audioPath;
+    if (stat.size > MAX_AUDIO_BYTES) {
+      try { workPath = await deps.toMp3(audioPath); }
+      catch (err) { throw new CoverRequestError(`Audio source is over 100 MB and could not be converted: ${(err as Error).message}`); }
+    }
+    const duration = await deps.duration(workPath);
     if (!Number.isFinite(duration) || duration <= 0 || duration > MAX_AUDIO_SECONDS) throw new CoverRequestError('Audio source must have a readable duration of at most 10 minutes.');
     if (input.sourceLabel !== undefined) {
       if (typeof input.sourceLabel !== 'string' || input.sourceLabel.trim().length > 120) throw new CoverRequestError('sourceLabel must be at most 120 characters.');
       if (input.sourceLabel.trim()) sourceLabel = input.sourceLabel.trim();
     }
-    return { sourceId, sourceLabel, audioPath };
+    return { sourceId, sourceLabel, audioPath, workPath };
   }
 
   async function start(input: CoverInput, userId: string) {
@@ -148,7 +156,7 @@ export function createYue2CoverService(deps = {
     const dir = path.join(deps.jobRoot, job.id);
     try {
       fs.mkdirSync(dir, { recursive: true });
-      const saved: SavedSource = { userId, sourceId: selected.sourceId, sourceLabel: selected.sourceLabel, name: path.basename(selected.audioPath) };
+      const saved: SavedSource = { userId, sourceId: selected.sourceId, sourceLabel: selected.sourceLabel, name: path.basename(selected.workPath) };
       fs.writeFileSync(path.join(dir, 'cover-source.json'), JSON.stringify(saved), { mode: 0o600 });
     } catch (err) {
       deps.queue.cancelJob(job.id);
@@ -156,7 +164,7 @@ export function createYue2CoverService(deps = {
     }
     deps.queue.enqueue(job, async j => {
       if (j.controller.signal.aborted) return;
-      try { await deps.run(j, selected.audioPath, dir); } catch { /* runner records failed/cancelled status */ }
+      try { await deps.run(j, selected.workPath, dir); } catch { /* runner records failed/cancelled status */ }
     });
     return { status: 'queued' as const, jobId: job.id, sourceId: selected.sourceId, sourceLabel: selected.sourceLabel };
   }
@@ -169,9 +177,10 @@ export function createYue2CoverService(deps = {
     const bpm = Number(fields.bpm);
     const key = fields.key?.trim() || '';
     const instrumental = fields.is_instrumental?.trim().toLowerCase();
-    const validInstrumental = ['true', 'false', '1', '0', 'yes', 'no'].includes(instrumental || '');
-    const isInstrumental = ['true', '1', 'yes'].includes(instrumental || '');
     const hasLyrics = typeof fields.lyrics === 'string' && !!fields.lyrics.trim();
+    // A blank flag (as many dataset sidecars carry) is read from the lyrics, as training reads it.
+    const validInstrumental = !instrumental || ['true', 'false', '1', '0', 'yes', 'no'].includes(instrumental);
+    const isInstrumental = instrumental ? ['true', '1', 'yes'].includes(instrumental) : !hasLyrics;
     const validBpm = Number.isFinite(bpm) && bpm >= 20 && bpm <= 300;
     const abc = readAbcSidecar(matched.audioPath);
     if (!validBpm || !key || !validInstrumental || (!hasLyrics && !isInstrumental)) {
@@ -204,40 +213,98 @@ export function createYue2CoverService(deps = {
     return find(jobId, userId);
   }
 
-  /** Retag the lyrics with the score's sections where the source vocal sings
-   *  each block. Nothing is saved; the client shows the diff first. */
-  async function matchSections(input: CoverInput & { lyrics?: unknown }, userId: string) {
+  /** What a match proposal was made against: the dataset song and the bytes of
+   *  its merged metadata and score. A save refuses when either has moved on. */
+  function datasetRevision(matched: CoverDatasetSource) {
+    return crypto.createHash('sha256').update(JSON.stringify([
+      matched.datasetId, matched.sampleId, loadSidecarMetadata(matched.audioPath), readAbcSidecar(matched.audioPath),
+    ])).digest('hex');
+  }
+
+  /** The source vocal's word times for these lyrics, on the cached stem. */
+  async function alignSource(input: CoverInput & { lyrics?: unknown }, userId: string) {
     if (typeof input.abc !== 'string' || !input.abc.trim() || input.abc.length > MAX_ABC_LENGTH ||
         typeof input.lyrics !== 'string' || !input.lyrics.trim() || input.lyrics.length > MAX_ABC_LENGTH) {
       throw new CoverRequestError('ABC and lyrics must be non-empty strings of at most 64 KB each.');
     }
     const { abc: _abc, lyrics: _lyrics, ...rest } = input;
     const selected = await source(rest, userId);
+    const matched = deps.datasetMatch(selected.audioPath);
+    const revision = matched ? datasetRevision(matched) : undefined;
     let stem: string;
-    try { stem = await deps.vocalStem(selected.audioPath); }
+    try { stem = await deps.vocalStem(selected.workPath); }
     catch (err) {
       if (err instanceof NoVocalsError) throw new CoverRequestError('The source has no vocals to align.', 422);
       throw err;
     }
     const lyrics = input.lyrics.replace(/\r\n?/g, '\n');
     const aligned = await deps.align(fs.readFileSync(stem), lyrics);
-    let result;
-    try { result = matchSectionsToScore(input.abc, lyrics, aligned.words); }
-    catch (err) { throw new CoverRequestError((err as Error).message, 422); }
-    return { ...result, datasetSong: !!deps.datasetMatch(selected.audioPath) };
+    return { abc: input.abc, lyrics, words: aligned.words, dataset: matched ? { revision: revision! } : null };
   }
 
-  /** Write lyrics, or the score's tempo and key, into the matched dataset
-   *  song's sidecar (.txt); the sidecar writer keeps the previous file as
-   *  .txt.bak, or a timestamped .bak when one is already there. */
-  async function saveDatasetDetails(input: CoverInput & { lyrics?: unknown; bpm?: unknown; key?: unknown }, userId: string) {
-    const { lyrics, bpm, key, ...rest } = input;
+  /** Retag the lyrics with the score's sections where the source vocal sings
+   *  each block. Nothing is saved; the client shows the diff first. */
+  async function matchSections(input: CoverInput & { lyrics?: unknown }, userId: string) {
+    const { abc, lyrics, words, dataset } = await alignSource(input, userId);
+    let result;
+    try { result = matchSectionsToScore(abc, lyrics, words); }
+    catch (err) { throw new CoverRequestError((err as Error).message, 422); }
+    return { ...result, datasetSong: !!dataset, ...dataset };
+  }
+
+  /** The other direction: the score's sections set from where the source
+   *  vocal sings each lyric block, with the lyrics retagged to match. Nothing
+   *  is saved; the client rewrites its own copy of the score. */
+  async function planScoreSections(input: CoverInput & { lyrics?: unknown }, userId: string) {
+    const { abc, lyrics, words, dataset } = await alignSource(input, userId);
+    try { return { ...planScoreFromLyrics(abc, lyrics, words), datasetSong: !!dataset, ...dataset }; }
+    catch (err) { throw new CoverRequestError((err as Error).message, 422); }
+  }
+
+  /** Proposals for which lyric blocks belong to which section of a Prepare
+   *  document, as section id -> block ids. Nothing is stored or rewritten: the
+   *  reply names the {sourceKey, structureHash, lyricRevision} it was made for,
+   *  so the client can drop it if the document moved on. With `useRecording`
+   *  the source vocal is aligned to place blocks by where they are sung; if
+   *  that fails the instant (tag and order) proposals are returned instead,
+   *  with `recordingError`. */
+  async function suggestAssignments(input: CoverInput & { prepare?: unknown; useRecording?: unknown }, userId: string) {
+    const { prepare, useRecording, abc: _abc, ...rest } = input;
+    const problem = prepareV2Problem(prepare);
+    if (problem) throw new CoverRequestError(problem);
+    const p = prepare as PrepareV2;
+    if (!p.sectionIds.length) throw new CoverRequestError('The score has no sections.');
+    const blocks = p.blocks.map(({ id, tag, text }) => ({ id, tag, text }));
+    const stamp = { sourceKey: p.sourceKey, structureHash: structureHash(p.abc), lyricRevision: p.lyricRevision };
+    const make = (words?: Yue2AlignWord[]) => {
+      try { return suggestSections(p.abc, p.sectionIds, blocks, words); }
+      catch (err) { throw new CoverRequestError((err as Error).message, 422); }
+    };
+    if (useRecording !== true) return { ...stamp, ...make(), recordingError: undefined as string | undefined };
+    let words: Yue2AlignWord[];
+    try { words = (await alignSource({ ...rest, abc: p.abc, lyrics: suggestionLyrics(blocks) }, userId)).words; }
+    catch (err) { return { ...stamp, ...make(), recordingError: (err as Error).message }; }
+    return { ...stamp, ...make(words), recordingError: undefined };
+  }
+
+  /** Write lyrics and/or the revised score, or the score's tempo and key, into
+   *  the matched dataset song. Lyrics and tempo go in the .txt, the score in
+   *  the .abc; each writer keeps the previous file as a .bak (a timestamped
+   *  .bak when one is already there). Lyrics and score need the `revision` a
+   *  match returned, so a song that changed since matching is refused. The
+   *  two files are separate writes: the .txt goes first, and if the .abc then
+   *  fails the result says so rather than reporting a save. */
+  async function saveDatasetDetails(input: CoverInput & { lyrics?: unknown; abc?: unknown; revision?: unknown; bpm?: unknown; key?: unknown }, userId: string) {
+    const { lyrics, abc, revision, bpm, key, ...rest } = input;
     const fields: Record<string, string> = {};
     if (lyrics !== undefined) {
       if (typeof lyrics !== 'string' || !lyrics.trim() || lyrics.length > MAX_ABC_LENGTH) {
         throw new CoverRequestError('Lyrics must be a non-empty string of at most 64 KB.');
       }
       fields.lyrics = lyrics.replace(/\r\n?/g, '\n');
+    }
+    if (abc !== undefined && (typeof abc !== 'string' || abc.length > MAX_ABC_LENGTH || !hasSoundingVocalBar(abc))) {
+      throw new CoverRequestError('The score must be ABC of at most 64 KB with a sounding vocal bar.');
     }
     if (bpm !== undefined || key !== undefined) {
       if (typeof bpm !== 'number' || !Number.isFinite(bpm) || bpm < 20 || bpm > 300 ||
@@ -247,16 +314,26 @@ export function createYue2CoverService(deps = {
       fields.bpm = String(Math.round(bpm));
       fields.key = key;
     }
-    if (!Object.keys(fields).length) throw new CoverRequestError('Nothing to save.');
+    if (!Object.keys(fields).length && abc === undefined) throw new CoverRequestError('Nothing to save.');
     const selected = await source(rest, userId);
     const matched = deps.datasetMatch(selected.audioPath);
     if (!matched) throw new CoverRequestError('This source is not a dataset song.', 404);
-    await deps.saveDetails(matched, fields);
-    return { saved: true as const, datasetId: matched.datasetId, sampleId: matched.sampleId,
+    if ((fields.lyrics !== undefined || abc !== undefined) && revision !== datasetRevision(matched)) {
+      throw new CoverRequestError('The dataset song changed since matching. Match again.', 409);
+    }
+    const saved = { saved: true as const, datasetId: matched.datasetId, sampleId: matched.sampleId,
       file: path.basename(sidecarPathFor(matched.audioPath)) };
+    if (Object.keys(fields).length) await deps.saveDetails(matched, fields);
+    if (abc === undefined) return saved;
+    try {
+      if (!deps.saveAbc(matched, abc as string)) throw new Error('the score was not written');
+      return { ...saved, abcSaved: true as const };
+    } catch (err) {
+      return { ...saved, abcSaved: false as const, abcError: (err as Error).message };
+    }
   }
 
-  return { readiness, source, lookup, start, find, cancel, reviewScore, matchSections, saveDatasetDetails };
+  return { readiness, source, lookup, start, find, cancel, reviewScore, matchSections, planScoreSections, suggestAssignments, saveDatasetDetails };
 }
 
 export const yue2CoverService = createYue2CoverService();

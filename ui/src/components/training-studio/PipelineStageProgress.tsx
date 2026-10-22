@@ -16,7 +16,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { blankTrainSeries, useTrainingStore } from '../../stores/trainingStore';
-import { getJob, type PipelineItem, type PipelineStage } from '../../services/trainingApi';
+import type { PipelineItem, PipelineStage } from '../../services/trainingApi';
+import { queryClient } from '../../queries/client';
+import { trainingQueries } from '../../queries/training-data/queries';
 import { JobProgress } from './JobProgress';
 import { TrainingChart } from './TrainingChart';
 import { TrainingRunStats } from './TrainingRunStats';
@@ -60,9 +62,11 @@ export const PipelineStageProgress: React.FC<Props> = ({ item }) => {
     if (!jobId) return;
     let cancelled = false;
     previous.current = useTrainingStore.getState().activeJob;
-    void getJob(jobId).then(
+    // The pipeline runs on the worker selected now; adopt only while it still is.
+    const worker = useTrainingStore.getState().trainingWorker;
+    void queryClient.query(trainingQueries.job(worker, jobId)).then(
       (job) => {
-        if (cancelled) return;
+        if (cancelled || useTrainingStore.getState().trainingWorker !== worker) return;
         // BLANK THE CHART BEFORE ADOPTING. trainStepSeries is shared by both
         // training kinds and the epoch arrays are per-kind but not per-run, so
         // carrying them across a stage change drew the new run into the old

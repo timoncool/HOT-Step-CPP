@@ -1,3 +1,6 @@
+import { useQuery } from '@tanstack/react-query';
+import { snapshotOptions } from '../../queries/cover-lyrics/reads';
+import type { AlbumPreset } from '../../services/lireekApi';
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Save, Loader2, ChevronDown, ChevronRight, Zap, Music, FolderSearch, FolderOpen, Search, Brain } from 'lucide-react';
@@ -76,7 +79,8 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
 }) => {
   const [form, setForm] = useState<PresetForm>(DEFAULT_FORM);
   const { t } = useTranslation();
-  const [loading, setLoading] = useState(true);
+  const presetQuery = useQuery({ ...snapshotOptions<{ preset: AlbumPreset | null }>('lireek', `/lireek/lyrics-sets/${lyricsSetId}/preset`), enabled: isOpen });
+  const loading = presetQuery.isPending;
   const [saving, setSaving] = useState(false);
   const [groupsExpanded, setGroupsExpanded] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
@@ -95,9 +99,8 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
   useEffect(() => {
     if (yue2Mode && !yue2Catalogue) void fetchBackendModels(YUE2_BACKEND_ID);
   }, [yue2Mode, yue2Catalogue, fetchBackendModels]);
-  const [mm3Adapters, setMm3Adapters] = useState<{
-    datasetSlug: string | null; candidates: Mm3PresetAdapter[]; others: Mm3PresetAdapter[];
-  } | null>(null);
+  const mm3Query = useQuery({ ...snapshotOptions<{ datasetSlug: string | null; candidates: Mm3PresetAdapter[]; others: Mm3PresetAdapter[] }>('lireek', `/training/lyrics-sets/${lyricsSetId}/mm3-adapters`), enabled: isOpen && mm3Mode });
+  const mm3Adapters = mm3Query.data ?? null;
 
   // Repointing which folder the two YuE2 halves are picked from — same folder
   // scan the global Adapters picker uses (Yue2LmAdapterDropdown), so adapters
@@ -154,42 +157,25 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
   // Load existing preset
   useEffect(() => {
     if (!isOpen) return;
-    setLoading(true);
-    lireekApi.getPreset(lyricsSetId)
-      .then(res => {
-        if (res.preset) {
-          setForm({
-            adapter_path: res.preset.adapter_path || '',
-            self_attn: res.preset.adapter_group_scales?.self_attn ?? 1.0,
-            cross_attn: res.preset.adapter_group_scales?.cross_attn ?? 1.0,
-            mlp: res.preset.adapter_group_scales?.mlp ?? 1.0,
-            cond_embed: res.preset.adapter_group_scales?.cond_embed ?? 1.0,
-            reference_track_path: res.preset.reference_track_path || '',
-            lm_adapter_path: res.preset.lm_adapter_path || '',
-            mm3_adapter_path: res.preset.mm3_adapter_path || '',
-            yue2_ar_adapter_path: res.preset.yue2_ar_adapter_path || '',
-            yue2_nar_adapter_path: res.preset.yue2_nar_adapter_path || '',
-          });
-        } else {
-          setForm(DEFAULT_FORM);
-        }
-      })
-      .catch(err => showToast(`Failed to load preset: ${err.message}`))
-      .finally(() => setLoading(false));
-  }, [isOpen, lyricsSetId, showToast]);
-
-  // The MM3 adapters that belong to this album (runs on the dataset it was
-  // exported from), plus every other installed one. Advisory: a failure here
-  // leaves the picker empty, never blocks the modal.
-  useEffect(() => {
-    if (!isOpen || !mm3Mode) return;
-    let cancelled = false;
-    setMm3Adapters(null);
-    lireekApi.mm3AdaptersForLyricsSet(lyricsSetId)
-      .then(res => { if (!cancelled) setMm3Adapters(res); })
-      .catch(() => { if (!cancelled) setMm3Adapters({ datasetSlug: null, candidates: [], others: [] }); });
-    return () => { cancelled = true; };
-  }, [isOpen, mm3Mode, lyricsSetId]);
+    const res = presetQuery.data;
+    if (!res) return;
+    if (res.preset) {
+      setForm({
+        adapter_path: res.preset.adapter_path || '',
+        self_attn: res.preset.adapter_group_scales?.self_attn ?? 1.0,
+        cross_attn: res.preset.adapter_group_scales?.cross_attn ?? 1.0,
+        mlp: res.preset.adapter_group_scales?.mlp ?? 1.0,
+        cond_embed: res.preset.adapter_group_scales?.cond_embed ?? 1.0,
+        reference_track_path: res.preset.reference_track_path || '',
+        lm_adapter_path: res.preset.lm_adapter_path || '',
+        mm3_adapter_path: res.preset.mm3_adapter_path || '',
+        yue2_ar_adapter_path: res.preset.yue2_ar_adapter_path || '',
+        yue2_nar_adapter_path: res.preset.yue2_nar_adapter_path || '',
+      });
+    } else {
+      setForm(DEFAULT_FORM);
+    }
+  }, [isOpen, lyricsSetId, presetQuery.data]);
 
   const save = async () => {
     setSaving(true);

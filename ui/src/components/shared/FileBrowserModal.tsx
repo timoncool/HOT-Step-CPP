@@ -4,10 +4,11 @@
 // Supports both file-selection and folder-selection modes.
 // Remembers last-visited directory per filter type in localStorage.
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { createPortal } from 'react-dom';
 import { Folder, FileText, ChevronUp, X, Loader2 } from 'lucide-react';
-import { adapterApi } from '../../services/api';
+import { browseOptions } from '../../queries/shell-queue/settings';
 import type { BrowseEntry } from '../../types';
 
 interface FileBrowserModalProps {
@@ -56,22 +57,28 @@ export const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
+  const queryClient = useQueryClient();
+  // Only the newest navigation may land: a slow listing of a folder the user
+  // already left must not replace the one they are looking at.
+  const latest = useRef(0);
 
   const loadDir = useCallback(async (dir: string) => {
+    const request = ++latest.current;
     setLoading(true);
     setError(null);
     try {
-      const result = await adapterApi.browse(dir, filter);
+      const result = await queryClient.query(browseOptions(dir, filter));
+      if (request !== latest.current) return;
       setCurrentDir(result.current);
       setPathInput(result.current);
       setEntries(result.entries);
       saveLastDir(result.current, filter);
     } catch (err: any) {
-      setError(err?.message || 'Failed to list directory');
+      if (request === latest.current) setError(err?.message || 'Failed to list directory');
     } finally {
-      setLoading(false);
+      if (request === latest.current) setLoading(false);
     }
-  }, [filter]);
+  }, [filter, queryClient]);
 
   // Load initial directory when modal opens
   useEffect(() => {
@@ -106,7 +113,7 @@ export const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
   return createPortal(
     <div
       data-portal-layer
-      className="fixed inset-0 z-50 flex items-center justify-center"
+      className="fixed inset-0 z-[70] flex items-center justify-center"
       style={{ background: 'rgba(0, 0, 0, 0.5)', backdropFilter: 'blur(4px)' }}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >

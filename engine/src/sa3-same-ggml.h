@@ -83,6 +83,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -454,6 +455,14 @@ static struct ggml_tensor * sa3_same_dyt(struct ggml_context * ctx, struct ggml_
     return ggml_add(ctx, ggml_mul(ctx, t, gamma), beta);
 }
 
+// Opt-in: SA3_SAME_FA=1 runs the banded self-attention through
+// ggml_flash_attn_ext (F16 K/V, F16 band mask, F32 accumulation) instead of the dense
+// S x S mul_mat/soft_max/mul_mat. Default (unset) keeps the original graph bit-identical.
+static inline bool sa3_same_use_fa() {
+    static const bool v = getenv("SA3_SAME_FA") != NULL && atoi(getenv("SA3_SAME_FA")) != 0;
+    return v;
+}
+
 // One attention map: q, k [D, S, H] f32 (cont) -> out [D, S, H].
 // vt: [S, D, H] (cont transpose of v). mask: [S, S] f32 band (0 / -inf).
 static struct ggml_tensor * sa3_same_attn_map(struct ggml_context * ctx, struct ggml_tensor * q,
@@ -517,15 +526,31 @@ static struct ggml_tensor * sa3_same_build_layer(struct ggml_context * ctx, cons
     kd = heads_out(kd);
 
     struct ggml_tensor * vp = heads_out(v);                            // [D, S, H]
-    struct ggml_tensor * vt = ggml_cont(ctx, ggml_transpose(ctx, vp)); // [S, D, H]
+    struct ggml_tensor * out;
+    if (sa3_same_use_fa()) {
+        // flash path: band mask F16 [S, S] (S multiple of 64), result already [D, H, S]
+        struct ggml_tensor * v16 = ggml_cast(ctx, vp, GGML_TYPE_F16);
+        auto fa = [&](struct ggml_tensor * qq, struct ggml_tensor * kk) {
+            struct ggml_tensor * k16 = ggml_cast(ctx, kk, GGML_TYPE_F16);
+            struct ggml_tensor * r   = ggml_flash_attn_ext(ctx, qq, k16, v16, mask, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(r, GGML_PREC_F32);
+            return r;
+        };
+        struct ggml_tensor * o1 = fa(q, k);
+        struct ggml_tensor * o2 = fa(qd, kd);
+        out                     = ggml_sub(ctx, o1, o2);               // [D, H, S]
+        out                     = ggml_reshape_2d(ctx, out, dim, S);
+    } else {
+        struct ggml_tensor * vt = ggml_cont(ctx, ggml_transpose(ctx, vp)); // [S, D, H]
 
-    // Differential attention (L790-795): attn(q,k,v) - attn(qd,kd,v), shared v
-    struct ggml_tensor * o1  = sa3_same_attn_map(ctx, q, k, vt, mask, scale);
-    struct ggml_tensor * o2  = sa3_same_attn_map(ctx, qd, kd, vt, mask, scale);
-    struct ggml_tensor * out = ggml_sub(ctx, o1, o2);                  // [D, S, H]
+        // Differential attention (L790-795): attn(q,k,v) - attn(qd,kd,v), shared v
+        struct ggml_tensor * o1 = sa3_same_attn_map(ctx, q, k, vt, mask, scale);
+        struct ggml_tensor * o2 = sa3_same_attn_map(ctx, qd, kd, vt, mask, scale);
+        out                     = ggml_sub(ctx, o1, o2);               // [D, S, H]
 
-    out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));          // [D, H, S]
-    out = ggml_reshape_2d(ctx, out, dim, S);
+        out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));      // [D, H, S]
+        out = ggml_reshape_2d(ctx, out, dim, S);
+    }
     out = ggml_mul_mat(ctx, ly->to_out, out);                          // [dim, S]
     x   = ggml_add(ctx, x, out);
 
@@ -576,7 +601,7 @@ static void sa3_same_forward(SA3Same * m, const float * input, float * output, i
 
     // Band mask (transformer.py L118-127 / L143-158): keep kv - q in
     // [-win_left, +win_right], INCLUSIVE both ends; -inf outside.
-    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, S);
+    struct ggml_tensor * mask = ggml_new_tensor_2d(ctx, sa3_same_use_fa() ? GGML_TYPE_F16 : GGML_TYPE_F32, S, S);
     ggml_set_name(mask, "mask");
     ggml_set_input(mask);
 
@@ -682,7 +707,13 @@ static void sa3_same_forward(SA3Same * m, const float * input, float * output, i
                     (delta >= -(int64_t) c.win_left && delta <= (int64_t) c.win_right) ? 0.0f : -INFINITY;
             }
         }
-        ggml_backend_tensor_set(mask, md.data(), 0, (size_t) S * S * sizeof(float));
+        if (sa3_same_use_fa()) {
+            std::vector<ggml_fp16_t> m16((size_t) S * S);
+            for (size_t i = 0; i < m16.size(); i++) m16[i] = ggml_fp32_to_fp16(md[i]);
+            ggml_backend_tensor_set(mask, m16.data(), 0, m16.size() * sizeof(ggml_fp16_t));
+        } else {
+            ggml_backend_tensor_set(mask, md.data(), 0, (size_t) S * S * sizeof(float));
+        }
     }
     if (m->is_encoder) {
         // PatchedPretransform.encode (pretransforms.py L76): "b c (l h) -> b (c h) l"

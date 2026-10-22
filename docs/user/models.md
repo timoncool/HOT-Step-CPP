@@ -340,3 +340,7 @@ transcription, captioning, and the CUDA and cuDNN runtime libraries.
 | whisper | Large v3 | `ggml-large-v3.bin` |  | 3.1 GB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | Maximum accuracy (2.9 GB). Slower but best for difficult transcriptions. ~10-20s per 30s track on GPU. |
 | whisper | Medium | `ggml-medium.bin` |  | 1.5 GB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | Good accuracy with lower VRAM usage (1.4 GB). ~3-8s per 30s track on GPU. |
 <!-- generated:end files-shared -->
+
+## Release data paths
+
+In release builds, downloaded models live under the shared data folder and runtime libraries under its `tools/runtime/`. A new extracted version reuses them through the saved profile location. See [Data folder and upgrades](data-folder.md).

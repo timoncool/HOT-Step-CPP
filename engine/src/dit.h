@@ -731,6 +731,19 @@ static bool dit_ggml_load(DiTGGML *    m,
     if (adapter_path) {
         bool runtime_mode = (g_hotstep_params.adapter_mode == "runtime" ||
                              g_hotstep_params.adapter_mode == "runtime_lowrank");
+        // Validate the entire stack before the first adapter can alter pending
+        // weights. A malformed later DoRA must not leave a partially merged base.
+        const auto & validate_stack = g_hotstep_params.adapters;
+        bool valid = true;
+        if (validate_stack.empty()) valid = adapter_dora_preflight_file(adapter_path, ws);
+        else for (const auto & a : validate_stack) {
+            if (!adapter_dora_preflight_file(a.path.c_str(), ws)) { valid = false; break; }
+        }
+        if (!valid) {
+            if (is_st) { st_multi_close(&sm); } else { gf_close(&gf); }
+            dit_ggml_free(m);
+            return false;
+        }
         // ConvRot weights live in rotated space; merge-mode deltas are unrotated
         // and would corrupt them. Runtime mode is safe (deltas run as separate
         // matmuls on the UNROTATED activations in the graph).
@@ -841,7 +854,8 @@ static bool dit_ggml_load(DiTGGML *    m,
                     // scales still apply (they gate weight groups, not sections).
                     std::vector<AdapterSpec> one{ AdapterSpec{ stack[i].path, 1.0f } };
                     if (!adapter_load_runtime_stack(&m->loras[i], &m->wctx, ws, one,
-                                                    g_hotstep_params.adapter_group_scales, m->backend)) {
+                                                    g_hotstep_params.adapter_group_scales, m->backend,
+                                                    nullptr, 0.0f, m->convrot.active ? &rotmap : nullptr)) {
                         fprintf(stderr, "[Adapter-RT] ERROR: section adapter %zu loaded no deltas: %s\n",
                                 i, stack[i].path.c_str());
                         rt_ok = false;

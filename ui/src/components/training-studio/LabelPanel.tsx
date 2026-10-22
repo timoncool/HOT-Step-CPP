@@ -43,6 +43,8 @@ export const LabelPanel: React.FC = () => {
 
   const [scope, setScope] = useState<'unlabeled' | 'all' | 'selected'>('unlabeled');
   const [useEssentia, setUseEssentia] = useState(true);
+  const [minTempo, setMinTempo] = useState('');
+  const [maxTempo, setMaxTempo] = useState('');
   const [useGenius, setUseGenius] = useState(true);
   const [useCaption, setUseCaption] = useState(true);
   // Default to MOSS when present: it is local, free, and describes what it hears
@@ -79,6 +81,13 @@ export const LabelPanel: React.FC = () => {
   // /understand step is not offered by this panel.)
   const needsEngine = effectiveCaption && (captionProvider || (mossOk ? 'moss' : '')) === 'moss';
   const blockedByJob = trainerRunning ? needsEngine : jobRunning;
+  const minBpm = minTempo ? Number(minTempo) : undefined;
+  const maxBpm = maxTempo ? Number(maxTempo) : undefined;
+  const invalidTempoBounds = effectiveEssentia && (
+    (minBpm !== undefined && (!Number.isInteger(minBpm) || minBpm < 40 || minBpm > 180)) ||
+    (maxBpm !== undefined && (!Number.isInteger(maxBpm) || maxBpm < 60 || maxBpm > 250)) ||
+    (minBpm !== undefined && maxBpm !== undefined && minBpm >= maxBpm)
+  );
 
   const handleStart = async () => {
     setStarting(true);
@@ -86,6 +95,10 @@ export const LabelPanel: React.FC = () => {
       await startLabel({
         ...(scope === 'selected' ? { sampleIds: Array.from(selectedSampleIds) } : { scope: scope === 'all' ? 'all' : 'unlabeled' }),
         useEssentia: effectiveEssentia,
+        ...(minTempo || maxTempo ? { essentiaTempo: {
+          ...(minTempo ? { minTempo: Number(minTempo) } : {}),
+          ...(maxTempo ? { maxTempo: Number(maxTempo) } : {}),
+        } } : {}),
         useGenius: effectiveGenius,
         useCaption: effectiveCaption,
         // Without this the server falls back to config.lireek.defaultProvider,
@@ -152,6 +165,20 @@ export const LabelPanel: React.FC = () => {
           />
           {!essentiaOk && (
             <div className="ml-6 text-[11px] text-amber-600 dark:text-amber-400">{t('trainingStudio.caps.essentiaMissing')}</div>
+          )}
+          {effectiveEssentia && (
+            <div className="ml-6 flex flex-wrap items-end gap-2">
+              {([['min', minTempo, setMinTempo, 40, 180], ['max', maxTempo, setMaxTempo, 60, 250]] as const).map(([kind, value, setValue, min, max]) => (
+                <label key={kind} className="flex flex-col gap-1 text-[11px] text-zinc-600 dark:text-zinc-400">
+                  {t(`trainingStudio.label.${kind}Tempo`, `${kind === 'min' ? 'Minimum' : 'Maximum'} tempo (optional)`)}
+                  <input type="number" min={min} max={max} step="1" value={value}
+                    onChange={e => setValue(e.target.value)}
+                    className="w-28 rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-white/10 dark:bg-suno-card dark:text-white" />
+                </label>
+              ))}
+              <span className="text-[11px] text-zinc-500">{t('trainingStudio.label.tempoBoundsInfo', 'Leave blank for Essentia defaults.')}</span>
+              {invalidTempoBounds && <span className="text-[11px] text-red-500">{t('trainingStudio.label.tempoBoundsError', 'Use 40–180 for minimum, 60–250 for maximum, with minimum below maximum.')}</span>}
+            </div>
           )}
 
           <Toggle
@@ -260,7 +287,7 @@ export const LabelPanel: React.FC = () => {
 
         <button
           onClick={() => void handleStart()}
-          disabled={blockedByJob || starting || !anyStep}
+          disabled={blockedByJob || starting || !anyStep || invalidTempoBounds}
           title={trainerRunning && needsEngine ? t('trainingStudio.label.mossBlocked', 'MOSS needs the engine, which the running training job owns. Pick a cloud captioner or wait.') : undefined}
           className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >

@@ -229,10 +229,14 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
 }
 
 // MLP: SwiGLU (fused gate+up or separate)
+// down_scale != 1 scales the down_proj input and undoes it on the output. Metal's
+// matrix-matrix kernel stages the f32 activation as half, and the ACE-Step 1.7B LM
+// has SwiGLU outliers past 65504 (77k seen), which turn into inf there.
 static struct ggml_tensor * qwen3_build_mlp(struct ggml_context * ctx,
                                             Qwen3Layer *          ly,
                                             struct ggml_tensor *  x,  // [H, S]
-                                            int                   S) {
+                                            int                   S,
+                                            float                 down_scale = 1.0f) {
     (void) S;
     struct ggml_tensor * ff;
     if (ly->gate_up) {
@@ -243,7 +247,12 @@ static struct ggml_tensor * qwen3_build_mlp(struct ggml_context * ctx,
         struct ggml_tensor * up   = qwen3_linear_lora(ctx, ly->up_proj, qwen3_lora_slot(ly->lora, QW_LORA_UP), x);
         ff                        = ggml_swiglu_split(ctx, gate, up);
     }
-    return qwen3_linear_lora(ctx, ly->down_proj, qwen3_lora_slot(ly->lora, QW_LORA_DOWN), ff);
+    if (down_scale == 1.0f) {
+        return qwen3_linear_lora(ctx, ly->down_proj, qwen3_lora_slot(ly->lora, QW_LORA_DOWN), ff);
+    }
+    ff                       = ggml_scale(ctx, ff, down_scale);
+    struct ggml_tensor * out = qwen3_linear_lora(ctx, ly->down_proj, qwen3_lora_slot(ly->lora, QW_LORA_DOWN), ff);
+    return ggml_scale(ctx, out, 1.0f / down_scale);
 }
 
 // Single layer: input [H, S] -> output [H, S]

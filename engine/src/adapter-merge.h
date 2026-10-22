@@ -888,6 +888,141 @@ static bool adapter_hq_should_skip(const std::string & name) {
 //   delta = (alpha / rank) * scale * B @ A
 // Applied to base weights in place. Alpha is read per tensor if present
 // (ComfyUI baked), else from adapter_config.json, else defaults to rank.
+// Validate the entire DoRA payload before a caller can change any weights.
+// Missing metadata remains supported for legacy flat files; an explicit
+// use_dora value must agree with the payload. Plain LoRA keeps its old path.
+static bool adapter_dora_preflight(const STFile & st, const std::string & cfg_dir,
+                                    const WeightSource * ws, bool * has_dora = nullptr) {
+    bool declared = false, explicit_method = false;
+    const std::string config_path = cfg_dir + "/adapter_config.json";
+    HS_STAT_T config_stat;
+    const bool config_exists = hs_stat(config_path, &config_stat) == 0;
+    bool config_parsed = false;
+    if (yyjson_doc * doc = yyjson_read_file(config_path.c_str(), 0, nullptr, nullptr)) {
+        config_parsed = yyjson_is_obj(yyjson_doc_get_root(doc));
+        yyjson_val * v = yyjson_obj_get(yyjson_doc_get_root(doc), "use_dora");
+        explicit_method = v != nullptr;
+        declared = yyjson_is_true(v);
+        if (v && !yyjson_is_bool(v)) { yyjson_doc_free(doc); return false; }
+        yyjson_doc_free(doc);
+    }
+    bool present = false;
+    for (const auto & e : st.entries) {
+        if (lora_is_magnitude(e.name) || e.name.find(".dora_scale") != std::string::npos) present = true;
+    }
+    if (has_dora) *has_dora = present || declared;
+    auto fail = [](const std::string & why) {
+        fprintf(stderr, "[Adapter] FATAL: malformed DoRA: %s\n", why.c_str());
+        return false;
+    };
+    if (present && config_exists && !config_parsed) return fail("invalid adapter_config.json");
+    if (explicit_method && declared != present) return fail("use_dora disagrees with magnitude tensors");
+    if (!present && !declared) return true;
+
+    // Bounds, positive shapes and finite floating-point values are checked
+    // before adapter_to_f32 or any graph sees data from the mapped file.
+    auto valid = [&](const STEntry * e) {
+        if (!e || e->n_dims < 0 || e->n_dims > 4) return false;
+        size_t count = 1;
+        const size_t bytes = e->dtype == "F32" ? 4 : (e->dtype == "F16" || e->dtype == "BF16") ? 2 : 0;
+        if (!bytes) return false;
+        for (int d = 0; d < e->n_dims; ++d) {
+            if (e->shape[d] <= 0 || (uint64_t)e->shape[d] > SIZE_MAX / count) return false;
+            count *= (size_t)e->shape[d];
+        }
+        if (count > SIZE_MAX / bytes || e->data_start > e->data_end ||
+            st.data_offset > st.file_size || e->data_end > st.file_size - st.data_offset ||
+            e->data_end - e->data_start != count * bytes) return false;
+        // Decode in bounded chunks so preflight does not duplicate full factors.
+        float tmp[256];
+        for (size_t i = 0; i < count; i += 256) {
+            size_t n = std::min<size_t>(256, count - i);
+            if (!adapter_to_f32((const uint8_t *)st_data(st, *e) + i*bytes, tmp, (int64_t)n, e->dtype)) return false;
+            for (size_t j = 0; j < n; ++j) if (!std::isfinite(tmp[j])) return false;
+        }
+        return true;
+    };
+    auto vector_for = [&](const STEntry * e, int64_t out) {
+        if (!valid(e) || e->n_dims < 1 || e->n_dims > 2) return false;
+        if (e->n_dims == 2 && e->shape[0] != 1 && e->shape[1] != 1) return false;
+        return e->shape[0] * (e->n_dims == 2 ? e->shape[1] : 1) == out;
+    };
+    std::map<std::string, const STEntry *> as, bs, ms;
+    std::map<std::string, std::map<std::string, const STEntry *>> kr;
+    for (const auto & e : st.entries) {
+        const std::string base = lora_base_name(e.name);
+        auto * map = lora_is_a(e.name) ? &as : lora_is_b(e.name) ? &bs : lora_is_magnitude(e.name) ? &ms : nullptr;
+        if (map) {
+            if (base.empty() || !map->emplace(base, &e).second) return fail("unmapped or duplicate " + e.name);
+        }
+        std::string prefix, suffix;
+        if (adapter_split_suffix(e.name, &prefix, &suffix) && prefix.compare(0,8,"lycoris_") == 0) {
+            if (!kr[prefix].emplace(suffix, &e).second) return fail("duplicate " + e.name);
+        }
+    }
+    if (as.size() != bs.size() || as.size() != ms.size()) return fail("incomplete A/B/magnitude sites");
+    for (const auto & kv : as) {
+        const STEntry * a = kv.second;
+        const STEntry * b = bs.count(kv.first) ? bs.at(kv.first) : nullptr;
+        const STEntry * m = ms.count(kv.first) ? ms.at(kv.first) : nullptr;
+        if (!valid(a) || !valid(b) || a->n_dims != 2 || b->n_dims != 2 ||
+            a->shape[0] != b->shape[1] || !vector_for(m, b->shape[0])) return fail(kv.first);
+        if (ws) {
+            if (!ws->exists(kv.first.c_str())) return fail("missing base " + kv.first);
+            int nd; int64_t ne[4]; ws->shape(kv.first.c_str(), nd, ne);
+            const int64_t in = nd == 3 ? ne[0]*ne[1] : ne[0];
+            const int64_t out = nd == 3 ? ne[2] : ne[1];
+            if (out != b->shape[0] || in % a->shape[1] != 0) return fail("base shape " + kv.first);
+        }
+    }
+    const auto names = ws ? lokr_build_reverse_map(*ws) : std::unordered_map<std::string,std::string>{};
+    for (const auto & kv : kr) {
+        const auto & parts = kv.second;
+        auto get = [&](const char * s) -> const STEntry * { auto it=parts.find(s); return it==parts.end()?nullptr:it->second; };
+        const STEntry * m=get("dora_scale");
+        if (!m) return fail("missing dora_scale " + kv.first);
+        const STEntry * w1=get("lokr_w1"), *w2=get("lokr_w2"), *a=get("lokr_w2_a"), *b=get("lokr_w2_b");
+        if (!valid(w1) || w1->n_dims != 2 || !valid(get("alpha")) ||
+            ((w2 != nullptr) == (a != nullptr || b != nullptr))) return fail(kv.first);
+        int64_t out=0, in=0;
+        if (w2) {
+            if (!valid(w2) || w2->n_dims!=2 || adapter_read_lokr_dim(st)<=0) return fail(kv.first);
+            out=w1->shape[0]*w2->shape[0]; in=w1->shape[1]*w2->shape[1];
+        } else {
+            if (!valid(a) || !valid(b) || a->n_dims!=2 || b->n_dims!=2 || a->shape[1]!=b->shape[0]) return fail(kv.first);
+            out=w1->shape[0]*a->shape[0]; in=w1->shape[1]*b->shape[1];
+        }
+        if (!vector_for(m,out)) return fail("dora_scale shape " + kv.first);
+        if (ws) {
+            auto it=names.find(kv.first);
+            if (it==names.end()) return fail("missing base " + kv.first);
+            int nd; int64_t ne[4]; ws->shape(it->second.c_str(),nd,ne);
+            const int64_t base_in=nd==3?ne[0]*ne[1]:ne[0], base_out=nd==3?ne[2]:ne[1];
+            if (out!=base_out || base_in%in!=0) return fail("base shape " + kv.first);
+        }
+    }
+    return true;
+}
+
+// Also used to preflight a whole stack before its first merge.
+static bool adapter_dora_preflight_file(const char * path, const WeightSource & ws, bool * has_dora = nullptr) {
+    std::string file=path, dir;
+    HS_STAT_T sb;
+    if (hs_stat(file,&sb)!=0) return false;
+    if (S_ISDIR(sb.st_mode)) {
+        dir=file; file += "/adapter_model.safetensors";
+        if (hs_stat(file,&sb)!=0) file=dir+"/adapter_model.bin.safetensors";
+        if (hs_stat(file,&sb)!=0) file=dir+"/lokr_weights.safetensors";
+    } else {
+        size_t sep=file.find_last_of("/\\"); dir=sep==std::string::npos?".":file.substr(0,sep);
+    }
+    STFile st{};
+    if (!st_open(&st,file.c_str())) return false;
+    bool ok=adapter_dora_preflight(st,dir,&ws,has_dora);
+    st_close(&st);
+    return ok;
+}
+
 static bool adapter_merge_lora(WeightCtx *            wctx,
                                const WeightSource &   ws,
                                const STFile &      st,
@@ -1799,6 +1934,9 @@ static bool adapter_merge(WeightCtx *          wctx,
         // no adapter_model.safetensors). Mirrors hot-step-server.cpp's probe.
         sf_path = std::string(adapter_path) + "/adapter_model.safetensors";
         cfg_dir = adapter_path;
+        if (hs_stat(sf_path, &sb) != 0) {
+            sf_path = cfg_dir + "/adapter_model.bin.safetensors";
+        }
         if (hs_stat(sf_path, &sb) == 0) {
             // warn if adapter_config.json is missing, alpha lives there for PEFT so
             // the merge silently falls back to alpha=rank (scaling=1) otherwise
@@ -1831,6 +1969,10 @@ static bool adapter_merge(WeightCtx *          wctx,
 
     STFile st = {};
     if (!st_open(&st, sf_path.c_str())) {
+        return false;
+    }
+    if (!adapter_dora_preflight(st, cfg_dir, &ws)) {
+        st_close(&st);
         return false;
     }
 

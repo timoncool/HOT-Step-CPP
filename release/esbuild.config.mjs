@@ -2,8 +2,11 @@
 //
 // Usage: node release/esbuild.config.mjs
 //
-// Produces: release/staging/server/server.mjs
-// - All TypeScript/JS source bundled into a single ESM file
+// Produces: release/staging/server/server.mjs plus server/chunks/*.mjs
+// - All TypeScript/JS source bundled as ESM. Code splitting keeps dynamic
+//   import() targets as real ESM chunks. Without it esbuild wraps them in lazy
+//   init functions; dataroot/bootstrap.ts's top-level await makes those async,
+//   and the server's import cycles then deadlock at startup (exit 13, 1.4.1).
 // - better-sqlite3 marked external (native addon, can't be bundled)
 // - ffmpeg-static excluded (replaced by config-based path resolution)
 // - model-registry.json loaded via fs.readFileSync (not bundled inline)
@@ -28,7 +31,11 @@ const result = await esbuild.build({
   platform: 'node',
   target: 'node22',
   format: 'esm',
-  outfile: path.join(projectRoot, 'release/staging/server/server.mjs'),
+  outdir: path.join(projectRoot, 'release/staging/server'),
+  splitting: true,
+  entryNames: 'server',
+  chunkNames: 'chunks/[name]-[hash]',
+  outExtension: { '.js': '.mjs' },
 
   // External: native addon + all Node.js built-in modules
   // Node builtins must be external because esbuild's ESM CJS-compat shim

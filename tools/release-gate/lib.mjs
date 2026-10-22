@@ -59,7 +59,7 @@ export async function auth() {
   return token;
 }
 
-/** Raw call: never throws on HTTP errors. Returns { status, body } (body parsed when JSON). */
+/** Raw call: returns { status, contentType, body }. SSE bodies are cancelled, not consumed. */
 export async function apiRaw(method, route, body, { auth: useAuth = false, timeoutMs = 60_000 } = {}) {
   const headers = {};
   const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
@@ -71,10 +71,24 @@ export async function apiRaw(method, route, body, { auth: useAuth = false, timeo
     body: body === undefined ? undefined : isForm ? body : JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
+  const contentType = res.headers.get('content-type') ?? '';
+  if (contentType.split(';')[0].trim().toLowerCase() === 'text/event-stream') {
+    await res.body?.cancel();
+    return { status: res.status, contentType, body: null };
+  }
   const text = await res.text();
   let parsed;
   try { parsed = JSON.parse(text); } catch { parsed = text; }
-  return { status: res.status, body: parsed };
+  return { status: res.status, contentType, body: parsed };
+}
+
+/** Read the literal metadata table used by the engine; helper modules have none. */
+export function pluginDeclaration(source) {
+  const table = source.match(/^\s*(solver|scheduler|guidance|postprocess)\s*=\s*\{/m);
+  if (!table) return null;
+  const head = source.slice(table.index + table[0].length).split('}')[0];
+  const name = head.match(/(?:^|[,\n])\s*name\s*=\s*(["'])(.*?)\1/)?.[2];
+  return { type: table[1], name };
 }
 
 /** Call that throws on a non-2xx status with the server's error text. */

@@ -1,3 +1,6 @@
+import { useQuery } from '@tanstack/react-query';
+import { localOptions } from '../../queries/global-models/options';
+import type { VstPlugin } from '../../services/api';
 // VstChainDropdown.tsx — VST3 Post-Processing chain panel for the global bar
 //
 // Shows the plugin chain, lets you add/remove/reorder plugins,
@@ -20,6 +23,7 @@ import {
 import { useVstChainStore } from '../../stores/vstChainStore';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
+import { PresetSyncNotices } from '../shared/PresetSyncNotices';
 import { usePlaybackSelector, togglePlay } from '../../stores/playbackStore';
 
 const ACCENT = 'violet' as const;
@@ -35,14 +39,13 @@ function formatTime(s: number): string {
 // Stays open after adds. Done button closes.
 
 const PluginSearch: React.FC<{ onClose: () => void }> = ({ onClose }) => {
-  const { plugins, scanning, scanPlugins, addToChain, chain } = useVstChainStore();
+  const { plugins, scanPlugins, addToChain, chain } = useVstChainStore();
+  const scan = useQuery(localOptions<{ plugins: VstPlugin[] }>('vst-scan', '/vst/scan'));
+  const scanning = scan.isFetching;
   const { t } = useTranslation();
   const [filter, setFilter] = useState('');
   const [addedUids, setAddedUids] = useState<Set<string>>(new Set());
 
-  useEffect(() => {
-    if (plugins.length === 0 && !scanning) scanPlugins();
-  }, [plugins.length, scanning, scanPlugins]);
 
   const filtered = useMemo(() => {
     const q = filter.toLowerCase();
@@ -135,14 +138,19 @@ const PluginSearch: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 };
 
 // ── Preset Manager ──────────────────────────────────────────
-// Save / load / delete named chain snapshots (localStorage).
+// Save / load / delete named chain snapshots (server-side, keyed by id).
 
 const PresetManager: React.FC = () => {
-  const { presets, savePreset, loadPreset, deletePreset, chain } = useVstChainStore();
+  const { presetSnapshot, presetCollection, savePreset, loadPreset, deletePreset, chain } = useVstChainStore();
   const { t } = useTranslation();
   const [saving, setSaving] = useState(false);
   const [newName, setNewName] = useState('');
-  const names = Object.keys(presets);
+  // Two presets may share a name: number the repeats so both can be chosen.
+  const options = presetSnapshot.entries.map((e, i, all) => {
+    const before = all.slice(0, i).filter(x => x.body.name === e.body.name).length;
+    return { value: e.key, label: before ? `${e.body.name} (${before + 1})` : e.body.name, busy: e.status !== 'saved' };
+  });
+  const hasNotices = !!presetSnapshot.loadError || presetSnapshot.importConflicts.length > 0 || presetSnapshot.entries.some(e => e.error);
 
   const handleSave = () => {
     const name = newName.trim();
@@ -152,17 +160,18 @@ const PresetManager: React.FC = () => {
     setSaving(false);
   };
 
-  if (names.length === 0 && !saving && chain.length === 0) return null;
+  if (options.length === 0 && !saving && chain.length === 0 && !hasNotices) return null;
 
   return (
+    <div className="space-y-1">
     <div className="flex items-center gap-1.5 flex-wrap">
-      {names.length > 0 && (
+      {options.length > 0 && (
         <StyledSelect
           accent={ACCENT}
           size="sm"
           value=""
-          onChange={(name) => { if (name) loadPreset(name); }}
-          options={names.map(n => ({ value: n, label: n }))}
+          onChange={(key) => { if (key) loadPreset(key); }}
+          options={options.map(o => ({ value: o.value, label: o.label }))}
           placeholder={t('vst.loadPreset')}
           title={t('vst.loadPresetInfo')}
           aria-label={t('vst.loadPreset')}
@@ -170,13 +179,13 @@ const PresetManager: React.FC = () => {
         />
       )}
 
-      {names.length > 0 && (
+      {options.length > 0 && (
         <StyledSelect
           accent={ACCENT}
           size="sm"
           value=""
-          onChange={(name) => { if (name) deletePreset(name); }}
-          options={names.map(n => ({ value: n, label: `✕ ${n}` }))}
+          onChange={(key) => { if (key) void deletePreset(key); }}
+          options={options.filter(o => !o.busy).map(o => ({ value: o.value, label: `✕ ${o.label}` }))}
           placeholder={t('vst.deletePreset')}
           title={t('vst.deletePresetInfo')}
           aria-label={t('vst.deletePreset')}
@@ -214,6 +223,8 @@ const PresetManager: React.FC = () => {
           </button>
         )
       )}
+    </div>
+    <PresetSyncNotices collection={presetCollection} snapshot={presetSnapshot} labelOf={b => b.name} />
     </div>
   );
 };
@@ -314,7 +325,10 @@ export const VstChainDropdown: React.FC = () => {
   } = useVstChainStore();
   const currentTrack = usePlaybackSelector(s => s.currentTrack);
   const isPlaying = usePlaybackSelector(s => s.isPlaying);
-  const presets = useVstChainStore(s => s.presets);
+  const loadPresets = useVstChainStore(s => s.loadPresets);
+  const presetsVisible = useVstChainStore(s => s.presetSnapshot.entries.length > 0
+    || s.presetSnapshot.importConflicts.length > 0 || !!s.presetSnapshot.loadError);
+  useEffect(() => { void loadPresets(); }, [loadPresets]);
   const [showSearch, setShowSearch] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const { t } = useTranslation();
@@ -346,7 +360,7 @@ export const VstChainDropdown: React.FC = () => {
   return (
     <div className="space-y-3">
       {/* Presets */}
-      {(safeChain.length > 0 || Object.keys(presets).length > 0) && (
+      {(safeChain.length > 0 || presetsVisible) && (
         <div className="space-y-1">
           <ParamLabel
             label="Presets"

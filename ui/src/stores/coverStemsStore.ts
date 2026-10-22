@@ -32,6 +32,8 @@ interface CoverStemsState {
   clearStems(): void;
 }
 
+let separationEpoch = 0;
+
 export const useCoverStemsStore = create<CoverStemsState>((set, get) => ({
   sepJobId: null,
   sepStems: null,
@@ -45,6 +47,7 @@ export const useCoverStemsStore = create<CoverStemsState>((set, get) => ({
   setStemControls: (controls) => set({ stemControls: controls }),
 
   startSeparation: async (sourceAudioUrl, level) => {
+    const epoch = ++separationEpoch;
     const prevJobId = get().sepJobId;
     if (prevJobId) void apiReleaseSeparation(prevJobId);
 
@@ -54,6 +57,7 @@ export const useCoverStemsStore = create<CoverStemsState>((set, get) => ({
     });
     try {
       const jobId = await apiStartSeparation(sourceAudioUrl, level);
+      if (epoch !== separationEpoch) { void apiReleaseSeparation(jobId); return; }
       set({ sepJobId: jobId });
       const result = await waitForCompletion(jobId, (progress, message) => {
         // A later clearStems()/startSeparation() call superseded this job —
@@ -75,12 +79,13 @@ export const useCoverStemsStore = create<CoverStemsState>((set, get) => ({
         isSeparating: false,
       });
     } catch (err) {
-      set({ isSeparating: false });
+      if (epoch === separationEpoch) set({ isSeparating: false });
       throw err;
     }
   },
 
   clearStems: () => {
+    separationEpoch++;
     const jobId = get().sepJobId;
     if (jobId) void apiReleaseSeparation(jobId);
     set({

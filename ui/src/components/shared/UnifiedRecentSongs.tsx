@@ -1,185 +1,73 @@
 /**
  * UnifiedRecentSongs.tsx — Shows recently generated songs across ALL modes.
  *
- * Data flow: GET /api/songs/recent?source=X returns normalized rows.
- * MODULE-LEVEL CACHE ensures instant render on navigation.
+ * Data flow: GET /api/songs/recent?source=X returns normalized rows, cached
+ * per source by the shell-queue recent-songs query. The cache outlives every
+ * mount, so navigation renders instantly; song writes (App.tsx) patch and
+ * invalidate it.
  * Visual design matches the original Lyric Studio RecentSongsList.
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Play, Loader2, Music, ListPlus, Check } from 'lucide-react';
 import { songApi } from '../../services/api';
 import type { UnifiedRecentSong } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { downloadTrack } from '../../utils/downloadTrack';
 import { usePlaylist } from '../lyric-studio/playlistStore';
-import { playFromList, unifiedRecentSongToTrack } from '../../stores/playbackStore';
+import { playFromList, togglePlay, unifiedRecentSongToTrack, usePlaybackSelector } from '../../stores/playbackStore';
 import { SongActionsMenu, songFromRecent } from './SongActionsMenu';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { CoverImage } from './CoverImage';
+import { recentSongsOptions, removeSongs } from '../../queries/shell-queue/songs';
 
 interface UnifiedRecentSongsProps {
   showToast: (msg: string, type?: 'success' | 'error') => void;
-  refreshKey?: number;
   compact?: boolean;
   /** Filter by source mode — undefined or 'all' shows everything */
   source?: string;
 }
 
-// ── Module-level cache (keyed by source) ─────────────────────────────────────
-
-const _cache = new Map<string, { songs: UnifiedRecentSong[]; key: number }>();
-const _fetchInFlight = new Set<string>();  // per-source to avoid cross-blocking
-
-const CACHE_CLEARED_EVENT = 'recent-songs-cache-cleared';
-
-/** Drop all cached recent-song lists (e.g. after Nuke All Generations) and
- *  tell any mounted instances to empty themselves. */
-export function clearRecentSongsCache(): void {
-  _cache.clear();
-  window.dispatchEvent(new Event(CACHE_CLEARED_EVENT));
-}
-
-// Cache correction at MODULE scope, not inside the component.
-//
-// The per-source cache outlives every mount, so patching it only from a
-// mounted instance meant a post-processing pass that finished while you were
-// on another page left the cache claiming the track was still unprocessed.
-// The menu then offered "Run Post-Processing" (refused by the server) and hid
-// "Remove Post-Processed Version" — both decisions driven by the same stale
-// flag. Listening here fixes the cache whether or not anything is on screen.
-function patchCachedSong(songId: string, patch: Partial<UnifiedRecentSong>): void {
-  for (const [key, entry] of _cache) {
-    if (!entry.songs.some(s => s.id === songId)) continue;
-    _cache.set(key, {
-      ...entry,
-      songs: entry.songs.map(s => (s.id === songId ? { ...s, ...patch } : s)),
-    });
-  }
-}
-
-window.addEventListener('song-postprocessed', (e: Event) => {
-  const { songId, masteredAudioUrl } = (e as CustomEvent).detail || {};
-  if (songId && masteredAudioUrl) patchCachedSong(songId, { mastered_audio_url: masteredAudioUrl });
-});
-
-window.addEventListener('song-postprocess-reverted', (e: Event) => {
-  const { songId } = (e as CustomEvent).detail || {};
-  if (songId) patchCachedSong(songId, { mastered_audio_url: '' });
-});
+const NO_SONGS: UnifiedRecentSong[] = [];
+const playable = (res: { songs: UnifiedRecentSong[] }) => (res.songs || []).filter(s => !!s.audio_url);
 
 // ── Component ────────────────────────────────────────────────────────────────
 
 export const UnifiedRecentSongs: React.FC<UnifiedRecentSongsProps> = ({
-  showToast, refreshKey = 0, compact = false, source = 'all',
+  showToast, compact = false, source = 'all',
 }) => {
-  const { token } = useAuth();
-  const cacheKey = source || 'all';
-  const cached = _cache.get(cacheKey);
-  const [songs, setSongs] = useState<UnifiedRecentSong[]>(cached?.songs || []);
-  // Only show loading spinner if we have NO cached data at all (not even an empty result).
-  // A cache entry with songs=[] means "we fetched and there are none" — don't spin for that.
-  const [loading, setLoading] = useState(!cached);
-  const mountedRef = useRef(true);
+  const { token, sessionEpoch } = useAuth();
+  void sessionEpoch;
+  const queryClient = useQueryClient();
+  const query = useQuery({ ...recentSongsOptions(source || 'all'), enabled: !!token, select: playable });
+  const songs = query.data ?? NO_SONGS;
+  // Spin only with nothing cached at all; an empty result is an answer.
+  const loading = query.isPending && !!token;
   const { disguiseArtist, disguiseTitle } = useDisguiseMode();
 
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, [cacheKey]);
-
-  useEffect(() => {
-    const onCleared = () => { setSongs([]); setLoading(false); };
-    window.addEventListener(CACHE_CLEARED_EVENT, onCleared);
-    return () => window.removeEventListener(CACHE_CLEARED_EVENT, onCleared);
-  }, []);
-
-  // A post-processing re-run gives an existing row a mastered file. This list
-  // keeps its own module-level cache, so it has to be patched directly —
-  // App.tsx's song state is a different copy.
-  useEffect(() => {
-    const onProcessed = (e: Event) => {
-      const { songId, masteredAudioUrl } = (e as CustomEvent).detail || {};
-      if (!songId || !masteredAudioUrl) return;
-      setSongs(prev => {
-        const updated = prev.map(s =>
-          s.id === songId ? { ...s, mastered_audio_url: masteredAudioUrl } : s
-        );
-        _cache.set(cacheKey, { songs: updated, key: refreshKey });
-        return updated;
-      });
-    };
-    const onReverted = (e: Event) => {
-      const { songId } = (e as CustomEvent).detail || {};
-      if (!songId) return;
-      setSongs(prev => {
-        const updated = prev.map(s =>
-          s.id === songId ? { ...s, mastered_audio_url: '' } : s
-        );
-        _cache.set(cacheKey, { songs: updated, key: refreshKey });
-        return updated;
-      });
-    };
-    window.addEventListener('song-postprocessed', onProcessed);
-    window.addEventListener('song-postprocess-reverted', onReverted);
-    return () => {
-      window.removeEventListener('song-postprocessed', onProcessed);
-      window.removeEventListener('song-postprocess-reverted', onReverted);
-    };
-  }, [cacheKey, refreshKey]);
-
-  useEffect(() => {
-    if (!token) { setLoading(false); return; }
-    // Check cache inline (not via closure) to avoid stale dep issues
-    const entry = _cache.get(cacheKey);
-    if (entry && entry.key === refreshKey) {
-      // Cache hit — still sync state so component reflects the correct source
-      // (React may reuse this instance across view changes, keeping stale useState)
-      setSongs(entry.songs);
-      setLoading(false);
-      return;
-    }
-    if (_fetchInFlight.has(cacheKey)) return;
-    // Only show spinner if we have no cached data at all
-    if (!entry) setLoading(true);
-
-    _fetchInFlight.add(cacheKey);
-    songApi.getRecentSongs(token, source, 50).then(res => {
-      const resolved = (res.songs || []).filter(s => !!s.audio_url);
-      _cache.set(cacheKey, { songs: resolved, key: refreshKey });
-      _fetchInFlight.delete(cacheKey);
-      if (mountedRef.current) { setSongs(resolved); setLoading(false); }
-    }).catch(() => {
-      _fetchInFlight.delete(cacheKey);
-      if (mountedRef.current) setLoading(false);
-    });
-  }, [refreshKey, token, source, cacheKey]);
-
+  const currentTrackId = usePlaybackSelector(s => s.currentTrack?.id ?? null);
   const handlePlay = useCallback(async (rs: UnifiedRecentSong) => {
     const track = unifiedRecentSongToTrack(rs);
+    // The current track pauses/resumes in place; reloading it would restart it.
+    if (track.id === currentTrackId) { togglePlay(); return; }
     const allTracks = songs.map(unifiedRecentSongToTrack);
     const playbackSource = source === 'cover-studio' ? 'cover-studio' as const
       : source === 'lyric-studio' ? 'lireek-recent' as const
       : 'library' as const;
     playFromList(track, allTracks, playbackSource);
-  }, [songs, source]);
+  }, [songs, source, currentTrackId]);
 
   const handleDelete = useCallback(async (rs: UnifiedRecentSong) => {
     if (!token || !rs.audio_url) return;
     try {
-      await songApi.delete(rs.id, token);
-      setSongs(prev => {
-        const updated = prev.filter(s => s.id !== rs.id);
-        _cache.set(cacheKey, { songs: updated, key: refreshKey });
-        return updated;
-      });
+      await songApi.delete(rs.id);
+      void removeSongs(queryClient, [rs.id]);
       showToast('Song deleted');
     } catch {
       showToast('Failed to delete song', 'error');
     }
-  }, [token, showToast, cacheKey, refreshKey]);
+  }, [token, showToast, queryClient]);
 
   const handleDownload = useCallback((rs: UnifiedRecentSong) => {
     if (!rs.audio_url) return;

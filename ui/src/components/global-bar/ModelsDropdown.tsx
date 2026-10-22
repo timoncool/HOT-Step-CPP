@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query';
+import { aceModelsOptions } from '../../queries/global-models/options';
 // ModelsDropdown.tsx — Model selection UI for the global param bar
 //
 // Uses custom ModelSelect dropdown to show GGUF/SafeTensors format badges.
@@ -6,12 +8,10 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Download } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
-import { modelApi } from '../../services/api';
 import { formatDitModel, formatLmModel, formatVaeModel, formatEmbeddingModel, getDitModelDescription, getLmModelDescription, getVaeModelDescription } from './modelLabels';
 import { ModelManagerModal } from '../model-manager/ModelManagerModal';
 import { ModelSelect, getModelFormat } from './ModelSelect';
 import { ParamLabel } from '../shared/ParamLabel';
-import type { AceModels } from '../../types';
 
 type ModelFormat = 'gguf' | 'safetensors' | 'onnx';
 const FORMAT_ORDER: ModelFormat[] = ['gguf', 'safetensors', 'onnx'];
@@ -37,14 +37,9 @@ function loadFormatFilter(): Record<ModelFormat, boolean> {
 export const ModelsDropdown: React.FC = () => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
-  const [models, setModels] = useState<AceModels | null>(null);
+  const { data: models } = useQuery(aceModelsOptions());
   const [showModelManager, setShowModelManager] = useState(false);
 
-  useEffect(() => {
-    modelApi.list()
-      .then(setModels)
-      .catch(() => {});
-  }, []);
 
   // Auto-select first available model when list loads and nothing is selected
   useEffect(() => {

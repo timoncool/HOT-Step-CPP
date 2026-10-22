@@ -90,6 +90,7 @@
 #include "yue2-imatrix.h"
 #include "yue2-lm-graph.h"
 #include "yue2-model.h"
+#include "yue2-nar-loop.h"
 
 #include "backend.h"
 #include "ggml.h"
@@ -98,6 +99,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <random>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -129,8 +131,18 @@ struct Yue2NarVelocityGraph {
     ggml_tensor * in_attn_mask = nullptr;
     ggml_tensor * in_attn_zeros = nullptr;
     bool attn_constants_uploaded = false;
+    // Which mask is currently uploaded when plan CFG shares in_attn_mask:
+    // 0 none, 1 cond (plan keys visible), 2 uncond (plan keys at -inf).
+    int attn_mask_state = 0;
     ggml_tensor * x_embed_tap = nullptr;
     ggml_tensor * velocity_out = nullptr;
+    // CADS conditioning noise (only built when the chunk's cads_strength > 0).
+    ggml_tensor * in_cads_zk = nullptr;
+    ggml_tensor * in_cads_zv = nullptr;
+    ggml_tensor * in_cads_coef = nullptr;  // [2]: sqrt(gamma), s*sqrt(1-gamma)
+    bool cads_z_uploaded = false;
+    // Plan-strength w (only built when the chunk's plan_w_active is set).
+    ggml_tensor * in_plan_w = nullptr;     // [1]: w for the current step
 };
 
 static void yue2_nar_velocity_graph_free(Yue2NarVelocityGraph * g) {
@@ -156,7 +168,100 @@ struct Yue2NarChunk {
     // before the concat. state/noise/velocity buffers are [M][chunk_len][64].
     int64_t         n_var = 1;
     mutable Yue2NarVelocityGraph velocity_graph; // serial ODE calls share one shape
+    // CADS-style conditioning noise on the AR-prefix K/V (the NAR's plan
+    // conditioning). strength 0 builds no extra node (bit-identical output).
+    // t runs 1 (pure noise) -> 0 (clean), as in the ODE solvers: gamma = 1
+    // (clean cond) for t <= cads_t1, 0 (fully noised) for t >= cads_t2, linear
+    // between, so the conditioning is noisiest early (CADS paper convention).
+    float    cads_strength = 0.0f;
+    float    cads_t1       = 0.6f;
+    float    cads_t2       = 0.9f;
+    bool     cads_rescale  = true;
+    uint64_t cads_seed     = 0;
+    // Plan-strength curve w(step): the AR-prefix V (plan conditioning) is
+    // scaled by w each step. w = 1 everywhere builds no node (bit-identical).
+    // start/end/curve come from plugin_params; a scheduler plugin may override
+    // the whole table via the Lua global plan_strength. The solver fills
+    // plan_w_times (steps+1, descending t) and plan_w_vals (steps) before the
+    // first velocity call; velocity() maps its t back to the step it lies in.
+    float plan_w_start = 1.0f;
+    float plan_w_end   = 1.0f;
+    bool  plan_w_cosine = false;
+    mutable bool plan_w_active = false;
+    mutable std::vector<float> plan_w_times;
+    mutable std::vector<float> plan_w_vals;
+    // Classifier-free guidance on the plan: cfg = 1 is off (no extra pass, no
+    // extra node). cfg > 1 runs a second forward per velocity call with the
+    // plan V zeroed (w = 0, the "no plan" branch of the plan_w node) and
+    // returns v_u + cfg*(v_c - v_u). Applied only while t2 >= t >= t1
+    // (solver t: 1 = noise, 0 = clean).
+    float plan_cfg    = 1.0f;
+    float plan_cfg_t1 = 0.0f;
+    float plan_cfg_t2 = 1.0f;
+    float plan_cfg_rescale = 0.7f;  // phi: CFG-rescale blend (Lin et al. 2023), only when plan_cfg > 1
+    mutable int plan_cfg_uncond_calls = 0;  // uncond (plan-masked) forwards this solve
 };
+
+// Fill the per-step plan-strength table from start/end/curve (or from an
+// explicit override table of length steps). Sets plan_w_active iff any w != 1.
+static void yue2_plan_w_fill(const Yue2NarChunk & chunk, const std::vector<float> & times, int steps,
+                             const std::vector<float> * override_vals = nullptr) {
+    chunk.plan_w_times = times;
+    chunk.plan_w_vals.assign((size_t) steps, 1.0f);
+    for (int i = 0; i < steps; i++) {
+        float w;
+        if (override_vals && (int) override_vals->size() == steps) {
+            w = (*override_vals)[(size_t) i];
+        } else {
+            double p = steps > 1 ? (double) i / (double) (steps - 1) : 0.0;
+            if (chunk.plan_w_cosine) p = 0.5 * (1.0 - std::cos(3.14159265358979323846 * p));
+            w = (float) (chunk.plan_w_start + (chunk.plan_w_end - chunk.plan_w_start) * p);
+        }
+        chunk.plan_w_vals[(size_t) i] = std::isfinite(w) ? std::clamp(w, 0.0f, 4.0f) : 1.0f;
+    }
+    chunk.plan_w_active = false;
+    for (float w : chunk.plan_w_vals) if (std::abs(w - 1.0f) > 1e-6f) chunk.plan_w_active = true;
+    if (chunk.plan_w_active) {
+        fprintf(stderr, "[YuE2-NAR] plan strength w: step0=%.3f last=%.3f (%d steps)%s\n",
+                chunk.plan_w_vals.front(), chunk.plan_w_vals.back(), steps, override_vals ? " [plugin table]" : "");
+    }
+}
+
+// w for the ODE step whose interval [times[i], times[i+1]) contains t.
+static float yue2_plan_w_at(const Yue2NarChunk & chunk, double t) {
+    const auto & tt = chunk.plan_w_times;
+    const int steps = (int) chunk.plan_w_vals.size();
+    for (int i = 0; i < steps; i++) {
+        if (t > (double) tt[(size_t) i + 1] + 1e-7) return chunk.plan_w_vals[(size_t) i];
+    }
+    return steps ? chunk.plan_w_vals.back() : 1.0f;
+}
+
+// CADS schedule gamma(t) on the solver's t (1 = noise, 0 = clean).
+static double yue2_cads_gamma(double t, double t1, double t2) {
+    if (t <= t1) return 1.0;
+    if (t >= t2 || t2 <= t1) return 0.0;
+    return (t2 - t) / (t2 - t1);
+}
+
+// noisy = sqrt(g)*cond + s*sqrt(1-g)*std_row(cond)*z, then (optionally) the
+// CADS rescale back to cond's own per-row mean/std. Rows are head_dim vectors
+// (one per prefix token per KV head). z is scaled by the row std so strength
+// is relative to the K/V magnitude, which differs a lot between layers.
+static ggml_tensor * yue2_cads_apply(ggml_context * ctx, ggml_tensor * ar, ggml_tensor * z, ggml_tensor * coef,
+                                     bool rescale) {
+    const ggml_type ty = ar->type;
+    ggml_tensor * x    = ty == GGML_TYPE_F32 ? ar : ggml_cast(ctx, ar, GGML_TYPE_F32);
+    ggml_tensor * mean = ggml_mean(ctx, x);                                   // [1, T, Nkv, 1]
+    ggml_tensor * sd   = ggml_sqrt(ctx, ggml_mean(ctx, ggml_sqr(ctx, ggml_sub(ctx, x, mean))));
+    ggml_tensor * a    = ggml_view_1d(ctx, coef, 1, 0);
+    ggml_tensor * b    = ggml_view_1d(ctx, coef, 1, sizeof(float));
+    ggml_tensor * y    = ggml_add(ctx, ggml_mul(ctx, x, a), ggml_mul(ctx, ggml_mul(ctx, z, sd), b));
+    if (rescale) {
+        y = ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, y, 1e-6f), sd), mean);
+    }
+    return ty == GGML_TYPE_F32 ? y : ggml_cast(ctx, y, ty);
+}
 
 // Builds this chunk's AR-prefix KV via a fresh causal prefill (yue2_ar_prefill,
 // yue2-lm-graph.h — same math as the semantic-stage AR decode, deliberately
@@ -454,7 +559,8 @@ static ggml_tensor * yue2_nar_block(ggml_context * ctx, const Yue2LmConfig & c, 
         attn = ggml_flash_attn_ext(ctx, q4, k_cat, v_cat, attn_mask, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     } else {
-        attn = yue2_lm_attn_f32(ctx, q4, k_cat, v_cat, nullptr, scale);
+        // attn_mask is only non-null here for plan CFG (pad_gqa needs flash).
+        attn = yue2_lm_attn_f32(ctx, q4, k_cat, v_cat, attn_mask, scale);
     }
     attn = ggml_reshape_3d(ctx, attn, H, T, M);
 
@@ -600,6 +706,13 @@ static bool yue2_nar_velocity(const Yue2Model & m, const Yue2NarChunk & chunk, c
             ggml_set_name(g.in_attn_zeros, "yue2_nar_padding_zeros");
             ggml_set_input(g.in_attn_zeros);
         }
+    } else if (chunk.plan_cfg > 1.0f) {
+        // Plan CFG needs a key mask so the uncond pass can hide the AR prefix
+        // (plan) keys entirely. Only built when plan CFG is on, so the
+        // plan_cfg=1 graph is unchanged.
+        g.in_attn_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, nar_len);
+        ggml_set_name(g.in_attn_mask, "yue2_nar_plan_cfg_mask");
+        ggml_set_input(g.in_attn_mask);
     }
 
     // Input embedding: vae2llm(padded state) + time_embedder(shifted t) + pos_emb[local_idx].
@@ -635,6 +748,26 @@ static bool yue2_nar_velocity(const Yue2Model & m, const Yue2NarChunk & chunk, c
     // passes the tensor itself, as before.
     const Yue2ArKvCache & kc = *chunk.cache;
     const bool whole = kc.n_sets == 1 && kc.capacity == ar_length;
+    if (chunk.cads_strength > 0.0f) {
+        // One z pair shared by every layer (per-layer z would cost 2*L prefix
+        // copies of VRAM); the per-row std scaling adapts it to each layer.
+        const ggml_tensor * k0 = kc.k[0];
+        const ggml_tensor * v0 = kc.v[0];
+        g.in_cads_zk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, k0->ne[0], ar_length, k0->ne[2], 1);
+        g.in_cads_zv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, v0->ne[0], ar_length, v0->ne[2], 1);
+        g.in_cads_coef = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        ggml_set_name(g.in_cads_zk, "yue2_nar_cads_zk");
+        ggml_set_name(g.in_cads_zv, "yue2_nar_cads_zv");
+        ggml_set_name(g.in_cads_coef, "yue2_nar_cads_coef");
+        ggml_set_input(g.in_cads_zk);
+        ggml_set_input(g.in_cads_zv);
+        ggml_set_input(g.in_cads_coef);
+    }
+    if (chunk.plan_w_active || chunk.plan_cfg > 1.0f) {
+        g.in_plan_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(g.in_plan_w, "yue2_nar_plan_w");
+        ggml_set_input(g.in_plan_w);
+    }
     for (int i = 0; i < L; i++) {
         ggml_tensor * ar_k = kc.k[(size_t) i];
         ggml_tensor * ar_v = kc.v[(size_t) i];
@@ -643,6 +776,16 @@ static bool yue2_nar_velocity(const Yue2Model & m, const Yue2NarChunk & chunk, c
                                                 ar_k->nb[2], ar_k->nb[3], (size_t) chunk.set * ar_k->nb[3]));
             ar_v = ggml_cont(ctx, ggml_view_4d(ctx, ar_v, ar_v->ne[0], ar_length, ar_v->ne[2], 1, ar_v->nb[1],
                                                 ar_v->nb[2], ar_v->nb[3], (size_t) chunk.set * ar_v->nb[3]));
+        }
+        if (g.in_cads_coef) {
+            ar_k = yue2_cads_apply(ctx, ar_k, g.in_cads_zk, g.in_cads_coef, chunk.cads_rescale);
+            ar_v = yue2_cads_apply(ctx, ar_v, g.in_cads_zv, g.in_cads_coef, chunk.cads_rescale);
+        }
+        if (g.in_plan_w) {
+            const ggml_type ty = ar_v->type;
+            ggml_tensor * v32 = ty == GGML_TYPE_F32 ? ar_v : ggml_cast(ctx, ar_v, GGML_TYPE_F32);
+            v32 = ggml_mul(ctx, v32, g.in_plan_w);
+            ar_v = ty == GGML_TYPE_F32 ? v32 : ggml_cast(ctx, v32, ty);
         }
         x = yue2_nar_block(ctx, c, m.lm.nar_blk[(size_t) i], x, in_rope_pos, ar_k, ar_v, use_flash,
                            g.in_attn_mask, g.in_attn_zeros, &m, i);
@@ -677,13 +820,56 @@ static bool yue2_nar_velocity(const Yue2Model & m, const Yue2NarChunk & chunk, c
     ggml_backend_tensor_set(g.in_local_idx, local_idx_host.data(), 0, local_idx_host.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.in_rope_pos, rope_pos_host.data(), 0, rope_pos_host.size() * sizeof(int32_t));
     ggml_backend_tensor_set(g.in_content_idx, content_idx_host.data(), 0, content_idx_host.size() * sizeof(int32_t));
-    if (g.in_attn_mask && !g.attn_constants_uploaded) {
-        std::vector<uint16_t> mask_host((size_t) (kv_pad * nar_len), ggml_fp32_to_fp16(-INFINITY));
+    if (g.in_cads_coef) {
+        if (!g.cads_z_uploaded) {
+            // z drawn once per chunk from the chunk's seed: reproducible, and
+            // held fixed across every ODE step of the chunk.
+            std::mt19937_64 rng(chunk.cads_seed);
+            std::normal_distribution<float> nd(0.0f, 1.0f);
+            for (ggml_tensor * zt : { g.in_cads_zk, g.in_cads_zv }) {
+                std::vector<float> z((size_t) ggml_nelements(zt));
+                for (auto & v : z) v = nd(rng);
+                ggml_backend_tensor_set(zt, z.data(), 0, z.size() * sizeof(float));
+            }
+            g.cads_z_uploaded = true;
+        }
+        const double t     = 1.0 / (1.0 + std::exp(-raw_t));  // undo yue2_nar_logit_clamped
+        const double gamma = yue2_cads_gamma(t, chunk.cads_t1, chunk.cads_t2);
+        // strength s is a dial on the schedule itself: gamma_eff = 1 - min(s,1)*(1-gamma),
+        // so both the signal removal and the noise vanish continuously as s -> 0
+        // (plain CADS with gamma=0 for t >= t2 zeroes the cond for ANY s > 0, and
+        // the rescale then blows s*z up to full-scale noise: strength had no effect).
+        // s > 1 keeps gamma_eff = gamma and scales the noise further, as in the paper.
+        const double s     = (double) chunk.cads_strength;
+        const double ge    = 1.0 - std::min(s, 1.0) * (1.0 - gamma);
+        const float  coef[2] = { (float) std::sqrt(ge), (float) (std::max(s, 1.0) * std::sqrt(1.0 - ge)) };
+        ggml_backend_tensor_set(g.in_cads_coef, coef, 0, sizeof(coef));
+    }
+    const double t_plain = 1.0 / (1.0 + std::exp(-raw_t));
+    if (g.in_plan_w) {
+        const float w = yue2_plan_w_at(chunk, t_plain);
+        ggml_backend_tensor_set(g.in_plan_w, &w, 0, sizeof(float));
+    }
+    const bool cfg_on = g.in_plan_w && chunk.plan_cfg > 1.0f &&
+                        t_plain >= (double) chunk.plan_cfg_t1 - 1e-7 && t_plain <= (double) chunk.plan_cfg_t2 + 1e-7;
+    const int64_t mask_w = g.in_attn_mask ? g.in_attn_mask->ne[0] : 0;
+    // uncond = true hides the AR prefix (plan) keys [0, ar_length) with -inf,
+    // so softmax spends no mass on them: a true "no plan" branch, not just
+    // plan V zeroed. Columns past kv_len are alignment padding (always -inf).
+    auto upload_mask = [&](bool uncond) {
+        const uint16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        const uint16_t zero = ggml_fp32_to_fp16(0.0f);
+        std::vector<uint16_t> mask_host((size_t) (mask_w * nar_len), ninf);
+        const int64_t c0 = uncond ? ar_length : 0;
         for (int64_t row = 0; row < nar_len; ++row) {
-            std::fill(mask_host.begin() + (size_t) (row * kv_pad),
-                      mask_host.begin() + (size_t) (row * kv_pad + kv_len), ggml_fp32_to_fp16(0.0f));
+            std::fill(mask_host.begin() + (size_t) (row * mask_w + c0),
+                      mask_host.begin() + (size_t) (row * mask_w + kv_len), zero);
         }
         ggml_backend_tensor_set(g.in_attn_mask, mask_host.data(), 0, mask_host.size() * sizeof(uint16_t));
+        g.attn_mask_state = uncond ? 2 : 1;
+    };
+    if (g.in_attn_mask && g.attn_mask_state != 1) upload_mask(false);
+    if (g.in_attn_mask && !g.attn_constants_uploaded) {
         if (g.in_attn_zeros) {
             std::vector<uint16_t> zeros(ggml_nelements(g.in_attn_zeros), 0);
             ggml_backend_tensor_set(g.in_attn_zeros, zeros.data(), 0, zeros.size() * sizeof(uint16_t));
@@ -704,6 +890,50 @@ static bool yue2_nar_velocity(const Yue2Model & m, const Yue2NarChunk & chunk, c
             out->input_embedding.assign((size_t) (M * nar_len * H), 0.0f);
             ggml_backend_tensor_get(g.x_embed_tap, out->input_embedding.data(), 0,
                                     (size_t) (M * nar_len * H) * sizeof(float));
+            want_input_embedding = false;
+        }
+        if (cfg_on) {
+            // Unconditional pass: same graph, plan (AR prefix) keys masked to -inf.
+            upload_mask(true);
+            chunk.plan_cfg_uncond_calls++;
+            ok = ggml_backend_sched_graph_compute(g.sched, g.gf) == GGML_STATUS_SUCCESS;
+            if (!ok) {
+                if (err) *err = "YuE2 NAR velocity graph compute failed (plan CFG uncond pass)";
+                return false;
+            }
+            std::vector<float> vu(out->velocity.size());
+            ggml_backend_tensor_get(g.velocity_out, vu.data(), 0, vu.size() * sizeof(float));
+            const float s = chunk.plan_cfg;
+            for (size_t i = 0; i < vu.size(); i++) out->velocity[i] = vu[i] + s * (out->velocity[i] - vu[i]);
+            // CFG rescale (Lin et al. 2023, "Common Diffusion Noise Schedules..."):
+            // v <- phi * v * std(vc)/std(v) + (1-phi) * v. The reference takes std
+            // over all non-batch dims; here it is taken per latent channel (over
+            // the chunk's frames), per batch item. Measured 2026-09-30 (seed 1234,
+            // 20 s): phi 0.7 takes cfg 3 from +15.4 dB / 30.6% clip to +9.2 dB /
+            // 0.94% clip vs cfg 1; whole-chunk std measured the same within 0.1 dB.
+            const float phi = chunk.plan_cfg_rescale;
+            if (phi > 0.0f) {
+                const size_t T = (size_t) chunk_len, C = (size_t) LD;
+                for (int64_t m = 0; m < M; m++) {
+                    const size_t base = (size_t) m * T * C;
+                    float * v = out->velocity.data() + base;
+                    const float * u = vu.data() + base;
+                    for (size_t c = 0; c < C; c++) {
+                        double sc = 0, sc2 = 0, sv = 0, sv2 = 0;
+                        for (size_t t = 0; t < T; t++) {
+                            const double x = v[t * C + c], xu = u[t * C + c];
+                            const double xc = xu + (x - xu) / s;  // recover vc
+                            sc += xc; sc2 += xc * xc; sv += x; sv2 += x * x;
+                        }
+                        const double n = (double) T;
+                        const double std_c = std::sqrt(std::max(0.0, sc2 / n - (sc / n) * (sc / n)));
+                        const double std_v = std::sqrt(std::max(0.0, sv2 / n - (sv / n) * (sv / n)));
+                        if (std_v <= 1e-12) continue;
+                        const float fct = (float) (phi * (std_c / std_v) + (1.0 - phi));
+                        for (size_t t = 0; t < T; t++) v[t * C + c] *= fct;
+                    }
+                }
+            }
         }
     }
     return ok;
@@ -810,6 +1040,11 @@ static bool yue2_nar_solve_midpoint(const Yue2Model & m, const Yue2NarChunk & ch
     }
 
     const double dt = 1.0 / (double) steps;
+    {
+        std::vector<float> tt((size_t) steps + 1);
+        for (int i = 0; i <= steps; i++) tt[(size_t) i] = (float) (1.0 - (double) i * dt);
+        yue2_plan_w_fill(chunk, tt, steps);
+    }
     std::vector<float> state = initial_noise;
     std::vector<float> v_cached;
     bool have_cached_v = false;
@@ -885,8 +1120,23 @@ static bool yue2_nar_solve_midpoint(const Yue2Model & m, const Yue2NarChunk & ch
         }
     }
 
+    if (chunk.plan_cfg > 1.0f) {
+        fprintf(stderr, "[YuE2-NAR] plan CFG: %d uncond (plan-masked) passes / %d velocity calls\n",
+                chunk.plan_cfg_uncond_calls, out->velocity_calls);
+        chunk.plan_cfg_uncond_calls = 0;
+    }
     out->final_latents = std::move(state);
     return true;
+}
+
+// Deterministic per-chunk solver seed: splitmix64 finalizer over (seed, chunk
+// start). Masked to 53 bits so it survives a Lua number round trip.
+static inline int64_t yue2_chunk_solver_seed(uint64_t seed, uint64_t chunk_start) {
+    uint64_t z = seed + 0x9E3779B97F4A7C15ull * (chunk_start + 1);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return (int64_t) (z & 0x1FFFFFFFFFFFFFull);
 }
 
 // Optional YuE2 NAR Lua path. The native midpoint function above remains the
@@ -900,7 +1150,8 @@ static bool yue2_nar_solve_plugins(
     const std::vector<float> & initial_noise, int steps,
     const std::string & solver_name, const std::string & scheduler_name,
     const std::unordered_map<std::string, std::string> & plugin_params,
-    Yue2NarSolveResult * out, std::string * err, const Yue2NarStepFn & on_step = {}) {
+    Yue2NarSolveResult * out, std::string * err, const Yue2NarStepFn & on_step = {},
+    int64_t seed = 0, const LuaYue2Plan * plan_info = nullptr) {
     if (steps <= 0 || chunk.n_var != 1 ||
         initial_noise.size() != (size_t) (chunk.chunk_len * m.lm_cfg.latent_dim)) {
         if (err) *err = "YuE2 NAR plugin solve: invalid steps or noise shape (plugins solve one variation at a time)";
@@ -913,17 +1164,35 @@ static bool yue2_nar_solve_plugins(
         if (err) *err = "YuE2 NAR plugin was not loaded; check the plugin startup log";
         return false;
     }
-    if (solver && (solver->owns_loop || solver->needs_model)) {
-        if (err) *err = "YuE2 NAR supports only single-evaluation step() solvers";
+    if (solver && solver->needs_model && !solver->owns_loop) {
+        if (err) *err = "YuE2 NAR supports single-evaluation step() solvers and full-loop sample() solvers";
         return false;
     }
 
     std::vector<float> times((size_t) steps + 1, 0.0f);
+    std::vector<float> plan_w_override;
     if (scheduler) {
         std::vector<float> emitted((size_t) steps, std::numeric_limits<float>::quiet_NaN());
         LuaModelContext ctx;
         ctx.model_id = "yue2";
+        ctx.yue2     = plan_info;
         lua_call_scheduler(*scheduler, emitted.data(), steps, 1.0f, plugin_params, ctx);
+        // Optional plan-strength table set by the scheduler (global plan_strength,
+        // array of `steps` numbers). Cleared after reading: the lua_State is shared.
+        if (lua_State * L = scheduler->L) {
+            lua_getglobal(L, "plan_strength");
+            if (lua_istable(L, -1) && (int) lua_objlen(L, -1) == steps) {
+                plan_w_override.resize((size_t) steps);
+                for (int i = 0; i < steps; i++) {
+                    lua_rawgeti(L, -1, i + 1);
+                    plan_w_override[(size_t) i] = lua_isnumber(L, -1) ? (float) lua_tonumber(L, -1) : 1.0f;
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_setglobal(L, "plan_strength");
+        }
         for (int i = 0; i < steps; i++) times[(size_t) i] = emitted[(size_t) i];
     } else {
         for (int i = 0; i < steps; i++) {
@@ -944,6 +1213,7 @@ static bool yue2_nar_solve_plugins(
         }
     }
 
+    yue2_plan_w_fill(chunk, times, steps, plan_w_override.empty() ? nullptr : &plan_w_override);
     fprintf(stderr, "[YuE2-NAR-Plugins] solver=%s scheduler=%s steps=%d\n",
             solver ? solver->name.c_str() : "midpoint",
             scheduler ? scheduler->name.c_str() : "uniform", steps);
@@ -952,8 +1222,13 @@ static bool yue2_nar_solve_plugins(
     SolverState solver_state;
     solver_state.batch_n = 1;
     solver_state.n_per = n;
+    // step() solvers re-seed their Lua RNG from seeds[0] at step 0
+    // (lua-plugin.h); without this they always got seed 0.
+    const int64_t step_seed = seed;
+    solver_state.seeds = &step_seed;
     LuaModelContext ctx;
     ctx.model_id = "yue2";
+    ctx.yue2     = plan_info;
     auto eval = [&](const std::vector<float> & s, float t, Yue2NarVelocityResult * result) -> bool {
         const auto start = std::chrono::steady_clock::now();
         const bool ok = yue2_nar_velocity(m, chunk, s, yue2_nar_logit_clamped(t), false, result, err);
@@ -963,7 +1238,27 @@ static bool yue2_nar_solve_plugins(
         return ok;
     };
 
-    for (int step = 0; step < steps; step++) {
+    // Full-loop solver: sample() drives every step through model_fn/on_step.
+    const bool loop_solver = solver && solver->owns_loop;
+    if (loop_solver) {
+        const Yue2NarVelocityFn velocity = [&](const float * x, float t, float * v_out) -> bool {
+            Yue2NarVelocityResult r;
+            if (!eval(std::vector<float>(x, x + n), t, &r)) return false;
+            if (r.velocity.size() != (size_t) n) {
+                if (err) *err = "YuE2 NAR velocity size mismatch";
+                return false;
+            }
+            std::copy(r.velocity.begin(), r.velocity.end(), v_out);
+            return true;
+        };
+        if (!yue2_nar_run_loop_solver(*solver, state, times, steps, (int) chunk.chunk_len,
+                                      (int) m.lm_cfg.latent_dim, velocity, on_step, plugin_params, ctx,
+                                      seed, err)) {
+            return false;
+        }
+    }
+
+    for (int step = 0; !loop_solver && step < steps; step++) {
         const float t = times[(size_t) step];
         const float next_t = times[(size_t) step + 1];
         const float dt = t - next_t;
@@ -990,6 +1285,11 @@ static bool yue2_nar_solve_plugins(
             if (err) *err = "cancelled";
             return false;
         }
+    }
+    if (chunk.plan_cfg > 1.0f) {
+        fprintf(stderr, "[YuE2-NAR] plan CFG: %d uncond (plan-masked) passes / %d velocity calls\n",
+                chunk.plan_cfg_uncond_calls, out->velocity_calls);
+        chunk.plan_cfg_uncond_calls = 0;
     }
     out->final_latents = std::move(state);
     return true;

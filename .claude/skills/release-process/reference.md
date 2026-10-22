@@ -62,7 +62,7 @@ mirrored steps). Each portable package bundles:
 - ffmpeg from `ffmpeg-static`'s install script (release.yml:294-303, 461-464)
 - Prebuilt `ui/dist`, empty `models/` and `adapters/` dirs (release.yml:491-493)
 - `.env.example`, `release/HOT-Step.bat` (or `.sh`), `release/README.txt`,
-  `open-browser-if-needed.ps1` (release.yml:506-510)
+  `open-browser-if-needed.mjs` (release.yml:506-510)
 - Guarded optional copies: `noise_samples/`, `Essentia/` (`if exists` — whether
   Essentia is present in a CI checkout was not verified)
 

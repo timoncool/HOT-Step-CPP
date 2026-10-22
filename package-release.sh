@@ -2,7 +2,7 @@
 # HOT-Step CPP — macOS Release Packager
 #
 # Builds a portable .tar.gz release that requires ZERO prerequisites.
-# End users just extract and run ./launch.sh — no Xcode, no brew, no npm.
+# End users just extract and run ./HOT-Step.sh — no Xcode, no brew, no npm.
 #
 # What gets bundled:
 #   - Pre-built C++ engine binaries (Metal GPU)
@@ -116,8 +116,10 @@ ok "All engine binaries built"
 # Fix rpaths: replace any absolute build-dir rpaths with @executable_path
 # so dylibs are found relative to the binary (portable release requirement).
 echo "  Fixing dylib rpaths for portability..."
-for bin in engine/build/ace-server engine/build/ace-lm engine/build/ace-synth \
-           engine/build/ace-understand engine/build/neural-codec engine/build/quantize; do
+for bin in engine/build/ace-server engine/build/ace-train engine/build/ace-midi engine/build/ace-caption \
+           engine/build/ace-lm engine/build/ace-synth engine/build/ace-understand \
+           engine/build/mastering engine/build/mp3-codec engine/build/neural-codec \
+           engine/build/vst-host engine/build/quantize; do
     if [ -f "$bin" ]; then
         # Remove all existing rpaths (may be absolute build paths)
         for old_rpath in $(otool -l "$bin" 2>/dev/null | grep -A1 LC_RPATH | grep "path " | awk '{print $2}'); do
@@ -137,9 +139,9 @@ rm -rf node_modules
 npm install --omit=dev --loglevel=warn 2>&1 | tail -3
 # Rebuild native modules
 npm rebuild better-sqlite3 2>&1 | tail -1
-# tsx is in devDependencies but needed at runtime to run the TypeScript server
-npm install tsx --save-optional --loglevel=warn 2>&1 | tail -1
-ok "Server dependencies installed (production + tsx)"
+# Bundle the server with the same entry point as CI.
+(cd ../release && npm ci && node esbuild.config.mjs)
+ok "Server dependencies installed and server bundled"
 cd "${ROOT_DIR}"
 
 # ── Step 3: Build UI ─────────────────────────────────────────────────
@@ -178,12 +180,13 @@ rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}"
 
 # Engine binaries + dylibs
-mkdir -p "${STAGING_DIR}/engine/build"
-for bin in ace-server ace-lm ace-synth ace-understand mastering mp3-codec neural-codec quantize vst-host; do
-    [ -f "engine/build/${bin}" ] && cp "engine/build/${bin}" "${STAGING_DIR}/engine/build/"
+mkdir -p "${STAGING_DIR}/engine"
+for bin in ace-server ace-train ace-midi ace-caption ace-lm ace-synth ace-understand mastering mp3-codec neural-codec quantize vst-host; do
+    [ -f "engine/build/${bin}" ] || fail "Missing engine binary: ${bin}"
+    cp "engine/build/${bin}" "${STAGING_DIR}/engine/"
 done
 # Copy ggml dylibs
-cp engine/build/libggml*.dylib "${STAGING_DIR}/engine/build/" 2>/dev/null || true
+cp engine/build/libggml*.dylib "${STAGING_DIR}/engine/" 2>/dev/null || true
 
 # Lua plugins — dual directory system:
 #   engine/plugins/  = native/built-in plugins (solvers, schedulers, guidance)
@@ -200,13 +203,17 @@ if [ -d "plugins" ]; then
     ok "Community plugins dir copied (plugins/)"
 fi
 
-# Server (source + node_modules, no devDependencies)
-mkdir -p "${STAGING_DIR}/server"
-cp server/package.json server/package-lock.json "${STAGING_DIR}/server/"
-cp server/tsconfig.json "${STAGING_DIR}/server/"
+# App-owned optional resources.
+[ ! -d noise_samples ] || cp -R noise_samples "${STAGING_DIR}/noise_samples"
+[ ! -d Essentia ] || cp -R Essentia "${STAGING_DIR}/Essentia"
+
+# Bundled server and app-owned resources, matching CI.
+mkdir -p "${STAGING_DIR}/server/data"
+cp release/staging/server/server.mjs "${STAGING_DIR}/server/"
+[ ! -d release/staging/server/chunks ] || cp -R release/staging/server/chunks "${STAGING_DIR}/server/"
 cp -r server/node_modules "${STAGING_DIR}/server/"
-cp -r server/src "${STAGING_DIR}/server/"
-[ -f server/migrate_lireek.cjs ] && cp server/migrate_lireek.cjs "${STAGING_DIR}/server/"
+cp -R server/src/data/. "${STAGING_DIR}/server/data/"
+cp server/node_modules/ffmpeg-static/ffmpeg "${STAGING_DIR}/server/ffmpeg"
 ok "Server copied"
 
 # Pre-built UI
@@ -214,59 +221,27 @@ mkdir -p "${STAGING_DIR}/ui"
 cp -r ui/dist "${STAGING_DIR}/ui/"
 ok "UI copied"
 
-# Node.js runtime (just the binary + npm essentials)
-mkdir -p "${STAGING_DIR}/runtime"
-cp "${NODE_EXTRACTED}/bin/node" "${STAGING_DIR}/runtime/node"
-# Copy npm/npx for server to use tsx
-mkdir -p "${STAGING_DIR}/runtime/lib"
-cp -r "${NODE_EXTRACTED}/lib/node_modules" "${STAGING_DIR}/runtime/lib/"
-# Create npx/npm symlinks
-ln -sf "../lib/node_modules/npm/bin/npm-cli.js" "${STAGING_DIR}/runtime/npm"
-ln -sf "../lib/node_modules/npm/bin/npx-cli.js" "${STAGING_DIR}/runtime/npx"
-ok "Node.js runtime bundled"
+# Bundled runtime and shared release inputs.
+mkdir -p "${STAGING_DIR}/runtime/bin"
+cp "${NODE_EXTRACTED}/bin/node" "${STAGING_DIR}/runtime/bin/node"
+cp release/HOT-Step.sh release/profile-path.mjs release/README.txt "${STAGING_DIR}/"
+cp release/.env.example "${STAGING_DIR}/.env.example"
+printf '%s\n' "v${VERSION}" > "${STAGING_DIR}/VERSION"
+chmod +x "${STAGING_DIR}/HOT-Step.sh"
 
-# Empty directories for user content
-mkdir -p "${STAGING_DIR}/models"
-mkdir -p "${STAGING_DIR}/adapters"
-
-# Scripts
-cp launch.sh "${STAGING_DIR}/"
-cp .env.example "${STAGING_DIR}/"
-chmod +x "${STAGING_DIR}/launch.sh"
-
-# README snippet for release
-cat > "${STAGING_DIR}/README.txt" << 'HEREDOC'
-HOT-Step CPP — macOS (Apple Silicon)
-
-Quick Start:
-  1. Extract this archive
-  2. Run: ./launch.sh
-  3. Open http://localhost:3001 in your browser
-  4. Go to Models → Get More Models to download AI models (~7 GB)
-
-If macOS blocks the app (unsigned binary):
-  xattr -cr /path/to/HOT-Step-CPP-macOS-arm64/
-
-Requirements:
-  - macOS 13+ (Apple Silicon)
-  - ~10 GB free disk space
-  - No other software needed — Node.js is bundled
-
-For the full README, source code, and updates:
-  https://github.com/scragnog/HOT-Step-CPP
-HEREDOC
 ok "Release assembled"
+
+# Boot the assembled server with the shipped node, so a missing chunk fails here.
+"${STAGING_DIR}/runtime/bin/node" release/smoke-boot.mjs "${STAGING_DIR}/server/server.mjs"     || fail "Assembled server failed its boot test"
+ok "Server boot test passed"
 
 # ── Step 6: Set permissions ──────────────────────────────────────────
 step 6 "Setting permissions..."
 
-find "${STAGING_DIR}/engine/build" -type f -perm +0111 -exec chmod +x {} \; 2>/dev/null || true
-chmod +x "${STAGING_DIR}/engine/build/"* 2>/dev/null || true
-chmod +x "${STAGING_DIR}/runtime/node"
-# npm/npx are symlinks to .js files — make targets executable
-chmod +x "${STAGING_DIR}/runtime/lib/node_modules/npm/bin/npm-cli.js" 2>/dev/null || true
-chmod +x "${STAGING_DIR}/runtime/lib/node_modules/npm/bin/npx-cli.js" 2>/dev/null || true
-chmod +x "${STAGING_DIR}/launch.sh"
+find "${STAGING_DIR}/engine" -type f -perm +0111 -exec chmod +x {} \; 2>/dev/null || true
+chmod +x "${STAGING_DIR}/engine/"* 2>/dev/null || true
+chmod +x "${STAGING_DIR}/runtime/bin/node"
+chmod +x "${STAGING_DIR}/HOT-Step.sh"
 ok "Permissions set"
 
 # ── Step 7: Create archive ──────────────────────────────────────────
@@ -291,7 +266,7 @@ echo "  Size:  ${SIZE_MB} MB"
 echo ""
 echo "  Test locally:"
 echo "    cd release-staging/${RELEASE_NAME}"
-echo "    ./launch.sh"
+echo "    ./HOT-Step.sh"
 echo ""
 
 # Clean up staging (keep the archive)

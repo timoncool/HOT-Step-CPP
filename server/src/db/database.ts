@@ -277,6 +277,42 @@ export function initDb(): void {
       created_at   TEXT DEFAULT (datetime('now')),
       updated_at   TEXT DEFAULT (datetime('now'))
     );
+
+    -- Compare studio: A/B listening sessions, their takes and per-criterion scores.
+    CREATE TABLE IF NOT EXISTS compare_sessions (
+      id               TEXT PRIMARY KEY,
+      name             TEXT NOT NULL,
+      criteria_json    TEXT NOT NULL DEFAULT '[]',
+      baseline_song_id TEXT,
+      group_name       TEXT NOT NULL DEFAULT '',
+      archived         INTEGER NOT NULL DEFAULT 0,
+      created_at       TEXT DEFAULT (datetime('now')),
+      updated_at       TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS compare_takes (
+      session_id TEXT NOT NULL,
+      song_id    TEXT NOT NULL,
+      position   INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (session_id, song_id)
+    );
+    CREATE TABLE IF NOT EXISTS compare_scores (
+      session_id TEXT NOT NULL,
+      song_id    TEXT NOT NULL,
+      criterion  TEXT NOT NULL,
+      value      INTEGER,
+      keep       INTEGER,
+      note       TEXT NOT NULL DEFAULT '',
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE (session_id, song_id, criterion)
+    );
+    CREATE TABLE IF NOT EXISTS audio_metrics (
+      song_id      TEXT NOT NULL,
+      file_mtime   REAL NOT NULL,
+      analyzer_ver TEXT NOT NULL,
+      metrics_json TEXT NOT NULL,
+      peaks_json   TEXT NOT NULL,
+      PRIMARY KEY (song_id, analyzer_ver)
+    );
   `);
 
   // ── Migrations — add columns that may not exist in older databases ────────
@@ -376,6 +412,12 @@ export function initDb(): void {
       // See docs/plans/multi-backend-architecture.md §3.5.
       check: `SELECT COUNT(*) as c FROM pragma_table_info('songs') WHERE name='backend'`,
       alter: `ALTER TABLE songs ADD COLUMN backend TEXT DEFAULT 'ace'`,
+    },
+    {
+      // Optimistic revision for Song Builder projects: every project edit and
+      // late render result goes through bumpRevision (services/workflows/revisions.ts).
+      check: `SELECT COUNT(*) as c FROM pragma_table_info('builder_projects') WHERE name='revision'`,
+      alter: `ALTER TABLE builder_projects ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
     },
   ];
   for (const m of songsMigrations) {

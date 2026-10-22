@@ -18,13 +18,43 @@ submodule at configure time.
 | metal-acc-set-cpy | Metal non-inplace `ACC`/`SET` copy every column | — |
 | metal-bin-threads | Metal binary ops without the 256-thread cap | — |
 | metal-im2col-ic | Metal im2col parallel over input channels for N == 1 1D convs | — |
-| mm-backward | `GGML_BACKWARD_MM=1` mul_mat formulation of the activation gradient | 8 |
+| metal-kquant-cpy | Metal K-quant (Q2_K to Q6_K) → F32/F16 `CPY`, the dequant the `mm-backward` arm needs to train on a K-quant base | — |
+| metal-out-prod-smem | Metal tiled `OUT_PROD` store scratch aliases its input tiles, so two threadgroups share a core; same arithmetic | — |
+| metal-cpy-transpose | Same-type F32/BF16 transposed row views copy through a padded 32 by 32 integer tile, preserving all bits; other layouts keep the generic copy. `GGML_METAL_CPY_TRANSPOSE=0` keeps the generic path | — |
+| metal-bf16-round-producer | Metal skips an in-place `BF16_ROUND` of an already-rounded value, and the simdgroup `mul_mm`, an unfused `RMS_NORM` and `SILU` store a following single-consumer `BF16_ROUND` themselves. Bit-identical; `GGML_METAL_NO_BF16_ROUND_PRODUCER=1` turns it off | — |
+| metal-mul-mm-half-prepass | In training graphs on Apple8, a base-forward BF16 `mul_mm` runs on half copies of its operands for every 32-wide K step whose values are all exact in half, and on bfloat otherwise. Bit-identical; `GGML_METAL_HALF_PREPASS_DISABLE=1` turns it off | — |
+| mm-backward | `GGML_BACKWARD_MM=1` mul_mat formulation of the activation gradient; on Windows the latch reads the process environment, so a static-CRT build sees the trainer's `_putenv` | 8 |
 | quant-cpy-kquant | quant → F32 `CPY` for every type the dequantizers cover | 10 |
 | sched-unplaced-log | name the node no backend accepts | — |
+| bf16-mul-mat-grad | a BF16 `MUL_MAT` weight operand may carry a gradient | 18 |
 | zz-yue2-convrot8 | `CONVROT8` / `_BACK`, CUDA int8 rotated-linear training op | 15 |
 | zzz-yue2-bf16-round | `BF16_ROUND` unary op (CPU + CUDA) | 16 |
+| cuda-bf16-round-fuse | CUDA runs an F32 `ADD`/`SUB`/`MUL` and its single-consumer `BF16_ROUND` as one launch; `GGML_CUDA_NO_BF16_ROUND_FUSION=1` turns it off | — |
+| cuda-bf16-round-defer | CUDA skips an in-place `BF16_ROUND` whose only reader is an F32 `ADD`/`SUB`/`MUL`, and that reader rounds the input as it loads it (bit-identical); `GGML_CUDA_NO_BF16_ROUND_DEFER=1` turns it off | — |
+| cuda-bf16-storage | BF16 sources with F32 results for `ADD`/`SUB`/`MUL`, `REPEAT`, `SCALE`, `SILU`/`NEG`, `SILU_BACK`, `RMS_NORM`(`_BACK`), `ACC`, `SET` and `OUT_PROD`, plus `BF16_ROUND` as an F32 → BF16 store, for the YuE2 trainer's BF16 activation storage. An F32 `ADD`/`SUB`/`MUL` and its single-consumer BF16 round store run as one launch (`GGML_CUDA_NO_BF16_STORE_FUSION=1` turns it off); a deferred round's reader may have a BF16 other input; the other fusions skip a 32-node window around BF16 activations. Bit-identical: each load widens exactly and the arithmetic is the F32 path's | — |
+| cuda-gemm-bf16-store | a BF16-weight `MUL_MAT` whose only reader is the next node's F32 → BF16 `BF16_ROUND` store has cuBLAS write the BF16 result there (FP32 accumulate, BF16 C), for the YuE2 trainer's BF16 activation storage; the trainer stores such rounds instead of deferring them. Not bit-identical (cuBLAS may pick another kernel); YuE2 track 003 losses within 0.01%, about -50 ms/step on a 5090. `GGML_CUDA_NO_GEMM_BF16_STORE=1` turns both off | — |
+| cuda-bf16-producer-store | an `RMS_NORM`, `RMS_NORM_BACK`, `SILU`, `SILU_BACK` or NeoX `ROPE` whose only reader is the next node's F32 → BF16 `BF16_ROUND` store writes the BF16 value itself (the kernels take a BF16 dst), also exactly over its own dead BF16 input. Bit-identical: same F32 result, same RNE cast; about -45 ms/step on YuE2 training. `GGML_CUDA_NO_BF16_PRODUCER_STORE=1` turns it off | — |
+| bf16-round-elide | `BF16_ROUND`'s backward passes a gradient that is already a round output straight through; `GGML_NO_BF16_ROUND_ELIDE=1` turns it off | — |
+| bf16-round-inplace | a `BF16_ROUND` of an already-rounded value is built in place and CUDA skips its launch (the backward rule stays); `GGML_NO_BF16_ROUND_INPLACE=1` turns it off | — |
+| fa-train-cuda-hints | the BF16 `FLASH_ATTN_TRAIN` kernels use the causal hint instead of reading the mask, and skip dK/dV below `kv_grad_start`; `GGML_CUDA_FA_TRAIN_NO_HINTS=1` turns it off. With the causal hint and 16-byte aligned rows they pipeline their tile loads with `cp.async` (bit-identical); `GGML_CUDA_FA_TRAIN_NO_PIPE=1` keeps the scalar kernels | — |
 | zzzz-vulkan-train-ops | Vulkan `BF16_ROUND` and fused training attention | 14 |
 | ggml-rpc patch-level check | refuse an RPC server that lacks the fork's ops | — |
+
+The YuE2 trainer's own speed changes sit outside the fork:
+
+| change | rollback |
+|---|---|
+| gradient clip runs on the device, its abs-max as two cascaded 64-wide pools | `YUE2_AITK_CLIP_HOST=1` keeps the host path (D2H, host norm, H2D) |
+| a LoRA scale of exactly 1.0 (alpha == rank) is skipped | none: `x * 1.0f` is bit-exact, so there is nothing to roll back |
+| device-only stack blocks launch async, and each stack call synchronizes once at its end | `YUE2_AITK_SYNC_BLOCKS=1` waits after every block |
+| the block backward's loss seed points at a resident 1.0 instead of `ggml_graph_reset` uploading it per block | `YUE2_AITK_BLOCK_RESET=1` |
+| the AR head rows and the NAR final read the stack's final hidden and write dx as device tensors | `YUE2_AITK_HANDOFF_HOST=1` hands them over through host vectors |
+| on CUDA the gradient clip is four kernel launches on its own stream (abs-max, fixed-order sum of squares, factor, apply) instead of a ggml graph of about ten nodes per slot. Same maths; the norm can differ in the last bits (summation order), the applied factor is unchanged unless the clip engages. About -50 ms/step on a 5090 | `YUE2_AITK_CLIP_GRAPH=1` |
+| the fused q\|k\|v and gate\|up linears over a fused GGUF weight run one GEMM per output over a row view of the weight (and of the companion and LoRA B), instead of one fused GEMM whose output is sliced apart by copies, whose gradients then accumulate into a zero canvas. Not bit-identical (the input gradient is a sum of per-output GEMMs); track 003 losses within 0.03%, about -55 ms/step on a 5090. LoKr, the dense companion, ConvRot bases and strict F32 keep the fused path | `YUE2_AITK_FUSED_SLICE=1` |
+| the frozen teacher's final hidden is cached on the host per AR input-id sequence (it depends on nothing else), so a repeated item skips the 28 base blocks. Filled until `YUE2_AITK_TEACHER_CACHE_MB` (default 2048) and never evicted, since epochs revisit items in a cycle. Bit-identical; about -130 ms/step from the second epoch on a 5090 | `YUE2_AITK_TEACHER_CACHE_MB=0` |
+| BF16 flash attention takes q and k as they are (one BF16 copy each into its layout) and applies 1/sqrt(D) to the F32 scores, instead of scaling q and k by D^-1/4 in F32 and rounding them again. Not bit-identical; track 003 losses within 0.04%, about -23 ms/step on a 5090. Math attention and strict F32 keep the prescale | `YUE2_AITK_QK_PRESCALE=1` |
+| RoPE is one `ggml_rope_ext` NeoX op (F32 trig, theta 1e6, the op the YuE2 inference graph runs) with one BF16 round of its output, instead of the BF16 table path that rounds each product and joins the halves through a zero canvas. Not bit-identical; track 003 losses within 0.03%, about -85 ms/step on a 5090. Strict F32 keeps the table path | `YUE2_AITK_ROPE_TABLE=1` |
+| BF16 activation storage stores every BF16_ROUND output (and the views and conts that reread it) as a BF16 tensor; every other op keeps its F32 result, so the values are the same. A round whose only reader is an `ADD`/`SUB`/`MUL` and whose source is not one stays F32 for the CUDA deferral (`YUE2_AITK_BF16_DEFER=0` retypes it too). About -40 ms/step on a 5090; a GEMM whose only reader is a BF16_ROUND has the cuBLAS call write BF16 C directly (fork `c2a4fc04`), fusing the round into the store; not bit-identical for every shape, and `GGML_CUDA_NO_GEMM_BF16_STORE=1` restores the separate round. On CUDA the AR head stores its logits as BF16 too, and the loss kernel writes the logit gradient as BF16. A BF16 copy of a BF16 tensor that only flash attention reads becomes a strided view (`YUE2_AITK_ATTENTION_COPY=1` keeps the copies) | `YUE2_AITK_BF16_STORAGE=0` |
 
 `cpy-q-occupancy` (the quant → F32 copy launch geometry) is upstream since ggml-org
 `b64fb805`; Hook 9 checks the launch shape itself. Hook 17 checks that `engine/ggml` is clean
@@ -68,6 +98,118 @@ old ggml's cuBLAS mul_mat and out_prod each call `cublasSetStream` per op; the p
 separate the two. To build it there, cherry-pick the commit that adds the probe (the tool and
 its `engine/CMakeLists.txt` block only) onto that checkout.
 
+## Metal transposed copies
+
+`metal-cpy-transpose` handles same-type F32 and BF16 `CPY`/`CONT` from a
+transposed row view into a contiguous tensor of the same shape. Both matrix
+dimensions must be at least 32. Source rows and batch planes may have padding,
+and source and destination may start at an element-aligned view offset. The
+dispatch checks strides, batch-plane separation and disjoint storage ranges.
+Reshapes, casts, smaller matrices, other permutations and strided destinations
+keep their existing copy path. A missing pipeline or a threadgroup limit below
+256 also keeps that path.
+
+Each 32 by 8 threadgroup loads a 32 by 32 tile along the contiguous source
+dimension, synchronizes, and writes along the contiguous destination dimension.
+The tile has a padded column to reduce bank conflicts. BF16 uses `ushort` storage
+and F32 uses `uint`, so the kernel performs no floating-point conversion or
+arithmetic. Tail guards cover both loads and stores. `GGML_METAL_CPY_TRANSPOSE=0`
+selects the original dispatch for a control run; it is read once per process.
+
+Production changes are confined to `src/ggml-metal/` in the fork. Shared ops,
+tensor ABI, graph construction and CPU, CUDA and Vulkan code are unchanged.
+
+Measured on an M2 Max: the 6144 by 2048 BF16 transpose took 0.525 ms versus
+3.933 ms on the generic path, averaged over 100 synchronized copies after
+warmup. The independent host-reference probe passes 126 cases with the feature
+enabled and disabled, including partial tiles, batches, padding, offsets,
+non-contiguous fallbacks, source preservation, destination canaries and raw
+F32/BF16 bit patterns.
+
+Three paired fresh-state warm-song updates took 33.779/33.271/32.781 s for the
+predecessor and 31.980/32.304/32.395 s with the transpose enabled. Median paired
+saving is 0.967 s, or 2.91%; the separate medians are 33.271 and 32.304 s.
+This uses the approved exact-copy exception to the default 3% kernel-change bar.
+All seven matched updates log bit-identical AR CE, NAR MSE, KL and gradient norm
+against both the predecessor and original Metal baseline. C alone on the
+original fork also matches all seven updates. The existing Metal CPY/CONT suite
+passes 285/285 cases with the feature enabled and disabled. Raw evidence lives
+under `.scratch/hs344/` on the development checkout and `.probe-logs/hs344/` on
+the measurement mirror (HOTSTEP-344).
+
+## Metal BF16_ROUND producer epilogues
+
+The YuE2 trainer rounds most activations with `ggml_bf16_round()`. On Metal each
+round ran as its own unary pass: about 9,000 per training update and about 370 GB
+of extra memory traffic. `ADD`/`SUB`/`MUL` already store a following round
+(`rnd=1`). `metal-bf16-round-producer` covers the rest of the large producers:
+
+- A round that `ggml_bf16_round()` marked as a round of an already-rounded value
+  (`op_params[1] == 1`, built in place) encodes nothing, as on CUDA.
+- The simdgroup `mul_mm` kernel, an `RMS_NORM` that no table fusion took, and
+  `SILU` write `bf16_round_cast(result)` into the round's buffer when the next
+  node is a single-consumer F32 `BF16_ROUND` of their contiguous F32 result.
+  `mul_mm` stages its accumulators through threadgroup memory and rounds on the
+  copy out. Rounding the simdgroup matrices in registers made it about 4x slower.
+
+The F32 result and the rounding function are the standalone pass's, so the output
+is bit-identical. The tensor-API `mul_mm`, mat-vec paths, the K = 32 kernel and
+table fusions keep the separate round. `GGML_METAL_NO_BF16_ROUND_PRODUCER=1` or
+`GGML_METAL_FUSION_DISABLE=1` turns all of it off; `GGML_METAL_FUSION_DEBUG=2`
+logs each fusion and skip. Rounds of graph inputs and those after `ROPE`,
+`RMS_NORM_BACK`, `SILU_BACK` and the attention output still run standalone,
+about 2,300 per update and 54 GB.
+
+Measured on an M2 Max. A 2048 by 6144 BF16 GEMM over 7,668 rows took 26.8 ms
+with the epilogue against 27.5 ms for GEMM plus round. A probe of 27 cases
+(full and partial tiles, K tails, batches, LoRA rank, F32 weights, a second
+consumer, views, in-place chains, mat-vec and K = 32 fallbacks, `RMS_NORM` and
+`SILU` row shapes) matches the unfused graph bit for bit with the feature on, off
+and with fusion disabled. Three paired fresh-state warm-song updates took
+32.319/32.426/32.293 s for the predecessor and 30.903/30.953/30.750 s with it;
+median paired saving 1.473 s (4.6%). All seven matched updates log bit-identical
+AR CE, NAR MSE, KL and gradient norm against the predecessor and the original
+Metal baseline, and so do the switched-off control and this change alone on the
+original fork. Raw evidence lives under `.scratch/hs345/` on the development
+checkout and `.probe-logs/hs345/` on the measurement mirror (HOTSTEP-345).
+
+## Metal half pre-pass for base-forward GEMMs
+
+On Apple8 the half MAC is about 22% faster than the bfloat one, and a half product
+equals the bfloat product whenever both inputs are exact in half, also with the type
+mixed per K step (HOTSTEP-347). Converting inside the GEMM cost as much as it saved
+(HOTSTEP-348). `metal-mul-mm-half-prepass` converts first instead:
+
+- `kernel_mul_mm_hp_cvt_w` writes a half copy of the BF16 weights, and
+  `kernel_mul_mm_hp_cvt_a` writes bfloat and half copies of the BF16-rounded F32
+  activations. Both set one flag per 8-wide K block of each tile (64 weight rows,
+  32 activation rows) when every value in it is exact in half.
+- `kernel_mul_mm_bf16_f32_hp` runs a 32-wide K step on the half MAC when all of
+  the step's flags are set and on the bfloat MAC otherwise. Staging is a 16-bit
+  copy from whichever copy the step picks; accumulation and the store, BF16_ROUND
+  epilogue included, are `kernel_mul_mm`'s.
+
+It applies only in graphs built with grads, on Apple8 without the tensor API, to
+2-D contiguous BF16-by-F32 GEMMs with `K % 32 == 0` whose weight reaches a frozen
+leaf without a transpose. dX GEMMs, BF16 casts of trainable LoRA factors, graphs
+without grads and inference keep the existing kernel. The copies share one private
+scratch buffer grown on demand; the op puts barriers around its pre-pass. Each use
+holds a reference until its command buffer completes, and a replaced buffer is freed
+once none remain, on the next scratch request or in `ggml_metal_free`.
+`GGML_METAL_HALF_PREPASS_DISABLE=1` turns it off.
+
+Measured on an M2 Max. Microbenchmark on the base-forward shapes with the audit's
+fallback mix: 0.903 of the existing kernel's time with both pre-passes, FLOP-weighted
+(F16 weights would be 0.78), bit-identical on every shape and mix. Three paired
+fresh-state warm-song updates took 31.765/32.259/32.032 s for the predecessor and
+31.146/31.173/31.402 s with it; median paired saving 0.629 s (1.97%), and 7.35 s over
+the seven updates. Peak process footprint rose 0.53 GB at the median. All seven
+matched updates log bit-identical AR CE, NAR MSE, KL and gradient norm against the
+original Metal baseline, with equal exported adapter hashes, and so do the
+switched-off control and this change alone on the original fork. `scratch-life.cpp`
+checks that replaced scratch buffers outlive their command buffers and are all freed. Report: `tools/yue2-aitk-reference/hs353-half-prepass/REPORT.md`
+(HOTSTEP-353).
+
 ## Why each change exists
 
 The sections below are the measurements and reasoning behind each change, kept from the
@@ -93,6 +235,8 @@ The `mm` arm also dequantizes a **block-quantized `src0`** to F32 before transpo
 - **`BF16_ROUND`**: one more entry in the generic `unary.comp`, round-to-nearest-even with NaN kept quiet, bit-identical to the CPU's `GGML_FP32_TO_BF16`.
 - **`FLASH_ATTN_TRAIN` / `_BACK`**: three new kernels (`fa_train_fwd`, `fa_train_bwd_dq`, `fa_train_bwd_dkv`) implementing the CPU oracle's maths and layouts: online softmax with LSE, then dQ per query row and dK/dV per key row recomputing P from the LSE. One 32-lane cluster per row, reduced with `subgroupShuffleXor`, so they need 32-wide subgroups with shuffle; without them `supports_op` says no and the trainer uses exact attention. `fattn-train-test --backend cuda` (which just asks for the first GPU) passes 49/49 against the CPU with `--extra` on an RTX 5090 and a 4090 over Vulkan, including GQA, S ≠ S_kv, dead key columns and bitwise determinism. The kernels are plain f32 scalar code: correct, several times slower than CUDA's.
 - **Dispatches are sliced** to about 2^25 (row, partner, head) pairs each (`GGML_VK_FA_TRAIN_SLICE_PAIRS` overrides, for tests). One dispatch over a whole song is seconds of GPU time, which freezes the desktop on a GPU that also drives a display and can trip the Windows TDR reset. The parity grid passes at the smallest slices too.
+
+`bf16-mul-mat-grad` relaxes one assert in `ggml_build_backward_expand`, which required every source on a gradient path to be F32 or F16. The YuE2 trainer casts its F32 adapter factors to BF16 at each GEMM so the products run on BF16 tensor cores, and that cast is `MUL_MAT`'s `src0` on the parameter's gradient path. `MUL_MAT`'s backward writes the `src0` gradient in F32 (`OUT_PROD`), and the cast's `CPY` backward reshapes it onto the F32 parameter, so nothing downstream needs the restriction. The allowance is BF16, `MUL_MAT`, `src0` only; every graph that built before builds the same. Lost, YuE2 joint training aborts at its first backward unless `YUE2_AITK_PRECISION=strict-f32`.
 
 `sched-unplaced-log` makes `ggml_backend_sched_split_graph` **name the node no backend accepts** before its `GGML_ASSERT(*cur_backend_id != -1)`: op, type, shape, and each source's type, strides and buffer. Without it, a user on Vulkan or Metal who reaches an op neither the GPU backend nor the CPU fallback supports sends a bare assert, and we have to guess which op it was.
 
@@ -190,5 +334,9 @@ Drift sits in the same documented non-identity class as `--bwd mm` and `--mirror
 `alloc-free-blocks` raises ggml-alloc's **per-chunk free-block table** from 256 to 1024 entries. `ggml_dyn_tallocr` tracks the holes in each buffer chunk in a fixed array and asserts when it fills; the DiT trainer's LoKR at dim 256 / factor 6 routes 224 matrices through factorized `w2`, which makes a ~19k-node fwd+bwd graph whose many small, short-lived tensors fragment a chunk past 256 holes. Seen 2026-09-02 during the overnight sweep — twice, same signature, epoch 8 at crop 936 and epoch 17 at crop 850 — as `ggml-alloc.c:135: GGML_ASSERT(chunk->n_free_blocks < MAX_FREE_BLOCKS)`. Capacity only: the array is per chunk, so the cost is 768 × 16 B per chunk and no allocation decision changes; every other configuration allocates exactly as before. It is an inference-shared file, so a smoke generation after applying it is the honest check.
 
 `metal-acc-set-cpy` fixes the **non-inplace `ACC` and `SET` on Metal** (#206). Both ops first copy `src0` into `dst` with `kernel_cpy_t_t`, which copies one element per thread, but upstream dispatched one threadgroup per row, so a row wider than the threadgroup size (1024) had only its first 1024 columns copied and the rest of `dst` kept whatever the reused buffer held. Autodiff builds the gradient of a `view` from exactly this op, so every YuE2 joint-training backward on Metal was affected: non-finite adapter gradients a few steps in, and silently polluted gradients on the steps that did not crash. The patch dispatches `ceil(ne00/nth)` threadgroups per row, as `ggml_metal_op_cpy` already does for the same kernel. Found, diagnosed and fixed by the issue's reporter on an M1 Max; nobody on the team has Metal hardware to re-run it. No other backend is touched and no verify-hook guards it.
+
+`metal-out-prod-smem` (fork `bea8ded3`) shrinks the **tiled Metal `OUT_PROD`**'s threadgroup memory. `kernel_out_prod_mm_f32` kept a separate 32x64 F32 store scratch next to its src0 and src1 tiles, 22016 bytes, which filled a core, so one 128-thread threadgroup ran per core and its scalar strided loads had nothing to hide behind. The scratch is only written after the K loop, so it now aliases the src0 tile behind a barrier: 13824 bytes (9216 for the small-M kernel), two threadgroups per core, unchanged arithmetic and order. These are the LoRA weight gradients of YuE2 joint training, which reduce over the whole sequence. On an M2 Max at rank 64 and K = 7668, a 6144x64 gradient went from 9.7 to 5.3 ms and a 64x2048 one from 4.9 to 2.7 ms; seven matched joint-training updates logged bit-identical AR CE, NAR MSE, KL and gradient norm, and warm update 1 went from 36.01 to 34.67 s (median of three interleaved pairs). `yue2-out-prod-metal-tiled-test` covers the real orientation (`ar-*`, `nar-*`). Only `src/ggml-metal/` changes.
+
+**Tried and rejected: split-K for the same kernel** (fork `ad683338`, reverted by `14fcaf20`, which is what the pin carries). Splitting K into chunks with F32 partials summed in a fixed order took the big shapes to 3.7 ms and repeated bit-identically, but it changes the summation order, and AdamW's first step (close to lr*sign(g)) turns that into training differences: AR CE up to 3.5e-4 on updates 2-7, outside the per-update scalar gates frozen for this work (`tools/yue2-aitk-reference/metal-baseline/gates.json`). Two different split counts differed from each other by the same amount, so no chunking passes. It gained 0.31 s per update over the aliasing. Logs: `.scratch/hs343/` on the development machine (HOTSTEP-343).
 
 Verify they are present: `powershell -File engine\verify-hooks.ps1` (hooks 7-17, see the table above). **Hooks 9 and 10 matter most among the silent ones**: losing 9 leaves the numbers right and only the clock wrong, and losing 10 makes every sub-`q8_0` base vanish from the trainer rather than error.

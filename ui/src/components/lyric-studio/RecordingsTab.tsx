@@ -9,12 +9,15 @@
  * Adapted for cpp engine: uses generateApi.status() per-job (no bulk history endpoint).
  */
 
+import { queryClient } from '../../queries/client';
+import { serverKey } from '../../queries/keys';
+import { apiClient } from '../../services/httpClient';
+import type { GenerationJob } from '../../types';
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Play, Trash2, Headphones, ChevronDown, ChevronRight, Loader2, Clock, X, Filter, Download, ListPlus, Check } from 'lucide-react';
 import { lireekApi } from '../../services/lireekApi';
 import type { Generation, AudioGeneration } from '../../services/lireekApi';
-import { generateApi } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import type { Song } from '../../types';
 import { downloadTrack } from '../../utils/downloadTrack';
@@ -75,6 +78,8 @@ export const RecordingsTab: React.FC<RecordingsTabProps> = ({
     }
 
     let cancelled = false;
+    const controller = new AbortController();
+    setGroups([]);
     setLoading(true);
 
     const load = async () => {
@@ -85,7 +90,7 @@ export const RecordingsTab: React.FC<RecordingsTabProps> = ({
         // Songs from other albums rendered as this one ("Render as"/"Render from").
         if (lyricsSetId && !filterGenerationId) {
           try {
-            const { generations: foreign } = await lireekApi.getRenderedAs(lyricsSetId);
+            const { generations: foreign } = await lireekApi.getRenderedAs(lyricsSetId, { signal: controller.signal });
             gens = [...gens, ...foreign];
           } catch { /* older server: own songs only */ }
         }
@@ -93,7 +98,7 @@ export const RecordingsTab: React.FC<RecordingsTabProps> = ({
         const results: SongGroup[] = [];
         for (const gen of gens) {
           try {
-            const res = await lireekApi.getAudioGenerations(gen.id, lyricsSetId);
+            const res = await lireekApi.getAudioGenerations(gen.id, lyricsSetId, { signal: controller.signal });
             if (res.audio_generations.length > 0) {
               const songs: Song[] = [];
               for (const ag of res.audio_generations) {
@@ -115,7 +120,7 @@ export const RecordingsTab: React.FC<RecordingsTabProps> = ({
                 } else {
                   // Fallback: check job status
                   try {
-                    const status = await generateApi.status(ag.hotstep_job_id);
+                    const status = await queryClient.query({ queryKey: serverKey('shell-queue/generation-status', { id: ag.hotstep_job_id }), queryFn: ({ signal }) => apiClient.get<GenerationJob>(`/generate/status/${encodeURIComponent(ag.hotstep_job_id)}`, { signal: AbortSignal.any([signal, controller.signal]) }), staleTime: 0 });
                     if (status?.status === 'succeeded' && status.result?.audioUrls) {
                       for (const audioUrl of status.result.audioUrls) {
                         songs.push({
@@ -161,12 +166,12 @@ export const RecordingsTab: React.FC<RecordingsTabProps> = ({
       } catch (err) {
         console.error('[RecordingsTab] Failed to load:', err);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     };
 
     load();
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   }, [genKey, token]);
 
   useEffect(() => {

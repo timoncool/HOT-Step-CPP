@@ -9,27 +9,57 @@ export class UnslothProvider extends LLMProvider {
   get local() { return true; }
   name = 'Unsloth Studio';
   get defaultModel() { return config.lireek.unslothModel; }
-  
+
+  // Studio's opt-in "keyless API access" setting (off by default) admits
+  // loopback callers to /v1 without a real credential — an absent, empty, or
+  // whitelisted dummy bearer (unsloth: studio/backend/utils/keyless_api_access.py).
+  // 'not-needed' is one of the approved dummies; verified locally with curl.
+  private static readonly KEYLESS_BEARER = 'not-needed';
+
+  // The provider appends /v1/... (and /api/auth/login) to the base itself, so a
+  // base pasted from an OpenAI-compat example — which already ends in /v1 — would
+  // double up to /v1/v1/... and 404. Strip a trailing /v1 (and any trailing slash)
+  // so both `http://host:8888` and `http://host:8888/v1` work.
+  private get baseUrl(): string {
+    return config.lireek.unslothBaseUrl.replace(/\/+$/, '').replace(/\/v1$/i, '');
+  }
+
   private cachedToken = '';
   private tokenExpiry = 0;
 
-  isAvailable() { return !!config.lireek.unslothUsername && !!config.lireek.unslothPassword; }
+  private hasCredentials(): boolean {
+    return !!config.lireek.unslothUsername && !!config.lireek.unslothPassword;
+  }
+
+  isAvailable() {
+    // Usable with both credentials set (local or remote), or when the user has
+    // opted into keyless local mode via UNSLOTH_KEYLESS. The default base URL is
+    // already loopback, so "points at localhost" must NOT count as "installed" —
+    // otherwise a fresh install would show the provider as available with
+    // nothing configured.
+    return this.hasCredentials() || config.lireek.unslothKeyless;
+  }
 
   private async authenticate(): Promise<string> {
+    // Keyless local mode: no credentials to log in with — Studio's keyless API
+    // access admits the approved dummy bearer instead (see KEYLESS_BEARER).
+    // Real credentials win when both are present.
+    if (config.lireek.unslothKeyless && !this.hasCredentials()) return UnslothProvider.KEYLESS_BEARER;
+
     const now = Date.now() / 1000;
     if (this.cachedToken && now < this.tokenExpiry - 60) return this.cachedToken;
 
     const payload = { email: config.lireek.unslothUsername, password: config.lireek.unslothPassword };
-    const resp = await fetch(`${config.lireek.unslothBaseUrl}/api/auth/login`, {
+    const resp = await fetch(`${this.baseUrl}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    
+
     // Unsloth also sometimes takes username instead of email, trying generic handling if this fails
     if (!resp.ok) {
         const payload2 = { username: config.lireek.unslothUsername, password: config.lireek.unslothPassword };
-        const resp2 = await fetch(`${config.lireek.unslothBaseUrl}/api/auth/login`, {
+        const resp2 = await fetch(`${this.baseUrl}/api/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload2)
@@ -53,9 +83,10 @@ export class UnslothProvider extends LLMProvider {
   }
 
   private async getLocalModels(): Promise<string[]> {
+    if (!this.isAvailable()) return []; // no credentials configured — don't probe
     try {
       const token = await this.authenticate();
-      const resp = await fetch(`${config.lireek.unslothBaseUrl}/v1/models`, {
+      const resp = await fetch(`${this.baseUrl}/v1/models`, {
         headers: { 'Authorization': `Bearer ${token}` },
         signal: AbortSignal.timeout(3000),
       });
@@ -86,7 +117,7 @@ export class UnslothProvider extends LLMProvider {
     const modelName = model || (await this.getLocalModels())[0] || this.defaultModel;
     if (!modelName) throw new Error("No models loaded in Unsloth Studio");
 
-    const url = `${config.lireek.unslothBaseUrl}/v1/chat/completions`;
+    const url = `${this.baseUrl}/v1/chat/completions`;
     const payload = {
       model: modelName,
       messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],

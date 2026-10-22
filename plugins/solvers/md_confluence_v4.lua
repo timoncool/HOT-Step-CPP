@@ -134,15 +134,15 @@ solver = {
         { key = "rms_servo", type = "toggle", label = "Anchor: RMS Servo",
           default = false, hint = "Downward-only RMS ceiling." },
         { key = "rms_target_min", type = "slider", label = "Anchor: RMS Target Min",
-          default = 1.2, min = 0.1, max = 3.0, step = 0.05, hint = "RMS ceiling at low sigma." },
+          default = 0, min = 0.0, max = 3.0, step = 0.05, hint = "RMS ceiling at low sigma. 0 = auto (1.2, scaled to the active model's latent RMS)." },
         { key = "rms_target_max", type = "slider", label = "Anchor: RMS Target Max",
-          default = 2.5, min = 0.5, max = 5.0, step = 0.05, hint = "RMS ceiling at high sigma." },
+          default = 0, min = 0.0, max = 5.0, step = 0.05, hint = "RMS ceiling at high sigma. 0 = auto (2.5, scaled to the active model's latent RMS)." },
         { key = "rms_servo_gain", type = "slider", label = "Anchor: RMS Servo Gain",
           default = 0.6, min = 0.1, max = 1.0, step = 0.05, hint = "Servo correction aggressiveness." },
         { key = "latent_pressure", type = "toggle", label = "Anchor: Latent Pressure",
           default = false, hint = "Entropy x RMS target correction (off by default)." },
         { key = "pressure_target_rms", type = "slider", label = "Anchor: Pressure Target RMS",
-          default = 2.0, min = 0.5, max = 4.0, step = 0.1, hint = "RMS component of pressure target." },
+          default = 0, min = 0.0, max = 4.0, step = 0.1, hint = "RMS component of pressure target. 0 = auto (2.0, scaled to the active model's latent RMS)." },
         { key = "pressure_target_entropy", type = "slider", label = "Anchor: Pressure Target Entropy",
           default = 7.5, min = 1.0, max = 15.0, step = 0.5, hint = "Shannon entropy target." },
 
@@ -516,11 +516,11 @@ local function anchor_candidate(x, v_curr, sigma_curr, sigma_next, step_idx, n, 
     local lb_lambda     = num_param(p, "look_back_lambda_anchor", 0.15)
     local lb_snr_power  = num_param(p, "look_back_snr_power_anchor", 1.3)
     local f_rms         = bool_param(p, "rms_servo", false)
-    local rms_tgt_min   = num_param(p, "rms_target_min", 1.2)
-    local rms_tgt_max   = num_param(p, "rms_target_max", 2.5)
+    local rms_tgt_min   = C.rms_scaled(p, "rms_target_min", 1.2)
+    local rms_tgt_max   = C.rms_scaled(p, "rms_target_max", 2.5)
     local rms_gain      = num_param(p, "rms_servo_gain", 0.6)
     local f_pressure    = bool_param(p, "latent_pressure", false)
-    local p_tgt_rms     = num_param(p, "pressure_target_rms", 2.0)
+    local p_tgt_rms     = C.rms_scaled(p, "pressure_target_rms", 2.0)
     local p_tgt_entropy = num_param(p, "pressure_target_entropy", 7.5)
     local sclamp        = num_param(p, "safety_clamp", 2.5)
 

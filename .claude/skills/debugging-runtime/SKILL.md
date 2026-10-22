@@ -1,11 +1,15 @@
 ---
 name: debugging-runtime
-description: Diagnoses HOT-Step CPP generation failures, engine crashes, hangs, and startup problems from the logs/ session folders. Use when a music generation failed, ace-server crashed or keeps respawning, the app hangs with no progress, an API call returns 500/503, or you need to trace a gen_<uuid> log back to engine output.
+description: Diagnoses HOT-Step CPP generation failures, engine crashes, hangs, and startup problems from the <data root>/logs/ session folders. Use when a music generation failed, ace-server crashed or keeps respawning, the app hangs with no progress, an API call returns 500/503, or you need to trace a gen_<uuid> log back to engine output.
 ---
 
 # Debugging generation failures & crashes (log-driven playbook)
 
-HOT-Step CPP has two runtime processes: the **Node server** (Express, port 3001) and its child **ace-server.exe** (the C++ inference engine, port 8085). Agents work in dev mode (`dev.bat`), where the Vite dev server on **3000** fronts the app and proxies `/api`, `/audio` and `/references` to 3001 — every URL below is the 3000 address. The Node server orchestrates every generation: it optionally calls the engine's LM (language model that expands your caption/lyrics into audio codes), then submits synthesis (DiT — the Diffusion Transformer that generates audio latents — followed by VAE decode to a WAV), polls until done, then saves the result to SQLite. Almost every runtime problem is diagnosable from the per-session log folders under `logs/` at the repo root. This skill tells you which file to open first for each symptom, what the real failure strings mean, and how to correlate the three log files.
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
+HOT-Step CPP has two runtime processes: the **Node server** (Express, port 3001) and its child **ace-server.exe** (the C++ inference engine, port 8085). Agents work in dev mode (`dev.bat`), where the Vite dev server on **3000** fronts the app and proxies `/api`, `/audio` and `/references` to 3001 — every URL below is the 3000 address. The Node server orchestrates every generation: it optionally calls the engine's LM (language model that expands your caption/lyrics into audio codes), then submits synthesis (DiT — the Diffusion Transformer that generates audio latents — followed by VAE decode to a WAV), polls until done, then saves the result to SQLite. Almost every runtime problem is diagnosable from the per-session log folders under `<data root>/logs/` at the repo root. This skill tells you which file to open first for each symptom, what the real failure strings mean, and how to correlate the three log files.
 
 All `path:line` references verified against the code on 2026-07-02.
 
@@ -33,7 +37,7 @@ All `path:line` references verified against the code on 2026-07-02.
 One folder per Node-server session, named so name-sort = time-sort. Created at server boot by `initLogger()` ([server/src/services/logger.ts:40](../../../server/src/services/logger.ts)):
 
 ```
-logs/YYYY-MM-DD_HH-MM-SS/
+<data root>/logs/YYYY-MM-DD_HH-MM-SS/
   node_console.log            all Node stdout+stderr, mirrored transparently
   ace_engine.log              raw ace-server child stdout+stderr
   generations/
@@ -57,7 +61,7 @@ Facts you must know before reading them:
 
 | Symptom | Open first | Then | Looking for |
 |---|---|---|---|
-| Generation failed (UI error) | Newest `logs/<session>/generations/gen_<uuid>_*.log` — last line is `GENERATION FAILED: <reason>` | `node_console.log` around that job; `ace_engine.log` for C++ detail | The failure reason string (table below) |
+| Generation failed (UI error) | Newest `<data root>/logs/<session>/generations/gen_<uuid>_*.log` — last line is `GENERATION FAILED: <reason>` | `node_console.log` around that job; `ace_engine.log` for C++ detail | The failure reason string (table below) |
 | Engine crash | `node_console.log` | `ace_engine.log` tail | `[ace-server] Process exited with code N` + the FATAL/assert lines just before it |
 | Server 500 / API error | `node_console.log` | — | Express stack traces; `[Server] Uncaught exception` / `Unhandled rejection` (logged and swallowed — process keeps running, index.ts:576-581) |
 | Startup failure | `node --version` FIRST, then `node_console.log` | `ace_engine.log` | **Node 20 to 24 LTS, 24 recommended** (`engines` in server/package.json enforces `<25`; use matching native modules). Then: `[Server] ace-server not found at:`, CUDA-runtime download banner, `Crashed 3 times within 30s — giving up`, DB errors |
@@ -94,7 +98,7 @@ No session folder at all → the server never reached `initLogger()`; run `npx t
    This cancels all non-terminal jobs (they fail with `Queue reset by user`) and drains the pending queue (generate.ts:1469-1500). Also available: `POST /api/generate/cancel/:id`, `POST /api/generate/cancel-all`.
 7. To search all history for a pattern:
    ```powershell
-   Select-String -Path "logs\*\generations\*.log" -Pattern "GENERATION FAILED" | Select-Object -Last 10
+   Select-String -Path "<data root>/logs\*\generations\*.log" -Pattern "GENERATION FAILED" | Select-Object -Last 10
    ```
 
 ## Failure signatures — gen-log `GENERATION FAILED: <X>`
@@ -151,7 +155,7 @@ There are **two job-ID namespaces**: the server UUID (the `gen_<uuid>` filename;
 3. If you need the exact region of `ace_engine.log` (e.g. to see noise-filtered lines), grep it for a distinctive engine line found in step 2 (the last `[DiT] Step N/M`, a model-load line) and read forward from there.
 4. Repro comes from the params JSON at the top of the gen log — it is the fully resolved request actually sent to the engine.
 
-Dev-mode note: under `dev.bat` (tsx watch), every source-change auto-restart creates a **new** session folder. A burst of near-identical `logs/` folders seconds apart means tsx was restarting, not that the app was crashing.
+Dev-mode note: under `dev.bat` (tsx watch), every source-change auto-restart creates a **new** session folder. A burst of near-identical `<data root>/logs/` folders seconds apart means tsx was restarting, not that the app was crashing.
 
 ## Key files
 

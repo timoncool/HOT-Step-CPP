@@ -163,6 +163,10 @@ export interface PostProcessParams {
   slShimmerReduction?: number;
   masteringEnabled?: boolean;
   masteringReference?: string;
+  /** Lyric Studio "Master to album track": the album's lyrics set id. The
+   *  chain masters to a random track of that album's training dataset and
+   *  skips the VST chain. */
+  masterToAlbumLyricsSet?: number;
   // Vocal Naturalizer
   vocalNaturalizerEnabled?: boolean;
   naturalizeAmount?: number;
@@ -365,7 +369,18 @@ export async function runPostProcessingChain(
   const stableStepOn = ppMasterOn && !!(params.stableStepOn ?? params.stableStep);
   const ppVaeOn = ppMasterOn && !!params.ppVaeReencode;
   const spectralLifterOn = ppMasterOn && !!params.spectralLifterEnabled;
-  const masteringRef = params.masteringReference;
+  let masteringRef = params.masteringReference;
+  const albumMaster = ppMasterOn && params.masterToAlbumLyricsSet !== undefined && params.masterToAlbumLyricsSet !== null;
+  if (albumMaster) {
+    const { albumDatasetAudio } = await import('../training/yue2DatasetCaptions.js');
+    const tracks = await albumDatasetAudio(Number(params.masterToAlbumLyricsSet)).catch(() => [] as string[]);
+    if (tracks.length) {
+      masteringRef = tracks[Math.floor(Math.random() * tracks.length)];
+      log('INFO', `[Mastering] Master to album track: ${path.basename(masteringRef)} (one of ${tracks.length}); VST chain skipped`);
+    } else {
+      log('WARNING', '[Mastering] Master to album track: this album has no training dataset with audio, so the mastering reference stays as set; VST chain skipped');
+    }
+  }
   const masteringOn = ppMasterOn && !!masteringRef && !!params.masteringEnabled;
   // Hoisted: earlier stages need to know whether anything runs after them
   // before they decide what to do with peaks that exceed full scale.
@@ -843,7 +858,7 @@ export async function runPostProcessingChain(
       try {
         // Everything downstream of this point that touches audio.
         const downstream: string[] = [];
-        if (vstChainActive()) downstream.push('VST chain');
+        if (!albumMaster && vstChainActive()) downstream.push('VST chain');
         if (masteringOn && masteringRef) downstream.push('mastering');
         if (lufsWillRun) downstream.push('LUFS');
 
@@ -885,7 +900,7 @@ export async function runPostProcessingChain(
       if (gainMs > 10) timing.push({ name: 'Gain Offset', ms: gainMs });
     }
 
-    if (ppMasterOn) {
+    if (ppMasterOn && !albumMaster) {
       const vstStart = performance.now();
       setStage(`Applying VST chain${totalTracks > 1 ? ` (${i+1}/${totalTracks})` : ''}...`);
       try {

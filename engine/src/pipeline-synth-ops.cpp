@@ -965,6 +965,95 @@ void ops_init_noise(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
         philox_randn(reqs[b].seed, dst, s.Oc * s.T, /*bf16_round=*/true);
         fprintf(stderr, "[Init-Noise Batch%d] Philox noise seed=%lld, [%d, %d] solver=%s\n", b,
                 (long long) reqs[b].seed, s.T, s.Oc, s.rr.solver.c_str());
+
+        // Seed breeding: slerp this item's noise toward a second seed's noise
+        // (whole item treated as one vector). blend 0 = A exactly, 1 = B exactly.
+        const float t = reqs[b].seed_blend;
+        // Seed morph: blend weight varies along the latent time axis. Noise layout
+        // is [T, Oc] time-major, so frame f is the Oc-float vector at dst + f*Oc and
+        // each frame is slerped on its own at w(f) = start + (end-start)*smoothstep.
+        if (reqs[b].seed_b >= 0 && reqs[b].seed_blend_end >= 0.0f &&
+            fabsf(reqs[b].seed_blend_end - t) > 1e-6f) {
+            const size_t       n  = (size_t) s.Oc * s.T;
+            const float        te = reqs[b].seed_blend_end;
+            std::vector<float> nb(n);
+            philox_randn(reqs[b].seed_b, nb.data(), (int) n, /*bf16_round=*/true);
+            fprintf(stderr, "[Init-Noise Batch%d] seed morph: A=%lld B=%lld blend start=%.3f end=%.3f\n", b,
+                    (long long) reqs[b].seed, (long long) reqs[b].seed_b, t, te);
+            for (int f = 0; f < s.T; f++) {
+                const double u  = s.T > 1 ? (double) f / (double) (s.T - 1) : 0.0;
+                const double ss = u * u * (3.0 - 2.0 * u);
+                const double w  = (double) t + ((double) te - (double) t) * ss;
+                float *       fa = dst + (size_t) f * s.Oc;
+                const float * fb = nb.data() + (size_t) f * s.Oc;
+                if (w <= 0.0) {
+                    continue;
+                }
+                if (w >= 1.0) {
+                    memcpy(fa, fb, (size_t) s.Oc * sizeof(float));
+                    continue;
+                }
+                double dot = 0.0, na = 0.0, nbb = 0.0;
+                for (int i = 0; i < s.Oc; i++) {
+                    dot += (double) fa[i] * fb[i];
+                    na += (double) fa[i] * fa[i];
+                    nbb += (double) fb[i] * fb[i];
+                }
+                const double la = sqrt(na), lb = sqrt(nbb);
+                double       c  = (la > 0.0 && lb > 0.0) ? dot / (la * lb) : 1.0;
+                c               = c > 1.0 ? 1.0 : (c < -1.0 ? -1.0 : c);
+                const double om     = acos(c);
+                const bool   nearly = sin(om) < 1e-4;
+                const double wa     = nearly ? 1.0 - w : sin((1.0 - w) * om) / sin(om);
+                const double wb     = nearly ? w : sin(w * om) / sin(om);
+                double       nl     = 0.0;
+                for (int i = 0; i < s.Oc; i++) {
+                    fa[i] = (float) (wa * fa[i] + wb * fb[i]);
+                    nl += (double) fa[i] * fa[i];
+                }
+                if (nearly && nl > 0.0) {
+                    const float k = (float) (((1.0 - w) * la + w * lb) / sqrt(nl));
+                    for (int i = 0; i < s.Oc; i++) {
+                        fa[i] *= k;
+                    }
+                }
+            }
+        } else if (reqs[b].seed_b >= 0 && t > 0.0f) {
+            const size_t       n = (size_t) s.Oc * s.T;
+            std::vector<float> nb(n);
+            philox_randn(reqs[b].seed_b, nb.data(), (int) n, /*bf16_round=*/true);
+            fprintf(stderr, "[Init-Noise Batch%d] seed breeding: A=%lld B=%lld blend=%.3f\n", b,
+                    (long long) reqs[b].seed, (long long) reqs[b].seed_b, t);
+            if (t >= 1.0f) {
+                memcpy(dst, nb.data(), n * sizeof(float));
+            } else {
+                double dot = 0.0, na = 0.0, nbb = 0.0;
+                for (size_t i = 0; i < n; i++) {
+                    dot += (double) dst[i] * nb[i];
+                    na += (double) dst[i] * dst[i];
+                    nbb += (double) nb[i] * nb[i];
+                }
+                const double la = sqrt(na), lb = sqrt(nbb);
+                double       c  = (la > 0.0 && lb > 0.0) ? dot / (la * lb) : 1.0;
+                c               = c > 1.0 ? 1.0 : (c < -1.0 ? -1.0 : c);
+                const double om     = acos(c);
+                const bool   nearly = sin(om) < 1e-4;
+                const double wa     = nearly ? 1.0 - t : sin((1.0 - t) * om) / sin(om);
+                const double wb     = nearly ? (double) t : sin(t * om) / sin(om);
+                double       nl     = 0.0;
+                for (size_t i = 0; i < n; i++) {
+                    dst[i] = (float) (wa * dst[i] + wb * nb[i]);
+                    nl += (double) dst[i] * dst[i];
+                }
+                if (nearly && nl > 0.0) {
+                    // normalized lerp: rescale to the interpolated norm
+                    const float k = (float) (((1.0 - t) * la + t * lb) / sqrt(nl));
+                    for (size_t i = 0; i < n; i++) {
+                        dst[i] *= k;
+                    }
+                }
+            }
+        }
     }
 
     // cover_noise_strength: blend initial noise with clean source latents.
@@ -1665,10 +1754,16 @@ int ops_vae_decode_postprocess(const AceSynth * ctx,
 
         // Build the VAE decode callback for the Lua plugin
         // This wraps vae_ggml_decode_tiled with the engine's VAE and chunk params
+        // vae_ggml_decode_tiled packs ch1 at the returned count; the bridge
+        // contract is capacity stride, so move ch1 out to max_T.
         PostprocessVaeDecodeFn decode_fn = [&](const float * latent, int T_lat, float * aud_out, int max_T) -> int {
-            return vae_ggml_decode_tiled(vae, latent, T_lat, aud_out, max_T,
-                                         hs_vae_chunk(ctx), ctx->params.vae_overlap,
-                                         cancel, cancel_data);
+            int n = vae_ggml_decode_tiled(vae, latent, T_lat, aud_out, max_T,
+                                          hs_vae_chunk(ctx), ctx->params.vae_overlap,
+                                          cancel, cancel_data);
+            if (n > 0 && n < max_T) {
+                memmove(aud_out + max_T, aud_out + n, (size_t) n * sizeof(float));
+            }
+            return n;
         };
 
         // Allocate output buffer
@@ -1692,6 +1787,9 @@ int ops_vae_decode_postprocess(const AceSynth * ctx,
                 out[b].sample_rate = 48000;
                 continue;
             }
+        } else if (T_audio < T_audio_max) {
+            // The plugin path leaves ch1 at capacity stride; pack it like the fallback.
+            memmove(audio.data() + T_audio, audio.data() + T_audio_max, (size_t) T_audio * sizeof(float));
         }
         fprintf(stderr, "[Postprocess Batch%d] Decode: %.1f ms (T_audio=%d)\n", b, s.timer.ms(), T_audio);
 

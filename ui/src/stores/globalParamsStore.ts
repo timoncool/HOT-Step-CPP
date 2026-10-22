@@ -57,6 +57,7 @@ export const GLOBAL_PARAM_DEFAULTS = {
   adapterSectionIsolation: 0.5,
   adapterMode: 'runtime',
   adapterRuntimeQuant: 'bf16',
+  adapterRuntimeDora: false,
   adapterMergeLowVram: false,
   adapterGroupScales: {
     self_attn: 1.0, cross_attn: 1.0, mlp: 1.0, cond_embed: 1.0, time_embed: 0.0, proj_in: 0.0,
@@ -243,6 +244,19 @@ export function scopedKey(base: string, backendId: string = activeBackendId()): 
   return backendId === 'ace' ? base : `${base}@${backendId}`;
 }
 
+/** The YuE2 LM tab's planner/composer sampler settings and CFG, whichever
+ *  backend is active: training previews render with them. */
+export function yue2SamplerSnapshot(): Record<string, number | string> {
+  const bp = (activeBackendId() === 'yue2'
+    ? useGlobalParamsStore.getState().backendParams
+    : readScoped<Record<string, unknown>>('hs-backendParams', {}, 'yue2')) ?? {};
+  const out: Record<string, number | string> = {};
+  for (const [k, v] of Object.entries(bp)) {
+    if (/^yue2(Plan|Sem|End)[A-Za-z]+$|^yue2CfgScale$/.test(k) && (typeof v === 'number' || typeof v === 'string') && v !== '') out[k] = v;
+  }
+  return out;
+}
+
 function readScoped<T>(base: string, fallback: T, backendId: string = activeBackendId()): T {
   const key = scopedKey(base, backendId);
   if (key !== base) {
@@ -323,6 +337,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   // Runtime adapter delta VRAM precision: 'bf16' (full), 'q8_0' (~½), 'q4_k' (~¼).
   // Lets many stacked adapters fit in VRAM; runtime mode only.
   adapterRuntimeQuant: readKey("hs-adapterRuntimeQuant", GLOBAL_PARAM_DEFAULTS.adapterRuntimeQuant),
+  adapterRuntimeDora: readKey("hs-adapterRuntimeDora", GLOBAL_PARAM_DEFAULTS.adapterRuntimeDora),
   // Merge (low VRAM): re-encode merged weights to the base's native quant instead
   // of F32 promotion (~¼ the merged-DiT VRAM on a Q8 base). Merge mode only.
   adapterMergeLowVram: readKey("hs-adapterMergeLowVram", GLOBAL_PARAM_DEFAULTS.adapterMergeLowVram),
@@ -544,6 +559,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   setAdapterSectionIsolation: (v: any) => { set({ adapterSectionIsolation: v }); writeKey("hs-adapterSectionIsolation", v); },
   setAdapterMode: (v: any) => { set({ adapterMode: v }); writeKey("hs-adapterMode", v); },
   setAdapterRuntimeQuant: (v: any) => { set({ adapterRuntimeQuant: v }); writeKey("hs-adapterRuntimeQuant", v); },
+  setAdapterRuntimeDora: (v: boolean) => { set({ adapterRuntimeDora: v }); writeKey("hs-adapterRuntimeDora", v); },
   setAdapterMergeLowVram: (v: any) => { set({ adapterMergeLowVram: v }); writeKey("hs-adapterMergeLowVram", v); },
   setAdapterGroupScales: (v: any) => { set({ adapterGroupScales: v }); writeKey("hs-adapterGroupScales", v); },
   setRebaseSource: (v: any) => { set({ rebaseSource: v }); writeKey("hs-rebaseSource", v); },
@@ -808,6 +824,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       adapterSectionIsolation: stack.length >= 2 ? s.adapterSectionIsolation : undefined,
       adapterGroupScales: primary ? s.adapterGroupScales : undefined,
       adapterMode: primary ? s.adapterMode : 'merge',
+      adapterRuntimeDora: s.adapterRuntimeDora === true ? true : undefined,
       // Runtime delta quantization (VRAM saver) — relevant in both runtime modes
       // (lowrank still stores full-size re-base corrections / Conv1d fallbacks).
       // Also sent when timestep windows are active: they force runtime mode

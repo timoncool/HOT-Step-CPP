@@ -208,7 +208,7 @@ inline bool read_dataset(const std::string & manifest_path, Dataset * out, std::
     yyjson_val * trigger = yyjson_obj_get(root, "trigger");
     yyjson_val * style_template = yyjson_obj_get(root, "style_template");
     if ((trigger && (!string_value(trigger, &tmp.trigger) || tmp.trigger.size() > 128)) ||
-        (style_template && (!string_value(style_template, &tmp.style_template) || tmp.style_template != "upstream")))
+        (style_template && (!string_value(style_template, &tmp.style_template) || (tmp.style_template != "upstream" && tmp.style_template != "bare"))))
         return bad(error, "dataset trigger metadata is invalid");
     if (!tmp.trigger.empty() != !tmp.style_template.empty()) return bad(error, "dataset trigger/template metadata must occur together");
     tmp.base_sha256 = base_s;

@@ -4,7 +4,7 @@ import { scoreSections } from './scoreSections.js';
 import { scoreBarClock, scoreBarPosition, scoreVocalNoteOnsets } from './scoreClock.js';
 import type { MatchedWhisperWord } from '../../lyricsReconcile.js';
 
-export const COVER_DRIFT_METRIC_VERSION = 4;
+export const COVER_DRIFT_METRIC_VERSION = 5;
 const MIN_WORD_CONFIDENCE = 0.2;
 
 /** Reject obvious transcription loops before using Whisper as timing evidence. */
@@ -119,23 +119,24 @@ export function measureCoverDrift(
   const usedTags = new Set<number>();
   const rows = sections.map((section, index): CoverDriftSection => {
     const endBar = index + 1 < sections.length ? sections[index + 1].startBar - 1 : totalBars;
-    const match = instrumental(section.label) ? -1 : tags.findIndex((tag, tagIndex) =>
-      tagIndex >= nextTag && tag.hasLyrics && !instrumental(tag.label) &&
+    const match = tags.findIndex((tag, tagIndex) =>
+      tagIndex >= nextTag &&
       sectionKind(tag.label) === sectionKind(section.label));
     const block = match < 0 ? undefined : tags[match];
     if (match >= 0) { nextTag = match + 1; usedTags.add(match); }
-    const aligned = block ? alignedBlock(block, words) : null;
-    const stem = block && stemWords ? alignedBlock(block, stemWords) : null;
-    const firstWhisper = block && whisperWords?.find(word => word.char0 >= block.start &&
-      word.char0 < block.end && word.wordIndexInBlock < 5);
     const boundary = { start: bars[section.startBar - 1].start, end: bars[endBar - 1].end };
     const noteOnset = noteOnsets.slice(section.startBar - 1, endBar).find(onset => onset !== null) ?? null;
+    const vocalBlock = noteOnset !== null && block?.hasLyrics ? block : undefined;
+    const aligned = vocalBlock ? alignedBlock(vocalBlock, words) : null;
+    const stem = vocalBlock && stemWords ? alignedBlock(vocalBlock, stemWords) : null;
+    const firstWhisper = vocalBlock && whisperWords?.find(word => word.char0 >= vocalBlock.start &&
+      word.char0 < vocalBlock.end && word.wordIndexInBlock < 5);
     const expected = { start: noteOnset, end: boundary.end };
     const disagreementBars = aligned?.sung && stem?.sung
       ? Math.abs(scoreBarPosition(bars, aligned.sung.start) - scoreBarPosition(bars, stem.sung.start)) : null;
     const whisperDisagreementBars = aligned?.sung && firstWhisper
       ? Math.abs(scoreBarPosition(bars, aligned.sung.start) - scoreBarPosition(bars, firstWhisper.start)) : null;
-    const unscoredReason = !block ? 'no_matching_lyric_tag' : noteOnset === null ? 'no_vocal_note' :
+    const unscoredReason = noteOnset === null ? 'no_vocal_note' : !block?.hasLyrics ? 'no_matching_lyric_tag' :
       aligned?.reason ?? stem?.reason ??
       (disagreementBars !== null && disagreementBars > 0.5 ? 'mix_stem_disagreement' :
         whisperWords === undefined ? null :
@@ -162,7 +163,7 @@ export function measureCoverDrift(
   return { tempoBpm: bars[0].bpm, meter, secondsPerBar, stemChecked: stemWords !== undefined,
     whisperChecked: whisperWords !== undefined,
     tempoSource: renderedClock ? 'rendered-score' : 'source-score-fallback',
-    sectionWarning: unmatchedScoreSections || unmatchedLyricBlocks.length
+    sectionWarning: unmatchedLyricBlocks.length
       ? `${unmatchedScoreSections} score sections lack a matching sung tag; ${unmatchedLyricBlocks.length} sung lyric tags unused.`
       : null, sungLyricBlocks, unmatchedLyricBlocks, sections: rows, meanAbsoluteOffsetBars,
     firstOverOneBar: first < 0 ? null : { index: first + 1, label: rows[first].scoreLabel,

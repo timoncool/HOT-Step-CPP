@@ -5,44 +5,39 @@
 //
 // First measurement: base loss, the base model's loss on every song before any
 // training (server/src/services/training/yue2Optimise.ts).
-import React, { useCallback, useEffect, useState } from 'react';
-import { useTranslation } from 'react-i18next';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Circle, Gauge, Loader2, XCircle } from 'lucide-react';
-import { ParamLabel } from '../shared/ParamLabel';
+import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { trainingQueries } from '../../queries/training-data/queries';
+import { useJobSelection, useReload } from '../../queries/training-runs/hooks';
+import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { startYue2BaseLoss } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
-import { getJob, getYue2Optimise, startYue2BaseLoss, type TrainingJobSummary, type Yue2OptimiseStatus } from '../../services/trainingApi';
+import { ParamLabel } from '../shared/ParamLabel';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
 
 export const Yue2OptimisePanel: React.FC<{ datasetId: string }> = ({ datasetId }) => {
   const { t } = useTranslation();
   const setPhase = useTrainingStore(s => s.setPhase);
-  const [status, setStatus] = useState<Yue2OptimiseStatus | null>(null);
-  const [job, setJob] = useState<TrainingJobSummary | null>(null);
-  const [error, setError] = useState('');
-
-  const load = useCallback(() => { getYue2Optimise(datasetId).then(setStatus).catch(err => setError(err instanceof Error ? err.message : String(err))); }, [datasetId]);
-  useEffect(() => { setStatus(null); setJob(null); setError(''); load(); }, [load]);
-
-  // Follow a started job to its end, then read the saved file again.
-  useEffect(() => {
-    if (!job || (job.status !== 'queued' && job.status !== 'running')) return;
-    const timer = window.setInterval(() => {
-      getJob(job.id).then(next => {
-        setJob(next);
-        if (next.status === 'done') load();
-        if (next.status === 'failed') setError(next.error || t('trainingStudio.yue2.optimise.failed', 'The base-loss pass failed.'));
-      }).catch(() => { /* next tick */ });
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [job, load, t]);
-
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const client = useQueryClient();
+  const statusQuery = useQuery(runQueries.optimise(worker, datasetId));
+  const status = statusQuery.data;
+  const [job, setJob] = useJobSelection(worker, datasetId);
+  const [commandError, setError] = useState('');
+  const error = commandError || statusQuery.error?.message || (job?.status === 'failed' ? job.error : '') || '';
+  useReload(runQueries.optimise(worker, datasetId).queryKey, job?.status === 'done' ? job.id : undefined);
   const measure = async () => {
     setError('');
-    try { const { jobId } = await startYue2BaseLoss(datasetId); setJob(await getJob(jobId)); }
-    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    try {
+      const { jobId } = await runCommand(client, worker, () => startYue2BaseLoss(datasetId, { worker }));
+      setJob(await client.query(trainingQueries.job(worker, jobId)));
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
   };
 
+  if (!status && error) return <p role="alert" className="text-sm text-red-500">{error}</p>;
   if (!status) return <div className="flex items-center justify-center py-20 text-zinc-500 text-sm"><Loader2 size={18} className="animate-spin mr-2" /> …</div>;
   const ready = status.stages.cache && status.stages.codes && status.stages.sheets;
   const running = job?.status === 'queued' || job?.status === 'running';

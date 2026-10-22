@@ -18,16 +18,24 @@ import fs from 'fs';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { config } from '../config.js';
+import { registerBusyCheck } from '../dataroot/pointer.js';
 
 export const MUSCRIPTOR_DIR = path.join(config.data.dir, 'muscriptor');
 
 export const MUSCRIPTOR_MODELS = ['small', 'medium', 'large'] as const;
 export type MuscriptorModel = typeof MUSCRIPTOR_MODELS[number];
 
-export const HF_MODEL_REPOS: Record<MuscriptorModel, string> = {
+/** Beat This! (CPJKU, MIT, not gated): beats and downbeats that give the
+ *  MIDI its tempo, time signature and bar lines (ace-midi --beat-model). */
+export const BEAT_MODEL = 'beat-this';
+export type DownloadableModel = MuscriptorModel | typeof BEAT_MODEL;
+
+export const HF_MODEL_REPOS: Record<DownloadableModel, string> = {
   small: 'MuScriptor/muscriptor-small',
   medium: 'MuScriptor/muscriptor-medium',
   large: 'MuScriptor/muscriptor-large',
+  // final0 as safetensors; tensors verified bit-identical to the official checkpoint
+  [BEAT_MODEL]: 'safe-models/beat-this-final0',
 };
 
 // ── Hugging Face access token ────────────────────────────────────────────
@@ -80,11 +88,11 @@ export function aceMidiExe(): string | null {
 // change needs a restart.
 export const MODELS_DIR = process.env.MUSCRIPTOR_MODELS_DIR || path.join(config.data.dir, 'models', 'muscriptor');
 
-export function modelDir(m: MuscriptorModel): string {
+export function modelDir(m: DownloadableModel): string {
   return path.join(MODELS_DIR, m);
 }
 
-export function isModelDownloaded(m: MuscriptorModel): boolean {
+export function isModelDownloaded(m: DownloadableModel): boolean {
   return fs.existsSync(path.join(modelDir(m), 'model.safetensors'))
       && fs.existsSync(path.join(modelDir(m), 'config.json'));
 }
@@ -97,11 +105,11 @@ export interface ModelDownloadState {
   gated?: boolean;
 }
 
-const downloads = new Map<MuscriptorModel, ModelDownloadState>();
+const downloads = new Map<DownloadableModel, ModelDownloadState>();
 
 export function getModelStates(): Record<string, ModelDownloadState & { downloaded: boolean; sizeBytes: number }> {
   const out: Record<string, any> = {};
-  for (const m of MUSCRIPTOR_MODELS) {
+  for (const m of [...MUSCRIPTOR_MODELS, BEAT_MODEL] as DownloadableModel[]) {
     const dl = downloads.get(m);
     let sizeBytes = 0;
     const downloaded = isModelDownloaded(m);
@@ -146,7 +154,7 @@ async function fetchToFile(url: string, token: string | null, dest: string,
  * Begin downloading a model's config.json + model.safetensors from its gated
  * HF repo. Fire-and-poll: progress via getModelStates(). Single-flight.
  */
-export function startModelDownload(m: MuscriptorModel): { started: boolean; error?: string } {
+export function startModelDownload(m: DownloadableModel): { started: boolean; error?: string } {
   if (downloads.get(m)?.downloading) return { started: false, error: 'Download already in progress' };
   if (isModelDownloaded(m)) return { started: false, error: 'Already downloaded' };
 
@@ -172,4 +180,177 @@ export function startModelDownload(m: MuscriptorModel): { started: boolean; erro
   })();
 
   return { started: true };
+}
+
+registerBusyCheck('muscriptor-downloads', () => [...downloads.entries()]
+  .filter(([, s]) => s.downloading)
+  .map(([m]) => `downloading MuScriptor ${m}`));
+
+// ── Beat grid (ace-midi --beats-out) ─────────────────────────────────────
+
+/** The grid a tempo-aware MIDI was written on, in seconds of the audio. */
+export interface MidiGrid {
+  bpm: number;
+  /** 0 when the meter was not clear enough to write a time signature */
+  beatsPerBar: number;
+  /** false: the MIDI carries a tempo map that follows the performance */
+  steady: boolean;
+  onsetDelay: number;
+  /** grid steps per beat the notes sit on (0: none found) */
+  subdivision: number;
+  /** add to a MIDI time (seconds from tick 0) to get the audio time */
+  audioShift: number;
+  beats: number[];
+  bars: number[];
+}
+
+export function readGrid(beatsJsonText: string): MidiGrid | null {
+  try {
+    const g = JSON.parse(beatsJsonText)?.grid;
+    if (!g || typeof g.bpm !== 'number') return null;
+    return {
+      bpm: g.bpm, beatsPerBar: g.beats_per_bar || 0, steady: !!g.steady, onsetDelay: g.onset_delay || 0,
+      subdivision: g.subdivision || 0, audioShift: g.audio_shift_s || 0, beats: g.beats || [], bars: g.bars || [],
+    };
+  } catch { return null; }
+}
+
+/** A parsed bar-aligned MIDI moved back onto the audio's clock, with its grid,
+ *  so the piano roll lines up with the source. */
+export function alignToAudio<T extends { durationSec: number; notes: { start: number; duration: number }[] }>(
+  parsed: T, grid: MidiGrid,
+): T & { grid: MidiGrid } {
+  const notes = parsed.notes.map(n => ({ ...n, start: n.start + grid.audioShift }));
+  const durationSec = notes.reduce((m, n) => Math.max(m, n.start + n.duration), 0);
+  return { ...parsed, notes, durationSec, grid };
+}
+
+/** ace-midi export flags from the UI's options; unknown or empty fields are skipped. */
+export interface MidiExportOptions {
+  bpm?: number;
+  beatsPerBar?: number;
+  firstDownbeat?: number;
+  tempoMode?: 'auto' | 'map' | 'fixed';
+  beatScale?: number;
+  quantize?: boolean;
+  grid?: number;
+  strength?: number;
+  fillGaps?: number;
+  trimLeadingBars?: boolean;
+}
+
+export function exportArgs(o: MidiExportOptions): string[] {
+  const a: string[] = [];
+  const num = (flag: string, v: unknown, ok: (x: number) => boolean) => {
+    if (typeof v === 'number' && Number.isFinite(v) && ok(v)) a.push(flag, String(v));
+  };
+  num('--bpm', o.bpm, x => x >= 20 && x <= 400);
+  num('--beats-per-bar', o.beatsPerBar, x => Number.isInteger(x) && x >= 1 && x <= 16);
+  num('--first-downbeat', o.firstDownbeat, x => x >= 0);
+  if (o.tempoMode === 'map') a.push('--tempo-map');
+  if (o.tempoMode === 'fixed') a.push('--fixed-tempo');
+  num('--beat-scale', o.beatScale, x => [0.25, 0.5, 2, 4].includes(x));
+  if (o.quantize) {
+    a.push('--quantize');
+    num('--grid', o.grid, x => Number.isInteger(x) && x >= 1 && x <= 24);
+    num('--quantize-strength', o.strength, x => x > 0 && x <= 1);
+  }
+  num('--fill-gaps', o.fillGaps, x => x > 0 && x <= 4);
+  if (o.trimLeadingBars) a.push('--trim-leading-bars');
+  return a;
+}
+
+// ── Partial MIDI from the streamed events ────────────────────────────────
+
+// ace-midi's instrument names (instrument_for_program in engine/tools/ace-midi.cpp)
+// back to their GM programs; names it formats as program_<n> parse below.
+const INSTRUMENT_PROGRAMS: Record<string, number> = {
+  acoustic_piano: 0, electric_piano: 2, chromatic_percussion: 8, organ: 16,
+  acoustic_guitar: 24, clean_electric_guitar: 26, distorted_electric_guitar: 29,
+  acoustic_bass: 32, electric_bass: 33, violin: 40, viola: 41, cello: 42,
+  contrabass: 43, orchestral_harp: 46, timpani: 47, string_ensemble: 48,
+  synth_strings: 50, voice: 52, orchestra_hit: 55, trumpet: 56, trombone: 57,
+  tuba: 58, french_horn: 60, brass_section: 61, soprano_and_alto_sax: 64,
+  tenor_sax: 66, baritone_sax: 67, oboe: 68, english_horn: 69, bassoon: 70,
+  clarinet: 71, flutes: 72, synth_lead: 80, synth_pad: 88,
+};
+
+function varLen(n: number): number[] {
+  const out = [n & 0x7f];
+  while ((n >>= 7) > 0) out.unshift((n & 0x7f) | 0x80);
+  return out;
+}
+
+/**
+ * Build a type-0 SMF (480 tpb, 120 bpm, velocity 100) from ace-midi's JSONL
+ * note events, so a run that dies before writing out.mid still leaves the
+ * notes it decoded. Notes still open at the cut are dropped. Null when no
+ * note completed. Notes are fixed up as the engine's writer does
+ * (validate_notes_fix, trim_overlapping in engine/tools/ace-midi.cpp).
+ */
+export function partialMidiFromEvents(events: any[]): Buffer | null {
+  const open = new Map<number, { pitch: number; time: number; instrument: string }>();
+  const notes: { pitch: number; on: number; off: number; instrument: string }[] = [];
+  for (const ev of events) {
+    if (ev?.type === 'note_start') open.set(ev.index, ev);
+    else if (ev?.type === 'note_end' && open.has(ev.index)) {
+      const s = open.get(ev.index)!;
+      open.delete(ev.index);
+      // A too-short note gets the engine's 0.01 s minimum, so its off never sorts before its on.
+      const off = ev.time - s.time < 0.01 ? s.time + 0.01 : ev.time;
+      notes.push({ pitch: s.pitch, on: s.time, off, instrument: s.instrument });
+    }
+  }
+  // A note of the same pitch and instrument ends where the next one starts.
+  notes.sort((a, b) => a.on - b.on);
+  const lastOf = new Map<string, (typeof notes)[number]>();
+  for (const n of notes) {
+    const key = `${n.instrument}:${n.pitch}`;
+    const prev = lastOf.get(key);
+    if (prev && prev.off > n.on) prev.off = n.on;
+    lastOf.set(key, n);
+  }
+  const kept = notes.filter(n => n.on < n.off);
+  if (!kept.length) return null;
+
+  // Channels by first appearance: 0-8, 10-15 (overflow shares 15), drums on 9.
+  const channels = new Map<string, number>();
+  const free = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15];
+  const setup: number[] = [];
+  const chanFor = (instrument: string): number => {
+    let ch = channels.get(instrument);
+    if (ch !== undefined) return ch;
+    if (instrument === 'drums') ch = 9;
+    else {
+      ch = free.shift() ?? 15;
+      const program = INSTRUMENT_PROGRAMS[instrument] ?? (parseInt(instrument.replace(/^program_/, ''), 10) || 0);
+      setup.push(0, 0xc0 | ch, program & 0x7f);
+    }
+    channels.set(instrument, ch);
+    return ch;
+  };
+
+  const tick = (sec: number) => Math.round(sec * 960); // 480 tpb at 120 bpm
+  const evs: { tick: number; status: number; pitch: number; vel: number }[] = [];
+  for (const n of kept) {
+    const ch = chanFor(n.instrument);
+    evs.push({ tick: tick(n.on), status: 0x90 | ch, pitch: n.pitch, vel: 100 });
+    evs.push({ tick: tick(n.off), status: 0x80 | ch, pitch: n.pitch, vel: 0 });
+  }
+  // Offs before ons at the same tick, so a repeated pitch is not cut short.
+  evs.sort((a, b) => a.tick - b.tick || (a.status & 0xf0) - (b.status & 0xf0));
+
+  const body: number[] = [0, 0xff, 0x51, 3, 0x07, 0xa1, 0x20, ...setup];
+  let last = 0;
+  for (const e of evs) {
+    body.push(...varLen(e.tick - last), e.status, e.pitch & 0x7f, e.vel);
+    last = e.tick;
+  }
+  body.push(0, 0xff, 0x2f, 0);
+
+  const header = Buffer.from([0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xe0]);
+  const trackHead = Buffer.alloc(8);
+  trackHead.write('MTrk', 0, 'ascii');
+  trackHead.writeUInt32BE(body.length, 4);
+  return Buffer.concat([header, trackHead, Buffer.from(body)]);
 }

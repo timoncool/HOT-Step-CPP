@@ -3471,6 +3471,16 @@ static int mm3_lm_train_main(const MM3LmTrainArgs & a) {
                     start_step, a.steps, epoch, order_pos, order.size(), opt.opt_iter);
             jl("{\"type\":\"resumed\",\"step\":%d,\"totalSteps\":%d,\"epoch\":%d,\"bestEvalStep\":%d}",
                start_step, a.steps, epoch, best_eval_step);
+            // DoRA: nrm is not in the resume file (it is base-dependent) and
+            // still holds ||W|| from init, but the restored B is not zero. The
+            // per-step refresh only runs AFTER the next step, so without this
+            // the first resumed window trains against the wrong denominator.
+            std::string derr;
+            if (lora.dora && !lm_lora_dora_refresh(&lora, sched, &derr)) {
+                fprintf(stderr, "[mm3-lm-train] %s\n", derr.c_str());
+                fatal_msg = derr;
+                rc        = 1;
+            }
         }
     }
     if (start_step >= a.steps && rc == 0) {

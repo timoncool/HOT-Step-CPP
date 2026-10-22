@@ -18,7 +18,7 @@ The **Adapters** section of the generation bar. Its contents follow the active b
 |---|---|
 | ACE-Step 1.5 | A DiT adapter picker or stack, loading mode and VRAM options, basin re-base, group scales, and a planner (LM) adapter |
 | MiniMax-Music3 | One LM adapter picker with strength dials |
-| YuE2 | Two LM adapter slots, NAR (renderer) and AR (composer), each with its own dials and an Apply button |
+| YuE2 | Two LM adapter slots, NAR (renderer) and AR (composer), each with its own dials |
 
 A backend without adapter support shows a "not yet" panel instead.
 
@@ -27,6 +27,11 @@ the install directory. Change it under Settings > Environment > **Adapters direc
 <!-- TODO(verify): whether changing Adapters directory takes effect without restarting the app. -->
 
 ## The adapters folder
+
+After deleting adapters, use **Settings > General > Adapters > Update adapter
+references** to clear their paths from Lyric Studio album presets. The result lists
+each changed preset and removed adapter. Live adapters and reference tracks stay in
+place. This cleanup runs only when clicked and never substitutes another adapter.
 
 The Training Studio writes into a fixed layout. Hand-installed files can sit at the top.
 
@@ -57,8 +62,20 @@ ACE-Step DiT adapters load from three shapes:
 - A LoKr folder from the Training Studio, holding `lokr_weights.safetensors`. No config
   file is needed.
 
-DoRA adapters (either the LyCORIS or the PEFT naming) load in Merge mode only. In the
-other modes the engine logs a warning and applies them as plain LoRA.
+DoRA adapters support Merge mode and opt-in runtime magnitude rescaling. In the
+ACE-Step Adapters section, turn on **Runtime DoRA magnitudes** to apply the learned
+magnitudes in Runtime or Low-Rank mode, including when section controls or active
+phases force runtime loading. This may materialize full-size deltas in Low-Rank mode.
+The switch is saved in the browser and defaults to off, preserving the older runtime
+result that skips magnitude rescaling. Merge mode and planner LM adapters keep their
+existing behavior. The same saved switch is sent to MiniMax-Music3 requests; its DiT
+training and adapter controls remain CLI-only.
+
+ACE-Step checks DoRA files before applying their weights, including with the default
+loading settings. A PEFT config with `use_dora: true` must have matching magnitude
+tensors. If those tensors are missing, loading fails instead of treating the file as
+plain LoRA. Keep the original config and weights together; replace an incomplete
+adapter with a complete export.
 
 MiniMax-Music3 adapters are PEFT `.safetensors` files trained on the MiniMax-Music3 LM.
 Each can have a sidecar named `<file>.safetensors.json` that records the trigger word,
@@ -113,7 +130,7 @@ you use it.
 |---|---|
 | Merge | Bakes the adapter into the model weights when the model loads. Sampling runs at full speed. **Merge VRAM** picks how the merged weights are stored: **HQ** keeps them at F32, about four times the VRAM on a Q8 base; **Low ¼** re-encodes them to the base's own quantization. FP4 bases always take the low path. Not available on ConvRot models. |
 | Runtime (default) | Leaves the base weights alone and applies the adapter at every step. **Adapter VRAM** stores the deltas as **Full** (BF16), **Q8 ½** or **Q4 ¼**. Q4 fits the most stacked adapters for a small quality cost. |
-| Low-Rank | Applies the raw adapter factors per step without building full-size deltas. The lowest VRAM of the three. Works with LoRA and LoKr; DoRA needs Merge. |
+| Low-Rank | Applies the raw adapter factors per step without building full-size deltas. The lowest VRAM of the three for LoRA and LoKr. With **Runtime DoRA magnitudes** on, DoRA uses full-size deltas to include magnitude rescaling. |
 
 Changing the adapter, a scale, the mode or the VRAM setting reloads the DiT on the next
 generation. Generations with unchanged settings reuse the loaded model. The first Runtime
@@ -260,8 +277,20 @@ structure and phrasing. An adapter trained on one half is refused by the other.
    subfolders included, is added.
 2. Pick an adapter for either slot or both. Each row shows its trigger, dataset, rank,
    steps and training loss.
-3. Set **Strength**, **Attention** and **MLP** (0 to 2), and optionally the depth thirds,
-   then click **Apply strengths**.
+3. Set **Strength**, **Attention** and **MLP** (0 to 2), and optionally the depth thirds.
+   Each dial saves when you let go of the slider, or when you leave or press Enter in its
+   number box.
+
+A picked adapter shows the trigger word it was trained with. One that carries none (no
+trigger in the file, its run or its dataset) shows a **LoRA trigger word** box instead: type the
+word if you know it and it is put at the start of the style prompt for every render with that
+adapter file. It saves when you leave the box or press Enter; clear it to stop.
+
+The AR slot splits Strength in two. **Planner Strength** applies while the AR writes the
+score (melody, chords and sections); **Composer Strength** applies while it turns that
+score into audio. Planner Strength follows Composer Strength until you move it, and
+**Reset** makes it follow again. It needs Chain of Thought on. When the two differ, the
+score is planned in its own job, so each generation reloads the model twice: once to plan, once to render.
 
 The picker sets the default for songs you queue from then on. Each song keeps the adapters
 it was queued with, including an album's own adapters when it comes from Lyric Studio, so
@@ -272,6 +301,9 @@ In [Cover Studio](studios/cover-studio.md), choose **Base YuE2** to clear both
 adapter slots for that cover, or choose an AR composer and NAR renderer pair.
 The cover captures the pair and its strength settings when you click Generate;
 changing the global picker while it waits does not change the queued job. The
+AR strength is Cover Studio's own setting (0 to 10, default 0.6) and replaces the
+picker's AR scale for covers; values above 0.6 hurt adherence to the score. A
+build by section can change it until its first keep. The
 approved ABC score supplies the composition plan in either mode. An adapter
 changes how its half of the model uses that plan, but the app does not promise
 to preserve the source performance or match a particular voice.
@@ -349,3 +381,7 @@ For reading the logs, see the troubleshooting page.
 - [ACE-Step training](training/ace-step.md)
 - [MiniMax-Music3 training](training/minimax-music3.md)
 - [YuE2 training](training/yue2.md)
+
+## Release data paths
+
+Release adapters default to the shared data folder's `adapters/`. A managed-folder move updates saved adapter paths inside transferred folders. An adapter directory override outside that folder remains external. See [Data folder and upgrades](data-folder.md).

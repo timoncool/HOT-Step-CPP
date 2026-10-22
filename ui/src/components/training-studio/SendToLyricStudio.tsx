@@ -10,10 +10,12 @@ import React, { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Loader2, Mic2, RefreshCw, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
-  exportToLyricStudio, getLyricStudioPreview,
+  exportToLyricStudio,
   type LyricStudioExportPreview, type LyricStudioExportResult,
 } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
+import { queryClient } from '../../queries/client';
+import { trainingQueries as tq } from '../../queries/training-data/queries';
 import { ParamLabel } from '../shared/ParamLabel';
 import { Toggle } from '../shared/Toggle';
 
@@ -26,6 +28,7 @@ const fileName = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 export const SendToLyricStudio: React.FC = () => {
   const { t } = useTranslation();
   const detail = useTrainingStore(s => s.detail);
+  const worker = useTrainingStore(s => s.trainingWorker);
 
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -47,7 +50,8 @@ export const SendToLyricStudio: React.FC = () => {
     setResult(null);
     setError('');
     try {
-      const p = await getLyricStudioPreview(datasetId);
+      // Seeds the editable artist/album fields, so it is a one-shot read.
+      const p = await queryClient.query(tq.lyricStudioPreview(worker, datasetId));
       setPreview(p);
       setArtist(p.artist);
       setAlbum(p.album);
@@ -67,7 +71,7 @@ export const SendToLyricStudio: React.FC = () => {
         artist: artist.trim(),
         album: album.trim(),
         linkAdapters,
-      });
+      }, { worker });
       setResult(r);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'export failed');

@@ -75,7 +75,9 @@ jobs:
           - variant: cpu
             cmake_flags: >-
               -DGGML_CUDA=OFF -DGGML_VULKAN=OFF
+              -DGGML_BACKEND_DL=ON
               -DHOT_STEP_STATIC_RUNTIME=ON
+              -DGGML_CPU_ALL_VARIANTS=ON
             cuda_version: ''
 
     steps:
@@ -287,7 +289,8 @@ jobs:
           - variant: cpu
             cmake_flags: >-
               -DGGML_CUDA=OFF -DGGML_VULKAN=OFF
-              -DGGML_BACKEND_DL=OFF
+              -DGGML_BACKEND_DL=ON
+              -DGGML_CPU_ALL_VARIANTS=ON
             cuda_version: ''
 
     steps:

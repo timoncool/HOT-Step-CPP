@@ -7,7 +7,7 @@
 //   1. generated tables are current (delegates to build-docs.mjs --check)
 //   2. every UI studio folder has a user page (STUDIO_PAGES below)
 //   3. every skill folder is listed in .claude/skills/README.md
-//   4. every relative link and image in a tracked .md resolves
+//   4. every relative link and image in a tracked .md resolves (gitignored targets warn)
 //   5. FEATURES.md links to every studio page
 //   6. no new native <select> / checkbox under ui/src (docs/dev/ui-design.md); the
 //      files that still have them are listed in ui-primitives-baseline.json, which
@@ -43,6 +43,7 @@ const STUDIO_PAGES = {
   storm: 'docs/user/studios/storm.md',
   'midi-studio': 'docs/user/studios/midi-studio.md',
   'training-studio': 'docs/user/studios/training-studio.md',
+  'compare-studio': 'docs/user/studios/compare-studio.md',
   settings: 'docs/user/studios/settings.md',
   terminal: 'docs/user/studios/settings.md',
   'model-manager': 'docs/user/studios/model-manager.md',
@@ -65,15 +66,34 @@ for (const dir of fs.readdirSync(path.join(ROOT, 'ui/src/components'), { withFil
 // 3. skills index
 const skillsReadme = fs.readFileSync(path.join(ROOT, '.claude/skills/README.md'), 'utf8');
 for (const s of fs.readdirSync(path.join(ROOT, '.claude/skills'), { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name)) {
+  // Local integrations can install gitignored skills that are not part of the release.
+  if (spawnSync('git', ['check-ignore', '-q', '--', `.claude/skills/${s}/`], { cwd: ROOT }).status === 0) continue;
   if (!skillsReadme.includes(`${s}/SKILL.md`)) fail.push(`.claude/skills/${s} is not listed in .claude/skills/README.md`);
 }
 
 // 4. links
 const tracked = execFileSync('git', ['ls-files', '*.md', '**/*.md'], { cwd: ROOT, encoding: 'utf8' }).split(/\r?\n/).filter((f) => f && !f.startsWith('node_modules/'));
 const untrackedNew = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '*.md', '**/*.md'], { cwd: ROOT, encoding: 'utf8' }).split(/\r?\n/).filter(Boolean);
+// A skip-worktree file may contain local injected links absent from the committed copy.
+let skipWorktree = new Set();
+try {
+  skipWorktree = new Set(execFileSync('git', ['ls-files', '-v', '*.md', '**/*.md'], { cwd: ROOT, encoding: 'utf8' })
+    .split(/\r?\n/).filter((line) => line.startsWith('S ')).map((line) => line.slice(2)));
+} catch { /* Without git metadata, read the working files as before. */ }
+const trackedSet = new Set(tracked);
+const isDanglingSymlink = (p) => { try { return fs.lstatSync(p).isSymbolicLink() && !fs.existsSync(p); } catch { return false; } };
 const linkRe = /!?\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 for (const file of [...tracked, ...untrackedNew]) {
-  const raw = fs.readFileSync(path.join(ROOT, file), 'utf8');
+  let raw;
+  try {
+    raw = skipWorktree.has(file)
+      ? execFileSync('git', ['show', `:${file}`], { cwd: ROOT, encoding: 'utf8' })
+      : fs.readFileSync(path.join(ROOT, file), 'utf8');
+  } catch (e) {
+    // Only an untracked dangling symlink is skipped; a missing tracked doc is a real failure.
+    if (e.code === 'ENOENT' && !trackedSet.has(file) && isDanglingSymlink(path.join(ROOT, file))) { warn.push(`${file}: unreadable (skipped - broken symlink)`); continue; }
+    throw e;
+  }
   const text = raw.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
   for (const m of text.matchAll(linkRe)) {
     let target = m[1];
@@ -82,6 +102,11 @@ for (const file of [...tracked, ...untrackedNew]) {
     if (!target) continue;
     const resolved = path.resolve(path.dirname(path.join(ROOT, file)), target);
     if (fs.existsSync(resolved)) continue;
+    // Agent-only files can exist locally but be absent from CI and public checkouts.
+    if (spawnSync('git', ['check-ignore', '-q', '--', rel(resolved)], { cwd: ROOT }).status === 0) {
+      warn.push(`${file}: gitignored link target missing ${m[1]}`);
+      continue;
+    }
     // A missing screenshot that the page already flags with <!-- screenshot: needed --> is a
     // known gap, reported but not fatal, so CI does not block on images only a human can take.
     if (m[0].startsWith('!') && raw.includes('screenshot: needed')) warn.push(`${file}: screenshot missing ${m[1]}`);

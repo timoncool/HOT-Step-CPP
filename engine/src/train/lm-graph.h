@@ -22,6 +22,7 @@
 // docs/plans/2026-07-27-lm-trainer-implementation.md §3.4
 
 #include "qwen3-lm.h"
+#include "dora-common.h"
 #include "lokr-common.h"
 #include "qwen3-lora.h"
 #include "train/lm-bf16.h"  // LmWtCollect — Lever A (--weights bf16)
@@ -682,12 +683,8 @@ static bool lm_lora_dora_refresh(LmLora * L, ggml_backend_sched_t sched, std::st
                 continue;
             }
             ggml_tensor * w  = lm_slot_weight(&L->model->layers[l], s);
-            ggml_tensor * wf = qwen3_f32(ctx, w);
-            // delta[in, out] = A[in, r] . B[r, out]: mul_mat contracts ne0, so
-            // the left operand is A transposed to [r, in].
-            ggml_tensor * delta = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, pr.A)), pr.B);
-            ggml_tensor * wd    = ggml_add(ctx, wf, ggml_scale(ctx, delta, pr.scale));
-            ggml_tensor * nr    = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, wd)));  // [1, out]
+            // B is an F32 param here, so only the base needs a cast.
+            ggml_tensor * nr = dora_col_norm(ctx, qwen3_f32(ctx, w), pr.A, pr.B, pr.scale);  // [1, out]
             ggml_build_forward_expand(gf, ggml_cpy(ctx, nr, ggml_reshape_2d(ctx, pr.nrm, 1, pr.nrm->ne[0])));
         }
         ggml_backend_sched_reset(sched);

@@ -5,6 +5,8 @@ MiniMax-Music3 and YuE2. All three run inside the same C++/GGML engine process, 
 switching between them changes which model's weights are loaded, not which program is
 running. Each one turns a style description and lyrics into a stereo song, but they
 build it differently, accept different inputs, and work with different parts of the app.
+Their capability manifests also declare which Create and Lyric Studio caption source
+picker applies (`none`, MM3 tracks, or YuE2 dataset).
 ACE-Step 1.5 is the default and the only backend that supports every studio.
 YuE2 also supports Cover Studio, through a reviewed lead sheet rather than audio
 conditioning. MiniMax-Music3 is text-to-music only.
@@ -15,10 +17,10 @@ page covers what each backend is and what it can do.
 
 ## Switching backends
 
-The backend picker is in the global bar at the top of the app, a small button labelled
-with the active backend's name. Click it and choose another backend from the list. The picker
-appears whenever two or more backends are registered with the server, and is hidden
-when there is only one.
+The engine picker is at the top of the left sidebar, directly under the logo: a pink box
+headed "Generation engine" with the active backend's name. Click it and choose another
+backend from the list. The picker appears whenever two or more backends are registered with
+the server, and is hidden when there is only one.
 
 - The choice is stored on the server, so it survives a restart. A new install starts on
   ACE-Step 1.5.
@@ -27,8 +29,12 @@ when there is only one.
   loads the new backend's models first.
 - The global bar reshapes to the active backend. The Models, Adapters, Generation and
   LM / Thinking clusters show that backend's own controls, and controls that do nothing
-  on it are hidden. Cover Studio works under ACE-Step and YuE2; Repaint, Stem
-  Builder and STORM need ACE-Step. MiniMax-Music3 cannot open Cover Studio.
+  on it are hidden.
+- The sidebar lists only the studios the active backend can use. Cover Studio is listed
+  under ACE-Step and YuE2; Repaint, Stem Builder and Song Builder under ACE-Step
+  only; STORM under ACE-Step and YuE2; Training under every backend except Stable Audio 3. The rest are always listed.
+  If the open studio is not listed for the backend you switch to, the app moves to
+  Custom-Gen.
 - If the active backend's model files are not installed, the bar says so and shows a
   Get models button that opens the [Model Manager](studios/model-manager.md).
 
@@ -51,7 +57,7 @@ A small text encoder model conditions the DiT on the caption.
 What sets it apart from the other two:
 
 - It is the only backend with source-audio-conditioned covers, repaint
-  (Repaint), stem generation (Stem Builder) and continuous streaming (STORM).
+  (Repaint) and stem generation (Stem Builder). It also supports continuous streaming in STORM.
 - BPM, key, time signature and duration are real input fields. Duration is a target the
   planner aims for, from 10 to 600 seconds.
 - It runs the full set of Lua [plugins](plugins.md): solvers, schedulers, guidance modes
@@ -155,6 +161,10 @@ What sets it apart:
 - The prompt is freeform: a plain style description plus lyrics. BPM and key are folded
   into the style sentence rather than sent as fields. The language comes from the
   lyrics.
+- Include BPM/key in caption (on by default) controls that tail. Turn it off for an
+  adapter trained without BPM and key: Song Info BPM and key are left out, and a
+  "<bpm> BPM, key of <key>." tail already on the caption (from a dataset caption) is
+  removed. Training captions are unchanged.
 - The song decides its own length, up to six minutes, and there is no duration control.
 - Chain of Thought (Generation cluster) sets how much the planner writes before audio:
   Full (the default), Melody only, or Off. Off skips the lead sheet but runs guidance,
@@ -163,13 +173,13 @@ What sets it apart:
   playback, and lets you continue, re-plan with a new seed, or cancel before any audio
   is rendered. You can also paste your own ABC lead sheet to render from.
 - Lyric Timing (Lead sheet section) ties each sung lyric block to its score section's
-  first Vocal note, once a score and lyrics are supplied. Soft is the default: it nudges
-  the composer toward that timing. Hard hides a section's lyrics, and optionally its
-  score lines, from the composer until then. Off turns it off. It needs CFG 1 — the
-  engine's own default for Full and Melody only — so an explicit CFG elsewhere skips it
-  with a note and renders at the requested CFG instead; a score it can't build a
-  schedule from (unlabelled sections, no tempo, no matching timed lyric block) also
-  renders without it, and the generation log says why.
+  first Vocal note, once a score and lyrics are supplied. Off is the default. Soft
+  nudges the composer toward that timing. Hard hides a section's lyrics, and optionally
+  its score lines, from the composer until then. It needs CFG 1 — the engine's own
+  default for Full and Melody only — so an explicit CFG elsewhere skips it with a note
+  and renders at the requested CFG instead; a score it can't build a schedule from
+  (unlabelled sections, no tempo, no matching timed lyric block) also renders without
+  it, and the generation log says why.
 - Cover Studio takes an uploaded or Library recording and uses SheetSage2 to
   transcribe its melody and chords into ABC. Review and approve the full score before rendering.
   You can supply ABC yourself without installing SheetSage2. The recording does
@@ -181,8 +191,20 @@ What sets it apart:
   lyrics and score together. Cover jobs store the source identity, reviewed
   full score, all five render choices and ABC actually rendered.
   Choose the base model or an explicit AR/NAR adapter pair for that job.
+- Instrumental follows the upstream YuE2 instrumental workflow. Whenever the app holds
+  the score before rendering (a cover, a previewed or pasted lead sheet, or the plan
+  picked by re-planning), it moves the Vocal melody onto the Ins voice. Where both
+  voices sound at once, the melody wins and Ins keeps the rest of its notes; chord
+  symbols stay on Vocal. On the base model the style also gains "Instrumental" and
+  "no vocals, no singing, no choir, no spoken words"; an adapter's style is left as
+  trained. With **Re-plan runaway scores** off and no score supplied, an instrumental
+  still plans its score once before rendering, so the melody can move. That one plan
+  renders whatever it is, with no redraw. With Chain of Thought off there is no score
+  to move, so the melody may still come out as wordless vocals.
 - Without the preview, the app plans first anyway and redraws the seed when the lead sheet
-  is a runaway, has no vocal line, or hit its cap, up to the attempt count in Settings. With
+  is a runaway, has no vocal line, or hit its cap, up to the attempt count in Settings. A
+  single unnamed ABC voice, such as `V:1`, counts as the vocal melody; in a multi-voice
+  score, an unnamed voice with `w:` lyric lines counts as vocal too. With
   **Re-plan flagged scores** (on by default) it also redraws a plan that passes but is
   illegible: one chord for the whole song, a riff looped for most of it, a vocal melody on
   one or two pitches, or far fewer sections than the lyric. If no attempt is clean, the
@@ -196,7 +218,11 @@ What sets it apart:
   batch plans in the same pass. The first pass draws one plan
   per song; if any song needs another try, later passes draw up to 8 plans at once, shared
   between the songs still looking, in roughly the time of two single plans. The first clean
-  attempt wins, even when later ones in the same pass are clean as well. A song whose plan
+  attempt wins, even when later ones in the same pass are clean as well. Each redraw's seed
+  follows from the song's seed, so the same seed and settings replay the same attempts and
+  render the same song, whichever VAE decodes it. Generate songs one at a time for that: songs
+  sent together render as one batch, which can change them slightly. The song keeps the
+  winning attempt's seed, so to repeat a song exactly, reuse the seed you typed. A song whose plan
   is settled shows "Plan ready, waiting for N other songs"; one that has finished composing
   while the rest of its batch is still going shows "Composed, waiting for N other songs".
 - The re-plan and recompose knobs live in the collapsed **Re-planning** section of the
@@ -230,8 +256,9 @@ What sets it apart:
   After the render, songs whose post-processing is CPU only (a VST chain, mastering, the
   normaliser) finish at once and side by side; only StableStep, Whisper, the aligner and
   cover art wait for the GPU.
-- It has its own NAR solver and scheduler choices (Midpoint or Wasserstein Flow, Uniform
-  or HT V3). Their tuning knobs sit in a collapsed "Controls" section under the picker.
+- It has its own NAR solver and scheduler choices (Midpoint, Wasserstein Flow, Ancestral
+  Euler, Latent Channel EQ or Timestep Lie; Uniform, HT V3, Plan-Aware, Plan-Loose or Plan
+  Overdrive). Their tuning knobs sit in a collapsed "Controls" section under the picker.
   The shared Lua plugins do not run on it.
 - Adapters load into two slots in the Adapters cluster, one for the AR half and one for
   the NAR half, each with its own strengths. An adapter is merged into the loaded model,
@@ -241,6 +268,31 @@ What sets it apart:
   splits them into the two halves.
 - Lyric timestamps come from a forced aligner run after the render, switched on per
   render in the Post-Processing cluster. It needs the `mms-fa-f32.gguf` model.
+
+### What changes what on YuE2
+
+The composer supplies YuE2's song plan. Composer seed, sampling settings, composer CFG, style words and the ABC sketch can change that plan. The NAR renderer turns it into audio. Solver, scheduler, guidance and noise settings affect the rendering. With the experimental plan controls from #269, Plan Strength, Plan CFG, CADS and plan-aware scheduler plugins can also change how closely the rendering follows the plan; their effects are not limited to clarity or loudness.
+
+Dials that change the song plan:
+
+- An ABC melody sketch (pasted lead sheet).
+- Style words in the prompt.
+- Seed, Composer Temperature, Top-K, Top-P and repetition penalty.
+- Composer CFG.
+
+Dials that change how closely the rendering follows the plan (experimental):
+
+- Plan Strength.
+- Plan CFG.
+- CADS.
+- Plan-aware schedulers.
+
+Listening observations (not guarantees):
+
+- Top-K 0 (unlimited) with Composer Temperature above 1.0 breaks the render, so the server clamps the temperature to 1.0 in that case and adds a warning to the job notes. The Composer Top-K slider now reaches 0 for unlimited.
+- Temperature works in both directions: around 0.7 and around 1.3 are both usable.
+- Higher CFG follows the style more closely but costs some high-end air.
+- Words like "choir" or "reverb" in the style add heavy reverb.
 
 Models: a language model GGUF and a VAE GGUF, selected separately in the Models cluster.
 The packs:
@@ -261,6 +313,26 @@ individual creators, musicians and researchers may use the model and its outputs
 freely, including commercially, and that only companies need a commercial licence
 (contact gezhang@umich.edu). Adapters trained on YuE2 carry the same terms.
 
+## Stable Audio 3
+
+SA3 generation defaults to 8 steps with the MD Pingpong Blend Lua sampler.
+You can select native Pingpong or Euler instead, or enable a solver in Sampler
+Plugins to override the default solver.
+
+Seed breeding only runs when a seed B is set. If you set seed B and leave the
+blend empty, the blend defaults to 0.5 (an even mix of the two seeds' noise).
+A blend of 0 turns breeding off; 1 uses seed B's noise throughout sampling.
+Both the native Pingpong and MD Pingpong Blend paths mix the second noise
+stream at every re-noise step. StableStep refinement does not use seed breeding.
+This differs from ACE-Step, where a shared
+seed B with no blend sends no blend at all.
+
+Stable Audio 3 also supports STORM slots and Directed Drift for guidance, steps
+and duration. Open `/storm` directly; its capability manifest currently hides the
+sidebar entry. Stop finishes the current slot, then stops; no next slot starts.
+The completed output is discarded after Stop, and GPU ownership is retained until
+the slot finishes. See [STORM](studios/storm.md).
+
 ## Capability matrix
 
 "Yes" and "No" come from each backend's capability manifest in the server and the
@@ -278,7 +350,8 @@ controls the UI shows for it. "?" means not yet confirmed.
 | Extend | ? | No | No |
 | Adapters at generation | DiT LoRA and LoKr, planner LM LoRA | Planner LM LoRA, applied per render | AR and NAR LoRA and LoKr, merged at load; ComfyUI joint files via import |
 | Training in Training Studio | Yes | Yes | Yes |
-| Streaming playback | Continuous streaming in STORM; no per-render preview | Play While Rendering | No |
+| Streaming playback | Continuous streaming in STORM; no per-render preview | Play While Rendering | Continuous streaming in STORM |
+| STORM Directed Drift | Caption, seed, guidance, LSS, steps, BPM and duration | No | Caption, seed, CFG scale, ODE steps and NAR cache ratio |
 | Lua plugins (solvers, schedulers, guidance) | Yes, plus postprocess plugins | Yes, opt-in and experimental; no postprocess plugins | No (own NAR solver and scheduler) |
 | Lyric timestamps (LRC) | Yes, from the DiT | Yes, from the planner | Yes, forced alignment after the render |
 | Post-processing (VST chain, mastering, StableStep, Whisper) | Yes | Yes | Yes |

@@ -1,5 +1,9 @@
 # server-feature-dev — reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Deep detail supporting [SKILL.md](SKILL.md). All paths repo-relative; all line numbers verified against the code as of 2026-07.
 
 ## 1. aceClient method catalog (`server/src/services/aceClient.ts`)
@@ -110,7 +114,7 @@ Bulk cross-DB migration reference (`migrateLireekData`, database.ts:293-386): `A
 ## 5. Logger and SSE log stream
 
 `services/logger.ts`:
-- `initLogger()` (called at index.ts:49 **before any console output**) creates `logs/<YYYY-MM-DD_HH-MM-SS>/` with `node_console.log` + `ace_engine.log` streams and a `generations/` dir, then monkey-patches `process.stdout.write`/`process.stderr.write` to mirror everything into `node_console.log` (logger.ts:60-72).
+- `initLogger()` (called at index.ts:49 **before any console output**) creates `<data root>/logs/<YYYY-MM-DD_HH-MM-SS>/` with `node_console.log` + `ace_engine.log` streams and a `generations/` dir, then monkey-patches `process.stdout.write`/`process.stderr.write` to mirror everything into `node_console.log` (logger.ts:60-72).
 - `logEngine(line)` appends to `ace_engine.log` (logger.ts:84-89).
 - Per-generation: `startGenerationLog(jobId, taskType)` seeds an in-memory buffer; `logGeneration(jobId, level, msg)` appends (levels `INFO|DEBUG|WARNING|ERROR`) and also pushes `[Gen:<8-char-id>] msg` to the SSE stream; `logGenerationParams(jobId, obj)` pretty-prints JSON line-by-line; `finishGenerationLog(jobId, taskType)` / `failGenerationLog(jobId, error, taskType)` write `gen_<jobId>_<taskType>.log` and drop the buffer (logger.ts:95-178). Buffer is lost if the process dies before finish/fail.
 

@@ -1,5 +1,9 @@
 # Training and runtime adapters
 
+Resolve runtime paths first using [Finding the data folder](../../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 > Reference for the `mm3-backend` skill. Read only when the task needs it.
 
 ## Runtime LM adapters (SHIPPED 2026-08-20 — engine + server + UI)
@@ -134,7 +138,7 @@ PurpleOrc's V4Encoder (169M: conv stack + 3 dilated ResBlocks + frame pooling +
 **weights-agnostic** — the whole community encoder lineage shares this
 architecture, so a new checkpoint is a `engine/tools/convert-rvq-encoder.py`
 run (arch `mm3rvq`, verbatim PyTorch tensor names), never a code change.
-Adopted checkpoint: `models/mm3/mm3-rvq-53kpooled-f32.gguf`.
+Adopted checkpoint: `<data root>/models/mm3/mm3-rvq-53kpooled-f32.gguf`.
 
 ```
 ace-train mm3-codes --dataset <ds.json> --rvq <mm3-rvq-*.gguf> --enc <mm3-enc-*.gguf> --out <dir>

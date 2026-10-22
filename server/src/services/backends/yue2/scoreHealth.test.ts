@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyYue2Score, yue2PlanDraws, yue2StyleNorms } from './scoreHealth.js';
+import { classifyYue2Score, hasSoundingVocalBar, yue2PlanDraws, yue2StyleNorms } from './scoreHealth.js';
+import { scoreBarClock } from './scoreClock.js';
+import { scoreSections } from './scoreSections.js';
 
 const HEADER = 'X:1\nT:\nM:4/4\nL:1/16\nQ:1/4=120\nV: Vocal clef=treble name="Vocal Melody" snm="Vocal"\nV: Ins clef=treble name="Ins Melody" snm="Inst."\nK:C\n';
 
@@ -49,6 +51,30 @@ test('Z-rests count as whole bars and chord symbols are ignored', () => {
 
 test('no vocal bars is unknown', () => {
   assert.equal(classifyYue2Score('').verdict, 'unknown');
+});
+
+test('bare sole voice and lyric-bearing voice count as vocal without changing named instrumental voice', () => {
+  const single = 'X:1\nM:4/4\nQ:1/4=120\n% verse\nV:1\nK:C\nCDEF|\nw:la la la la';
+  assert.equal(classifyYue2Score(single).vocalBars, 1);
+  assert.equal(hasSoundingVocalBar(single), true);
+  assert.equal(scoreBarClock(single).length, 1);
+  assert.deepEqual(scoreSections(single), [{ label: 'verse', startBar: 1 }]);
+  const duet = 'X:1\nV:1\nK:C\nCDEF|\nw:la la la la\nV:2\nGABc|';
+  assert.equal(classifyYue2Score(duet).vocalBars, 1);
+  assert.equal(hasSoundingVocalBar(duet), true);
+  const instrumental = 'X:1\nV: Vocal\nK:C\nCDEF|\nV: Ins\nGABc|';
+  assert.equal(classifyYue2Score(instrumental).vocalBars, 1);
+  assert.equal(hasSoundingVocalBar('X:1\nV: Ins\nK:C\nGABc|'), false);
+  assert.equal(hasSoundingVocalBar('X:1\nV: Ins\nK:C\nGABc|\nw:la la la la'), false);
+});
+
+test('instrumental-only score is accepted only with includeInstrumental', () => {
+  const ins = 'X:1\nV: Ins\nK:C\nGABc|';
+  assert.equal(hasSoundingVocalBar(ins), false);
+  assert.equal(hasSoundingVocalBar(ins, true), true);
+  assert.equal(hasSoundingVocalBar('X:1\nV: Ins\nK:C\nzzzz|', true), false);
+  // a declared-but-silent Vocal voice still fails even with the flag
+  assert.equal(hasSoundingVocalBar('X:1\nV: Vocal\nZ4|\nV: Ins\nC4|', true), false);
 });
 
 // Legibility: what a plan the verdict passed can still get wrong.

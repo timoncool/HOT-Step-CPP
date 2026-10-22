@@ -9,19 +9,21 @@ A live streaming performance mode. Instead of queuing one song and waiting for i
 
 The "STORM" entry in the sidebar (`/storm`). The engine must be ready first.
 
-STORM only works on the ACE-Step 1.5 backend. On any other active backend the page shows "Not supported by the active backend — switch back to ACE-Step 1.5 in the global bar" instead of the studio.
+STORM supports ACE-Step 1.5, YuE2 and Stable Audio 3. The sidebar lists it for ACE-Step and YuE2. Stable Audio 3 currently requires opening `/storm` directly because its capability manifest does not expose the sidebar entry. MiniMax-Music3 does not support STORM.
 
 Streaming and the normal generation queue can't run at the same time: starting a stream while any job is active in the queue is refused ("N generation job(s) active — wait for the queue to drain before streaming"), and while a stream is running you can't start a normal generation elsewhere.
 
 ## Workflow
 
-1. Pick a mode tab: **Sequential**, **Continuous**, **DJ**, or **Drift** (Drift is a placeholder, not built yet).
+1. Pick a mode tab: **Sequential**, **Continuous**, **DJ**, or **Drift** for automatic changes toward caption and parameter targets.
 2. In the Compose column, write a **Style** caption and, unless **Instrumental** is on, **Lyrics**. Optionally add a LoRA trigger word or a percussive beat intro/outro for DJ mixing.
 3. In the Sampler column, set guidance/steps/duration/BPM defaults, tune the extra params for whichever solver you're using, and optionally pick a specific Solver, Scheduler or Guider for the stream (leave them on "inherit global" to use the ones set in the global bar).
 4. Click **Generate** (Sequential) or **Start** (Continuous). Sequential queues one song through the normal job queue, the same as any other studio, and STORM's live controls don't apply to it. Continuous opens the audio stream and starts playing slot 1 as soon as it renders.
 5. While a Continuous stream plays, use the Live Controls column on the right to change the style, lyrics, seed, key, BPM or per-slot sliders for the *next* slot, then click **Send** (or drag a slider, which sends after you stop moving it). Changes land on the slot after the one currently rendering.
 6. Click **Record** to start capturing the master output to a downloadable `.webm` file; click it again to stop and download. Recording only happens in the browser, nothing is saved to the library automatically.
-7. Click **Stop** (or navigate away from the page) to end the stream.
+7. Click **Stop** (or navigate away from the page) to end playback. No next slot starts. An in-flight ACE-Step or YuE2 slot is cancelled; Stable Audio 3 finishes the current slot, then stops. Output is discarded either way, and the GPU lane stays held until the engine finishes.
+
+Each slot takes the shared GPU lane. Queued generations can run between slots.
 
 For DJ mode: start Deck A and Deck B independently from their own panels, each with its own caption, lyrics and Start/Stop. The center column shows each deck's detected key on the Camelot wheel with a compatibility read-out, a crossfader, cut buttons, per-deck nudge buttons, and Quantize A→B to line up Deck B's next slot to Deck A's next beat.
 
@@ -34,7 +36,7 @@ For DJ mode: start Deck A and Deck B independently from their own panels, each w
 | Sequential | Builds one song from the Compose/Sampler panels and sends it to the normal generation queue. No live stream, no crossfading. |
 | Continuous | Opens a persistent audio stream: slots render and crossfade back-to-back until you stop it. Live Controls become active. |
 | DJ | Two independent Continuous streams (Deck A, Deck B) mixed through a crossfader, with key-compatibility and beat-sync helpers. |
-| Drift | Placeholder screen only ("Coming soon"). Not implemented. |
+| Drift | Continuous streaming with Directed Drift. Caption weights, parameter values and seeds evolve between slots under your control. |
 
 ### Compose column
 
@@ -78,6 +80,32 @@ it to snap that one field back.
 | Record | Captures the mixed output to a `.webm` file, downloaded when you stop recording. |
 
 Timeline boxes above the panel show each slot's state (queued, rendering, rendered, playing, past). Clicking a box shows that slot's stamped metadata (seed, detected key/BPM, guidance, steps, style, lyrics) once it has played; clicking a future box does not seek playback.
+
+### Directed Drift
+
+Choose Drift, set the starting caption and sampler settings, then Start. Adjust the
+Drift panel while listening to steer later slots. Pressure settings persist in this
+browser and apply again when you start a Drift stream.
+
+| Control | What it does |
+|---|---|
+| Target Caption | Comma-separated tags describing where the stream should head. Commit with Enter or by leaving the field. Live tag bars show each tag's weight; tags above 50% enter the caption. |
+| Pull | Attraction toward the target caption and parameter values, from 0 to 1. Zero removes attraction; higher values pull harder. |
+| Rate | How far drift advances per slot, from 0 to 1. Zero stops drift movement. |
+| Jitter | Random variation in the path, from 0 to 1. Higher values make it less predictable. |
+| Param targets | Sliders set destinations within each parameter's range. The lock toggle excludes that parameter from drift so it uses the stream setting. Live readouts show current and target values. |
+| Pull now | Sets Pull to 1 for one slot, then restores the previous value. Per-slot movement limits still apply. |
+| Anchor | Copies the live parameter positions and active caption tags into the targets. Available after a live snapshot arrives. |
+| Energy boost | Raises guidance and, where supported, BPM targets and adds energetic caption tags. |
+| Mood / Genre | Mood buttons replace the target caption with a preset; Genre applies your comma-separated genre tags. |
+| Custom tag sets | Save a named group of tags locally, apply it as a target caption, or remove it. |
+| Seed evolution | Lock leaves the stream seed unchanged. Walk advances it each slot. Jump occasionally chooses a random seed, with higher jitter increasing the chance. |
+| Drift plugin choice | Allows occasional solver, scheduler or guidance changes when candidate plugins are available. The chance per slot is `0.1 × jitter × rate`. |
+
+ACE-Step targets include guidance, LSS strength, steps, BPM and duration. YuE2
+targets are CFG scale, ODE steps and NAR cache ratio. Stable Audio 3 targets are
+guidance, steps and duration. Backend-specific targets do not add capabilities
+that the selected model lacks.
 
 ## Tips and limits
 

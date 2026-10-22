@@ -557,12 +557,10 @@ export function buildYue2PreprocessArgs(o: ResolvedYue2PreprocessOptions): strin
   return args;
 }
 
-/** The loudness target a cache must be cut at for a training method: the
- *  engine's -14 LUFS for the tuned recipe, off (0) for base-matched, since
- *  the base was trained on raw recordings. */
-export function yue2LoudnessForMethod(method: unknown): number {
-  return method === 'base-matched' ? 0 : -14;
-}
+/** The loudness every YuE2 cache is cut at, for every training method
+ *  (2026-10-16): the engine's -14 LUFS default. An off cache flat-topped loud
+ *  albums; the engine now peak-scales overs instead of clamping them. */
+export const YUE2_CACHE_LUFS = -14;
 
 export interface ResolvedYue2TrainOptions extends Partial<Yue2OptimOptions> {
   /** `<latents>/yue2_preprocess.json`. */

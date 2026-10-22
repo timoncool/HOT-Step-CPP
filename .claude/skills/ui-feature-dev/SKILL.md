@@ -5,7 +5,16 @@ description: Guides adding or modifying UI features (React "studios") in HOT-Ste
 
 # UI Feature Development (React Studios)
 
-The UI tier of HOT-Step CPP is a single-page React 19 app in `ui/` (Vite 8, Tailwind 3.4, zustand 5, react-i18next, lucide-react icons). Every user-facing feature is a **"studio"** — a folder of components under `ui/src/components/` mounted as a top-level view. There is **no react-router**: routing is hand-rolled `history.pushState` in `App.tsx`. All server calls are plain `fetch()` against relative `/api/...` URLs (no axios, no react-query).
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
+The UI tier is a single-page React 19 app in `ui/`, with Vite, Tailwind,
+TanStack Query, Zustand, react-i18next and lucide-react icons. Each studio has
+a component folder under `ui/src/components/`. Routing uses `history.pushState`
+in `App.tsx`. TanStack Query owns server snapshots; services remain the HTTP
+transports. Read [the server-state contract](../../../docs/dev/ui-server-state.md)
+and the owning `ui/src/queries/<area>/README.md` before adding a reader.
 
 Terms used below:
 - **DiT** — the diffusion transformer, the C++ engine's core music-generation model. The UI only ever references it as a model name string.
@@ -47,6 +56,7 @@ Checks while developing:
 ```powershell
 cd D:\Ace-Step-Latest\hot-step-cpp\ui
 npx tsc -b          # type-check UI (project references — catches what a plain tsc --noEmit on one file misses)
+node --import ../server/node_modules/tsx/dist/loader.mjs --test --test-force-exit --test-timeout=60000 "src/**/*.test.ts"
 npx eslint .        # lint
 ```
 
@@ -78,9 +88,41 @@ Say the studio is "My Studio", slug `my-studio`.
 5. **Add i18n keys** to `ui/src/i18n/locales/en.json` (under the `"translation"` root) for every user-visible string.
 6. Type-check, then **ask the user to visually verify** — never a browser agent.
 
-## State management — three coexisting patterns
+## Server state and client state
 
-Top-level docs say "Zustand" but only 2 of 8 files in `ui/src/stores/` use zustand's `create()` (`globalParamsStore.ts:9`, `vstChainStore.ts:6` — verified by grep). The majority pattern is a hand-rolled `useSyncExternalStore` module singleton. **Match the pattern of the nearest existing store; don't introduce a fourth.**
+Query owns fetched lists, details, status and progress. One HMR-stable
+`queryClient` in `queries/client.ts` is provided above AuthProvider and App in
+`main.tsx`. Use `useQuery` for view snapshots, or `fetchQuery`/a Query observer
+for imperative execution. Never add a mount-effect fetch, module cache or
+network interval beside that owner. Keep form buffers separate: seed once for
+the captured selection and preserve unsaved edits across background refetches.
+
+Build keys with `serverKey`, `resourceKey` and `sharedKeys` from `queries/keys.ts`.
+Capture backend/worker with the request. Worker `null` means this PC; omit worker
+scope on local run/review/mirror resources. Authenticated requests use an opaque
+session epoch, never a credential in the key. Read `sessionEpoch` from `useAuth`
+so a changed session rebuilds the key. Pass Query's `signal` through every read
+helper. Throw HTTP errors; do not cache failures as empty results.
+
+Cross-area invalidation uses foundation's canonical keys, never another area's
+hooks. Preserve each key's wire shape and use observer `select` for projections.
+Defaults are 30 s freshness, 5 min retention, no focus refetch, reconnect refetch
+and at most two retries for network/5xx failures. Mutations never auto-retry.
+Use `pollWhile` for active jobs with terminal stop and capped error backoff;
+document any resource override. Abort cancels the read, not the server job.
+
+Capture mutation targets before awaiting. After success, update or invalidate
+all related list/detail keys. For deletion, cancel reads before the command and
+again after success, then remove cached rows and invalidate. Keep streams and
+their log/text/audio reducers; map events and reconnects into scoped cache
+updates or invalidation with `bridgeEvents`, coalesce bursts and tear down
+subscriptions. Replay must never submit a command or deliver completion twice.
+
+The following store patterns are for client state: forms, selections, playback,
+generation parameters and execution. Match the nearest existing store. Scoped
+compatibility projections may expose Query data but cannot own a second cache
+or independent fetch loop. The integration audit and open migration requests
+live in [architecture.md](../../../docs/dev/architecture.md#ui-server-state-integration-audit).
 
 **Pattern A — hand-rolled external store (majority; canonical example `ui/src/stores/abCompareStore.ts`, 101 lines).** Module-level `let _state`, a `Set` of listeners, `setState()` that spreads + notifies, exported *plain action functions* (importable from non-React code), plus a `useXxx()` hook (`useSyncExternalStore(subscribe, getSnapshot)`) and a ref-cached `useXxxSelector(selector)` hook. Selector hooks are the preferred subscription style: `useAudioGenQueueSelector(s => s.items.filter(...).length)` (StemStudio.tsx:77-79). Used by: `playbackStore`, `audioGenQueueStore`, `discoStore`, `streamingStore`, `abCompareStore`, `components/lyric-studio/playlistStore` (studio-local stores may live inside the studio folder).
 
@@ -88,16 +130,28 @@ Top-level docs say "Zustand" but only 2 of 8 files in `ui/src/stores/` use zusta
 
 **Pattern C — plain `useState` + localStorage inside the studio.** StemStudio persists studio-local state via manual `localStorage` with `hs-stem-*` keys (StemStudio.tsx:43-46,97-104) or via `usePersistedState(key, default)` (`ui/src/hooks/usePersistedState.ts:9`). **Cross-component/same-tab sync requires `writePersistedState()`** (usePersistedState.ts:43-49), which manually dispatches a `StorageEvent` — native StorageEvents only fire cross-tab.
 
-The generation queue store `audioGenQueueStore.ts` (992 lines) persists to **IndexedDB** (`lireek-queue-store` DB) with debounced 2 s writes because large queues blew localStorage's 5 MB cap (lines 65-73,126-133); on reload it resets in-flight items to `pending` + "Reconnecting…" (`_sanitizeItems`, lines 142-156).
+The generation queue persists client execution state in IndexedDB. Its executor
+retains serialization, manual rows, legacy owner migration and completion
+effects; `queries/shell-queue/queue.ts` owns HTTP snapshots. Keep the existing
+projection loop as the scheduler. Do not add a parallel poller or resubmit on
+remount. Server-owned rows reattach to server work; browser-owned recovery
+follows the existing migration and resume rules.
 
 ## API layer — how the UI reaches the server
 
 Two tiers, both in `ui/src/services/`:
 
-- **Central client `api.ts`** (406 lines): private `get/post/patch/del<T>` fetch helpers, `BASE = '/api'`, optional `Bearer` token, uniform errors (non-OK → `throw new Error(err.error || 'API error: <status>')`, api.ts:10-64). Exports per-domain objects (`songApi`, `generateApi`, `modelApi`, `adapterApi`, `settingsApi`, ...).
-- **Per-studio client files** (model: `stemStudioApi.ts`, 220 lines): standalone exported async functions, own `API_BASE = '/api/stem-studio'`, own types/constants, and a submit-then-poll helper `waitForExtraction(jobId, onProgress, pollMs=1000)` (stemStudioApi.ts:190-211). New studios with their own routes follow this shape.
+- `api.ts` exports domain clients such as `songApi`, `generateApi` and
+  `settingsApi` over the shared `httpClient.ts`. Reads take trailing
+  `ReadOptions` with `signal`; `ApiError` preserves HTTP status and message.
+- Per-studio clients retain endpoint types and command functions. Their reads
+  feed area query options. Existing extraction/separation waiters use Query
+  observers; follow that pattern instead of adding a submit-then-poll timer.
+- `trainingApi.ts` reads accept captured `{ worker, signal }` for worker routes
+  and `{ signal }` for local-only routes. Pass explicit `worker: null` for a
+  local target; omitted worker can mean the live selection in legacy callers.
 
-**Auth**: single-user local app. `AuthContext` auto-logs-in on mount via `authApi.autoLogin()` (`GET /api/auth/auto`); components do `const { token } = useAuth()` and pass `token` to api methods. Newer endpoints (stem-studio, vst, settings) skip the token entirely — both styles coexist.
+**Auth**: single-user local app. `AuthContext` auto-logs-in on mount via `authApi.autoLogin()` (`GET /api/auth/auto`); components do `const { token } = useAuth()` and pass `token` to api methods. Some routes (stem-studio, vst, settings, song detail) take no token. Any Query key whose read sends the token sets `{ auth: true }` so it carries `sessionEpoch` (see above); the song-detail key carries one too, but only so sign-out drops it.
 
 **snake_case gotcha**: the server returns SQLite snake_case rows. `normalizeSong()` (api.ts:76-114) maps to camelCase while keeping BOTH spellings (`audioUrl` and `audio_url`) and parses `generation_params` if it arrives as a JSON string. Any new endpoint returning songs must route through it or the player/library break.
 
@@ -110,7 +164,10 @@ GET  /api/generate/status/:id → GenerationJob { status: 'pending|lm_running|sy
                                                 result?: { audioUrls[], songIds[], masteredAudioUrl?, duration?, ... } }
 ```
 
-Poll every 1.5 s. Progress may arrive as 0–1 OR 0–100 — normalise both, as `audioGenQueueStore.ts:548-550` does. No websockets. Job status is polled (`audioGenQueueStore`); SSE exists in three places: logs (`hooks/useEventSource.ts` → `TerminalPanel`), model-download progress (`components/model-manager/useDownloadStream.ts`, its own `EventSource`), and streaming audio previews during generation (`hooks/useStreamGeneration.ts` → `GET /api/generate/stream/:jobId`).
+Active status reads normally use a 1.5 s cadence through Query. Progress may be
+0-1 or 0-100; preserve the queue's normalization. SSE also carries logs, model
+downloads, training metrics, MIDI notes and workflows. Shared connections and
+stream reducers stay; reconnect and terminal events reconcile cached snapshots.
 
 ## Styling and i18n conventions
 
@@ -127,17 +184,18 @@ Poll every 1.5 s. Progress may arrive as 0–1 OR 0–100 — normalise both, as
 | Path | Role |
 |---|---|
 | `ui/src/App.tsx` (1437 ln) | Root: hand-rolled routing (`viewFromUrl`/`urlForView`/`navigateTo`), `renderContent()`, `DISCO` hues, player wiring |
-| `ui/src/main.tsx` | Entry: StrictMode > AuthProvider > Suspense > App |
+| `ui/src/main.tsx` | Entry: StrictMode > QueryClientProvider > AuthProvider > Suspense > App |
 | `ui/src/components/<studio>/` | One folder per studio; orchestrator component named after the studio |
 | `ui/src/components/shared/` | `Section` (in `ActivitySidebar.tsx` — props `title, icon, count?, countColor?, defaultOpen?`), `Slider`, `EditableSlider`, `Toast`, `ConfirmDialog`, `StemMixer`, `DiscoPulseWrapper`, ... |
 | `ui/src/components/sidebar/Sidebar.tsx` | Left nav — one `NavItem` per studio |
 | `ui/src/stores/globalParamsStore.ts` | zustand; all generation knobs; `getGlobalParams()` = sole request assembler (line 324) |
 | `ui/src/stores/abCompareStore.ts` | Smallest canonical hand-rolled store — copy this as a template |
-| `ui/src/stores/audioGenQueueStore.ts` | Generation queue; IndexedDB persistence; submit/poll loop (line 534) |
+| `ui/src/stores/audioGenQueueStore.ts` | Generation executor, persistence, projection scheduling and completion guards |
+| `ui/src/queries/` | Canonical keys/client/policy, area options, observers and event mappings |
 | `ui/src/services/api.ts` | Central fetch client + `normalizeSong()` (line 76) |
-| `ui/src/services/stemStudioApi.ts` | Model per-studio API client (submit-then-poll) |
+| `ui/src/services/stemStudioApi.ts` | Per-studio transport and Query-observed progress waiter |
 | `ui/src/hooks/usePersistedState.ts` | Persisted useState + `writePersistedState()` same-tab sync |
-| `ui/src/context/AuthContext.tsx` | Auto-login, `useAuth()` → `{ user, token }` |
+| `ui/src/context/AuthContext.tsx` | Auto-login, `useAuth()` exposes user, token and sessionEpoch |
 | `ui/src/context/GlobalParamsContext.tsx` | LEGACY compat shim — do not extend |
 | `ui/src/i18n/locales/en.json` | Source-of-truth strings (root key `"translation"`) |
 | `ui/vite.config.ts` | Dev proxy: `/api`, `/audio`, `/references` → :3001 |
@@ -157,16 +215,16 @@ Poll every 1.5 s. Progress may arrive as 0–1 OR 0–100 — normalise both, as
 | New slider has no effect on generations | Value not wired into `getGlobalParams()` (globalParamsStore.ts:324) — the only place the request body is assembled. If it reaches `getGlobalParams()` but never reaches `/synth`: the server chain is `routes/generate.ts` → `translateParams()` (`server/src/services/generation/translateParams.ts:11`) → `aceReq`; sideband params must join `aceReq` BEFORE the LM phase (Golden rule 9 — never whitelist across the LM echo). |
 | Setting change in one studio doesn't reflect in another | Wrote `localStorage` directly instead of `writePersistedState()` — same-tab listeners need the manually-dispatched StorageEvent. |
 | Progress bar jumps 0→100 or shows 5000% | Server progress is 0–1 on some paths, 0–100 on others; normalise like audioGenQueueStore.ts:548-550. |
-| Queue items stuck "generating" after reload | Expected behaviour: `_sanitizeItems` resets to `pending`+"Reconnecting…" and `resumeQueue()` re-submits (audioGenQueueStore.ts:142-156,610-621). |
+| Queue items stuck after reload | Check server/browser ownership, migration fences and reattachment before changing execution. Never blindly resubmit an existing server job. |
 | UI shows a raw key like `stem.queue` | Key missing from `i18n/locales/en.json`. |
 | `npx tsc --noEmit` on a file passes but `npm run build` fails | `build` runs `tsc -b` across ALL project references — reproduce with `npx tsc -b` from `ui\`. |
-| Generation fails and the UI just shows "failed" | Debug server-side: newest `logs/YYYY-MM-DD_HH-MM-SS/` folder → `generations/gen_*.log`, then `ace_engine.log` / `node_console.log`. |
+| Generation fails and the UI just shows "failed" | Debug server-side: newest `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` folder → `generations/gen_*.log`, then `ace_engine.log` / `node_console.log`. |
 
 ## Institutional knowledge
 
 - **VALIDATED (lead engineer, verbatim rule): Never use a browser agent for visual verification — ask the human user for screenshots/feedback. Browser agent is acceptable only for non-visual API checks.**
 - VALIDATED: `getGlobalParams()` is the sole assembly point for generation request bodies; params bypass it → silently dropped. Confirmed by code and by commit 8ea519b ("adapter param plumbing bugs").
-- VALIDATED: the "Zustand" label in top-level docs is aspirational — 5 of the 8 files in `ui/src/stores/` are hand-rolled `useSyncExternalStore` stores (a 6th, `playlistStore`, lives in `components/lyric-studio/`); 2 use zustand; `playbackConverters.ts` is pure helpers, not a store. Match your neighbours.
+- Client stores use Zustand or hand-rolled `useSyncExternalStore` subscriptions. Query owns server reads; match existing client-state patterns without copying fetched snapshots into an unscoped store.
 - VALIDATED: queue persistence moved localStorage → IndexedDB because 600+-item queues exceeded the 5 MB localStorage cap (comment at audioGenQueueStore.ts:66-68).
 - VALIDATED: `GlobalParamsContext.tsx` is a migration shim by its own header — extend the store, not the context.
 - UNVERIFIED: exact behaviour of `ui/add_strings.mjs` / `ui/generate_translations.mjs` (files exist; purpose inferred from names — read before running).

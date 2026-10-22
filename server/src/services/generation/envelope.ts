@@ -2,6 +2,7 @@
 
 import { getActiveBackendId, getBackend } from '../backends/registry.js';
 import { GENERATION_ENVELOPE_VERSION } from '../backends/types.js';
+import { readBackendOverride } from '../../contracts/generation.js';
 import type {
   GenerationEnvelope,
   GenerationOperation,
@@ -102,7 +103,18 @@ export function buildEnvelope(
   enqueuedAt: number,
 ): Readonly<GenerationEnvelope> {
   const body = requireBody(raw, userId, jobId, enqueuedAt);
-  const backendId = getActiveBackendId();
+  // Opt-in per-job override (a separate field from `raw.backend`, which stays
+  // log-only as described above). Absent means the active backend.
+  let override: string | undefined;
+  try {
+    override = readBackendOverride(body);
+  } catch (err) {
+    throw new GenerationEnvelopeError('invalid_body', err instanceof Error ? err.message : 'Invalid backendOverride');
+  }
+  if (override !== undefined && !getBackend(override)) {
+    throw new GenerationEnvelopeError('invalid_body', `Unknown backendOverride '${override}'`);
+  }
+  const backendId = override ?? getActiveBackendId();
   const backend = getBackend(backendId);
   if (!backend) {
     throw new GenerationEnvelopeError(
@@ -113,6 +125,18 @@ export function buildEnvelope(
 
   const submission = freezeDeep(clone(body));
   const resolved = clone(resolve(submission, backendId, backend));
+  // An override must not quietly change what was asked for: a backend whose
+  // resolver ignores `taskType` (YuE2, SA3) would turn a repaint into a
+  // text2music render. Without an override this stays as before.
+  if (override !== undefined) {
+    const requested = typeof body.taskType === 'string' && body.taskType ? body.taskType : 'text2music';
+    if (requested !== resolved.operation) {
+      throw new GenerationEnvelopeError(
+        'unsupported_operation',
+        `Backend '${backendId}' does not support generation operation '${requested}'`,
+      );
+    }
+  }
   const mismatch = typeof body.backend === 'string' && body.backend !== backendId
     ? body.backend : undefined;
   const envelope: GenerationEnvelope = {

@@ -1,3 +1,5 @@
+import { useQuery } from '@tanstack/react-query';
+import { backendModelsOptions } from '../../queries/global-models/options';
 // BackendModelsDropdown.tsx — model picker for backends whose model choice is
 // ENGINE STATE rather than a per-request parameter.
 //
@@ -13,7 +15,7 @@
 // { lm, synth }, a future backend may report something else entirely. Nothing
 // here hardcodes a bucket name beyond a label lookup with a sane fallback.
 
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Download } from 'lucide-react';
 import { useBackendStore } from '../../stores/backendStore';
 import { useCapabilities } from '../../hooks/useCapabilities';
@@ -44,8 +46,7 @@ function formatBytes(bytes?: number): string {
 
 export const BackendModelsDropdown: React.FC = () => {
   const activeBackendId = useBackendStore(s => s.activeBackendId);
-  const catalogue = useBackendStore(s => s.models[s.activeBackendId] ?? null);
-  const fetchModels = useBackendStore(s => s.fetchModels);
+  const { data: catalogue } = useQuery(backendModelsOptions(activeBackendId));
   const selectModels = useBackendStore(s => s.selectModels);
   // Same path the Generation dropdown's old Renderer hint used to read
   // dit_runtime off of: the active backend's capability manifest (see the
@@ -62,10 +63,6 @@ export const BackendModelsDropdown: React.FC = () => {
   const [note, setNote] = useState<string | null>(null);
   const [showModelManager, setShowModelManager] = useState(false);
 
-  useEffect(() => {
-    if (!activeBackendId) return;
-    void fetchModels(activeBackendId);
-  }, [activeBackendId, fetchModels]);
 
   const buckets = Object.entries(catalogue?.buckets ?? {}).filter(([, opts]) => opts.length > 0);
 
@@ -136,6 +133,7 @@ export const BackendModelsDropdown: React.FC = () => {
               // Short, fixed list — a filter box would be furniture.
               filterable={false}
               disabled={busy !== null || !catalogue.selectable}
+              disabledReason={(opt) => meta[opt]?.disabledReason}
               formatLabel={(opt) =>
                 `${opt === 'convrot' ? 'INT8 ConvRot (CUDA)' : opt}${meta[opt]?.bytes ? ` — ${formatBytes(meta[opt].bytes)}` : ''}`}
               placeholder={busy === bucket ? 'Switching…' : 'Select model…'}

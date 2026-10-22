@@ -30,7 +30,7 @@ import { mergeFields, writeSidecar } from './sidecarIO.js';
 import {
   clearTransientStatus, clearTransientStatuses, patchLabel, readLabel, setTransientStatus,
 } from './labelStore.js';
-import { analyzeWithEssentia, essentiaAvailable, essentiaKeyString } from './essentiaClient.js';
+import { analyzeWithEssentia, essentiaAvailable, essentiaKeyString, reconcileEssentiaBpm } from './essentiaClient.js';
 import { captionLimiter, essentiaLimiter, geniusLimiter } from './rateLimit.js';
 import { AbortError, runUnderstand } from './understandClient.js';
 import {
@@ -163,6 +163,9 @@ export function createJob(
     controller: new AbortController(),
   };
   jobs.set(job.id, job);
+  // On disk from the start, not only once it ends: a job the server dies
+  // during must still be there for recoverStaleJobs to mark failed.
+  persistMeta(job);
   return job;
 }
 
@@ -261,6 +264,9 @@ export function pushEvent(job: TrainingJob, ev: TrainingStreamEvent): void {
 
 export function emitJob(job: TrainingJob): void {
   pushEvent(job, { type: 'job', job: toSummary(job) });
+  // Keep an active job's meta current (running, startedAt, phase); finishJob
+  // and cancelJob write the final one themselves.
+  if (job.status === 'queued' || job.status === 'running') persistMeta(job);
 }
 
 export function emitProgress(job: TrainingJob): void {
@@ -314,11 +320,24 @@ export function attachStream(job: TrainingJob, res: Response): void {
 
 // ── Persistence (§7.9) ───────────────────────────────────────────────────
 
+/** Replace a job's _meta.json through a temp file and a rename, so a write
+ *  that fails part-way leaves the previous record whole, never truncated. */
+function writeMetaFile(metaPath: string, summary: TrainingJobSummary): void {
+  const temp = `${metaPath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(summary, null, 2), 'utf-8');
+    fs.renameSync(temp, metaPath);
+  } catch (err) {
+    try { fs.rmSync(temp, { force: true }); } catch { /* already gone */ }
+    throw err;
+  }
+}
+
 function persistMeta(job: TrainingJob): void {
   try {
     const dir = path.join(jobsDir(), job.id);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify(toSummary(job), null, 2), 'utf-8');
+    writeMetaFile(path.join(dir, '_meta.json'), toSummary(job));
   } catch (err: any) {
     console.warn(`[Training] Could not persist job ${job.id}: ${err.message}`);
   }
@@ -339,7 +358,7 @@ function recoverStaleJobs(): void {
         meta.status = 'failed';
         meta.error = 'Server restarted';
         meta.finishedAt = Date.now();
-        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+        writeMetaFile(metaPath, meta);
       } catch { /* skip corrupted meta */ }
     }
   } catch { /* jobs dir unreadable */ }
@@ -391,6 +410,15 @@ function laneFor(job: TrainingJob): 'gpu' | 'net' {
   }
 }
 
+/** Runners that replace a job kind's real one. Only an isolated harness sets
+ *  them (the frontend reference suite, which must never spawn a trainer);
+ *  production never calls overrideTrainingRunner, so every real runner
+ *  stands. A replacement runs on the same lane, after the same route checks. */
+const runnerOverrides = new Map<TrainingJobKind, (j: TrainingJob) => Promise<void>>();
+export function overrideTrainingRunner(kind: TrainingJobKind, run: ((j: TrainingJob) => Promise<void>) | null): void {
+  if (run) runnerOverrides.set(kind, run); else runnerOverrides.delete(kind);
+}
+
 /**
  * Append to this job's lane. The two lanes run concurrently; each is serial
  * internally. Per-dataset exclusivity is unaffected — the route layer still
@@ -398,6 +426,7 @@ function laneFor(job: TrainingJob): 'gpu' | 'net' {
  */
 export function enqueue(job: TrainingJob, run: (j: TrainingJob) => Promise<void>): void {
   const swallow = () => { /* runners handle their own errors */ };
+  run = runnerOverrides.get(job.kind) ?? run;
   if (laneFor(job) === 'gpu') {
     gpuTail = gpuTail.then(() => run(job)).catch(swallow);
   } else {
@@ -676,6 +705,7 @@ interface PassAResult {
   tagGenre: string;
   tagBpm: number | null;
   essentiaBpm: number | null;
+  bpmFromTag: boolean;
   essentiaKey: string;
 }
 
@@ -703,6 +733,7 @@ async function runPassA(
   const cached = readLabel(ds.slug, sample.sampleId);
   const cacheFresh = (() => {
     if (!cached?.durationCache) return false;
+    if (JSON.stringify(cached.essentiaTempo ?? null) !== JSON.stringify(opts.essentiaTempo ?? null)) return false;
     try {
       const st = fs.statSync(sample.audioPath);
       return cached.durationCache.sizeBytes === st.size && cached.durationCache.mtimeMs === st.mtimeMs;
@@ -713,16 +744,18 @@ async function runPassA(
   const essentia = (opts.useEssentia !== false && essentiaAvailable())
     ? (cacheFresh && cached?.essentia
         ? cached.essentia
-        : await analyzeWithEssentia(sample.audioPath, job.controller.signal))
+        : await analyzeWithEssentia(sample.audioPath, job.controller.signal, opts.essentiaTempo))
     : null;
 
   const essentiaKey = essentia ? essentiaKeyString(essentia.key, essentia.scale) : '';
+  const essentiaBpm = reconcileEssentiaBpm(essentia?.bpm ?? null, meta.bpm);
   const result: PassAResult = {
     duration: meta.duration,
     tags: { artist: meta.artist, title: meta.title, album: meta.album },
     tagGenre: meta.genre,
     tagBpm: meta.bpm,
-    essentiaBpm: essentia?.bpm ?? null,
+    essentiaBpm,
+    bpmFromTag: essentiaBpm !== null && essentiaBpm === meta.bpm && essentiaBpm !== essentia?.bpm,
     essentiaKey,
   };
   results.set(sample.sampleId, result);
@@ -739,13 +772,14 @@ async function runPassA(
     relPath: sample.relPath,
     tags: result.tags,
     essentia: essentia ?? null,
+    essentiaTempo: opts.essentiaTempo ?? null,
     durationCache: meta.duration > 0 ? { seconds: meta.duration, sizeBytes, mtimeMs } : null,
   });
 
   // Interim sidecar write — a cancelled job still leaves usable BPM/key data.
   const incoming: Record<string, string> = {};
   const sources: Record<string, FieldSource> = {};
-  if (result.essentiaBpm !== null) { incoming.bpm = String(result.essentiaBpm); sources.bpm = 'essentia'; }
+  if (result.essentiaBpm !== null) { incoming.bpm = String(result.essentiaBpm); sources.bpm = result.bpmFromTag ? 'tags' : 'essentia'; }
   else if (result.tagBpm !== null) { incoming.bpm = String(result.tagBpm); sources.bpm = 'tags'; }
   if (essentiaKey) { incoming.key = essentiaKey; sources.key = 'essentia'; }
   if (meta.genre) { incoming.genre = meta.genre; sources.genre = 'tags'; }
@@ -905,7 +939,7 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
         let lyricsError: string | null = null;
 
         // Local results first — Essentia wins bpm/key (§4.8), tags win genre.
-        if (a?.essentiaBpm != null) { incoming.bpm = String(a.essentiaBpm); sources.bpm = 'essentia'; }
+        if (a?.essentiaBpm != null) { incoming.bpm = String(a.essentiaBpm); sources.bpm = a.bpmFromTag ? 'tags' : 'essentia'; }
         else if (a?.tagBpm != null) { incoming.bpm = String(a.tagBpm); sources.bpm = 'tags'; }
         if (a?.essentiaKey) { incoming.key = a.essentiaKey; sources.key = 'essentia'; }
         if (a?.tagGenre) { incoming.genre = a.tagGenre; sources.genre = 'tags'; }

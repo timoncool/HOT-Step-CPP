@@ -15,10 +15,10 @@ import fs from 'fs';
 import path from 'path';
 import { spawn, execSync, ChildProcess } from 'child_process';
 
-import { config } from '../config.js';
+import { config, USER_PLUGINS_DIR } from '../config.js';
 import { logEngine } from './logger.js';
 import { pushLog } from '../routes/logs.js';
-import { setEngineReady } from '../engineState.js';
+import { setEngineReady, setEngineNoModels, backendLineFeeder, resetEngineDevice } from '../engineState.js';
 import { aceClient } from './aceClient.js';
 import { buildGpuEnv } from './gpuDevices.js';
 
@@ -41,9 +41,36 @@ let suspended = false;
 let respawnTimer: NodeJS.Timeout | null = null;
 let lifecycleEpoch = 0;
 
+/**
+ * While the engine waits on an empty models folder, a model copied in by hand
+ * (not through the Model Manager) must start it too. The engine scans only
+ * top-level *.gguf, so look for one that has stopped growing (mtime older than
+ * 3 s, so a copy in progress does not trigger an early start).
+ */
+const MODELS_WATCH_MS = 5_000;
+let modelsWatch: NodeJS.Timeout | null = null;
+
+function stopWatchingForModels(): void {
+  if (modelsWatch) { clearInterval(modelsWatch); modelsWatch = null; }
+}
+
+function watchForModels(): void {
+  stopWatchingForModels();
+  modelsWatch = setInterval(() => {
+    try {
+      const dir = config.aceServer.models;
+      const found = fs.readdirSync(dir).some(n => n.toLowerCase().endsWith('.gguf')
+        && Date.now() - fs.statSync(path.join(dir, n)).mtimeMs > 3000);
+      if (found) retryIfGaveUp();
+    } catch { /* folder missing or unreadable: keep waiting */ }
+  }, MODELS_WATCH_MS);
+  modelsWatch.unref();
+}
+
 /** Cancel any pending crash-respawn and invalidate one already in flight. */
 function cancelPendingRespawn(): void {
   lifecycleEpoch++;
+  stopWatchingForModels();
   if (respawnTimer) {
     clearTimeout(respawnTimer);
     respawnTimer = null;
@@ -55,6 +82,8 @@ let crashCount = 0;
 let firstCrashTime = 0;
 const MAX_CRASHES = 3;
 const CRASH_WINDOW_MS = 30_000; // 30 seconds
+/** Set when the crash limiter gives up; cleared by the next restart. */
+let gaveUp = false;
 
 /**
  * Bumped on every unexpected engine exit. A job in flight when it changes is
@@ -66,8 +95,20 @@ export function engineCrashSeq(): number {
   return crashSeq;
 }
 
+/** Line ace-server prints before exiting 1 on an empty models folder (hot-step-server.cpp). */
+const NO_MODELS_LINE = "ERROR: no models found";
+
 /** How long restartAceServer() waits for /health after a respawn. */
 const RESTART_HEALTH_TIMEOUT_MS = 90_000;
+/** Poll interval of the watcher that outlives that timeout. */
+const LATE_READY_POLL_MS = 2_000;
+
+/** Test seam: swap the spawn and shrink the timings. Production never touches it. */
+export const testHooks = {
+  spawn: spawn as typeof spawn,
+  restartHealthTimeoutMs: RESTART_HEALTH_TIMEOUT_MS,
+  lateReadyPollMs: LATE_READY_POLL_MS,
+};
 
 // ── Post-restart restore hooks ──────────────────────────────────────────────
 //
@@ -127,6 +168,9 @@ export function startAceServer(): ChildProcess | null {
   if (config.aceServer.adapters && fs.existsSync(config.aceServer.adapters)) {
     args.push('--adapters', config.aceServer.adapters);
   }
+
+  // Release only: the data folder's plugins/ overlay, scanned after the shipped plugins.
+  if (USER_PLUGINS_DIR) args.push('--user-plugins', USER_PLUGINS_DIR);
 
   // --keep-loaded: flips the engine's ModelStore to EVICT_NEVER so the ~17 s
   // LoKr precompute (and the DiT/VAE load) only happens once per combo instead
@@ -197,13 +241,17 @@ export function startAceServer(): ChildProcess | null {
     console.log(`[Server] TensorRT libs: ${config.aceServer.trtLibs}`);
   }
 
-  const child = spawn(exe, args, spawnOpts);
+  resetEngineDevice();
+  const child = testHooks.spawn(exe, args, spawnOpts);
 
   // Filter repetitive GGML noise from console output (still written to ace_engine.log via logEngine)
   const isNoise = (line: string) =>
     line.includes('CUDA graph warmup') || line.includes('CUDA Graph id') || line.includes('ggml_backend_cuda_graph_compute');
 
+  const feedOut = backendLineFeeder();
+  const feedErr = backendLineFeeder();
   child.stdout?.on('data', (data: Buffer) => {
+    feedOut(data.toString());
     const lines = data.toString().split('\n').filter(Boolean);
     for (const line of lines) {
       if (!isNoise(line)) console.log(`[ace-server] ${line}`);
@@ -213,6 +261,10 @@ export function startAceServer(): ChildProcess | null {
   });
 
   child.stderr?.on('data', (data: Buffer) => {
+    feedErr(data.toString());
+    // Chunks are not lines: match on a rolling tail so a split marker still counts.
+    errTail = (errTail + data.toString()).slice(-256);
+    if (errTail.includes(NO_MODELS_LINE)) sawNoModels = true;
     const lines = data.toString().split('\n').filter(Boolean);
     for (const line of lines) {
       if (!isNoise(line)) console.log(`[ace-server] ${line}`);
@@ -222,11 +274,37 @@ export function startAceServer(): ChildProcess | null {
   });
 
   const spawnEpoch = lifecycleEpoch;
+  let sawNoModels = false;
+  let errTail = '';
 
   child.on('exit', (code, signal) => {
     if (aceProcess === child) aceProcess = null;   // never hand out a dead child
+    // 'exit' can precede the last stderr chunk; classify only after it drains.
+    const err = child.stderr;
+    if (err && err.readableEnded === false && !err.destroyed) {
+      let done = false;
+      const go = () => { if (done) return; done = true; clearTimeout(t); onExited(code, signal); };
+      const t = setTimeout(go, 500);
+      err.once('close', go);
+      err.once('end', go);
+    } else {
+      onExited(code, signal);
+    }
+  });
+
+  const onExited = (code: number | null, signal: NodeJS.Signals | null) => {
     if (suspended) return;   // deliberate stop — never respawn
     if (spawnEpoch !== lifecycleEpoch) return;     // superseded by a stop/restart
+    if (sawNoModels && code === 1) {
+      // Empty models folder: a first run, not a crash. No restart budget spent;
+      // retryIfGaveUp() brings the engine up once a download lands.
+      console.log('[ace-server] No models installed — waiting for a download in the Model Manager.');
+      setEngineNoModels(true);
+      setEngineReady(false, 'No models installed — download one in the Model Manager');
+      gaveUp = true;
+      watchForModels();
+      return;
+    }
     if (signal !== 'SIGTERM' && signal !== 'SIGINT' && code !== 0) {
       console.error(`[ace-server] Process exited with code ${code}, signal ${signal}`);
       crashSeq++;
@@ -241,9 +319,10 @@ export function startAceServer(): ChildProcess | null {
 
       if (crashCount >= MAX_CRASHES) {
         console.error(`[ace-server] Crashed ${MAX_CRASHES} times within ${CRASH_WINDOW_MS / 1000}s — giving up.`);
-        console.error('[ace-server] This usually means a required DLL is missing from the engine/ directory.');
-        console.error('[ace-server] Check the error above, or try re-extracting the release zip.');
-        setEngineReady(false, `Engine crashed ${MAX_CRASHES} times — check logs for missing DLLs`);
+        console.error('[ace-server] Check the error above: usually no models downloaded yet, or a DLL missing from the engine/ directory.');
+        console.error('[ace-server] The engine starts again by itself once a model download finishes.');
+        setEngineReady(false, `Engine crashed ${MAX_CRASHES} times — download a model in the Model Manager, or check the logs`);
+        gaveUp = true;
         return;
       }
 
@@ -257,7 +336,7 @@ export function startAceServer(): ChildProcess | null {
         startAceServer();
       }, 3000);
     }
-  });
+  };
 
   child.on('error', (err) => {
     console.error(`[ace-server] Failed to start: ${err.message}`);
@@ -352,6 +431,17 @@ export function stopAceServer(reason = 'Engine stopped', timeoutMs = 15_000,
 }
 
 /**
+ * Respawn the engine if the crash limiter gave up. A first launch with an empty
+ * models folder exits at the model scan three times before the user has had a
+ * chance to download anything; this brings it back once they have.
+ */
+export function retryIfGaveUp(): void {
+  if (!gaveUp || suspended) return;
+  console.log('[Server] Models changed since the engine gave up — starting it again');
+  void restartAceServer();
+}
+
+/**
  * Clear `suspended`, respawn ace-server and poll /health until it answers.
  * Resolves true when the engine came back, false on timeout.
  */
@@ -360,6 +450,9 @@ export async function restartAceServer(): Promise<boolean> {
   // `suspended`, or the orphaned timer spawns a duplicate engine 3 s from now.
   cancelPendingRespawn();
   suspended = false;
+  gaveUp = false;
+  crashCount = 0;
+  setEngineNoModels(false);
   setEngineReady(false, 'Restarting engine...');
 
   if (aceProcess && aceProcess.exitCode === null && aceProcess.signalCode === null) {
@@ -378,7 +471,7 @@ export async function restartAceServer(): Promise<boolean> {
     return false;
   }
 
-  const deadline = Date.now() + RESTART_HEALTH_TIMEOUT_MS;
+  const deadline = Date.now() + testHooks.restartHealthTimeoutMs;
   while (Date.now() < deadline) {
     if (await aceClient.isReachable()) {
       setEngineReady(true, 'Ready');
@@ -391,5 +484,29 @@ export async function restartAceServer(): Promise<boolean> {
 
   console.error('[Server] ace-server did not answer /health within 90 s after a restart');
   setEngineReady(false, 'Engine did not come back — restart the app');
+  // The verdict above is not final while the child lives: a cold first boot on
+  // fresh models can out-run 90 s, and engineReady stays false (every backend
+  // reads 'down', so the model lists stay empty) until something flips it.
+  void lateReadyWatch(child, lifecycleEpoch);
   return false;
+}
+
+/** Keep polling a live child after the restart timeout; flip ready when it answers. */
+async function lateReadyWatch(child: ChildProcess, epoch: number): Promise<void> {
+  while (aceProcess === child && epoch === lifecycleEpoch && !suspended
+         && child.exitCode === null && child.signalCode === null) {
+    await new Promise(r => setTimeout(r, testHooks.lateReadyPollMs));
+    if (aceProcess !== child || epoch !== lifecycleEpoch || suspended) return;
+    const up = await aceClient.isReachable();
+    // A stop or restart can land while the request is in flight; its stale
+    // success must not mark a stopped engine ready.
+    if (aceProcess !== child || epoch !== lifecycleEpoch || suspended
+        || child.exitCode !== null || child.signalCode !== null) return;
+    if (up) {
+      setEngineReady(true, 'Ready');
+      console.log('[Server] ace-server answered /health after the restart timeout — marking ready');
+      await runRestoreHooks();
+      return;
+    }
+  }
 }

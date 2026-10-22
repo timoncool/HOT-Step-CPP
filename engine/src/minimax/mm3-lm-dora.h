@@ -12,14 +12,15 @@
 // difference that lets the MM3 runtime apply DoRA properly where the DiT's
 // adapter-runtime.h only warns and defers to merge mode.
 //
-// WHAT THE DIALS DO NOT DO. The norm is computed at the adapter's own trained
-// strength (`base_scale`), not at the request's global/attn/mlp/early-mid-late
-// dials. Turning a dial still scales the delta — that is what the dial is for —
-// but it does not re-derive the normaliser, so a dialled render is DoRA's
-// direction at a different magnitude rather than a re-normalised DoRA. Baking
-// the dials in would mean re-running this pass (a full [in,out] materialisation
-// per module) on every scale change, and the dials exist precisely so that
-// changing them is free.
+// THE DIALS (2026-10-20). The norm is computed at the adapter's own trained
+// strength (`base_scale`). This pass also keeps the three row terms of
+// ||W + s*BA||^2 (n0 + 2s*n1 + s^2*n2) on the host, and
+// mm3_lm_dora_set_scales re-normalises from them for each request's dials when
+// the request opts in (MM3LmAdapterScales::dora_renorm): one [out] upload per
+// module, no second [in, out] pass. A dialled runtime render is then
+// m * (W + s*BA) / ||W + s*BA||, the W' mm3_lm_merge_apply writes for the same
+// dials. Off (the default) keeps the norm at the trained scale, the legacy
+// render, where runtime and merge disagree at any dial but 1.
 //
 // Cost: one [in, out] F32 transient per module (~200 MB at MM3's widths), a
 // rank-r GEMM, and a row reduction — a few seconds at load, once per (adapter,
@@ -30,6 +31,7 @@
 #include "mm3-model.h"
 
 #include "backend.h"
+#include "dora-common.h"
 #include "ggml.h"
 
 #include <cstdio>
@@ -113,13 +115,9 @@ static bool mm3_lm_dora_prepare(const MM3Model & m, MM3LmAdapter * ad, std::stri
             }
             // ggml_cast dequantizes, which is the point: the resident base is
             // routinely q8_0 and that is why the runtime path exists at all.
-            ggml_tensor * a_t   = ggml_cont(ctx, ggml_transpose(ctx, p.a));   // [r, in] f16
-            ggml_tensor * b32   = ggml_cast(ctx, p.b, GGML_TYPE_F32);         // [r, out]
-            ggml_tensor * delta = ggml_mul_mat(ctx, a_t, b32);                // [in, out] f32
-            ggml_tensor * basef = ggml_cast(ctx, w, GGML_TYPE_F32);
-            ggml_tensor * wd    = ggml_add(ctx, basef, ggml_scale(ctx, delta, p.base_scale));
-            ggml_tensor * nr    = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, wd)));  // [1, out]
-            ggml_tensor * outt  = ggml_reshape_1d(ctx, nr, nr->ne[1]);
+            ggml_tensor * nr   = dora_col_norm(ctx, ggml_cast(ctx, w, GGML_TYPE_F32), p.a,
+                                               ggml_cast(ctx, p.b, GGML_TYPE_F32), p.base_scale);  // [1, out]
+            ggml_tensor * outt = ggml_reshape_1d(ctx, nr, nr->ne[1]);
             ggml_set_output(outt);
 
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
@@ -137,6 +135,49 @@ static bool mm3_lm_dora_prepare(const MM3Model & m, MM3LmAdapter * ad, std::stri
             std::vector<float> host((size_t) ggml_nelements(outt));
             ggml_backend_tensor_get(outt, host.data(), 0, host.size() * sizeof(float));
             ggml_backend_tensor_set(p.nrm, host.data(), 0, host.size() * sizeof(float));
+            p.dora_nrm_base = host;
+            p.dora_nrm_s    = p.base_scale;
+            ggml_free(ctx);
+
+            // The three row terms of ||W + s*BA||^2, so a dialled request can
+            // re-normalise without another pass (mm3_lm_dora_set_scales). A
+            // second graph rather than more outputs on the first: the first
+            // stays node-for-node what it was, and the scheduler's peak is the
+            // larger of the two instead of their sum.
+            ctx = ggml_init(ip);
+            if (!ctx) {
+                if (err) {
+                    *err = "DoRA norm pass: ggml_init failed";
+                }
+                ok = false;
+                break;
+            }
+            ggml_tensor * wf = ggml_cast(ctx, w, GGML_TYPE_F32);
+            ggml_tensor * d  = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, p.a)),
+                                            ggml_cast(ctx, p.b, GGML_TYPE_F32));  // BA, [in, out]
+            ggml_mul_mat_set_prec(d, GGML_PREC_F32);
+            ggml_tensor * t[3] = { ggml_sum_rows(ctx, ggml_sqr(ctx, wf)), ggml_sum_rows(ctx, ggml_mul(ctx, wf, d)),
+                                   ggml_sum_rows(ctx, ggml_sqr(ctx, d)) };
+            gf = ggml_new_graph_custom(ctx, 64, false);
+            for (ggml_tensor * x : t) {
+                ggml_set_output(x);
+                ggml_build_forward_expand(gf, x);
+            }
+            ggml_backend_sched_reset(sched);
+            if (!ggml_backend_sched_alloc_graph(sched, gf) ||
+                ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+                if (err) {
+                    *err = "DoRA norm pass: row-term graph failed at layer " + std::to_string(l) + " (out of VRAM?)";
+                }
+                ggml_free(ctx);
+                ok = false;
+                break;
+            }
+            std::vector<float> * dst[3] = { &p.dora_n0, &p.dora_n1, &p.dora_n2 };
+            for (int k = 0; k < 3; k++) {
+                dst[k]->resize((size_t) ggml_nelements(t[k]));
+                ggml_backend_tensor_get(t[k], dst[k]->data(), 0, dst[k]->size() * sizeof(float));
+            }
             ggml_free(ctx);
             done++;
         }

@@ -9,10 +9,14 @@ models and its data folder on its own.
 
 1. `config.ts` sets the project root. If `HOT_STEP_ROOT` is set (the portable launchers set
    it), that is the root and the app runs in portable mode. Otherwise the root is two levels
-   above `server/src/`, which is the repo root.
-2. If `<root>/.env` does not exist and `<root>/.env.example` does, the example is copied to
-   `.env` on first launch, so the Settings page has a file to write to.
-3. `dotenv` loads `<root>/.env` into `process.env`. Variables already set in the shell win,
+   above `server/src/`, which is the repo root. In portable mode, `dataroot/bootstrap.ts`
+   then picks the data folder before anything opens a file; see
+   [Release data folder](#release-data-folder).
+2. If the `.env` does not exist and `<root>/.env.example` does, the example is copied to
+   `.env` on first launch, so the Settings page has a file to write to. The `.env` is
+   `<root>/.env` in a checkout and `<data folder>/settings/.env` in a release (the release
+   copy drops the example's `DATA_DIR` line).
+3. `dotenv` loads that `.env` into `process.env`. Variables already set in the shell win,
    because `dotenv` does not override them.
 4. An empty `CUDA_VISIBLE_DEVICES` is deleted from `process.env`. An empty value hides every
    GPU from child processes, and the Settings GPU picker writes exactly that for "Auto".
@@ -24,11 +28,20 @@ app runs; see [Settings page and hot reload](#settings-page-and-hot-reload).
 
 | Store | What goes there | Edited from |
 |---|---|---|
-| `<root>/.env` | Paths, ports, engine flags, GPU choice, LLM keys and endpoints, labelling throughput | Settings, Environment and AI Services tabs, or a text editor |
+| `<root>/.env` (release: `<data folder>/settings/.env`) | Paths, ports, engine flags, GPU choice, LLM keys and endpoints, labelling throughput | Settings, Environment and AI Services tabs, or a text editor |
 | SQLite `settings` table in `hotstep.db` | Active backend (`active_backend_id`), MiniMax-Music3 and YuE2 model and adapter selections, custom Lyric Studio prompts (`prompt_<name>`), the Insta-Gen system prompt (`instagen_system_prompt`), training defaults (`training_defaults_v1`), active training models (`active_models_v1`) | The matching UI controls |
 | Browser `localStorage` | Generation parameters in `ui/src/stores/globalParamsStore.ts` (keys prefixed `hs-`) and other per-browser UI state | The generation controls |
 
 ## Settings page and hot reload
+
+Settings > General > Adapters includes **Update adapter references**. This explicit
+command posts to `/api/lireek/presets/update-adapter-references` and clears missing
+adapter paths in SQLite's `album_presets`, returning each preset name, adapter field,
+and dropped path. It checks ACE files and PEFT/LoKR directories, MM3 paths under
+`<adapters>/mm3-lm-adapters`, and absolute YuE2 AR/NAR files. Other preset columns
+are preserved. It does not run at startup or change browser generation parameters.
+An unavailable adapter root or filesystem access error aborts the command; writes
+are transactional.
 
 `server/src/routes/settings.ts` exposes a whitelist of `.env` keys to the UI:
 
@@ -60,28 +73,121 @@ In the tables below, the Settings column says where a key appears:
 | `ACESTEPCPP_NOISE_PROFILE` | First `.wav` in `<root>/noise_samples/`, or empty | env only | Passed as `--noise-profile` when the file exists |
 | `DATA_DIR` | `./data` | Environment, Restart | Data folder: `hotstep.db`, `audio/`, `references/`, `vst/`, `lyrics/`, `training/`. See [How DATA_DIR resolves](#how-data_dir-resolves) |
 | `LYRICS_EXPORT_DIR` | `<data dir>/lyrics` | Environment | Where Lyric Studio exports lyrics. Hot-reloaded |
+| `DOWNLOAD_DIR` | empty | Environment | Absolute folder that `POST /api/download/:id/save` writes into. Empty keeps browser downloads. Checked (creatable, writable) when saved. Hot-reloaded |
 | `MUSCRIPTOR_MODELS_DIR` | `<data dir>/models/muscriptor` | Environment, Restart | Where MIDI Studio keeps its MuScriptor weights. Read in `services/muscriptor.ts` when the module loads |
 | `TRAINING_DIR` | `<data dir>/training` | env only | Training Studio working folder |
 | `WHISPER_EXE` | `<root>/tools/whisper/whisper-cli[.exe]` | env only | Whisper binary for lyric transcription. On macOS and Linux, the app also checks for `whisper-cli` on PATH and does not auto-download it. Install with [`brew install whisper.cpp`](https://formulae.brew.sh/formula/whisper.cpp) or set this to an existing executable path. |
 | `WHISPER_MODELS_DIR` | `<models>/whisper` | env only | Whisper model folder |
 | `ESSENTIA_BIN` | `<root>/Essentia/essentia_streaming_extractor_music[.exe]` | env only | Essentia extractor used for BPM and key analysis and dataset labelling |
 
+In a release the defaults in this table that sit under `<root>` or `<data dir>` move into the
+data folder instead: `<data dir>` is `<data folder>/library`, models and adapters are
+`<data folder>/models` and `/adapters`, Whisper is `<data folder>/tools/whisper`. A relative
+value in the release `.env` resolves against the data folder. Engine, Essentia and noise
+samples stay in the app.
+
 ### How DATA_DIR resolves
 
-`DATA_DIR` is resolved against the folder one level above the running server code, not
-against the project root:
+In a git checkout, `DATA_DIR` is resolved against `server/`, the folder one level above
+`server/src/`. The default `./data` means `server/data/`. The repo's `.env.example` sets
+`DATA_DIR=./server/data`, which is wrong for a checkout: it resolves to
+`server/server/data/` and the app starts with an empty library. In a checkout, use
+`DATA_DIR=./data` or an absolute path.
 
-- In a git checkout the server runs from `server/src/`, so the base is `server/`. The
-  default `./data` means `server/data/`.
-- In a portable release the server is bundled into `server/server.mjs`, so the base is the
-  package root. The shipped `.env.example` sets `DATA_DIR=./server/data`, which means
-  `<package>/server/data/`.
+In a release, an unset `DATA_DIR` means `<data folder>/library`, and a relative one
+resolves against the data folder.
 
-Because of this, the repo's `.env.example` value is wrong for a git checkout. If it is
-copied to `.env` there, `./server/data` resolves to `server/server/data/` and the app starts
-with an empty library. In a checkout, use `DATA_DIR=./data` or an absolute path.
+Releases before the data folder resolved it against the package root, so the shipped
+`DATA_DIR=./server/data` put the library in `<package>/server/data/`, beside the bundled
+catalogues, and no `DATA_DIR` meant `<package>/data/`. The first-run migration reads that
+install's `.env` to find which one it used.
 
 A repo-root `data/` folder is not the live data folder in either layout.
+
+### Release data folder
+
+A release keeps user data in one folder outside the app, so a new version unzipped
+elsewhere finds the same library. Code: `server/src/dataroot/` (`paths.ts` layout and
+pointer, `bootstrap.ts` start-up choice, `transfer.ts` moves and path rewrites,
+`pointer.ts` the Settings API). A checkout (no `HOT_STEP_ROOT`) uses it only once Settings has given it a data folder; see [Dev checkouts](#dev-checkouts).
+
+| Child | Holds |
+|---|---|
+| `library/` | What `DATA_DIR` held: `hotstep.db`, audio, references, stems, training, VST state, lyrics, MuScriptor |
+| `models/`, `adapters/` | Engine models (with cover art, Whisper models, TRT caches) and adapters |
+| `settings/.env` | Settings and API keys |
+| `logs/` | Session logs |
+| `tools/whisper/`, `tools/runtime/` | Whisper binary; Model Manager runtime DLLs, put on the engine's PATH through `TENSORRT_LIBS` |
+| `plugins/` | User plugin overlay |
+| `hot-step-data.json` | Marks the folder as a HOT-Step data folder |
+
+The chosen folder is recorded in `data-location.json` in the profile folder:
+`%LOCALAPPDATA%\HOT-Step\` on Windows, `~/Library/Application Support/HOT-Step/` on
+macOS, `$XDG_CONFIG_HOME/hot-step/` or `~/.config/hot-step/` on Linux. The release restart
+marker (`restart-requested`) and the transfer lock live there too.
+
+At start-up the folder is, in order: `HOT_STEP_DATA_ROOT`; the folder in
+`data-location.json`; if neither exists and this app folder still holds data from an older
+version, that data moved to `HOT-Step-Data` beside the app; otherwise a new, empty
+`HOT-Step-Data` beside the app. The move renames folders when source and destination are
+on the same drive, and copies, checks sizes, then deletes the source when they are not.
+Stored absolute paths inside the moved folders (preset adapters and references, dataset
+folders, rung checkpoints, settings, JSON request columns, JSON files under the library)
+are rewritten after a backup of the DB. Paths outside the moved folders are left alone.
+Boundaries are checked on real locations (junctions and links resolved), so a target that
+leads back into the app or the folder being moved is refused. Import carries the old
+install's settings; a `.env` the data folder already had is kept as
+`settings/.env.before-import-<id>`.
+
+Settings schedules a move, repoint, new folder or import from an older install into
+`data-location.json`; the next start carries it out before the DB opens. Scheduling is
+refused while any busy check registered with `registerBusyCheck` (`dataroot/pointer.ts`)
+reports work: generation, post-processing, stem, MIDI, cover-art and Inspire jobs
+(`registerJobsBusyCheck` on each job map for queued work, `trackBusy` on each runner until
+it settles), live streams with pending recording writes and exports, in-flight audio-queue items and
+workflow jobs, model, MuScriptor and cover-art downloads, training and the GPU lane. A new
+long-running job type registers its own check. If a saved root is missing or inaccessible,
+startup uses the default `HOT-Step-Data` beside the app and logs one warning naming both
+paths. It leaves the pointer unchanged, so reconnecting the drive and restarting uses the
+saved root again. The fallback may show an empty library; data in the saved root has not
+been moved or deleted. An unrelated or shared fallback folder still blocks startup.
+`HOT_STEP_DATA_ROOT` keeps precedence and an invalid override still blocks startup.
+The read-only `locateData()` inspector and `server/scripts/data-paths.ts` use the same
+fallback selection and report `source: "fallback"`, without creating folders or changing
+the pointer. Pending transfers remain reported as pending; finish recovery before opening
+their database.
+An unreadable pointer or a move that stops part way still prints the reason and serves
+one explanation page on `SERVER_PORT` instead of the app. Restarting retries.
+
+### Dev checkouts
+
+A checkout keeps its own paths (`.env` at the root, `DATA_DIR` against `server/`, `models/`,
+`adapters/`, `logs/`, `tools/whisper/`) until someone confirms a change in the Settings
+data-folder panel. Nothing migrates on boot. The change is recorded in the checkout's own
+pointer, `data-location.dev-<hash>.json` in the same profile folder, where `<hash>` is the
+first 12 hex digits of the SHA-256 of the checkout path (lower-cased on Windows and macOS).
+The file also holds a `checkout` field naming that path. A release never reads it, and a
+checkout never reads `data-location.json`, so each install and each checkout has its own
+pointer. Settings refuses a target that any other pointer in the profile already uses, and
+a release's first run refuses a `HOT-Step-Data` sibling that a checkout already uses.
+These compare real locations, and start-up checks them again before a transfer and
+before opening the folder.
+
+An unavailable saved dev root falls back to this checkout's original folders, with one
+warning and no pointer change. Reconnect the drive and restart to resume the saved root.
+
+**Move current data** from a checkout with no data folder moves those checkout paths with
+the same rename-or-copy rules as a release migration. Only folders inside the checkout
+move. The root `.env` becomes `settings/.env` (left behind as `.env.migrated`) with its
+engine binary paths kept, since the checkout is still the app. Planning resolves links and junctions, refuses a source or `.env` that leads outside the
+checkout or onto files git tracks, and checks again before anything moves, so
+`server/src/data` and other tracked files stay put. Once the checkout has a data folder, **Move**, **Use existing folder**,
+**Create empty data folder** and **Import previous install** work as in a release. Runtime
+DLLs stay beside the dev engine build, and restart still uses the checkout's
+`.restart-requested` marker and `server/restart-loop.cmd` (`dev.sh` on macOS), so it works when the root
+changes. A failed transfer serves its explanation page on `:3001`; the Vite UI on `:3000`
+shows only failed API calls, so read the server window. Deleting the dev pointer points the
+checkout back at its own folders; data that already moved stays in the data folder.
 
 ## Ports and hosts
 
@@ -89,6 +195,7 @@ A repo-root `data/` folder is not the live data folder in either layout.
 |---|---|---|---|
 | `SERVER_PORT` | `3001` | Environment, Restart | Port the Node server listens on. The Vite proxy in `ui/vite.config.ts` is hard-coded to `3001`, so dev mode breaks if you change it |
 | `SERVER_HOST` | `0.0.0.0` | env only | Interface the Node server binds to |
+| `GENERATION_INTENT_PATH` | `resolved` | Environment, Restart | `old` is the only rollback, keeping the legacy client builder; unset or any other value sends Create and written-song requests through Node intent resolution |
 | `ACESTEPCPP_PORT` | `8085` | Environment, Restart | Engine port. Passed as `--port`; the server connects to `http://<host>:<port>` |
 | `ACESTEPCPP_HOST` | `127.0.0.1` | Environment, Restart | Engine bind address, passed as `--host`, and the host the server connects to |
 
@@ -159,7 +266,7 @@ them are hot-reloaded when saved from Settings.
 | `OPENAI_API_KEY` | empty | AI Services | OpenAI key |
 | `OPENAI_MODEL` | `gpt-4o-mini` | AI Services | OpenAI model |
 | `ANTHROPIC_API_KEY` | empty | AI Services | Anthropic key |
-| `ANTHROPIC_MODEL` | `claude-3-5-haiku-20241022` | AI Services | Anthropic model |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | AI Services | Anthropic model |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | AI Services | Ollama server |
 | `OLLAMA_MODEL` | `llama3` | AI Services | Ollama model |
 | `LMSTUDIO_BASE_URL` | `http://localhost:1234/v1` | AI Services | LM Studio server |
@@ -168,6 +275,7 @@ them are hot-reloaded when saved from Settings.
 | `UNSLOTH_BASE_URL` | `http://127.0.0.1:8888` | AI Services | Unsloth server |
 | `UNSLOTH_USERNAME` | empty | AI Services | Unsloth login |
 | `UNSLOTH_PASSWORD` | empty | AI Services | Unsloth password |
+| `UNSLOTH_KEYLESS` | empty | AI Services | Set to `1` when a local Studio runs with its "keyless API access" setting on — no username/password needed. The provider stays hidden until this or both credentials are set |
 | `UNSLOTH_MODEL` | empty | AI Services | Unsloth model |
 | `LLAMACPP_BASE_URL` | `http://127.0.0.1:8080/v1` | AI Services | llama.cpp server |
 | `LLAMACPP_MODEL` | empty | AI Services | llama.cpp model |
@@ -214,23 +322,36 @@ Exposed in Settings → Server and hot-reloaded. Code: `server/src/services/trai
 
 A worker keeps pushed datasets under `<TRAINING_DIR>/worker-datasets/<slug>`, with the controller's dataset id and slug. Every machine records the last linked YuE2 pair per slug in `<TRAINING_DIR>/yue2-linked.json`; the controller's pull reads the worker's copy.
 
-The Workers panel calls `GET /api/workers`, which requests each worker's token-gated `GET /api/training/worker/status`. The controller compares the reported startup commit with its own Git HEAD using ancestry, and reports current, behind with commit count, or diverged. `POST /api/workers/:name/update` creates a bundle from the worker commit to local master and uploads it to the worker's token-gated `POST /api/training/worker/update`. The worker checks for queued and running jobs before the reset, then discards tracked checkout changes with submodule recursion disabled. Only when the bundle changes the recorded ggml commit does it sync the submodule URL, check out the committed HOT-ggml fork revision, and require hook verification to pass before the engine build. The checkout replaces tracked changes in `engine/ggml`; files committed in the fork remain in place. It installs dependencies when lockfiles changed, builds the UI, conditionally rebuilds the engine, and writes the restart marker last. `GET` and `DELETE /api/workers/:name/update` read progress or cancel during preparation. A worker without these endpoints needs a one-time bootstrap. The worker updater still builds without stopping the engine supervisor. The first migration to the fork requires a manual bootstrap while the worker is idle and the app and engine supervisor are stopped.
+The Workers panel calls `GET /api/workers`, which requests each worker's token-gated `GET /api/training/worker/status`. The controller compares the reported startup commit with its own Git HEAD using ancestry, and reports current, behind with commit count, or diverged. `POST /api/workers/:name/update` creates a bundle from the worker commit to local master and uploads it to the worker's token-gated `POST /api/training/worker/update`. The worker checks for queued and running jobs before the reset, then discards tracked checkout changes with submodule recursion disabled. Only when the bundle changes the recorded ggml commit does it sync the submodule URL, check out the committed HOT-ggml fork revision, and require hook verification to pass before the engine build. The checkout replaces tracked changes in `engine/ggml`; files committed in the fork remain in place. It installs dependencies when lockfiles changed, builds the UI, conditionally rebuilds the engine, and writes the restart marker last: `RESTART_MARKER_PATH` (`<root>/.restart-requested` in a checkout), the same file the restart loop (`server/restart-loop.cmd`, `dev.sh` on macOS) consumes. On macOS the updater checks hooks with `pwsh -NoProfile -File engine/verify-hooks.ps1`, runs plain `npm`, and builds with `bash engine/build-mac.sh`; Windows commands are unchanged. `GET` and `DELETE /api/workers/:name/update` read progress or cancel during preparation. A worker without these endpoints needs a one-time bootstrap. Before an engine rebuild the updater stops ace-server, which suspends the engine supervisor so it does not restart the engine mid-build. After the reset, a failed build keeps training writes returning 409 (reads still pass) until a person repairs the checkout; a failure before the reset releases the gate. The first migration to the fork requires a manual bootstrap while the worker is idle and the app and engine supervisor are stopped.
 
 ## Other variables
 
 | Variable | Default | Read in | Effect |
 |---|---|---|---|
 | `HOT_STEP_ROOT` | unset | `config.ts` | Project root. Setting it turns on portable mode, which among other things downloads the CUDA runtime DLLs on a Windows CUDA build's first launch. Set by the portable launchers `release/HOT-Step.bat` and `release/HOT-Step.sh` |
+| `HOT_STEP_DATA_ROOT` | unset | `dataroot/bootstrap.ts` | Release only. Use this data folder for this process, ignoring `data-location.json`. A scheduled move does not run while it is set |
+| `HOT_STEP_PROFILE_DIR` | unset | `dataroot/paths.ts` | Replaces the profile folder that holds `data-location.json` and the dev pointers. Meant for test fixtures |
 | `HOT_STEP_DEV` | unset | `routes/shutdown.ts` | Set by `dev.bat`. Lets `POST /api/shutdown` kill the Vite process on port 3000 after checking it is Node running Vite. Windows only |
+| `HOTSTEP_GENERATE_CAPTURE` | unset | `services/generation/requestCapture.ts` | Dev only, honoured only when `HOT_STEP_DEV` is set. `record` saves every `POST /api/generate` body as a fixture under `<data dir>/dev-captures/generate/`, then generates as normal; `capture-only` saves it and queues nothing. See [Generation API contracts](api-contracts.md#fixture-capture-dev-only) |
 | `PP_STEM_CACHE_GB` | `4` | `services/generation/stemCache.ts` | Disk budget for cached vocal and instrumental stems that the post-processing chain reuses when it runs again on the same audio. `0` disables the cache |
+| `HOTSTEP_DAW_KEY` | unset | `services/daw/dawFacade.ts` | Shared secret for the `/api/v1/daw` facade. Set = every caller, loopback and Vite-proxied included, must send it as `X-DAW-Key`. Unset = only demonstrably local callers pass: the socket and every `X-Forwarded-For`, `X-Real-IP` and `Forwarded` hop must be loopback Uploads and float32 take exports live in `<DATA_DIR>/daw_tmp/<id>/`, swept every 15 min (6 h TTL, 10 min for failed or cancelled jobs) |
 | `DOCKER_PATH_MAP` | unset | `services/pathMapper.ts` | JSON object mapping Windows path prefixes to container mount points, so presets saved on Windows work in Docker. Set in `.env.docker` |
 
 ## Other env files
 
-- `.env.docker` is copied to `/app/.env` by the `Dockerfile` and used by
+- `.env.docker` is copied to `/app/.env` by the Dockerfile's default `runtime` target and used by
   `docker-compose.yml`. It points the engine, models and adapters at container paths.
 - `tools/discord-claude/.env.example` configures the Discord bridge tool. The app does not
   read it.
+
+The `runpod` Docker target uses container environment defaults and the persistent
+`/workspace` volume instead of the local Compose path mappings. Its entrypoint
+uses `HOT_STEP_DATA_ROOT=/workspace` to link models, adapters, data and logs into
+that volume. This container guard also works without `HOT_STEP_ROOT`; the
+release-only data-root selection described above is a separate server mechanism.
+Keep `ACESTEPCPP_MODELS`, `ACESTEPCPP_ADAPTERS` and `DATA_DIR` aligned if you
+override the volume path. See the [RunPod guide](runpod.md) for the layout and
+the unauthenticated HTTP proxy warning.
 
 ## Adding a variable
 
@@ -249,3 +370,7 @@ The Workers panel calls `GET /api/workers`, which requests each worker's token-g
 - [building.md](building.md)
 - [engine.md](engine.md)
 - [api.md](api.md)
+
+### Release template and launcher contract
+
+Packagers use `release/.env.example`, leaving managed paths unset. The root `.env.example` is for dev and keeps `DATA_DIR=./server/data` and its lyric-export override. Do not copy that template into a release. `release/profile-path.mjs` mirrors `profileDir()` and `RESTART_MARKER_FILE`; keep that contract synchronized. Relative `HOT_STEP_PROFILE_DIR` overrides resolve against the launch process cwd. Ordinary data discovery uses absolute `HOT_STEP_ROOT` and the profile pointer. See [Data folder and upgrades](../user/data-folder.md).

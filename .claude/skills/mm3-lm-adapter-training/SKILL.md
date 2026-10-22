@@ -5,6 +5,10 @@ description: The validated recipe for training MiniMax-Music3 planner-LM style a
 
 # MM3 LM Adapter Training — the working recipe
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Goal this recipe is tuned for: an **album clone**. You want a generation that
 could be another track off that record. Memorisation is acceptable and in fact
 desirable; style bleed is acceptable. This is NOT tuned for a surgical trigger
@@ -123,9 +127,9 @@ samples".
 
 ```
 ace-train mm3-codes --jsonl --dataset <dataset.json> \
-  --rvq models/mm3/mm3-rvq-53kpooled-f32.gguf \
-  --enc models/mm3/mm3-enc-f16.gguf \
-  --out server/data/training/datasets/<slug>/mm3-codes
+  --rvq <data root>/models/mm3/mm3-rvq-53kpooled-f32.gguf \
+  --enc <data root>/models/mm3/mm3-enc-f16.gguf \
+  --out <data root>/library/training/datasets/<slug>/mm3-codes
 ```
 
 ~1 minute for 12 whole tracks. Writes `<out>/codes/<id>.codes`.

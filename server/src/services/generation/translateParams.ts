@@ -105,6 +105,19 @@ export function translateParams(params: any): AceRequest {
     req.lm_seed = params.lmSeed;
   }
 
+  // Seed breeding: slerp the DiT initial noise toward a second seed.
+  if (params.seedB !== undefined && params.seedB !== null && params.seedB !== '' && Number(params.seedB) >= 0) {
+    req.seed_b = Math.floor(Number(params.seedB));
+    if (params.seedBlend !== undefined) {
+      req.seed_blend = Math.min(1, Math.max(0, Number(params.seedBlend) || 0));
+    }
+    // Seed morph: time-varying blend, seedBlend at the start -> seedBlendEnd at the end.
+    if (params.seedBlendEnd !== undefined && params.seedBlendEnd !== null && params.seedBlendEnd !== ''
+        && Number(params.seedBlendEnd) >= 0) {
+      req.seed_blend_end = Math.min(1, Number(params.seedBlendEnd));
+    }
+  }
+
   // Batch
   if (params.batchSize) req.lm_batch_size = params.batchSize;
 
@@ -209,6 +222,7 @@ export function translateParams(params: any): AceRequest {
   if (params.adapterGroupScales) req.adapter_group_scales = params.adapterGroupScales;
   if (params.adapterMode) req.adapter_mode = params.adapterMode;
   if (params.adapterRuntimeQuant) req.adapter_runtime_quant = params.adapterRuntimeQuant;
+  if (params.adapterRuntimeDora === true) req.adapter_runtime_dora = true;
   if (params.adapterMergeLowVram) req.adapter_merge_lowvram = true;
 
   // Per-section adapter masking (regional LoRA): parse inline [Section]{k=v} directives

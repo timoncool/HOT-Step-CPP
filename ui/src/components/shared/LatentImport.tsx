@@ -6,6 +6,7 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { FileAudio, X, Loader2, Layers } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useUpload } from '../../queries/writes';
 
 export interface LatentMetadata {
   bpm?: number;
@@ -33,33 +34,25 @@ export const LatentImport: React.FC<LatentImportProps> = ({
   latentUrl, onLatentLoaded, onClear, className = '',
 }) => {
   const { t } = useTranslation();
-  const [isUploading, setIsUploading] = useState(false);
+  const { mutate: uploadLatent, isPending: isUploading } = useUpload<{ filename?: string; metadata?: LatentMetadata | null; latent_url: string }>();
   const [error, setError] = useState('');
   const [loadedFilename, setLoadedFilename] = useState('');
   const [loadedMeta, setLoadedMeta] = useState<LatentMetadata | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const handleFile = useCallback(async (file: File) => {
+  const handleFile = useCallback((file: File) => {
     setError('');
-    setIsUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append('latent', file);
-      const res = await fetch('/api/upload/latent', { method: 'POST', body: fd });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: res.statusText }));
-        throw new Error(err.error || `Upload failed: ${res.status}`);
-      }
-      const data = await res.json();
-      setLoadedFilename(data.filename || file.name);
-      setLoadedMeta(data.metadata || null);
-      onLatentLoaded(data.latent_url, data.metadata || {});
-    } catch (err: any) {
-      setError(err.message || t('latent.uploadFailed'));
-    } finally {
-      setIsUploading(false);
-    }
-  }, [onLatentLoaded]);
+    uploadLatent({
+      path: '/upload/latent',
+      files: [{ field: 'latent', file }],
+      onSuccess: data => {
+        setLoadedFilename(data.filename || file.name);
+        setLoadedMeta(data.metadata || null);
+        onLatentLoaded(data.latent_url, data.metadata || {});
+      },
+      onError: err => setError(err instanceof Error && err.message ? err.message : t('latent.uploadFailed')),
+    });
+  }, [onLatentLoaded, uploadLatent, t]);
 
   const handleClear = useCallback(() => {
     setLoadedFilename('');

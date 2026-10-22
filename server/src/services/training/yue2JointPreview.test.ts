@@ -15,11 +15,13 @@ test('preview options default off and clamp bounded values', () => {
   const d = parseYue2JointPreviewOptions(undefined, 50);
   assert.equal(d.enabled, false);
   assert.equal(d.everySteps, 50);
+  assert.equal(d.arScale, 0.6);
+  for (const arScale of [-1, NaN, Infinity, '0.8', null]) assert.equal(parseYue2JointPreviewOptions({ arScale }, 50).arScale, 0.6);
   const p = parseYue2JointPreviewOptions({ enabled: true, everySteps: 10, seconds: 999,
     previewMaxFrames: 9000, seed: 3, caption: '  song  ' }, 50);
   assert.deepEqual({ enabled: true, everySteps: 10, seconds: 90,
     previewMaxFrames: 9000, seed: 3, baseline: false, control: false,
-    caption: 'song' }, p);
+    caption: 'song', arScale: 0.6 }, p);
 });
 
 test('preview catalogue is durable and rejects traversal', () => {
@@ -88,6 +90,38 @@ test('renderer uses selected style/lyrics, writes audio, and restores selection'
   // Files carry the seed (takes at one step never overwrite each other).
   // (plus `-p<planSeed>` when a plan was recorded).
   assert.ok(fs.readdirSync(path.join(f.output, 'previews')).some(n => n.startsWith(`step-4-artist-s${YUE2_JOINT_PREVIEW_DEFAULTS.seed}`) && n.endsWith('.wav')));
+});
+
+test('previews render with the sampler snapshot, and junk keys are dropped', async () => {
+  const opts = parseYue2JointPreviewOptions({ sampler: { yue2PlanTemperature: 0.7, yue2SemRepPenalty: 1.1,
+    yue2CfgScale: '1.5', ditModel: 'x', yue2SemTopK: Infinity } }, 50);
+  assert.deepEqual(opts.sampler, { yue2PlanTemperature: 0.7, yue2SemRepPenalty: 1.1, yue2CfgScale: '1.5' });
+  const f = previewFixture();
+  const { deps, calls } = mockDeps();
+  await renderYue2JointPreview({ output: f.output, dataset: f.dataset, step: 4,
+    options: { ...YUE2_JOINT_PREVIEW_DEFAULTS, enabled: true, sampler: opts.sampler },
+    arAdapter: 'ar.safetensors', narAdapter: 'nar.safetensors', deps });
+  const synths = calls.filter(c => c.name === 'synth').map(c => c.value as any);
+  assert.ok(synths.length >= 2);  // the plan and the render
+  for (const s of synths) {
+    assert.equal(s.plan_temperature, 0.7);
+    assert.equal(s.semantic_repetition_penalty, 1.1);
+    assert.equal(s.cfg_scale, 1.5);
+  }
+});
+
+test('previews clamp composer temperature to 1.0 when Top-K is unlimited', async () => {
+  const f = previewFixture();
+  const { deps, calls } = mockDeps();
+  await renderYue2JointPreview({ output: f.output, dataset: f.dataset, step: 4,
+    options: { ...YUE2_JOINT_PREVIEW_DEFAULTS, enabled: true, sampler: { yue2SemTopK: 0, yue2SemTemperature: 1.4 } },
+    arAdapter: 'ar.safetensors', narAdapter: 'nar.safetensors', deps });
+  const synths = calls.filter(c => c.name === 'synth').map(c => c.value as any);
+  assert.ok(synths.length >= 1);
+  for (const s of synths) {
+    assert.equal(s.semantic_top_k, 0);
+    assert.equal(s.semantic_temperature, 1);
+  }
 });
 
 test('with no song picked, renderer skips an instrumental first track', async () => {
@@ -207,4 +241,21 @@ test('a preview gets one cached MP3 beside its WAV, and pruning removes both', a
   assert.equal(fs.existsSync(file), false);
   assert.equal(fs.existsSync(a!), false);
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+
+test('preview AR scale defaults to 0.6 and reaches adapter selection with NAR at unity', async () => {
+  for (const arScale of [undefined, 0, 0.85]) {
+    const f = previewFixture();
+    const { deps, calls } = mockDeps();
+    const options = parseYue2JointPreviewOptions({ enabled: true, arScale }, 50);
+    await renderYue2JointPreview({ output: f.output, dataset: f.dataset, step: 4,
+      options, arAdapter: 'ar.safetensors', narAdapter: 'nar.safetensors', deps });
+    const selected = calls.find(c => c.name === 'select')?.value as { lm_adapter: Array<{ path: string; scales: Record<string, number> }> };
+    const unity = { global: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1 };
+    assert.deepEqual(selected.lm_adapter, [
+      { path: 'ar.safetensors', scales: { ...unity, global: arScale ?? 0.6 } },
+      { path: 'nar.safetensors', scales: unity },
+    ]);
+  }
 });

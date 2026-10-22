@@ -5,6 +5,10 @@ description: Defines the verification bar every HOT-Step CPP change must clear b
 
 # Validating Changes to the Required Standard
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 HOT-Step CPP is a 3-tier app: a C++17/CUDA/GGML **engine** (`engine/`, spawned as
 `ace-server.exe` on port 8085), a Node/TypeScript/Express **server** (`server/src/`,
 port 3001), and a React 19 **UI** (`ui/src/`, Vite dev server on port 3000). Agents run the
@@ -101,7 +105,7 @@ cd D:\Ace-Step-Latest\hot-step-cpp\ui; npx tsc -b
 - In dev mode (`dev.bat`) the server runs under `tsx watch` (`server/package.json`
   `"dev": "tsx watch src/index.ts"`) — it auto-restarts on save. Server-side bar =
   passing tsc **plus** a clean restart visible in the newest
-  `logs/<session>/node_console.log` (no stack trace after the restart).
+  `<data root>/logs/<session>/node_console.log` (no stack trace after the restart).
 
 ## Tier 2 — C++ engine
 
@@ -123,7 +127,7 @@ Bar: rebuild compiles AND the engine starts clean after relaunch (log check).
    `http://localhost:3000` before any runtime verification. `LAUNCH.bat` is the end-user prod
    launcher — agents don't run it.
 
-3. Clean-start check — read the newest `logs/<session>/ace_engine.log` and confirm:
+3. Clean-start check — read the newest `<data root>/logs/<session>/ace_engine.log` and confirm:
    - model registry scan ran (`[Server] Scanning models in ...` / `[Registry] ...` lines),
    - `[Server] Listening on 127.0.0.1:8085` appears,
    - no crash/exception before the Listening line,
@@ -131,7 +135,7 @@ Bar: rebuild compiles AND the engine starts clean after relaunch (log check).
      (that exact string = crash respawn, `server/src/index.ts:304`).
 
    ```powershell
-   $sess = (Get-ChildItem D:\Ace-Step-Latest\hot-step-cpp\logs | Sort-Object Name -Descending | Select-Object -First 1).FullName
+   $sess = (Get-ChildItem <data root>/logs | Sort-Object Name -Descending | Select-Object -First 1).FullName
    Select-String -Path "$sess\ace_engine.log" -Pattern 'Listening on'
    Select-String -Path "$sess\node_console.log" -Pattern 'Restarting in 3 seconds'
    ```
@@ -162,7 +166,7 @@ user to look and wait for their screenshot/feedback.
 
 Bar: **the human's ear.** There is no mechanical substitute — see Golden rules 1–2.
 Your job ends at: generation succeeded mechanically, here is the file path
-(`server/data/audio/<uuid>.wav` or `http://localhost:3000/audio/<uuid>.wav` in dev), here
+(`<data root>/library/audio/<uuid>.wav` or `http://localhost:3000/audio/<uuid>.wav` in dev), here
 are the seed and params for reproduction. Then wait.
 
 ## Tier 5 — End-to-end headless smoke generation
@@ -230,18 +234,18 @@ Full request/response/log detail: [reference.md](reference.md).
    There is 1 automatic retry with a randomized seed on transient failure.
 
 6. **Confirm outputs.** On success `$s.result.audioUrls` is like
-   `["/audio/<uuid>.wav"]`. **The live data dir is `server\data`, NOT the repo-root
+   `["/audio/<uuid>.wav"]`. **The live data dir is `<data root>/library`, NOT the repo-root
    `data\`** (verified: `config.data.dir` resolves relative to `server/src`,
    `server/src/config.ts:191-199`; root `data/` is stale/legacy — never "verify"
-   outputs there). Files land in `server\data\audio\`; DB row in the `songs` table
-   of `server\data\hotstep.db` with the full request in `generation_params`.
+   outputs there). Files land in `<data root>/library\audio\`; DB row in the `songs` table
+   of `<data root>/library\hotstep.db` with the full request in `generation_params`.
 
 7. **Confirm the log.** Per-generation logs are buffered in memory and flushed
    **only at finish/fail** — mid-run, tail `node_console.log` (lines prefixed
    `[Gen:<jobId8>]`) or `ace_engine.log` instead.
 
    ```powershell
-   $sess = (Get-ChildItem D:\Ace-Step-Latest\hot-step-cpp\logs | Sort-Object Name -Descending | Select-Object -First 1).FullName
+   $sess = (Get-ChildItem <data root>/logs | Sort-Object Name -Descending | Select-Object -First 1).FullName
    Get-Content (Get-ChildItem "$sess\generations" | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName -Tail 40
    ```
 
@@ -324,9 +328,9 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
 | `server/src/services/generation/translateParams.ts` | UI param names → engine `AceRequest` names |
 | `server/src/services/aceClient.ts` | HTTP client to ace-server :8085 (single-threaded httplib caveat) |
 | `server/src/services/logger.ts` | Session log folders + buffered per-generation logs |
-| `server/src/config.ts` | Ports, paths; `config.data.dir` = `server/data` |
-| `logs/YYYY-MM-DD_HH-MM-SS/` | Per-session logs: `ace_engine.log`, `node_console.log`, `generations/gen_<jobId>_<task>.log` |
-| `server/data/audio/` | Where generated audio actually lands |
+| `server/src/config.ts` | Ports, paths; `config.data.dir` = `<data root>/library` |
+| `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` | Per-session logs: `ace_engine.log`, `node_console.log`, `generations/gen_<jobId>_<task>.log` |
+| `<data root>/library/audio/` | Where generated audio actually lands |
 
 ## Failure signatures
 
@@ -342,7 +346,7 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
 | Adapter/sideband params vanish between LM and synth phases | LM echo drops ServerFields-only params; synth requests are rebuilt from the current request + LM fields only (`generate.ts:312-328`) — new sideband params must flow through that reconstruction, never a whitelist |
 | First run stuck on `Building TRT engine` 5–10 min | normal one-time TensorRT compile, not a hang |
 | HTTP timeouts against :8085 during a generation | normal — ace-server is single-threaded httplib and can't answer mid-DiT-step (`aceClient.ts:6-8`) |
-| Output file "missing" from repo-root `data\` | wrong directory — live outputs are in `server\data\audio\` |
+| Output file "missing" from repo-root `data\` | wrong directory — live outputs are in `<data root>/library\audio\` |
 
 ## Institutional knowledge
 
@@ -353,7 +357,7 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
   output pasted; skipped = SKIPPED with reason; no hedged "should work".
 - **VALIDATED:** audio quality is human-ear-only; `quality_scores` telemetry is
   advisory, never a verdict.
-- **VALIDATED:** live data dir is `server\data`, root `data\` is stale
+- **VALIDATED:** live data dir is `<data root>/library`, root `data\` is stale
   (`config.ts:191-199` + runtime log confirm).
 - **VALIDATED:** `verify-hooks.ps1` checks 5 hooks, not the 3 CLAUDE.md lists —
   the script is the truth.
@@ -382,3 +386,7 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
   multi-platform CI build — never push casual `v*` tags).
 - `docs/plans/` — internal design/investigation docs. **Gitignored, local-only —
   may be absent on a fresh clone.**
+
+## Release layout checks
+
+The prereq script checks each CI platform and both local assemblers through `release/check-layout.mjs`, then runs `server/scripts/release-layout.test.ts` with isolated profile/data fixtures. The Windows fixture runs the launcher against a stub server from another cwd. Linux/macOS default-path fixtures and shell syntax checks are not native engine coverage. Report a Cache Warm gate failure separately from layout/Hugging Face checks.

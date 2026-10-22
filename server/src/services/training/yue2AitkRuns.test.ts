@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { checkpointRecords } from './yue2AitkRuns.js';
+import { checkpointRecords, isCheckpointLadder } from './yue2AitkRuns.js';
 import { readYue2ArRun } from './yue2ArRuns.js';
 import { readYue2Run } from './yue2Runs.js';
 import { uniqueDatasetTrigger } from './datasetTrigger.js';
@@ -50,6 +50,24 @@ test('AITK checkpoint discovery exposes combined and native AR/NAR outputs', () 
     assert.equal(rows[0].arPath, path.join(step10, 'native-ar.safetensors'));
     assert.equal(rows[0].narPath, path.join(step10, 'native-nar.safetensors'));
     assert.equal(rows[1].adapterPath, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('AITK checkpoint discovery finds trigger-named AR/NAR weights (#220)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yue2-aitk-runs-'));
+  try {
+    const step37 = path.join(root, 'checkpoint-step37');
+    const step5 = path.join(root, 'checkpoint-step5');
+    fs.mkdirSync(step37); fs.mkdirSync(step5);
+    for (const name of ['my-band_yue2_joint_ar_step37.safetensors', 'my-band_yue2_joint_nar_step37.safetensors']) fs.writeFileSync(path.join(step37, name), 'x');
+    fs.writeFileSync(path.join(step5, 'yue2_joint_nar_step5.safetensors'), 'x');
+    const rows = checkpointRecords(root);
+    assert.equal(rows[0].arPath, path.join(step37, 'my-band_yue2_joint_ar_step37.safetensors'));
+    assert.equal(rows[0].narPath, path.join(step37, 'my-band_yue2_joint_nar_step37.safetensors'));
+    assert.equal(rows[1].arPath, undefined, 'a NAR file is never taken for the AR half');
+    assert.equal(rows[1].narPath, path.join(step5, 'yue2_joint_nar_step5.safetensors'));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -253,4 +271,11 @@ test('startup reconcile only interrupts a local running row, never a remote-orig
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('base-matched and fixed-recipe runs are checkpoint ladders; tuned runs are not', () => {
+  assert.equal(isCheckpointLadder({ method: 'base-matched' }), true);
+  assert.equal(isCheckpointLadder({ method: 'fixed-recipe' }), true);
+  assert.equal(isCheckpointLadder({ method: 'tuned' }), false);
+  assert.equal(isCheckpointLadder(undefined), false);
 });

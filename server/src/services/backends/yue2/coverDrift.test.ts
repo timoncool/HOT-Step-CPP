@@ -24,7 +24,7 @@ function word(text: string, start: number, end: number): Yue2AlignWord {
 }
 
 test('perfect alignment has zero offsets on the score meter and beat grid', () => {
-  assert.equal(COVER_DRIFT_METRIC_VERSION, 4);
+  assert.equal(COVER_DRIFT_METRIC_VERSION, 5);
   const result = measureCoverDrift(score, score, lyrics, [word('first', 0, 0.5), word('second', 6, 6.5)]);
   assert.equal(result.secondsPerBar, 3); // 3/4 is six eighth notes at 120/min.
   assert.deepEqual(result.sections.map(s => [s.startBar, s.endBar]), [[1, 2], [3, 4]]);
@@ -105,10 +105,52 @@ test('matches sung labels in order while skipping instrumental tags and score ga
   const result = measureCoverDrift(abc, abc, text, [at('one', 0), at('two', 8), at('three', 12)]);
   assert.deepEqual(result.sections.map(row => row.lyricTag), ['Verse 1', null, 'Chorus', 'Verse 2']);
   assert.deepEqual(result.sections.map(row => row.unscoredReason),
-    [null, 'no_matching_lyric_tag', null, null]);
+    [null, 'no_vocal_note', null, null]);
   assert.deepEqual(result.sections.map(row => row.offsetBars), [0, null, 0, 0]);
   assert.equal(result.sungLyricBlocks, 3);
   assert.deepEqual(result.unmatchedLyricBlocks, []);
+  assert.equal(result.sectionWarning, null);
+});
+
+test('sung intros, interludes, solos and outros are measured regardless of their names', () => {
+  const labels = ['intro', 'interlude', 'solo', 'outro'];
+  const abc = ['X:1', 'M:4/4', 'L:1/4', 'Q:1/4=60', 'K:C',
+    ...labels.flatMap(label => [`% ${label}`, 'V: Vocal', 'C4|']), ''].join('\n');
+  const text = '[Intro - Instrumental]\none\n[Interlude]\ntwo\n[Solo]\nthree\n[Outro]\nfour';
+  const words = ['one', 'two', 'three', 'four'].map((value, index) => {
+    const char0 = text.indexOf(value);
+    return { char0, char1: char0 + value.length, start: index * 4, end: index * 4 + 0.5, score: 0.9 };
+  });
+  const result = measureCoverDrift(abc, abc, text, words);
+  assert.deepEqual(result.sections.map(row => row.offsetBars), [0, 0, 0, 0]);
+  assert.deepEqual(result.unmatchedLyricBlocks, []);
+  assert.equal(result.sectionWarning, null);
+});
+
+test('empty lyric blocks retain their place before repeated sung sections', () => {
+  const abc = ['X:1', 'M:4/4', 'L:1/4', 'Q:1/4=60', 'K:C',
+    '% verse', 'V: Vocal', 'C4|', '% verse', 'V: Vocal', 'D4|', ''].join('\n');
+  const text = '[Verse 1]\n[Verse 2]\nsing';
+  const result = measureCoverDrift(abc, abc, text,
+    [{ char0: text.indexOf('sing'), char1: text.length, start: 4, end: 4.5, score: 0.9 }]);
+  assert.deepEqual(result.sections.map(row => row.lyricTag), ['Verse 1', 'Verse 2']);
+  assert.deepEqual(result.sections.map(row => row.unscoredReason), ['no_matching_lyric_tag', null]);
+  assert.deepEqual(result.sections.map(row => row.offsetBars), [null, 0]);
+  assert.equal(result.meanAbsoluteOffsetBars, 0);
+  assert.equal(result.sectionWarning, null);
+});
+
+test('rest-only and untagged instrumental sections do not raise missing-tag warnings', () => {
+  const abc = ['X:1', 'M:4/4', 'L:1/4', 'Q:1/4=60', 'K:C',
+    '% intro', 'V: Vocal', 'z4|', '% verse', 'V: Vocal', 'C4|',
+    '% outro', 'V: Vocal', 'D4|', ''].join('\n');
+  const result = measureCoverDrift(abc, abc, '[Verse]\nsing',
+    [{ char0: 8, char1: 12, start: 4, end: 4.5, score: 0.9 }]);
+  assert.deepEqual(result.sections.map(row => row.unscoredReason),
+    ['no_vocal_note', null, 'no_matching_lyric_tag']);
+  assert.deepEqual(result.sections.map(row => row.offsetBars), [null, 0, null]);
+  assert.equal(result.meanAbsoluteOffsetBars, 0);
+  assert.equal(result.sectionWarning, null);
 });
 
 test('lists sung lyric blocks that cannot match a score label or order', () => {
@@ -134,7 +176,7 @@ test('D2 tag order keeps Pre-Chorus blocks out of score Chorus sections', () => 
     '[Chorus]', 'chorus three', '[Outro - Instrumental]'].join('\n');
   const result = measureCoverDrift(abc, abc, text, []);
   assert.deepEqual(result.sections.map(row => row.lyricTag),
-    [null, 'Verse 1', 'Chorus', null, 'Verse 2', 'Chorus', null, 'Bridge', 'Chorus', null]);
+    ['Intro - Instrumental', 'Verse 1', 'Chorus', null, 'Verse 2', 'Chorus', null, 'Bridge', 'Chorus', null]);
   assert.deepEqual(result.unmatchedLyricBlocks,
     [{ index: 3, label: 'Pre-Chorus' }, { index: 6, label: 'Pre-Chorus' }]);
 });

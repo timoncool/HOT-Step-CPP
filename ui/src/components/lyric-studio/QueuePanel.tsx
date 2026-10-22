@@ -1,3 +1,6 @@
+import { serverKey } from '../../queries/keys';
+import { useQuery } from '@tanstack/react-query';
+import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 /**
  * QueuePanel.tsx — Bulk operations panel for Lyric Studio V2.
  *
@@ -16,7 +19,7 @@
  * 'generate' keys selection by profile_id, 'audio' keys it by lyrics_set_id.
  */
 
-import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   X, Loader2, CheckCircle, AlertCircle, ListOrdered, Sparkles,
@@ -34,7 +37,8 @@ import type { QueueItemType } from '../../stores/streamingStore';
 import { lireekApi } from '../../services/lireekApi';
 import { adapterApi } from '../../services/api';
 import type { Artist, LyricsSet, Profile, AlbumPreset, Generation } from '../../services/lireekApi';
-import { enqueueAudioGen } from '../../stores/audioGenQueueStore';
+import { captureWrittenSongIntent } from '../../stores/audioGenQueueStore';
+import { lyricWorkflowApi } from '../../services/lyricWorkflowApi';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { useAuth } from '../../context/AuthContext';
 import { FileBrowserModal } from '../shared/FileBrowserModal';
@@ -125,16 +129,27 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const [genFillMode, setGenFillMode] = useState(false);
   const [genFillTarget, setGenFillTarget] = useState(10);
   const [genNoThink, setGenNoThink] = useState(false);
+  // Artists run side by side in a bulk profile/lyric run (per browser).
+  const [lyricConcurrency, setLyricConcurrency] = useState(() => {
+    try { return Math.max(1, Math.min(16, parseInt(localStorage.getItem('hs-lyricConcurrency') || '1') || 1)); } catch { return 1; }
+  });
+  const changeLyricConcurrency = (value: number) => {
+    const next = Math.max(1, Math.min(16, value || 1));
+    setLyricConcurrency(next);
+    try { localStorage.setItem('hs-lyricConcurrency', String(next)); } catch { /* per-browser convenience only */ }
+  };
 
   // Generation counts for the "generate" tab
-  const [genCountsMap, setGenCountsMap] = useState<Map<number, number>>(new Map());
-  const [genCountsLoading, setGenCountsLoading] = useState(false);
+  const generationQuery = useQuery({ ...snapshotOptions<Generation[] | { generations: Generation[] }>('lireek', '/lireek/generations/all'), enabled: open && (mode === 'audio' || mode === 'generate') });
+  const audioGens = Array.isArray(generationQuery.data) ? generationQuery.data : generationQuery.data?.generations ?? [];
+  const genCountsMap = new Map<number, number>();
+  for (const generation of audioGens) genCountsMap.set(generation.profile_id, (genCountsMap.get(generation.profile_id) ?? 0) + 1);
+  const genCountsLoading = generationQuery.isPending;
   const [genFilterThreshold, setGenFilterThreshold] = useState('');
 
   // Generate Audio state. `audioAllTracks` off means "take N per album", and only
   // then does the oldest/newest choice mean anything.
-  const [audioGens, setAudioGens] = useState<Generation[]>([]);
-  const [audioLoading, setAudioLoading] = useState(false);
+  const audioLoading = generationQuery.isPending;
   const [audioAllTracks, setAudioAllTracks] = useState(true);
   const [audioCount, setAudioCount] = useState(1);
   const [audioOrder, setAudioOrder] = useState<AudioOrder>('newest');
@@ -147,8 +162,9 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const [audioProgress, setAudioProgress] = useState({ current: 0, total: 0 });
 
   // Presets state
-  const [presetMap, setPresetMap] = useState<Map<number, AlbumPreset>>(new Map());
-  const [presetsLoading, setPresetsLoading] = useState(false);
+  const presetQuery = useQuery({ ...snapshotOptions<{ presets: AlbumPreset[] }>('lireek', '/lireek/presets'), enabled: open });
+  const presetMap = new Map((presetQuery.data?.presets ?? []).map(p => [p.lyrics_set_id, p]));
+  const presetsLoading = presetQuery.isFetching;
   const [applying, setApplying] = useState(false);
   const [adapterPath, setAdapterPath] = useState('');
   const [matcheringPath, setMatcheringPath] = useState('');
@@ -162,14 +178,14 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const [browserTarget, setBrowserTarget] = useState<'adapter' | 'matchering'>('adapter');
   // Planner-LM adapter bulk assignment (local HOT-Step feature)
   const [lmAdapterPath, setLmAdapterPath] = useState('');
-  const [lmAdapterList, setLmAdapterList] = useState<{ name: string; path: string }[]>([]);
-  useEffect(() => {
-    if (mode !== 'presets') return;
-    // Same scan folder the global Adapters menu uses (persisted store value)
-    let folder = '';
-    try { folder = JSON.parse(localStorage.getItem('hs-lmAdapterFolder') || '""') || ''; } catch { /* default */ }
-    adapterApi.lmList(folder || undefined).then(r => setLmAdapterList(r?.adapters || [])).catch(() => {});
-  }, [mode]);
+  let lmFolder = '';
+  try { lmFolder = JSON.parse(localStorage.getItem('hs-lmAdapterFolder') || '""') || ''; } catch { /* default */ }
+  const lmQuery = useQuery({
+    queryKey: serverKey('global-models/lm-adapters', { filters: { folder: lmFolder } }),
+    queryFn: ({ signal }) => adapterApi.lmList(lmFolder || undefined, { signal }),
+    enabled: open && mode === 'presets',
+  });
+  const lmAdapterList = lmQuery.data?.adapters ?? [];
 
   // Fetch lyrics state
   const [fetchInputMode, setFetchInputMode] = useState<FetchInputMode>('paste');
@@ -178,63 +194,11 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const [fetchMaxSongs, setFetchMaxSongs] = useState(50);
   const [fetchQueue, setFetchQueue] = useState<FetchQueueItem[]>([]);
   const [fetchRunning, setFetchRunning] = useState(false);
-  const fetchAbortRef = useRef(false);
+  const fetchJobRef = useRef<string | null>(null);
 
-  const loadPresets = useCallback(async () => {
-    setPresetsLoading(true);
-    try {
-      const res = await lireekApi.listAllPresets();
-      const map = new Map<number, AlbumPreset>();
-      for (const p of res.presets) map.set(p.lyrics_set_id, p);
-      setPresetMap(map);
-    } catch (err) {
-      console.error('[QueuePanel] Failed to load presets:', err);
-    } finally {
-      setPresetsLoading(false);
-    }
-  }, []);
-
-  const loadGenerationCounts = useCallback(async () => {
-    setGenCountsLoading(true);
-    try {
-      const res = await lireekApi.listAllGenerations();
-      // API returns raw array (server) but type says { generations }, handle both
-      const gens = Array.isArray(res) ? res : (res.generations || []);
-      const counts = new Map<number, number>();
-      for (const g of gens) {
-        counts.set(g.profile_id, (counts.get(g.profile_id) || 0) + 1);
-      }
-      setGenCountsMap(counts);
-    } catch (err) {
-      console.error('[QueuePanel] Failed to load generation counts:', err);
-    } finally {
-      setGenCountsLoading(false);
-    }
-  }, []);
-
-  const loadAudioGenerations = useCallback(async () => {
-    setAudioLoading(true);
-    try {
-      const res = await lireekApi.listAllGenerations();
-      // Server hands back a raw array; the declared type says { generations }. Both happen.
-      const gens: Generation[] = Array.isArray(res) ? res : (res.generations || []);
-      setAudioGens(gens);
-    } catch (err) {
-      console.error('[QueuePanel] Failed to load generations:', err);
-      showToast?.(`Failed to load written songs: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      setAudioLoading(false);
-    }
-  }, [showToast]);
-
-  // Refetch whenever the panel is OPEN on the audio tab — not just on tab click.
-  // The panel stays mounted across closes (state persists), and lyrics written
-  // by the MCP bypass the UI stores entirely, so a reopen straight onto this
-  // tab used to show the previous open's list: "Newest first" then honestly
-  // picked the newest of a STALE list, i.e. older songs. (Rob, 2026-08-08)
-  useEffect(() => {
-    if (open && mode === 'audio') loadAudioGenerations();
-  }, [open, mode, loadAudioGenerations]);
+  const loadPresets = useCallback(async () => { await presetQuery.refetch(); }, [presetQuery.refetch]);
+  const loadAudioGenerations = useCallback(async () => { await generationQuery.refetch(); }, [generationQuery.refetch]);
+  const loadGenerationCounts = useCallback(async () => { await lireekApi.listAllGenerations(); }, []);
 
   // Written songs folded into one row per album. /generations/all returns artist_id and
   // artist_name but NOT lyrics_set_id, so the album is recovered via the profile — which
@@ -326,6 +290,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   };
 
   const startFetchQueue = async () => {
+    if (!token) { showToast?.('Not authenticated'); return; }
     const entries = fetchInputMode === 'paste' ? parsePasteText(pasteText) : structuredRows.filter(r => r.artist.trim().length > 0);
     if (entries.length === 0) { showToast?.('No valid entries to fetch'); return; }
 
@@ -341,25 +306,46 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
 
     setFetchQueue(items);
     setFetchRunning(true);
-    fetchAbortRef.current = false;
-    let completed = 0, failed = 0, skipped = 0;
-
-    for (let i = 0; i < items.length; i++) {
-      if (fetchAbortRef.current) break;
-      const item = items[i];
-      if (item.status === 'skipped') { skipped++; continue; }
-      setFetchQueue(prev => prev.map((q, qi) => qi === i ? { ...q, status: 'running' } : q));
-      try {
-        const res = await lireekApi.fetchLyrics({ artist: item.artist, album: item.album || undefined, max_songs: fetchMaxSongs });
-        completed++;
-        setFetchQueue(prev => prev.map((q, qi) => qi === i ? { ...q, status: 'done', songsFetched: res.songs_fetched } : q));
-      } catch (err: any) {
-        failed++;
-        setFetchQueue(prev => prev.map((q, qi) => qi === i ? { ...q, status: 'error', error: err.message || 'Fetch failed' } : q));
+    const pending = items.map((item, index) => ({ item, index })).filter(({ item }) => item.status === 'pending');
+    let completed = 0, failed = 0;
+    const skipped = items.length - pending.length;
+    try {
+      if (pending.length) {
+        const job = await lyricWorkflowApi.submitBatch(pending.map(({ item }) => ({ type: 'fetch', artist: item.artist, album: item.album, maxSongs: fetchMaxSongs })));
+        fetchJobRef.current = job.id;
+        const status = await lyricWorkflowApi.follow(job.id, {
+          onEvent: event => {
+            const data = event.data as { index?: number; value?: { songs_fetched?: number }; error?: string } | null;
+            const row = data?.index === undefined ? undefined : pending[data.index];
+            if (!row) return;
+            if (event.type === 'item-start') setFetchQueue(prev => prev.map((q, i) => i === row.index ? { ...q, status: 'running' } : q));
+            if (event.type === 'item-result') { completed++; setFetchQueue(prev => prev.map((q, i) => i === row.index ? { ...q, status: 'done', songsFetched: data?.value?.songs_fetched } : q)); }
+            if (event.type === 'item-error') { failed++; setFetchQueue(prev => prev.map((q, i) => i === row.index ? { ...q, status: 'error', error: data?.error || 'Fetch failed' } : q)); }
+          },
+        });
+        if (status === 'succeeded') {
+          const final = await lyricWorkflowApi.get(job.id);
+          const results = (final.job.result as { results?: Array<{ index: number; status: 'done' | 'error'; value?: { songs_fetched?: number }; error?: string }> } | null)?.results || [];
+          completed = results.filter(result => result.status === 'done').length;
+          failed = results.filter(result => result.status === 'error').length;
+          setFetchQueue(prev => prev.map((q, i) => {
+            const index = pending.findIndex(row => row.index === i);
+            const result = results.find(r => r.index === index);
+            return result ? { ...q, status: result.status, songsFetched: result.value?.songs_fetched, error: result.error } : q;
+          }));
+        } else {
+          setFetchQueue(prev => prev.map(q => q.status === 'pending' || q.status === 'running'
+            ? { ...q, status: 'error', error: `Workflow ${status}` } : q));
+          showToast?.(`Fetch workflow ${status}`);
+        }
       }
+    } catch (err: any) {
+      failed += pending.length;
+      setFetchQueue(prev => prev.map(q => q.status === 'pending' || q.status === 'running' ? { ...q, status: 'error', error: err.message || 'Fetch failed' } : q));
+    } finally {
+      fetchJobRef.current = null;
+      setFetchRunning(false);
     }
-
-    setFetchRunning(false);
     const parts = [];
     if (completed > 0) parts.push(`${completed} fetched`);
     if (skipped > 0) parts.push(`${skipped} skipped`);
@@ -368,7 +354,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
     onFetchComplete?.();
   };
 
-  const stopFetchQueue = () => { fetchAbortRef.current = true; };
+  const stopFetchQueue = () => { if (token && fetchJobRef.current) void lyricWorkflowApi.cancel(fetchJobRef.current); };
   const clearFetchQueue = () => { if (!fetchRunning) setFetchQueue([]); };
 
   const fetchQueuePending = fetchQueue.filter(q => q.status === 'pending').length;
@@ -413,10 +399,11 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const handleQueue = () => {
     if (selected.size === 0) return;
     if (mode === 'profile') {
+      if (!token) { showToast?.('Not authenticated'); return; }
       addBulkToQueue(Array.from(selected).map(lsId => {
         const ls = lyricsSets.find(l => l.id === lsId);
         return { type: 'profile' as QueueItemType, targetId: lsId, label: `Profile: ${ls?.artist_name || '?'} — ${ls?.album || 'Unknown'}`, provider: profilingModel.provider, model: profilingModel.model };
-      }));
+      }), token, lyricConcurrency);
     } else {
       const items = Array.from(selected).map(profileId => {
         const profile = profiles.find(p => p.id === profileId);
@@ -434,7 +421,8 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
         };
       }).filter(item => item.count > 0);
       if (items.length === 0) { showToast?.('All selected profiles already at or above target'); return; }
-      addBulkToQueue(items);
+      if (!token) { showToast?.('Not authenticated'); return; }
+      addBulkToQueue(items, token, lyricConcurrency);
     }
     setSelected(new Set());
   };
@@ -455,23 +443,37 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
     const paramsSnapshot = globalParams.getGlobalParams();
     const artistMap = new Map(artists.map(a => [a.id, a]));
 
-    let queued = 0, failed = 0;
+    let failed = 0;
+    const intents = [];
     for (let i = 0; i < jobs.length; i++) {
       const { row, gen } = jobs[i];
       try {
-        await enqueueAudioGen(gen, {
+        intents.push(await captureWrittenSongIntent(gen, {
           artistId: row.artistId,
           artistName: row.artistName,
           artistImageUrl: artistMap.get(row.artistId)?.image_url || '',
           profileId: gen.profile_id,
           lyricsSetId: row.lyricsSetId,
-        }, paramsSnapshot, token);
-        queued++;
+        }, paramsSnapshot));
       } catch (err) {
         failed++;
-        console.error(`[QueuePanel] Failed to enqueue generation ${gen.id}:`, err);
+        console.error(`[QueuePanel] Failed to capture generation ${gen.id}:`, err);
       }
       setAudioProgress({ current: i + 1, total: jobs.length });
+    }
+
+    let queued = 0;
+    if (intents.length) {
+      try {
+        const job = await lyricWorkflowApi.submitRenders(intents);
+        queued = intents.length;
+        void lyricWorkflowApi.follow(job.id, { onEvent: event => {
+          if (event.type === 'item-error') showToast?.(`Render failed: ${(event.data as { error?: string })?.error || 'Unknown error'}`);
+        } }).catch(err => showToast?.(`Render status unavailable: ${err.message}`));
+      } catch (err) {
+        failed += intents.length;
+        console.error('[QueuePanel] Failed to submit render batch:', err);
+      }
     }
 
     showToast?.(failed === 0
@@ -537,8 +539,8 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
 
   return (
     <>
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 dark:bg-black/60 backdrop-blur-sm">
-        <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-300 dark:border-white/10 shadow-2xl w-[680px] max-h-[85vh] flex flex-col">
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 dark:bg-black/60 backdrop-blur-sm p-4">
+        <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-300 dark:border-white/10 shadow-2xl w-full max-w-[680px] max-h-[85vh] flex flex-col">
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-200 dark:border-white/5">
             <div className="flex items-center gap-2">
@@ -1015,6 +1017,19 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
             </div>
           )}
 
+          {(mode === 'profile' || mode === 'generate') && (
+            <div className="px-6 py-2 flex items-center gap-3">
+              <ParamLabel
+                label={t('lyric.concurrentArtists')}
+                info={t('lyric.concurrentArtistsInfo')}
+                className="text-xs text-zinc-600 dark:text-zinc-400"
+              />
+              <input type="number" min={1} max={16} value={lyricConcurrency}
+                onChange={e => changeLyricConcurrency(parseInt(e.target.value))}
+                className="w-16 px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 dark:border-white/10 text-sm text-white text-center focus:outline-none focus:border-green-500/50" />
+            </div>
+          )}
+
           {/* Action bar */}
           <div className="px-6 py-3 border-t border-zinc-200 dark:border-white/5 flex items-center justify-between">
             {mode === 'fetch-lyrics' ? (
@@ -1112,7 +1127,10 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
                     {item.status === 'running' && <Loader2 className="w-3 h-3 animate-spin text-pink-400" />}
                     {item.status === 'done' && <CheckCircle className="w-3 h-3 text-green-400" />}
                     {item.status === 'error' && <AlertCircle className="w-3 h-3 text-red-400" />}
-                    <span className="text-zinc-700 dark:text-zinc-300 flex-1 truncate">{item.label}</span>
+                    <span className="text-zinc-700 dark:text-zinc-300 flex-1 truncate" title={item.error}>
+                      {item.label}
+                      {item.error && <span className="text-red-400"> · {item.error}</span>}
+                    </span>
                     {item.count && item.count > 1 && <span className="text-[10px] text-zinc-500">{item.countCompleted || 0}/{item.count}</span>}
                     {item.status === 'pending' && (
                       <button onClick={() => removeFromQueue(item.id)} className="p-0.5 rounded hover:bg-red-500/20 text-zinc-500 hover:text-red-400 transition-colors">
@@ -1124,7 +1142,7 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
               </div>
               {(pendingCount > 0 || runningItem) && (
                 <div className="mt-2 text-[10px] text-zinc-500">
-                  {runningItem ? `Running: ${runningItem.label}` : ''} 
+                  {runningItem ? `Running: ${runningItem.label}` : ''}
                   {pendingCount > 0 ? ` · ${pendingCount} pending` : ''}
                   {doneCount > 0 ? ` · ${doneCount} done` : ''}
                 </div>

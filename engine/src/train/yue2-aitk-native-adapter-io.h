@@ -9,6 +9,7 @@
 
 #include "yue2-aitk-adapter-io.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -57,7 +58,8 @@ inline bool dims(const std::string & site, int64_t * input, int64_t * output) {
 inline bool add_pair(std::vector<STWTensor> & out, const std::string & module,
                      const char * target, const Yue2AitkNativeMatrix & a,
                      const Yue2AitkNativeMatrix & b, int64_t rank,
-                     int64_t first_row, int64_t row_count) {
+                     int64_t first_row, int64_t row_count,
+                     const Yue2AitkNativeMatrix * m = nullptr) {
     if (a.rows != rank || a.cols <= 0 || b.rows < first_row + row_count || b.cols != rank ||
         !a.data || !b.data) return false;
     std::vector<int64_t> ashape{rank, a.cols};
@@ -67,6 +69,13 @@ inline bool add_pair(std::vector<STWTensor> & out, const std::string & module,
     out.push_back({"yue2." + module + ".lora_A.weight", ashape, a.data, -1});
     out.push_back({"yue2." + module + ".lora_B.weight", bshape,
                    b.data + first_row * rank, -1});
+    if (m) {
+        // The norm is per output row, so the DoRA magnitude splits exactly
+        // like B's rows. F32 1-D [row_count]; the loader refuses anything else.
+        if (m->rows != 1 || !m->data || m->cols < first_row + row_count) return false;
+        out.push_back({"yue2." + module + ".lora_magnitude_vector.weight", {row_count},
+                       m->data + first_row, STW_F32});
+    }
     return true;
 }
 
@@ -82,8 +91,15 @@ inline bool write_one(const char * path, const std::vector<STWTensor> & tensors,
         {"rank", std::to_string(rank)}, {"alpha", std::to_string(alpha)},
         {"steps", std::to_string(steps)}, {"yue2_adapter_layout", "native_split_v1"},
     };
+    if (std::string(kind) == "dora") {
+        md.push_back({"use_dora", "true"});
+        md.push_back({"dora_scaling", std::to_string(alpha / static_cast<float>(rank))});
+    }
     md.insert(md.end(), extra.begin(), extra.end());
-    if (!trigger.empty()) { md.push_back({"trigger", trigger}); md.push_back({"style_template", "upstream"}); }
+    // The caller may name the template (fixed-recipe captions are bare); the
+    // native importer's wrapper is upstream, the default.
+    const bool templated = std::any_of(extra.begin(), extra.end(), [](const auto & kv) { return kv.first == "style_template"; });
+    if (!trigger.empty()) { md.push_back({"trigger", trigger}); if (!templated) md.push_back({"style_template", "upstream"}); }
     // Same key the legacy AR trainer writes; generate.ts reads it to know the
     // bare trigger is a prompt this adapter actually trained on.
     if (caption_dropout > 0.0f) {
@@ -202,21 +218,24 @@ inline bool yue2_aitk_write_native_split_lokr(const std::vector<Yue2AitkNativeMa
 
 // Export the complete 448-factor AI Toolkit inventory into separate native
 // adapters. `diffusion_model` is the NAR expert; `text_encoders` is AR. The
-// input inventory remains borrowed for the duration of this call.
+// input inventory remains borrowed for the duration of this call. `dora`
+// selects the 672-factor inventory (A, B, magnitude per site); callers use
+// yue2_aitk_write_native_split_dora below.
 inline bool yue2_aitk_write_native_split(const std::vector<Yue2AitkNativeMatrix> & factors,
                                          int64_t rank, float alpha, int64_t steps,
                                          const char * ar_path, const char * nar_path, const std::string & trigger = {},
                                          float caption_dropout = 0.0f,
-                                         const std::vector<std::pair<std::string, std::string>> & meta = {}) {
+                                         const std::vector<std::pair<std::string, std::string>> & meta = {},
+                                         bool dora = false) {
     using namespace yue2_aitk_native_detail;
     constexpr int layers = 28;
-    constexpr size_t expected = 2u * layers * 4u * 2u;
+    const size_t expected = 2u * layers * 4u * (dora ? 3u : 2u);
     if (factors.size() != expected || rank <= 0 || !std::isfinite(alpha) || alpha <= 0.0f ||
         steps < 0 || !ar_path || !nar_path || std::string(ar_path) == nar_path ||
         exists(ar_path) || exists(nar_path)) return false;
 
     for (const auto & f : factors) {
-        if (!f.data || f.rows <= 0 || f.cols <= 0 || f.rows > 12288 || f.cols > 6144) return false;
+        if (!f.data || f.rows <= 0 || f.cols <= 0 || f.rows > 12288 || f.cols > (dora ? 12288 : 6144)) return false;
         for (int64_t i = 0; i < f.rows * f.cols; ++i) if (!std::isfinite(f.data[i])) return false;
     }
     std::vector<STWTensor> ar, nar;
@@ -231,38 +250,53 @@ inline bool yue2_aitk_write_native_split(const std::vector<Yue2AitkNativeMatrix>
                 int64_t input = 0, output = 0;
                 if (!dims(site, &input, &output)) return false;
                 const std::string base = std::string(expert) + ".model.layers." + std::to_string(layer) + "." + site + ".lora_";
-                const Yue2AitkNativeMatrix * a = nullptr, * b = nullptr;
+                const Yue2AitkNativeMatrix * a = nullptr, * b = nullptr, * m = nullptr;
                 for (const auto & f : factors) {
                     if (f.name == base + "A.weight") a = &f;
                     if (f.name == base + "B.weight") b = &f;
+                    if (dora && f.name == base + "magnitude_vector.weight") m = &f;
                 }
+                if (dora && (!m || m->rows != 1 || m->cols != output || !m->data)) return false;
                 if (!a || !b || !seen.insert(base).second || a->rows != rank || a->cols != input ||
                     b->rows != output || b->cols != rank || !a->data || !b->data) return false;
                 const std::string native = std::string("blk.") + std::to_string(layer) + "." +
                     (std::string(expert) == "text_encoders" ? "" : "nar_");
                 if (site == "self_attn.qkv_proj") {
-                    if (!add_pair(out, native + "attn_q", "", *a, *b, rank, 0, 2048) ||
-                        !add_pair(out, native + "attn_k", "", *a, *b, rank, 2048, 1024) ||
-                        !add_pair(out, native + "attn_v", "", *a, *b, rank, 3072, 1024)) return false;
+                    if (!add_pair(out, native + "attn_q", "", *a, *b, rank, 0, 2048, m) ||
+                        !add_pair(out, native + "attn_k", "", *a, *b, rank, 2048, 1024, m) ||
+                        !add_pair(out, native + "attn_v", "", *a, *b, rank, 3072, 1024, m)) return false;
                 } else if (site == "self_attn.o_proj") {
-                    if (!add_pair(out, native + "attn_output", "", *a, *b, rank, 0, 2048)) return false;
+                    if (!add_pair(out, native + "attn_output", "", *a, *b, rank, 0, 2048, m)) return false;
                 } else if (site == "mlp.gate_up_proj") {
                     const std::string ffn = std::string("blk.") + std::to_string(layer) + "." +
                         (std::string(expert) == "text_encoders" ? "ffn_" : "nar_ffn_");
-                    if (!add_pair(out, ffn + "gate", "", *a, *b, rank, 0, 6144) ||
-                        !add_pair(out, ffn + "up", "", *a, *b, rank, 6144, 6144)) return false;
+                    if (!add_pair(out, ffn + "gate", "", *a, *b, rank, 0, 6144, m) ||
+                        !add_pair(out, ffn + "up", "", *a, *b, rank, 6144, 6144, m)) return false;
                 } else {
                     const std::string ffn = std::string("blk.") + std::to_string(layer) + "." +
                         (std::string(expert) == "text_encoders" ? "ffn_down" : "nar_ffn_down");
-                    if (!add_pair(out, ffn, "", *a, *b, rank, 0, 2048)) return false;
+                    if (!add_pair(out, ffn, "", *a, *b, rank, 0, 2048, m)) return false;
                 }
             }
         }
     }
-    if (!write_one(ar_path, ar, "ar", rank, alpha, steps, trigger, caption_dropout, "lora", meta)) return false;
-    if (!write_one(nar_path, nar, "nar", rank, alpha, steps, trigger, caption_dropout, "lora", meta)) {
+    if (!write_one(ar_path, ar, "ar", rank, alpha, steps, trigger, caption_dropout, dora ? "dora" : "lora", meta)) return false;
+    if (!write_one(nar_path, nar, "nar", rank, alpha, steps, trigger, caption_dropout, dora ? "dora" : "lora", meta)) {
         hs_remove(ar_path);
         return false;
     }
     return true;
+}
+
+// DoRA twin: 672 factors. Same A/B split, plus each site's magnitude split by
+// output row (qkv q/k/v, gate_up gate/up; o and down whole). Format
+// yue2-<ar|nar>-dora-v1, use_dora=true, dora_scaling=alpha/rank. A join is
+// concatenation in the same order.
+inline bool yue2_aitk_write_native_split_dora(const std::vector<Yue2AitkNativeMatrix> & factors,
+                                              int64_t rank, float alpha, int64_t steps,
+                                              const char * ar_path, const char * nar_path, const std::string & trigger = {},
+                                              float caption_dropout = 0.0f,
+                                              const std::vector<std::pair<std::string, std::string>> & meta = {}) {
+    return yue2_aitk_write_native_split(factors, rank, alpha, steps, ar_path, nar_path, trigger,
+                                        caption_dropout, meta, true);
 }

@@ -2,11 +2,17 @@ import { aceClient } from '../aceClient.js';
 import { engineCrashSeq } from '../aceEngineProcess.js';
 import type { GenerationJob } from './jobTypes.js';
 
+export interface PollWatchdogOptions {
+  /** Submitted YuE2 chunk cap, bounded by the 9000-frame song ceiling.
+   *  Used only during NAR, including the completed semantic handoff. */
+  narChunkFrames?: number;
+}
+
 /** Poll ace-server job until completion, with stall detection watchdog.
  *  If job.stage/progress don't change for STALE_TIMEOUT_MS, the job is
  *  considered stalled and is cancelled + failed. This prevents a single
  *  wedged generation from blocking the entire queue for 45 minutes. */
-export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal: AbortSignal, timeoutMinutes?: number): Promise<void> {
+export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal: AbortSignal, timeoutMinutes?: number, options: PollWatchdogOptions = {}): Promise<void> {
   const POLL_INTERVAL = 500;          // ms — 500ms is tight enough for UI, avoids hammering
   // User-configurable wall-clock timeout, clamped to [5, 120] min. Default 45 min.
   const clampedTimeout = Math.max(5, Math.min(360, timeoutMinutes || 45));
@@ -26,6 +32,15 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
   // judged on a 2 min silence; everything else gets the quiet window, and the
   // wall-clock timeout below remains the backstop for a genuine hang.
   const STALE_TIMEOUT_QUIET_MS = STALE_TIMEOUT_VAE_MS;
+  // Older engines report only at chunk boundaries. Budget 400 ms per frame
+  // plus 2 min for setup, with the existing 15 min floor. This is a silence
+  // allowance, never a heartbeat: a hung chunk still exhausts it or the wall
+  // clock. Current engines reset the timer on every real ODE step.
+  const frames = options.narChunkFrames;
+  const narQuietMs = typeof frames === 'number' && Number.isFinite(frames) && frames > 0
+    ? Math.max(STALE_TIMEOUT_QUIET_MS, Math.min(frames, 9000) * 400 + 120_000)
+    : STALE_TIMEOUT_QUIET_MS;
+  let inNar = false;
   const isTickingStage = (s: unknown): boolean => typeof s === 'string' && /: Step \d+/.test(s);
   // A failing poll means "I can't see the job", not "the job stopped". The
   // engine stops answering HTTP while a single long op holds its request
@@ -92,8 +107,9 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
     // Stall detection: no progress update for the window this stage allows
     const stalledFor = Date.now() - lastProgressAt;
     const inVaeDecode = typeof lastStage === 'string' && lastStage.startsWith('Decoding audio (VAE)');
+    const quietLimit = inNar ? narQuietMs : STALE_TIMEOUT_QUIET_MS;
     const staleLimit = inVaeDecode ? STALE_TIMEOUT_VAE_MS
-                     : isTickingStage(lastStage) ? STALE_TIMEOUT_MS : STALE_TIMEOUT_QUIET_MS;
+                     : isTickingStage(lastStage) ? STALE_TIMEOUT_MS : quietLimit;
     if (stalledFor > staleLimit && Date.now() - lastPollOkAt < BLIND_GRACE_MS
         && Date.now() - lastProbeAt > RUNNING_PROBE_MS) {
       lastProbeAt = Date.now();
@@ -108,13 +124,13 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
         // anything irreversible — and say so once, because a user watching a
         // frozen step counter deserves to know it is being waited on rather
         // than ignored.
-        if (isTickingStage(lastStage) && stalledFor < STALE_TIMEOUT_QUIET_MS) {
+        if (isTickingStage(lastStage) && stalledFor < quietLimit) {
           if (!stillRunningSince) {
             stillRunningSince = Date.now();
             console.warn(
               `[Generate] ${aceJobId}: no progress for ${Math.round(stalledFor / 1000)}s at ` +
               `"${lastStage}", but the engine reports it is still running — waiting up to ` +
-              `${Math.round(STALE_TIMEOUT_QUIET_MS / 60_000)} min before treating it as stalled.`
+              `${Math.round(quietLimit / 60_000)} min before treating it as stalled.`
             );
           }
         } else {
@@ -150,6 +166,8 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
         job.acePhase = status.phase;
         const step = status.phase_step ?? 0;
         const total = status.phase_total ?? 0;
+        const phase = status.phase as string;
+        inNar = phase === 'nar' || (phase === 'semantic' && total > 0 && step >= total);
         job.acePhaseProgress = total > 0 ? `step ${step}/${total}` : '';
         const aceHeartbeat = `${status.phase}|${step}|${total}|${status.adapter_progress ?? -1}`;
         if (aceHeartbeat !== lastAceHeartbeat) {

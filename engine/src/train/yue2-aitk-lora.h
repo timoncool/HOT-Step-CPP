@@ -9,7 +9,9 @@
 #include "../../ggml/include/ggml.h"
 #include "../lokr-apply.h"
 #include "../lokr-common.h"
+#include "../dora-common.h"
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -37,8 +39,15 @@ struct Yue2AitkFusedLora {
     // LoKr: kron(w1, w2) over the same fused matrix. lokr.scale carries
     // alpha/dim (forced to 1 on monolithic-w2 sites, LyCORIS K6).
     LokrApplySite lokr;
+    // DoRA (both null otherwise): m [out] is a trainable F32 magnitude per
+    // fused output row; nrm [out] is ||W0 + s*BA||_row, refreshed once per
+    // update from frozen A/B and never differentiated (paper section 4.3).
+    // The site's output is (W0 x + s*BA x) * m / nrm.
+    ggml_tensor * m = nullptr;
+    ggml_tensor * nrm = nullptr;
 
     bool is_lokr() const { return lokr.w1 != nullptr; }
+    bool is_dora() const { return m != nullptr; }
     bool valid() const {
         if (input_width <= 0 || output_width <= 0) return false;
         return is_lokr() ? lokr.valid() : (a && b && rank > 0);
@@ -85,6 +94,9 @@ inline void yue2_aitk_site_params(const Yue2AitkFusedLora & site, std::vector<Yu
     }
     out->push_back({site.a, ".lora_A.weight", false});
     out->push_back({site.b, ".lora_B.weight", true});
+    // After A/B, so the slot walk (and with it the A init RNG stream) of a
+    // DoRA run matches a LoRA run's up to the magnitudes.
+    if (site.m) out->push_back({site.m, ".lora_magnitude_vector.weight", false});
 }
 inline std::vector<ggml_tensor *> yue2_aitk_layer_params(const Yue2AitkLayerAdapters & l) {
     std::vector<Yue2AitkSiteParam> params;
@@ -98,6 +110,8 @@ inline std::vector<ggml_tensor *> yue2_aitk_layer_params(const Yue2AitkLayerAdap
 // Allocate one fused adapter collection. `params` receives eight tensors per
 // layer (four A/B pairs), rather than fourteen tensors from the Legacy split
 // maker. Both factors are F32 trainables and are marked with ggml_set_param.
+// `dora` adds a trainable magnitude and its norm cache to every site (twelve
+// params per layer); the caller fills both before the first forward.
 bool yue2_aitk_make_expert_adapters(
     ggml_context *ctx,
     const Yue2AitkDims &dims,
@@ -105,7 +119,8 @@ bool yue2_aitk_make_expert_adapters(
     int64_t rank,
     float alpha,
     Yue2AitkExpertAdapters *out,
-    const std::string &expert = "ar");
+    const std::string &expert = "ar",
+    bool dora = false);
 
 size_t yue2_aitk_unique_param_count(const Yue2AitkExpertAdapters &adapters);
 
@@ -128,7 +143,7 @@ inline bool valid_dims(const Yue2AitkDims &d) {
 }
 inline bool make_site(ggml_context *ctx, int64_t input, int64_t output, int64_t rank,
                      float scale, const std::string &name, Yue2AitkFusedLora *site,
-                     std::vector<ggml_tensor *> *params) {
+                     std::vector<ggml_tensor *> *params, bool dora = false) {
     site->a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input, rank);
     site->b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, output);
     if (!site->a || !site->b) return false;
@@ -136,13 +151,22 @@ inline bool make_site(ggml_context *ctx, int64_t input, int64_t output, int64_t 
     ggml_set_name(site->a, (name + ".A").c_str()); ggml_set_name(site->b, (name + ".B").c_str());
     ggml_set_param(site->a); ggml_set_param(site->b);
     params->push_back(site->a); params->push_back(site->b);
+    if (dora) {
+        site->m = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, output);
+        site->nrm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, output);
+        if (!site->m || !site->nrm) return false;
+        ggml_set_name(site->m, (name + ".dora_m").c_str()); ggml_set_name(site->nrm, (name + ".dora_nrm").c_str());
+        ggml_set_param(site->m);
+        params->push_back(site->m);
+    }
     return true;
 }
 } // namespace yue2_aitk_detail
 
 inline bool yue2_aitk_make_expert_adapters(ggml_context *ctx, const Yue2AitkDims &dims,
                                            int n_layers, int64_t rank, float alpha,
-                                           Yue2AitkExpertAdapters *out, const std::string &expert) {
+                                           Yue2AitkExpertAdapters *out, const std::string &expert,
+                                           bool dora) {
     if (!ctx || !out || !yue2_aitk_detail::valid_dims(dims) || n_layers <= 0 || n_layers > 256 || rank <= 0 || rank > 65536 ||
         (expert != "ar" && expert != "nar") ||
         !std::isfinite(alpha) || alpha <= 0.0f) return false;
@@ -151,10 +175,10 @@ inline bool yue2_aitk_make_expert_adapters(ggml_context *ctx, const Yue2AitkDims
     for (int layer = 0; layer < n_layers; ++layer) {
         const std::string prefix = expert + ".blk." + std::to_string(layer) + ".";
         auto &dst = out->layers[static_cast<size_t>(layer)];
-        if (!yue2_aitk_detail::make_site(ctx, dims.hidden, dims.q_width + 2 * dims.kv_width, rank, scale, prefix + "attn_qkv", &dst.qkv, &out->params) ||
-            !yue2_aitk_detail::make_site(ctx, dims.q_width, dims.hidden, rank, scale, prefix + "attn_output", &dst.output, &out->params) ||
-            !yue2_aitk_detail::make_site(ctx, dims.hidden, 2 * dims.feed_forward, rank, scale, prefix + "ffn_gate_up", &dst.gate_up, &out->params) ||
-            !yue2_aitk_detail::make_site(ctx, dims.feed_forward, dims.hidden, rank, scale, prefix + "ffn_down", &dst.down, &out->params)) {
+        if (!yue2_aitk_detail::make_site(ctx, dims.hidden, dims.q_width + 2 * dims.kv_width, rank, scale, prefix + "attn_qkv", &dst.qkv, &out->params, dora) ||
+            !yue2_aitk_detail::make_site(ctx, dims.q_width, dims.hidden, rank, scale, prefix + "attn_output", &dst.output, &out->params, dora) ||
+            !yue2_aitk_detail::make_site(ctx, dims.hidden, 2 * dims.feed_forward, rank, scale, prefix + "ffn_gate_up", &dst.gate_up, &out->params, dora) ||
+            !yue2_aitk_detail::make_site(ctx, dims.feed_forward, dims.hidden, rank, scale, prefix + "ffn_down", &dst.down, &out->params, dora)) {
             out->layers.clear(); out->params.clear(); return false;
         }
     }
@@ -261,4 +285,19 @@ inline ggml_tensor *yue2_aitk_fused_delta(ggml_context *ctx, ggml_tensor *x,
     if (!b_slice) return nullptr;
     ggml_tensor *delta = ggml_mul_mat(ctx, b_slice, ax);
     return delta ? ggml_scale(ctx, delta, site.scale) : nullptr;
+}
+
+// ── DoRA norm ───────────────────────────────────────────────────────────────
+//
+// nrm[1, out] = max(||w0 + s*BA||_row, floor) for one site, w0 the site's
+// frozen base [in, out] in F32 (whatever the base is stored as: the caller
+// materializes it, companion delta included). Zero-norm policy as in the MM3
+// trainer and merge: the floor keeps an all-zero row finite, so it outputs 0
+// whatever m is, where 0/0 would be NaN. yue2-adapter.h's merge uses the same
+// floor, so trainer and merge agree on that row too.
+constexpr float kYue2AitkDoraNormFloor = 1e-12f;
+inline ggml_tensor * yue2_aitk_dora_norm(ggml_context * ctx, ggml_tensor * w0_f32, const Yue2AitkFusedLora & site) {
+    if (!ctx || !w0_f32 || !site.is_dora() || site.is_lokr() || w0_f32->type != GGML_TYPE_F32 ||
+        w0_f32->ne[0] != site.input_width || w0_f32->ne[1] != site.output_width) return nullptr;
+    return ggml_clamp(ctx, dora_col_norm(ctx, w0_f32, site.a, site.b, site.scale), kYue2AitkDoraNormFloor, FLT_MAX);
 }

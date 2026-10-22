@@ -16,16 +16,15 @@ import { aceClient, type AceRequest } from '../services/aceClient.js';
 import { ensureEngineFormat } from '../services/audioConvert.js';
 import { config } from '../config.js';
 import { startGenerationLog, logGeneration, logGenerationParams, finishGenerationLog, failGenerationLog } from '../services/logger.js';
+import { STEM_TRACK_NAMES, stemExtractRequestSchema, stemSupersepRequestSchema } from '../contracts/stemSeparation.js';
+import { registerJobsBusyCheck, trackBusy } from '../dataroot/pointer.js';
 
 const router = Router();
 const ACE_URL = config.aceServer.url;
 
 // ── Constants ────────────────────────────────────────────────────────────
 
-const VALID_TRACKS = [
-  'vocals', 'backing_vocals', 'drums', 'bass', 'guitar', 'keyboard',
-  'percussion', 'strings', 'synth', 'fx', 'brass', 'woodwinds',
-];
+const VALID_TRACKS: readonly string[] = STEM_TRACK_NAMES;
 
 const stemsBaseDir = path.join(config.data.dir, 'stems');
 fs.mkdirSync(stemsBaseDir, { recursive: true });
@@ -56,6 +55,7 @@ interface StemJob {
 }
 
 const jobs = new Map<string, StemJob>();
+registerJobsBusyCheck('stem', jobs);
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -368,17 +368,19 @@ async function runExtraction(job: StemJob, ditSettings: any, style: string, lyri
  * POST /extract — Start a new extraction job
  */
 router.post('/extract', (req: Request, res: Response) => {
-  const { sourceAudioUrl, sourceFileName, tracks, style, lyrics, ditSettings } = req.body;
-
-  // Validate
-  if (!sourceAudioUrl) {
-    res.status(400).json({ error: 'sourceAudioUrl is required' });
+  const parsed = stemExtractRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const missingTracks = parsed.error.issues.some(i => i.path[0] === 'tracks');
+    const missingSource = parsed.error.issues.some(i => i.path[0] === 'sourceAudioUrl');
+    res.status(400).json({ error: missingSource ? 'sourceAudioUrl is required' : missingTracks ? 'tracks must be a non-empty array' : 'Invalid request' });
     return;
   }
-  if (!tracks || !Array.isArray(tracks) || tracks.length === 0) {
-    res.status(400).json({ error: 'tracks must be a non-empty array' });
-    return;
-  }
+  // Everything but sourceAudioUrl/tracks' presence is schema-unchecked —
+  // the pipeline below applies its own `|| <default>` fallbacks, same as
+  // when this was a bare req.body destructure.
+  const { sourceAudioUrl, sourceFileName, tracks, style, lyrics, ditSettings } = parsed.data as {
+    sourceAudioUrl: string; sourceFileName?: string; tracks: string[]; style?: string; lyrics?: string; ditSettings?: Record<string, unknown>;
+  };
   const invalidTracks = tracks.filter((t: string) => !VALID_TRACKS.includes(t));
   if (invalidTracks.length > 0) {
     res.status(400).json({ error: `Invalid track names: ${invalidTracks.join(', ')}` });
@@ -401,7 +403,7 @@ router.post('/extract', (req: Request, res: Response) => {
   jobs.set(job.id, job);
 
   // Start extraction async
-  runExtraction(job, ditSettings || {}, style || '', lyrics || '');
+  void trackBusy('stem', runExtraction(job, ditSettings || {}, style || '', lyrics || ''));
 
   console.log(`[StemStudio] Job ${job.id} created: ${tracks.length} tracks from ${sourceFileName || sourceAudioUrl}`);
   res.json({ id: job.id });
@@ -411,13 +413,14 @@ router.post('/extract', (req: Request, res: Response) => {
  * POST /supersep — Start a new SuperSep separation job
  */
 router.post('/supersep', (req: Request, res: Response) => {
-  const { sourceAudioUrl, sourceFileName, level } = req.body;
-
-  if (!sourceAudioUrl) {
+  const parsed = stemSupersepRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
     res.status(400).json({ error: 'sourceAudioUrl is required' });
     return;
   }
-
+  const { sourceAudioUrl, sourceFileName, level } = parsed.data as {
+    sourceAudioUrl: string; sourceFileName?: string; level?: string | number;
+  };
   const sepLevel = parseInt(String(level ?? '0'), 10);
 
   const job: StemJob = {
@@ -436,7 +439,7 @@ router.post('/supersep', (req: Request, res: Response) => {
   jobs.set(job.id, job);
 
   // Start separation async
-  runSupersep(job);
+  void trackBusy('stem', runSupersep(job));
 
   console.log(`[StemStudio] SuperSep job ${job.id} created: level=${sepLevel} from ${sourceFileName || sourceAudioUrl}`);
   res.json({ id: job.id });

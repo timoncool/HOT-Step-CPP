@@ -3,40 +3,27 @@
  * Ported from hot-step-9000 lyricStudioApi.ts for the cpp engine.
  */
 
+import { apiClient, sseFailure, type ReadOptions } from './httpClient';
+import { changed, readSnapshot } from '../queries/cover-lyrics/reads';
+
 const API_BASE = '';
 
 async function api<T>(endpoint: string, options: {
-  method?: string;
-  body?: unknown;
-  timeoutMs?: number;
+  method?: string; body?: unknown; timeoutMs?: number; signal?: AbortSignal;
 } = {}): Promise<T> {
-  const { method = 'GET', body, timeoutMs = 10000 } = options;
-  const headers: HeadersInit = { 'Content-Type': 'application/json' };
-
-  // Abort controller with timeout to prevent connection pool hangs
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(`${API_BASE}${endpoint}`, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Request failed' }));
-      throw new Error(error.detail || error.error || error.message || `Request failed (${response.status})`);
-    }
-
-    return response.json();
-  } finally {
-    clearTimeout(timer);
-  }
+  const { method = 'GET', body, timeoutMs = 10_000, signal } = options;
+  const path = endpoint.replace(/^\/api/, '');
+  if (method === 'GET') return readSnapshot<T>('lireek', path, { signal });
+  // LLM-backed writes run past the 60s default; each caller overrides timeoutMs.
+  const opts = { signal, timeout: timeoutMs };
+  let result: T;
+  if (method === 'DELETE') result = await apiClient.delete<T>(path, opts);
+  else if (method === 'PUT') result = await apiClient.put<T>(path, body, opts);
+  else if (method === 'PATCH') result = await apiClient.patch<T>(path, body, opts);
+  else result = await apiClient.post<T>(path, body, opts);
+  await changed('lireek');
+  return result;
 }
-
-// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface Artist {
   id: number;
@@ -197,8 +184,8 @@ export interface RecentSong {
 
 export const lireekApi = {
   // ── Artists ──────────────────────────────────────────────────────────────
-  listArtists: (): Promise<{ artists: Artist[] }> =>
-    api<Artist[]>('/api/lireek/artists').then(artists => ({ artists })),
+  listArtists: (options: ReadOptions = {}): Promise<{ artists: Artist[] }> =>
+    api<Artist[]>('/api/lireek/artists', options).then(artists => ({ artists })),
 
   deleteArtist: (id: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/artists/${id}`, { method: 'DELETE' }),
@@ -213,23 +200,23 @@ export const lireekApi = {
     api<Artist>('/api/lireek/artists/create', { method: 'POST', body: params }).then(artist => ({ artist })),
 
   // ── Lyrics Sets ─────────────────────────────────────────────────────────
-  listLyricsSets: (artistId?: number): Promise<{ lyrics_sets: LyricsSet[] }> => {
+  listLyricsSets: (artistId?: number, options: ReadOptions = {}): Promise<{ lyrics_sets: LyricsSet[] }> => {
     const params = new URLSearchParams();
     if (artistId != null) params.set('artist_id', String(artistId));
     const qs = params.toString();
-    return api<LyricsSet[]>(`/api/lireek/lyrics-sets${qs ? `?${qs}` : ''}`).then(lyrics_sets => ({ lyrics_sets }));
+    return api<LyricsSet[]>(`/api/lireek/lyrics-sets${qs ? `?${qs}` : ''}`, options).then(lyrics_sets => ({ lyrics_sets }));
   },
 
-  getLyricsSet: (id: number): Promise<LyricsSet> =>
-    api(`/api/lireek/lyrics-sets/${id}`),
+  getLyricsSet: (id: number, options: ReadOptions = {}): Promise<LyricsSet> =>
+    api(`/api/lireek/lyrics-sets/${id}`, options),
 
   /** Fetch everything for the album detail page in a single call. */
-  getAlbumFullDetail: (lyricsSetId: number): Promise<{
+  getAlbumFullDetail: (lyricsSetId: number, options: ReadOptions = {}): Promise<{
     lyrics_set: LyricsSet;
     profiles: Profile[];
     generations: Generation[];
     preset: AlbumPreset | null;
-  }> => api(`/api/lireek/lyrics-sets/${lyricsSetId}/full-detail`),
+  }> => api(`/api/lireek/lyrics-sets/${lyricsSetId}/full-detail`, options),
 
   deleteLyricsSet: (id: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/lyrics-sets/${id}`, { method: 'DELETE' }),
@@ -269,15 +256,15 @@ export const lireekApi = {
     api('/api/lireek/search-song-lyrics', { method: 'POST', body: { artist, title }, timeoutMs: 30_000 }),
 
   // ── Profiles ────────────────────────────────────────────────────────────
-  listProfiles: (lyricsSetId?: number): Promise<{ profiles: Profile[] }> => {
+  listProfiles: (lyricsSetId?: number, options: ReadOptions = {}): Promise<{ profiles: Profile[] }> => {
     const params = new URLSearchParams();
     if (lyricsSetId != null) params.set('lyrics_set_id', String(lyricsSetId));
     const qs = params.toString();
-    return api<Profile[]>(`/api/lireek/profiles${qs ? `?${qs}` : ''}`).then(profiles => ({ profiles }));
+    return api<Profile[]>(`/api/lireek/profiles${qs ? `?${qs}` : ''}`, options).then(profiles => ({ profiles }));
   },
 
-  getProfile: (id: number): Promise<Profile> =>
-    api(`/api/lireek/profiles/${id}`),
+  getProfile: (id: number, options: ReadOptions = {}): Promise<Profile> =>
+    api(`/api/lireek/profiles/${id}`, options),
 
   deleteProfile: (id: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/profiles/${id}`, { method: 'DELETE' }),
@@ -289,19 +276,19 @@ export const lireekApi = {
     api(`/api/lireek/lyrics-sets/${lyricsSetId}/build-profile`, { method: 'POST', body: params, timeoutMs: 300_000 }),
 
   // ── Generations ─────────────────────────────────────────────────────────
-  listGenerations: (profileId?: number, lyricsSetId?: number): Promise<{ generations: Generation[] }> => {
+  listGenerations: (profileId?: number, lyricsSetId?: number, options: ReadOptions = {}): Promise<{ generations: Generation[] }> => {
     const params = new URLSearchParams();
     if (profileId != null) params.set('profile_id', String(profileId));
     if (lyricsSetId != null) params.set('lyrics_set_id', String(lyricsSetId));
     const qs = params.toString();
-    return api<Generation[]>(`/api/lireek/generations${qs ? `?${qs}` : ''}`).then(generations => ({ generations }));
+    return api<Generation[]>(`/api/lireek/generations${qs ? `?${qs}` : ''}`, options).then(generations => ({ generations }));
   },
 
-  listAllGenerations: (): Promise<{ generations: Generation[] }> =>
-    api('/api/lireek/generations/all'),
+  listAllGenerations: (options: ReadOptions = {}): Promise<{ generations: Generation[] }> =>
+    api('/api/lireek/generations/all', options),
 
-  getGeneration: (id: number): Promise<Generation> =>
-    api(`/api/lireek/generations/${id}`),
+  getGeneration: (id: number, options: ReadOptions = {}): Promise<Generation> =>
+    api(`/api/lireek/generations/${id}`, options),
 
   generateLyrics: (profileId: number, params: {
     profile_id: number;
@@ -337,8 +324,8 @@ export const lireekApi = {
     api(`/api/lireek/generations/${generationId}/export`, { method: 'POST' }),
 
   // ── Album Presets ───────────────────────────────────────────────────────
-  getPreset: (lyricsSetId: number): Promise<{ preset: AlbumPreset | null }> =>
-    api(`/api/lireek/lyrics-sets/${lyricsSetId}/preset`),
+  getPreset: (lyricsSetId: number, options: ReadOptions = {}): Promise<{ preset: AlbumPreset | null }> =>
+    api(`/api/lireek/lyrics-sets/${lyricsSetId}/preset`, options),
 
   upsertPreset: (lyricsSetId: number, params: {
     adapter_path?: string;
@@ -356,16 +343,21 @@ export const lireekApi = {
 
   /** MM3 adapters for this album: `candidates` trained on the dataset the
    *  album was exported from (newest first), `others` = everything else. */
-  mm3AdaptersForLyricsSet: (lyricsSetId: number): Promise<{
+  mm3AdaptersForLyricsSet: (lyricsSetId: number, options: ReadOptions = {}): Promise<{
     datasetId: string | null; datasetSlug: string | null;
     candidates: Mm3PresetAdapter[]; others: Mm3PresetAdapter[];
-  }> => api(`/api/training/lyrics-sets/${lyricsSetId}/mm3-adapters`),
+  }> => api(`/api/training/lyrics-sets/${lyricsSetId}/mm3-adapters`, options),
 
   deletePreset: (lyricsSetId: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/lyrics-sets/${lyricsSetId}/preset`, { method: 'DELETE' }),
 
-  listAllPresets: (): Promise<{ presets: AlbumPreset[] }> =>
-    api('/api/lireek/presets'),
+  listAllPresets: (options: ReadOptions = {}): Promise<{ presets: AlbumPreset[] }> =>
+    api('/api/lireek/presets', options),
+
+  updateAdapterReferences: (): Promise<{
+    scanned: number; updated: number;
+    changes: Array<{ lyricsSetId: number; presetName: string; field: string; adapter: string }>;
+  }> => api('/api/lireek/presets/update-adapter-references', { method: 'POST' }),
 
   // ── Slop Detection ──────────────────────────────────────────────────────
   slopScan: (text: string): Promise<any> =>
@@ -385,12 +377,12 @@ export const lireekApi = {
     api(`/api/lireek/generations/${generationId}/audio`, { method: 'POST', body: { job_id: jobId, lyrics_set_id: lyricsSetId || null } }),
 
   /** `lyricsSetId` limits the list to recordings listed under that album. */
-  getAudioGenerations: (generationId: number, lyricsSetId?: number): Promise<{ audio_generations: AudioGeneration[] }> =>
-    api(`/api/lireek/generations/${generationId}/audio${lyricsSetId ? `?lyrics_set_id=${lyricsSetId}` : ''}`),
+  getAudioGenerations: (generationId: number, lyricsSetId?: number, options: ReadOptions = {}): Promise<{ audio_generations: AudioGeneration[] }> =>
+    api(`/api/lireek/generations/${generationId}/audio${lyricsSetId ? `?lyrics_set_id=${lyricsSetId}` : ''}`, options),
 
   /** Lyrics from other albums that have recordings rendered as this album. */
-  getRenderedAs: (lyricsSetId: number): Promise<{ generations: Generation[] }> =>
-    api(`/api/lireek/lyrics-sets/${lyricsSetId}/rendered-as`),
+  getRenderedAs: (lyricsSetId: number, options: ReadOptions = {}): Promise<{ generations: Generation[] }> =>
+    api(`/api/lireek/lyrics-sets/${lyricsSetId}/rendered-as`, options),
 
   deleteAudioGeneration: (agId: number): Promise<{ deleted: boolean }> =>
     api(`/api/lireek/audio-generations/${agId}`, { method: 'DELETE' }),
@@ -416,8 +408,8 @@ export const lireekApi = {
     api('/api/generate', { method: 'POST', body: params }),
 
   // ── Prompts ───────────────────────────────────────────────────────────
-  listPrompts: (): Promise<{ prompts: { name: string; default_content: string; custom: string | null }[] }> =>
-    api('/api/lireek/prompts'),
+  listPrompts: (options: ReadOptions = {}): Promise<{ prompts: { name: string; default_content: string; custom: string | null }[] }> =>
+    api('/api/lireek/prompts', options),
 
   savePrompt: (name: string, value: string): Promise<{ success: boolean }> =>
     api(`/api/lireek/prompts/${name}`, { method: 'PUT', body: { value } }),
@@ -426,8 +418,8 @@ export const lireekApi = {
     api(`/api/lireek/prompts/${name}`, { method: 'DELETE' }),
 
   // ── Recent Songs ────────────────────────────────────────────────────────
-  getRecentSongs: (limit = 30): Promise<{ songs: RecentSong[] }> =>
-    api(`/api/lireek/recent-songs?limit=${limit}`),
+  getRecentSongs: (limit = 30, options: ReadOptions = {}): Promise<{ songs: RecentSong[] }> =>
+    api(`/api/lireek/recent-songs?limit=${limit}`, options),
 
   // ── Curated Profile ─────────────────────────────────────────────────────
   buildCuratedProfile: (artistId: number, params: {
@@ -444,8 +436,8 @@ export const lireekApi = {
     api(`/api/lireek/artists/${artistId}/generate-caption`, { method: 'POST', body: params, timeoutMs: 60_000 }),
 
   // ── LLM Providers ───────────────────────────────────────────────────────
-  getProviders: (): Promise<{ id: string; name: string; available: boolean; models: string[]; default_model: string }[]> =>
-    api('/api/lireek/providers', { timeoutMs: 15000 }),
+  getProviders: (options: ReadOptions = {}): Promise<{ id: string; name: string; available: boolean; models: string[]; default_model: string }[]> =>
+    api('/api/lireek/providers', { ...options, timeoutMs: 15000 }),
 };
 
 // ── SSE Streaming ─────────────────────────────────────────────────────────
@@ -465,8 +457,9 @@ async function consumeSSE(url: string, body: any, callbacks: StreamCallbacks): P
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(text || `HTTP ${resp.status}`);
+    // SSE stays on fetch (axios doesn't stream), but failures still go
+    // through the one global catch so they toast like any other POST.
+    await sseFailure(resp, 'POST', `${API_BASE}${url}`);
   }
 
   const reader = resp.body?.getReader();
@@ -508,7 +501,7 @@ async function consumeSSE(url: string, body: any, callbacks: StreamCallbacks): P
           case 'chunk': callbacks.onChunk?.(data.text ?? data); break;
           case 'phase': callbacks.onPhase?.(data.phase ?? data.text ?? data); break;
           case 'complete':
-          case 'result': callbacks.onResult?.(data); break;
+          case 'result': void changed('lireek'); callbacks.onResult?.(data); break;
           case 'error': callbacks.onError?.(data.error ?? data.message ?? data); break;
         }
       } catch { /* skip malformed lines */ }

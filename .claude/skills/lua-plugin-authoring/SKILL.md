@@ -5,6 +5,10 @@ description: Explains how to write, test, and debug HOT-Step Lua plugins (solver
 
 # Writing Lua plugins for HOT-Step CPP
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Solvers, schedulers, guidance modes, and postprocess (VAE-decode replacement) are **Lua plugins (LuaJIT 2.1)** loaded by the C++ engine at startup. Adding one = drop a `.lua` file in the right directory and restart the app. **No C++ rebuild.**
 
 Glossary (used throughout):
@@ -36,7 +40,7 @@ Loader rules (`lua-plugin-registry.h:157-226`):
 - Only `.lua` files; sorted for deterministic order.
 - **Companion-file exclusion**: filename stems containing `_constants`, `_math`, or `_data` are never loaded as plugins — they are `require()` targets (e.g. `beta_math.lua`, `stork4_constants.lua`). Stems ending `_core` are skipped only if a sibling without `_core` exists in the same dir (`md_audio_tiled_core` is skipped; `storm_sampler_core` loads as a plugin because no `storm_sampler.lua` exists).
 - Plugin **type is detected by which global table the file defines**: `solver`, `scheduler`, `guidance`, or `postprocess` (`lua-plugin.h:348-386`). Wrong table for the directory → "declares wrong type, skipping". Empty/missing `name` → skipped. Lua syntax error → `[Plugins] ERROR loading <path>: <message>` on stderr, plugin absent.
-- Startup log (in `logs/<session>/ace_engine.log`): one line per plugin, then `[Plugins] Loaded N solvers, N schedulers, N guidance, N postprocess`.
+- Startup log (in `<data root>/logs/<session>/ace_engine.log`): one line per plugin, then `[Plugins] Loaded N solvers, N schedulers, N guidance, N postprocess`.
 
 Sandbox (`lua-plugin.h:180-195, 316-343`): `math`, `string`, `table`, `print`, `pairs`, `ipairs`, `tonumber`, `tostring`, `require` are available. `os`, `io`, `debug`, `dofile`, `loadfile` are removed. `require()` searches ONLY the plugin's own directory; C modules are blocked. Each plugin gets its **own `lua_State` that lives for the whole process** — file-level `local` variables persist across steps AND across generations (that is how stateful solvers work, and why they must self-reset; see Golden rule of state below).
 
@@ -60,7 +64,7 @@ Sandbox (`lua-plugin.h:180-195, 316-343`): `math`, `string`, `table`, `print`, `
    - `[DiT] Guidance: <display> (<name>) [native APG] [post_step]` (`hot-step-sampler.h:525`)
    - `[DiT] Custom schedule: <display> (<name>), shift=X` (`engine/src/sampler-schedule.h:151`)
    - `[Postprocess] Using plugin '<name>' for VAE decode` (`pipeline-synth-ops.cpp:1764`)
-6. Debug with `print()` — it goes to engine stdout, captured in `ace_engine.log` and the matching `logs/<session>/generations/gen_*.log`. Runtime Lua errors surface as `[Plugins] ERROR in solver '<name>' step(): <traceback>` (also `schedule()`/`guide()`/`post_step()`/`process()` variants):
+6. Debug with `print()` — it goes to engine stdout, captured in `ace_engine.log` and the matching `<data root>/logs/<session>/generations/gen_*.log`. Runtime Lua errors surface as `[Plugins] ERROR in solver '<name>' step(): <traceback>` (also `schedule()`/`guide()`/`post_step()`/`process()` variants):
    ```powershell
    Select-String -Path "$($s.FullName)\ace_engine.log" -Pattern '\[Plugins\] ERROR'
    ```

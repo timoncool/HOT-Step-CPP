@@ -3,6 +3,10 @@
 
 import React from 'react';
 import { X, Plus, Trash2 } from 'lucide-react';
+import { hashImportValue, type AiContinuePresetBody } from '../../services/preferencesApi';
+import { PresetCollection } from '../../services/presetCollection';
+import { SettingDocument } from '../../services/settingDocument';
+import { PresetSyncNotices } from '../shared/PresetSyncNotices';
 
 // ── Preset types ──────────────────────────────────────────────────────────────
 export interface AiPreset {
@@ -48,21 +52,63 @@ export const DEFAULT_TEMPLATE = `Continue these song lyrics naturally. Keep the 
 Existing lyrics:
 {lyrics}`;
 
-const TEMPLATE_KEY    = 'hs-ai-continue-template';
-const USER_STYLE_KEY  = 'hs-ai-continue-user-style';
-const USER_LYRIC_KEY  = 'hs-ai-continue-user-lyric';
+export const TEMPLATE_KEY    = 'hs-ai-continue-template';
+export const USER_STYLE_KEY  = 'hs-ai-continue-user-style';
+export const USER_LYRIC_KEY  = 'hs-ai-continue-user-lyric';
+export const PRESET_FAMILY: Record<PresetCategory, 'ai-continue-style' | 'ai-continue-lyric'> = {
+  style: 'ai-continue-style', lyric: 'ai-continue-lyric',
+};
+export const MIGRATED_FLAG: Record<PresetCategory, string> = {
+  style: `${USER_STYLE_KEY}:server-migrated`, lyric: `${USER_LYRIC_KEY}:server-migrated`,
+};
 
-function loadUserPresets(key: string): AiPreset[] {
-  try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch { return []; }
+function loadLegacyUserPresets(key: string): AiPreset[] {
+  try { const v = JSON.parse(localStorage.getItem(key) || '[]'); return Array.isArray(v) ? v : []; } catch { return []; }
 }
-function saveUserPresets(key: string, presets: AiPreset[]) {
-  try { localStorage.setItem(key, JSON.stringify(presets)); } catch {}
+
+const legacyKey = (category: PresetCategory) => category === 'style' ? USER_STYLE_KEY : USER_LYRIC_KEY;
+
+/** Named presets live server-side (preferences, installation scope); each
+ *  category is one PresetCollection, keyed by document id. The legacy
+ *  browser keys are imported once and kept, but no longer written to. */
+export function createPresetCollection(category: PresetCategory): PresetCollection<AiContinuePresetBody> {
+  return new PresetCollection<AiContinuePresetBody>({
+    family: PRESET_FAMILY[category],
+    migratedFlag: MIGRATED_FLAG[category],
+    legacyItems: () => Promise.all(loadLegacyUserPresets(legacyKey(category)).map(async p => {
+      const body: AiContinuePresetBody = { label: p.label, value: p.value };
+      return { storageKey: `${legacyKey(category)}:${p.id}`, sourceHash: await hashImportValue(JSON.stringify(body)), name: p.label, body };
+    })),
+  });
 }
+
+/** The continuation prompt template (preferences.ai-continue-template).
+ *  `loadTemplate` stays the synchronous first-render path for other readers
+ *  (StormLiveControls.tsx); the modal keeps them in step through
+ *  onTemplateChange. */
+export function createTemplateSetting(): SettingDocument {
+  return new SettingDocument({
+    family: 'ai-continue-template', localKey: TEMPLATE_KEY, fallback: DEFAULT_TEMPLATE,
+    migratedFlag: `${TEMPLATE_KEY}:server-migrated`,
+    read: body => typeof body.template === 'string' && body.template ? body.template : DEFAULT_TEMPLATE,
+    write: template => ({ template }),
+  });
+}
+
+let state: { style: PresetCollection<AiContinuePresetBody>; lyric: PresetCollection<AiContinuePresetBody>; template: SettingDocument } | null = null;
+
+/** The modal's server state, shared by every mount of it. */
+export function aiContinueState() {
+  return state ??= { style: createPresetCollection('style'), lyric: createPresetCollection('lyric'), template: createTemplateSetting() };
+}
+
+/** Test-only: start from a fresh browser state. */
+export function _resetAiContinueStateForTests(): void {
+  state = null;
+}
+
 export function loadTemplate(): string {
   try { return localStorage.getItem(TEMPLATE_KEY) || DEFAULT_TEMPLATE; } catch { return DEFAULT_TEMPLATE; }
-}
-function saveTemplate(t: string) {
-  try { localStorage.setItem(TEMPLATE_KEY, t); } catch {}
 }
 
 // ── Props ────────────────────────────────────────────────────────────────────
@@ -79,37 +125,42 @@ interface AiContinuePresetModalProps {
 export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
   isOpen, onClose, onPresetFire, onTemplateChange,
 }) => {
-  const [tab, setTab]                   = React.useState<'style' | 'lyric' | 'template'>('style');
-  const [userStylePresets, setUserStyle] = React.useState<AiPreset[]>(() => loadUserPresets(USER_STYLE_KEY));
-  const [userLyricPresets, setUserLyric] = React.useState<AiPreset[]>(() => loadUserPresets(USER_LYRIC_KEY));
-  const [template, setTemplate]         = React.useState(() => loadTemplate());
+  const server = aiContinueState();
+  const styleSnap    = React.useSyncExternalStore(server.style.subscribe, server.style.getSnapshot);
+  const lyricSnap    = React.useSyncExternalStore(server.lyric.subscribe, server.lyric.getSnapshot);
+  const templateSnap = React.useSyncExternalStore(server.template.subscribe, server.template.getSnapshot);
+  const [tab, setTab]                     = React.useState<'style' | 'lyric' | 'template'>('style');
+  const template = templateSnap.value;
   const [newLabel, setNewLabel]         = React.useState('');
   const [newValue, setNewValue]         = React.useState('');
   const [firedId,  setFiredId]          = React.useState<string | null>(null);
 
   React.useEffect(() => { if (!isOpen) { setNewLabel(''); setNewValue(''); } }, [isOpen]);
 
+  React.useEffect(() => {
+    void server.style.load();
+    void server.lyric.load();
+    void server.template.hydrate();
+  }, [server]);
+
+  // Keep StormLiveControls' own loadTemplate()-seeded copy in step with the
+  // hydrated or edited value.
+  React.useEffect(() => { onTemplateChange(template); }, [template]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const userPresets = (snap: typeof styleSnap): AiPreset[] => snap.entries.map(e => ({ id: e.key, label: e.body.label, value: e.body.value }));
+  const userStylePresets = userPresets(styleSnap);
+  const userLyricPresets = userPresets(lyricSnap);
+
   const addPreset = (category: PresetCategory) => {
-    if (!newLabel.trim() || !newValue.trim()) return;
-    const p: AiPreset = { id: `user-${Date.now()}`, label: newLabel.trim(), value: newValue.trim() };
-    if (category === 'style') {
-      const next = [...userStylePresets, p];
-      setUserStyle(next); saveUserPresets(USER_STYLE_KEY, next);
-    } else {
-      const next = [...userLyricPresets, p];
-      setUserLyric(next); saveUserPresets(USER_LYRIC_KEY, next);
-    }
+    const label = newLabel.trim(), value = newValue.trim();
+    if (!label || !value) return;
+    // A failed create stays in the list with its content, to reapply or discard.
+    void server[category].create({ label, value });
     setNewLabel(''); setNewValue('');
   };
 
-  const deletePreset = (category: PresetCategory, id: string) => {
-    if (category === 'style') {
-      const next = userStylePresets.filter(p => p.id !== id);
-      setUserStyle(next); saveUserPresets(USER_STYLE_KEY, next);
-    } else {
-      const next = userLyricPresets.filter(p => p.id !== id);
-      setUserLyric(next); saveUserPresets(USER_LYRIC_KEY, next);
-    }
+  const deletePreset = (category: PresetCategory, key: string) => {
+    void server[category].remove(key);
   };
 
   const firePreset = (preset: AiPreset, category: PresetCategory) => {
@@ -119,9 +170,7 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
   };
 
   const handleTemplateChange = (val: string) => {
-    setTemplate(val);
-    saveTemplate(val);
-    onTemplateChange(val);
+    server.template.edit(val);
   };
 
   if (!isOpen) return null;
@@ -134,7 +183,7 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
     </button>
   );
 
-  const PresetPill = ({ preset, category }: { preset: AiPreset; category: PresetCategory }) => (
+  const PresetPill = ({ preset, category, isUser }: { preset: AiPreset; category: PresetCategory; isUser?: boolean }) => (
     <div className="flex items-center gap-0.5 group">
       <button
         onClick={() => firePreset(preset, category)}
@@ -145,13 +194,12 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
         {firedId === preset.id ? '✓ fired' : preset.label}
       </button>
       {/* delete button for user presets */}
-      {preset.id.startsWith('user-') && (
+      {isUser ? (
         <button onClick={() => deletePreset(category, preset.id)}
           className="text-[9px] px-1 py-0.5 rounded-r-md bg-zinc-800 text-zinc-700 hover:bg-red-900/40 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100">
           <Trash2 size={8} />
         </button>
-      )}
-      {!preset.id.startsWith('user-') && (
+      ) : (
         <span className="w-0 rounded-r-md bg-zinc-800" /> // keep pill shape consistent
       )}
     </div>
@@ -173,7 +221,7 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
         <div className="text-[9px] text-zinc-600 uppercase tracking-wider mb-1.5">My Presets</div>
         {user.length > 0 && (
           <div className="flex flex-wrap gap-1 mb-2">
-            {user.map(p => <PresetPill key={p.id} preset={p} category={category} />)}
+            {user.map(p => <PresetPill key={p.id} preset={p} category={category} isUser />)}
           </div>
         )}
         {/* Add new */}
@@ -223,6 +271,11 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
 
           {/* Body */}
           <div className="px-4 py-3 max-h-[60vh] overflow-y-auto">
+            {tab !== 'template' && (
+              <div className="mb-2">
+                <PresetSyncNotices collection={server[tab]} snapshot={tab === 'style' ? styleSnap : lyricSnap} labelOf={b => b.label} />
+              </div>
+            )}
             {tab === 'style' && (
               <PresetSection
                 category="style"
@@ -239,6 +292,17 @@ export const AiContinuePresetModal: React.FC<AiContinuePresetModalProps> = ({
             )}
             {tab === 'template' && (
               <div className="space-y-2">
+                {templateSnap.error && (
+                  <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-red-950/40 border border-red-900 text-[10px] text-red-300" role="alert">
+                    <span className="flex-1">{templateSnap.error} Your edit is still shown below{templateSnap.status === 'conflict' ? ' and is not being saved' : ''}.</span>
+                    {templateSnap.status === 'conflict' && templateSnap.serverValue !== null && (
+                      <button onClick={() => server.template.useServer()} className="underline flex-shrink-0">Use theirs</button>
+                    )}
+                    <button onClick={() => void server.template.reapply()} className="underline flex-shrink-0">
+                      {templateSnap.status === 'conflict' ? 'Reapply mine' : 'Retry'}
+                    </button>
+                  </div>
+                )}
                 <p className="text-[10px] text-zinc-500 leading-relaxed">
                   Raw prompt sent to the LLM. Tokens: <code className="text-violet-400">{"\\{direction\\}"}</code> (replaced with direction hint if set), <code className="text-violet-400">{"\\{lyrics\\}"}</code> (current lyrics), <code className="text-violet-400">{"\\{style\\}"}</code> (current caption).
                 </p>

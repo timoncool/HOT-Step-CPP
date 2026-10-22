@@ -4,6 +4,7 @@
 // Environment settings read from / write to the server's .env file.
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Zap, Download, Tag, AlertTriangle, Loader2, Settings2,
   ChevronRight, Save, Scissors,
@@ -11,9 +12,13 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { FALLBACK_LANGUAGE, SUPPORTED_LANGUAGES } from '../../i18n';
-import { getStemStats, deleteAllJobs, formatBytes, type StemStats } from '../../services/stemStudioApi';
+import { deleteAllJobs, formatBytes, type StemStats } from '../../services/stemStudioApi';
 import { useAuth } from '../../context/AuthContext';
 import { songApi, settingsApi } from '../../services/api';
+import { envOptions, gpusOptions, healthOptions, stemStatsOptions } from '../../queries/shell-queue/settings';
+import { queryManager } from '../../queries/invalidation';
+import { DataFolderPanel } from './DataFolderPanel';
+import { AdapterReferencesAction } from './AdapterReferencesAction';
 import { lireekApi } from '../../services/lireekApi';
 import { FileBrowserModal } from '../shared/FileBrowserModal';
 import { StyledSelect } from '../shared/StyledSelect';
@@ -78,13 +83,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 }) => {
   const { t, i18n } = useTranslation();
   const { token } = useAuth();
+  const queryClient = useQueryClient();
   const [coverSet, setCoverSetState] = useState<CoverSet>(getCoverSet);
   const [nukeConfirm, setNukeConfirm] = useState(false);
   // The release tag the server reports; a git checkout says "dev" (#185).
-  const [appVersion, setAppVersion] = useState('');
-  useEffect(() => {
-    fetch('/api/health').then(r => r.json()).then(d => setAppVersion(String(d?.version || ''))).catch(() => {});
-  }, []);
+  const appVersion = String(useQuery(healthOptions()).data?.version || '');
   const [nukeRunning, setNukeRunning] = useState(false);
   const [nukeResult, setNukeResult] = useState<string | null>(null);
   const [nukeLyricsConfirm, setNukeLyricsConfirm] = useState(false);
@@ -93,7 +96,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [nukeProfilesRunning, setNukeProfilesRunning] = useState(false);
 
   // Stem storage state
-  const [stemStats, setStemStats] = useState<StemStats | null>(null);
+  const stemStats = useQuery(stemStatsOptions()).data ?? null;
   const [stemClearConfirm, setStemClearConfirm] = useState(false);
   const [stemClearing, setStemClearing] = useState(false);
   const [stemClearError, setStemClearError] = useState<string | null>(null);
@@ -107,7 +110,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     setNukeRunning(true);
     setNukeResult(null);
     try {
-      const res = await songApi.nukeGenerations(token);
+      const res = await songApi.nukeGenerations();
       setNukeResult(
         `Nuked ${res.songsDeleted} songs, ${res.filesDeleted} audio files, ${res.lireekAudioGensDeleted} Lyric Studio entries.`
       );
@@ -148,17 +151,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     }
   };
 
-  // Load stem storage stats
-  useEffect(() => {
-    getStemStats().then(setStemStats).catch(() => setStemStats(null));
-  }, []);
-
   const handleClearStems = async () => {
     setStemClearing(true);
     setStemClearError(null);
     try {
       await deleteAllJobs();
-      setStemStats({ totalBytes: 0, jobCount: 0, stemCount: 0 });
+      queryClient.setQueryData<StemStats>(stemStatsOptions().queryKey, { totalBytes: 0, jobCount: 0, stemCount: 0 });
+      void queryManager.keys(queryClient, stemStatsOptions().queryKey);
       setStemClearConfirm(false);
     } catch (err: any) {
       console.error('[Settings] Clear stems failed:', err);
@@ -201,8 +200,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     try {
       setEnvLoading(true);
       const [data, gpuData] = await Promise.all([
-        settingsApi.getEnv(),
-        settingsApi.getGpus().catch(() => ({ gpus: [] })),
+        queryClient.query(envOptions()),
+        queryClient.query(gpusOptions()).catch(() => ({ gpus: [] })),
       ]);
       setEnvValues(data.values);
       setEnvOriginal(data.values);
@@ -213,7 +212,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     } finally {
       setEnvLoading(false);
     }
-  }, []);
+  }, [queryClient]);
 
   useEffect(() => { loadEnvSettings(); }, [loadEnvSettings]);
 
@@ -253,6 +252,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     try {
       const res = await settingsApi.updateEnv(diff);
       setEnvOriginal({ ...envValues });
+      void queryManager.keys(queryClient, envOptions().queryKey);
       if (res.restartRequired) {
         // Name them. "Some changes require a restart" left the user to work out
         // which value on screen is a lie about what the engine is running.
@@ -465,6 +465,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
             <EnvSubsection title={t('settings.env.paths')} isOpen={openSections.paths} onToggle={() => toggleSection('paths')}>
               <EnvPathRow envKey="LYRICS_EXPORT_DIR" label={t('settings.env.lyricsExportDir')} description={t('settings.env.lyricsExportDirDesc')}
                 value={envValues.LYRICS_EXPORT_DIR || ''} onChange={handleEnvChange} onBrowse={handleBrowse} />
+              <EnvPathRow envKey="DOWNLOAD_DIR" label={t('settings.env.downloadDir')} description={t('settings.env.downloadDirDesc')}
+                value={envValues.DOWNLOAD_DIR || ''} onChange={handleEnvChange} onBrowse={handleBrowse} />
               <EnvPathRow envKey="MUSCRIPTOR_MODELS_DIR" label={t('settings.env.muscriptorModelsDir')} description={t('settings.env.muscriptorModelsDirDesc')}
                 value={envValues.MUSCRIPTOR_MODELS_DIR || ''} onChange={handleEnvChange} onBrowse={handleBrowse} />
             </EnvSubsection>
@@ -606,6 +608,20 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           value={envValues.UNSLOTH_USERNAME || ''} onChange={handleEnvChange} />
         <EnvPasswordRow envKey="UNSLOTH_PASSWORD" label={t('settings.ai.unslothPassword')} description={t('settings.ai.unslothPasswordDesc')}
           value={envValues.UNSLOTH_PASSWORD || ''} onChange={handleEnvChange} />
+        <div className="setting-row">
+          <div className="setting-info">
+            <ParamLabel
+              label={t('settings.ai.unslothKeyless')}
+              className="setting-label"
+              info={t('settings.ai.unslothKeylessDesc')}
+            />
+          </div>
+          <Toggle
+            id="env-UNSLOTH_KEYLESS"
+            checked={(envValues.UNSLOTH_KEYLESS || '0') === '1'}
+            onChange={(v) => handleEnvChange('UNSLOTH_KEYLESS', v ? '1' : '0')}
+          />
+        </div>
         <EnvTextRow envKey="LLAMACPP_BASE_URL" label={t('settings.ai.llamacppUrl')} description={t('settings.ai.llamacppUrlDesc')}
           value={envValues.LLAMACPP_BASE_URL || ''} onChange={handleEnvChange} placeholder="http://127.0.0.1:8080/v1" />
         <EnvTextRow envKey="OPENAI_COMPAT_BASE_URL" label={t('settings.ai.openaiCompatUrl')} description={t('settings.ai.openaiCompatUrlDesc')}
@@ -908,6 +924,8 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <span className="settings-section-title">{t('settings.general.adapters')}</span>
         </div>
 
+        <AdapterReferencesAction />
+
         <SettingRow
           id="setting-trigger-filename"
           label={t('settings.general.triggerFilename')}
@@ -950,6 +968,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {/* ═══════════════ STORAGE & DATA TAB ═══════════════ */}
       {activeTab === 'storage' && (
       <>
+      <DataFolderPanel />
       {/* Stem Storage Section */}
       <div className="settings-section">
         <div className="settings-section-header">

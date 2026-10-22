@@ -1,13 +1,15 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronRight, ListOrdered, Code2, Download, Clock, Shuffle, Brain } from 'lucide-react';
+import { ChevronDown, ChevronRight, ListOrdered, Code2, Download, Clock, Shuffle, Brain, Disc3 } from 'lucide-react';
 import type { Artist } from '../../services/lireekApi';
-import { TripleProviderSelector, type ModelSelections, loadSelections, saveSelections } from './ProviderSelector';
+import { TripleProviderSelector, type ModelSelections } from './ProviderSelector';
 import { LLM_DURATION_KEY } from '../../utils/estimateDuration';
 import { USE_LM_ADAPTER_KEY } from '../../utils/lmAdapterPref';
+import { MASTER_TO_ALBUM_KEY } from '../../utils/masterToAlbumPref';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
+import { useCapabilities } from '../../hooks/useCapabilities';
 
 // ── Persisted state hook ────────────────────────────────────────────────────
 function useLocalPersistedState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
@@ -33,17 +35,18 @@ interface ArtistPageSidebarProps {
   albumCount?: number;
   onOpenQueue: () => void;
   onOpenPromptEditor: () => void;
+  modelSelections: ModelSelections;
+  onModelSelectionsChange: (sel: ModelSelections) => void;
 }
 
 export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
-  artist, albumCount, onOpenQueue, onOpenPromptEditor,
+  artist, albumCount, onOpenQueue, onOpenPromptEditor, modelSelections, onModelSelectionsChange,
 }) => {
   const [imageError, setImageError] = useState(false);
   const { t } = useTranslation();
   const { disguiseArtist, disguiseImageUrl } = useDisguiseMode();
 
   // ── LLM Models ──
-  const [modelSelections, setModelSelections] = useState<ModelSelections>(loadSelections);
   const [llmExpanded, setLlmExpanded] = useState(false);
 
   // ── Download filename prepend ──
@@ -59,6 +62,11 @@ export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
   // Off by default: a trained DiT adapter on the stock planner has been
   // sounding better than the same DiT adapter paired with its LM adapter.
   const [useLmAdapter, setUseLmAdapter] = useLocalPersistedState<boolean>(USE_LM_ADAPTER_KEY, false);
+  const [masterToAlbum, setMasterToAlbum] = useLocalPersistedState<boolean>(MASTER_TO_ALBUM_KEY, false);
+  // Timbre reference and the preset's LM adapter are read by ACE-Step alone
+  // (features.lm marks it); on the other engines both toggles do nothing.
+  const { capabilities } = useCapabilities();
+  const aceOnlyOk = !capabilities || capabilities.features.lm;
 
   const gradient = (name: string) => {
     const hash = name.split('').reduce((a, c) => ((a << 5) - a + c.charCodeAt(0)) | 0, 0);
@@ -156,8 +164,21 @@ export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
           <Toggle size="sm" accent="pink" checked={useLlmDuration} onChange={setUseLlmDuration} aria-label={t('lyric.llmDuration')} />
         </div>
 
-        {/* ── Randomize Timbre Reference ────────────────────────── */}
+        {/* ── Master to Album Track ───────────────────────────── */}
         <div className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03] border border-zinc-200 dark:border-white/5">
+          <span className="flex items-center gap-1.5">
+            <Disc3 className="w-3 h-3 text-zinc-500" />
+            <ParamLabel
+              label={t('lyric.masterToAlbum')}
+              info={t('lyric.masterToAlbumInfo')}
+              className="text-[11px] text-zinc-500 uppercase tracking-wider font-semibold"
+            />
+          </span>
+          <Toggle size="sm" accent="pink" checked={masterToAlbum} onChange={setMasterToAlbum} aria-label={t('lyric.masterToAlbum')} />
+        </div>
+
+        {/* ── Randomize Timbre Reference ────────────────────────── */}
+        {aceOnlyOk && <div className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03] border border-zinc-200 dark:border-white/5">
           <span className="flex items-center gap-1.5">
             <Shuffle className="w-3 h-3 text-zinc-500" />
             <ParamLabel
@@ -167,10 +188,10 @@ export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
             />
           </span>
           <Toggle size="sm" accent="pink" checked={randomizeTimbre} onChange={setRandomizeTimbre} aria-label={t('lyric.randomizeTimbre')} />
-        </div>
+        </div>}
 
         {/* ── Use LM Adapter ────────────────────────────────────── */}
-        <div className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03] border border-zinc-200 dark:border-white/5">
+        {aceOnlyOk && <div className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/[0.03] border border-zinc-200 dark:border-white/5">
           <span className="flex items-center gap-1.5">
             <Brain className="w-3 h-3 text-zinc-500" />
             <ParamLabel
@@ -180,7 +201,7 @@ export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
             />
           </span>
           <Toggle size="sm" accent="pink" checked={useLmAdapter} onChange={setUseLmAdapter} aria-label={t('lyric.useLmAdapter')} />
-        </div>
+        </div>}
 
         {/* "Generate All Audio" lived here. It queued every written song in the library
             with no way to narrow it down, and has been replaced by the Generate Audio tab
@@ -202,10 +223,7 @@ export const ArtistPageSidebar: React.FC<ArtistPageSidebarProps> = ({
             <div className="mt-2 animate-in slide-in-from-top-1 duration-150">
               <TripleProviderSelector
                 selections={modelSelections}
-                onSelectionsChange={(sel) => {
-                  setModelSelections(sel);
-                  saveSelections(sel);
-                }}
+                onSelectionsChange={onModelSelectionsChange}
               />
             </div>
           )}

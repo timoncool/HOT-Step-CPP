@@ -542,6 +542,7 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
               }
             : {}),
       get_wav_bits: 16,
+      ...(params.adapterRuntimeDora === true ? { adapter_runtime_dora: true } : {}),
       // LRC timestamps ride the same toggle ACE uses (skipLrc inverted).
       // Instrumentals are filtered engine-side, so no check is needed here.
       get_lrc: params.skipLrc !== true,

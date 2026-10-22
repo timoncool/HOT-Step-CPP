@@ -301,6 +301,7 @@ static void print_usage(void) {
             "                \"<word>, \" to every caption, the shape --trigger-prepend trained.\n"
             "  mm3-train-dit MiniMax-Music3 flow-DiT LoRA training.\n"
             "                --cache <dir from mm3-condition> --models <dir> --out <dir>\n"
+            "                [--dora] learn per-output magnitudes alongside LoRA factors.\n"
             "                [--rank 32] [--alpha 32] [--lr 1e-4] [--steps 200] [--crop 689]\n"
             "                [--grad-accum 1] [--seed 42]\n"
             "                [--song <substring>] overfit one song. Matches a SUBSTRING OF THE\n"
@@ -429,6 +430,8 @@ static void print_usage(void) {
             "                yue2-preprocess uses, at 48 kHz, so codes and latents come from\n"
             "                identical decoded samples.\n"
             "                [--force]  re-encode sources whose codes are already cached\n"
+            "                [--dump-mert]  also write codes/<stem>.mert.f16, the head's instance-normed\n"
+            "                [T25, 1024] input (fp16), for tokenizer-head training\n"
             "                Codes are RAW, in [0, 32768). The + codec_offset (151853) is\n"
             "                added once, at conditioning time, by the trainer.\n"
             "                TF32 is forced off, same rule as yue2-preprocess.\n"
@@ -545,6 +548,19 @@ static void print_usage(void) {
             "                [--target nar_attn|nar_attn_mlp|nar_attn_mlp_proj] default\n"
             "                nar_attn_mlp; --fd-check promotes it to ..._proj unless given\n"
             "                explicitly, so the flow-head probes have tensors to address.\n"
+            "                [--manifest <json>] may repeat: every cache listed trains as one\n"
+            "                set (same latent_dim and clip length).\n"
+            "                [--companion] merge the tokenizer's companion decoder adapter\n"
+            "                (nar_lora_joint_v9) under the NAR first, as the server does at\n"
+            "                render time, so the adapter trains on the decoder it ships on.\n"
+            "                [--audio-loss <w>] add w * an audio-domain loss: the clean-latent\n"
+            "                estimate x_t - t*v is decoded through the frozen VAE and scored\n"
+            "                against the source recording (log-mel + multi-res STFT + stereo\n"
+            "                width), on steps with t <= [--audio-tmax 0.4]. The decode covers\n"
+            "                [--audio-frames 150] frames plus [--audio-margin 25] each side.\n"
+            "                References are decoded like yue2-preprocess did ([--ffmpeg\n"
+            "                ffmpeg] for non-WAV/MP3). With --fd-check it checks the decoder\n"
+            "                against the inference VAE, then gates the audio term alone.\n"
             "                [--style \"text\"] [--lyrics \"text\"] conditioning for the gate's\n"
             "                cot=off prefix (the loop takes captions from the manifest, and\n"
             "                --lyrics only as the fallback for a clip that states none).\n"
@@ -4458,6 +4474,7 @@ static int cmd_mm3_train_dit(int argc, char ** argv) {
         if      (!strcmp(argv[i], "--cache"))      a.cache_dir  = next("--cache");
         else if (!strcmp(argv[i], "--models"))     a.models_dir = next("--models");
         else if (!strcmp(argv[i], "--out"))        a.out_dir    = next("--out");
+        else if (!strcmp(argv[i], "--dora"))       a.dora       = true;
         else if (!strcmp(argv[i], "--rank"))       a.rank       = atoll(next("--rank"));
         else if (!strcmp(argv[i], "--alpha"))      a.alpha      = (float) atof(next("--alpha"));
         else if (!strcmp(argv[i], "--lr"))         a.lr         = (float) atof(next("--lr"));
@@ -4564,7 +4581,11 @@ static int cmd_yue2_nar_train(int argc, char ** argv) {
         if      (!strcmp(argv[i], "--lm"))          a.lm_path    = next("--lm");
         else if (!strcmp(argv[i], "--models"))      a.models_dir = next("--models");
         else if (!strcmp(argv[i], "--vae-dir"))     a.vae_dir    = next("--vae-dir");
-        else if (!strcmp(argv[i], "--manifest"))    a.manifest   = next("--manifest");
+        else if (!strcmp(argv[i], "--manifest")) {
+            const char * v = next("--manifest");
+            if (a.manifest.empty()) a.manifest = v; else a.extra_manifests.push_back(v);
+        }
+        else if (!strcmp(argv[i], "--companion"))   a.companion  = true;
         else if (!strcmp(argv[i], "--out"))         a.out_dir    = next("--out");
         else if (!strcmp(argv[i], "--style"))       a.style      = next("--style");
         else if (!strcmp(argv[i], "--lyrics"))      a.lyrics     = next("--lyrics");
@@ -4608,6 +4629,11 @@ static int cmd_yue2_nar_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--nar-layers"))  a.nar_layers = atoi(next("--nar-layers"));
         else if (!strcmp(argv[i], "--abc-dropout")) a.abc_dropout = (float) atof(next("--abc-dropout"));
         else if (!strcmp(argv[i], "--no-abc"))      a.no_abc     = true;
+        else if (!strcmp(argv[i], "--audio-loss"))  a.audio_loss = (float) atof(next("--audio-loss"));
+        else if (!strcmp(argv[i], "--audio-tmax"))  a.audio_tmax = (float) atof(next("--audio-tmax"));
+        else if (!strcmp(argv[i], "--audio-frames")) a.audio_frames = atoll(next("--audio-frames"));
+        else if (!strcmp(argv[i], "--audio-margin")) a.audio_margin = atoll(next("--audio-margin"));
+        else if (!strcmp(argv[i], "--ffmpeg"))      a.ffmpeg     = next("--ffmpeg");
         else if (!strcmp(argv[i], "--dump-cond")) {
             a.dump_cond_name = next("--dump-cond");
             a.dump_cond_mode = next("--dump-cond");
@@ -4756,6 +4782,7 @@ static int cmd_yue2_tokenize(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--decode"))   a.decode     = next("--decode");
         else if (!strcmp(argv[i], "--limit"))    a.limit      = atoi(next("--limit"));
         else if (!strcmp(argv[i], "--force"))    a.force      = true;
+        else if (!strcmp(argv[i], "--dump-mert")) a.dump_mert = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
         else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
     }
@@ -6356,7 +6383,7 @@ static int cmd_yue2_prepare_aitk(int argc, char ** argv) {
     const auto usage = []() { fprintf(stderr,
         "ace-train yue2-prepare-aitk --legacy-manifest FILE --checkpoint FILE "
         "--tokenizer GGUF_OR_DIR --output NEW_DIR --model vae=FILE "
-        "--model semantic=FILE --model sheetsage=FILE [--trigger WORD]\n"); };
+        "--model semantic=FILE --model sheetsage=FILE [--trigger WORD] [--caption-dropout-trigger TEXT]\n"); };
     yue2_aitk_native_import::Request request;
     std::unordered_set<std::string> seen;
     for (int i = 1; i < argc; ++i) {
@@ -6371,6 +6398,7 @@ static int cmd_yue2_prepare_aitk(int argc, char ** argv) {
         else if (arg == "--tokenizer") request.tokenizer_gguf_or_dir = value;
         else if (arg == "--output") request.output_dir = value;
         else if (arg == "--trigger") request.trigger = raw;
+        else if (arg == "--caption-dropout-trigger") request.caption_dropout_trigger = raw;
         else if (arg == "--lyric-timing") {
             if (raw != "0" && raw != "1") { usage(); return 2; }
             request.lyric_timing = raw == "1";

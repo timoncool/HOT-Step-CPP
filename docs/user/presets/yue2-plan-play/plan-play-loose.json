@@ -1,0 +1,31 @@
+{
+  "name": "Plan Play: Loose",
+  "backend": "yue2",
+  "description": "Looser plan start, light CADS, Ancestral Euler with churn 0.25.",
+  "data": {
+    "_format": "hot-step-preset",
+    "_version": 2,
+    "_mergeMaps": true,
+    "backendParams": {
+      "yue2NarSolver": "ancestral",
+      "yue2NarScheduler": "stock",
+      "yue2CadsStrength": 0.05,
+      "yue2CadsT1": 0.6,
+      "yue2CadsT2": 0.9,
+      "yue2CadsRescale": true,
+      "yue2PlanWStart": 0.8,
+      "yue2PlanWEnd": 1,
+      "yue2PlanWCurve": "linear",
+      "yue2PlanCfg": 1,
+      "yue2PlanCfgT1": 0,
+      "yue2PlanCfgT2": 1,
+      "yue2PlanCfgRescale": 0.7,
+      "yue2PlanCfgLevelMatch": true
+    },
+    "pluginParams": {
+      "md_ancestral_yue2:churn": 0.25,
+      "md_plan_loose_yue2:loose": 0.5,
+      "md_plan_loose_yue2:lock_at": 0.5
+    }
+  }
+}

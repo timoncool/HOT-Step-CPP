@@ -1,5 +1,7 @@
 // wordLrcUtils.ts — Parse .lyrics.json and find active word/line by time
 
+import { ApiError } from '../services/httpClient';
+
 export interface LyricsWord {
   word: string;
   start: number;
@@ -46,19 +48,19 @@ export function sidecarUrl(audioUrl: string, suffix: string): string {
   return audioUrl.split('?')[0].replace(/(?:_mastered|_noadapter)?\.\w+$/, suffix);
 }
 
-/** Fetch .lyrics.json for the given audio URL. Returns null if not found. */
-export async function fetchLyricsJson(audioUrl: string): Promise<LyricsJson | null> {
+/** Fetch .lyrics.json for the given audio URL: the word timings, or null when
+ *  the track has none. Other failures throw, so Query never caches them as
+ *  "no lyrics". Read it through the shared `lyrics-json` key
+ *  (queries/shell-queue/lyrics.ts), not directly. */
+export async function fetchLyricsJson(audioUrl: string, opts: { signal?: AbortSignal } = {}): Promise<LyricsJson | null> {
   if (!audioUrl) return null;
-  try {
-    const res = await fetch(sidecarUrl(audioUrl, '.lyrics.json'));
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.version && data?.lines ? data : null;
-  } catch {
-    // Includes the HTML-instead-of-JSON case above: a missing sidecar answers
-    // 200 with the SPA shell, and .json() throws on it.
-    return null;
-  }
+  const res = await fetch(sidecarUrl(audioUrl, '.lyrics.json'), { signal: opts.signal });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new ApiError(res.status, `Lyrics fetch failed (${res.status})`, null);
+  // A missing sidecar can also answer 200 with the SPA shell (see above), so
+  // anything that does not parse as lyrics is "none".
+  const data = await res.json().catch(() => null);
+  return data?.version && data?.lines ? data : null;
 }
 
 /** Find the index of the current line at the given time. */

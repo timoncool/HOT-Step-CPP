@@ -27,7 +27,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { checkReleaseLayout } from '../../release/check-layout.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -300,6 +301,18 @@ checkEngineBinaries();
 
 console.log('\nPackaged runtime data');
 checkPackagedData();
+
+console.log('\nPortable layouts and local packagers');
+problems.push(...checkReleaseLayout(REPO_ROOT));
+{
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, ['--import', pathToFileURL(path.join(REPO_ROOT, 'server/node_modules/tsx/dist/loader.mjs')).href,
+    '--test', path.join(REPO_ROOT, 'server/scripts/release-layout.test.ts')], {
+    encoding: 'utf8', env: { ...process.env, HOT_STEP_ROOT: '', HOT_STEP_DATA_ROOT: '', HOT_STEP_PROFILE_DIR: '' },
+  });
+  if (r.status !== 0) problems.push(`release layout fixtures failed: ${(r.stderr || r.stdout).trim()}`);
+  else console.log('  profile restart markers, fresh release, version reuse and unchanged dev defaults: ok');
+}
 
 if (OFFLINE) {
   notes.push('--offline: did not check Hugging Face');

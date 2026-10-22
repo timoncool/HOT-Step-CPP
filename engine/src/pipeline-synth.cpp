@@ -195,6 +195,9 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
     // bf16 keeps the legacy key.
     bool runtime_any = g_hotstep_params.adapter_mode == "runtime"
                     || g_hotstep_params.adapter_mode == "runtime_lowrank";
+    if (runtime_any && g_hotstep_params.adapter_runtime_dora) {
+        ctx->dit_key.adapter_stack += "|dora:merge-v1";
+    }
     if (runtime_any && g_hotstep_params.adapter_runtime_quant != "bf16") {
         ctx->dit_key.adapter_stack += "|q:" + g_hotstep_params.adapter_runtime_quant;
     }

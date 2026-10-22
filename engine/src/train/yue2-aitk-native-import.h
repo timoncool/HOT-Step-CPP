@@ -38,6 +38,7 @@ struct Request {
     std::vector<ModelInput> models;               // VAE, semantic tokenizer, SheetSage, etc.
     bool lyric_timing = false;                    // explicit opt-in; requires cursor_words for lyrical sources
     std::string trigger;                          // Legacy-style opener, included before tokenization
+    std::string caption_dropout_trigger;          // exact caption-dropout style, no wrapper; defaults to trigger
 };
 
 namespace detail {
@@ -257,9 +258,10 @@ inline bool prepare_from_legacy(const Request & request, std::string * error = n
         } else if (caption_format == "none") {
             style.clear(); lyrics.clear();
         }
-        if (!request.trigger.empty()) {
-            if (request.trigger.size() > 128 || request.trigger.find_first_of("\r\n\0", 0, 3) != std::string::npos)
+        for (const std::string * t : {&request.trigger, &request.caption_dropout_trigger})
+            if (t->size() > 128 || t->find_first_of("\r\n\0", 0, 3) != std::string::npos)
                 return fail(error, "trigger must be a single-line phrase of at most 128 bytes");
+        if (!request.trigger.empty()) {
             style = style.empty() ? request.trigger : request.trigger + ", in the style of " + request.trigger + ". " + style;
         }
         // A failed or absent sheet uses the off prefix; audio and lyrics remain usable.
@@ -290,7 +292,8 @@ inline bool prepare_from_legacy(const Request & request, std::string * error = n
         // is exactly what yue2_style_string / applyYue2StyleTemplate produce
         // for an empty caption at generation time. Same lyrics, same sheet.
         // Always emitted (cheap); the trainer only draws on them when asked.
-        const std::string style_nocap = request.trigger;
+        // --caption-dropout-trigger replaces the trigger here, bare.
+        const std::string style_nocap = request.caption_dropout_trigger.empty() ? request.trigger : request.caption_dropout_trigger;
         auto full_nocap = yue2_token_prefixes(&tokenizer, style_nocap, lyrics, YUE2_COT_FULL, nullptr);
         auto off_nocap = yue2_token_prefixes(&tokenizer, style_nocap, lyrics, YUE2_COT_OFF, nullptr);
         if (full_nocap.empty() || full_nocap.back() != YUE2_ABC_START || off_nocap.size() < 3 ||

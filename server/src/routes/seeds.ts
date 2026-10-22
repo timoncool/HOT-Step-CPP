@@ -23,13 +23,19 @@ import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { config } from '../config.js';
+import type {
+  ListSeedsResponse, ListFavoritesResponse, FavoriteSeedEntry, RandomSeedResponse, GetSeedResponse,
+  SaveSeedResponse, DeleteSeedResponse, ToggleFavoriteResponse,
+} from '../contracts/seeds.js';
 
 const router = Router();
 
 // ─── Storage root ─────────────────────────────────────────────────────────────
 
 function seedsRoot(): string {
-  return path.join(config.data.dir, 'seeds');
+  // config.data.dir is the data root (matches scragnog's generate.ts pattern)
+  const dir = (config as any)?.data?.dir ?? (config as any)?.data?.audioDir ?? './output';
+  return path.join(dir, 'seeds');
 }
 
 function seedsDir(subdir = ''): string {
@@ -124,7 +130,7 @@ router.get('/', (req, res) => {
     };
   });
 
-  res.json({ seeds, count: seeds.length });
+  res.json({ seeds, count: seeds.length } satisfies ListSeedsResponse);
 });
 
 // GET /api/seeds/favorites — list favorite seed names
@@ -135,8 +141,8 @@ router.get('/favorites', (_req, res) => {
       const data = readSeedFile(name);
       return data ? { name, seed: data.seed, saved_at: data.saved_at, favorite: true } : null;
     })
-    .filter(Boolean);
-  res.json({ seeds });
+    .filter((s): s is FavoriteSeedEntry => s !== null);
+  res.json({ seeds } satisfies ListFavoritesResponse);
 });
 
 // GET /api/seeds/random — return a random saved seed
@@ -149,7 +155,7 @@ router.get('/random', (req, res) => {
   const data = readSeedFile(name, subdir);
   if (!data) return res.status(404).json({ error: 'seed file missing' });
 
-  res.json({ name, seed: data.seed, saved_at: data.saved_at });
+  res.json({ name, seed: data.seed, saved_at: data.saved_at } satisfies RandomSeedResponse);
 });
 
 // GET /api/seeds/:name — load a single seed
@@ -168,7 +174,7 @@ router.get('/:name', (req, res) => {
     description: (data.metadata?.description as string) || '',
     tags:        (data.metadata?.tags as string[]) || [],
     favorite:    favorites.includes(name),
-  });
+  } satisfies GetSeedResponse);
 });
 
 // POST /api/seeds — save a seed
@@ -193,7 +199,7 @@ router.post('/', (req, res) => {
   const ok = writeSeedFile(name.trim(), seedVal, String(subdir), meta);
   if (!ok) return res.status(500).json({ error: 'failed to write seed file' });
 
-  res.json({ ok: true, name: name.trim(), seed: seedVal });
+  res.json({ ok: true, name: name.trim(), seed: seedVal } satisfies SaveSeedResponse);
 });
 
 // DELETE /api/seeds/:name — delete a seed
@@ -210,7 +216,7 @@ router.delete('/:name', (req, res) => {
     const favs = loadFavorites();
     const next = favs.filter(f => f !== name);
     if (next.length !== favs.length) saveFavorites(next);
-    res.json({ ok: true, deleted: name });
+    res.json({ ok: true, deleted: name } satisfies DeleteSeedResponse);
   } catch (e) {
     res.status(500).json({ error: 'delete failed' });
   }
@@ -232,7 +238,18 @@ router.post('/:name/favorite', (req, res) => {
   }
 
   saveFavorites(favs);
-  res.json({ ok: true, name, favorite: nowFavorite });
+  res.json({ ok: true, name, favorite: nowFavorite } satisfies ToggleFavoriteResponse);
 });
 
 export default router;
+
+// ─── Mount instructions ───────────────────────────────────────────────────────
+//
+// In your main server entry (app.ts or server.ts), add:
+//
+//   import seedsRouter from './routes/seeds.js';
+//   app.use('/api/seeds', seedsRouter);
+//
+// Add BEFORE the generate router registration so /api/seeds/random and
+// /api/seeds/favorites don't get caught by /api/seeds/:name.
+// (Express matches routes in registration order.)

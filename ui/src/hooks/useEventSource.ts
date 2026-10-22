@@ -64,6 +64,7 @@ export function useEventSource(url: string, enabled: boolean) {
 
     return () => {
       unsubscribe();
+      batchRef.current = [];
       if (flushTimer.current) {
         clearTimeout(flushTimer.current);
         flushTimer.current = undefined;

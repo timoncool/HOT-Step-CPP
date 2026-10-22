@@ -1,5 +1,9 @@
 # debugging-runtime — reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Companion to [SKILL.md](SKILL.md). Copy-paste command pack, wire formats, and timing constants. All line refs verified 2026-07-02.
 
 ## Triage command pack (PowerShell, repo root)
@@ -16,7 +20,7 @@ Get-Content "$s\ace_engine.log" -Tail 60
 Get-ChildItem "$s\generations" | Sort-Object LastWriteTime -Descending | Select-Object -First 3
 
 # All failures across history
-Select-String -Path "logs\*\generations\*.log" -Pattern "GENERATION FAILED" | Select-Object -Last 10
+Select-String -Path "<data root>/logs\*\generations\*.log" -Pattern "GENERATION FAILED" | Select-Object -Last 10
 
 # Crash forensics in current session
 Select-String -Path "$s\node_console.log" -Pattern "exited with code|Crashed|FATAL|CUDA error"
@@ -40,7 +44,7 @@ Invoke-RestMethod -Method Post http://localhost:3000/api/shutdown
 ```
 
 If the app never started, restart it detached with `dev.bat` and read the newest
-`logs/<session>/node_console.log`. If there is no session folder at all, run the Node
+`<data root>/logs/<session>/node_console.log`. If there is no session folder at all, run the Node
 server in the foreground for one diagnostic pass to see the error (this bypasses dev mode
 — do not use it as the normal way to run the app):
 
@@ -152,7 +156,7 @@ Exe candidates in order (config.ts:46-52): `engine/ace-server.exe` (portable), `
 
 Buffered in `generationBuffers` (logger.ts:24) and flushed in one `writeFileSync` by `finishGenerationLog`/`failGenerationLog` (logger.ts:139-178). Each gen log contains exactly one params block. (The retry loop in generate.ts is unreachable for generation failures — and even if it fired, `failGenerationLog` deletes the buffer before the `[Retry]` WARNING is logged and attempt 2 would overwrite the same filename, so a two-attempt log is structurally impossible.)
 
-## Known-good real-world log excerpts (from `logs/` history)
+## Known-good real-world log excerpts (from `<data root>/logs/` history)
 
 - Crash + supervised respawn (2026-06-04, wrong VAE file):
   ```

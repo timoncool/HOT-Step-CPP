@@ -12,6 +12,7 @@ static void jl(const char * fmt, ...) { (void) fmt; }
 #include "yue2-aitk-joint-step.h"
 #include "yue2-aitk-resume.h"
 #include "yue2-aitk-embedding-dequant.h"
+#include "yue2-aitk-fixture-replay.h"
 
 #include <csignal>
 #include <cstdlib>
@@ -48,6 +49,21 @@ void event(const char * stage, int step = -1) { std::cout << "{\"stage\":\"" << 
 std::string lower_hash(std::string value) {
     for (char & c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return value;
+}
+
+// Checkpoint weight file name, <trigger>_yue2_joint_<half>_step<N>.safetensors,
+// so a file copied out of its run folder still says what it is. The trigger is
+// cleaned the way the server names the run folder (yue2AitkRuns.ts).
+std::string joint_weight_name(const std::string & trigger, const char * half, int step) {
+    std::string name;
+    for (char c : trigger) {
+        const bool keep = std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-';
+        if (keep) name += c; else if (name.empty() || name.back() != '_') name += '_';
+    }
+    while (!name.empty() && (name.front() == '.' || name.front() == '_')) name.erase(0, 1);
+    if (name.size() > 48) name.resize(48);
+    while (!name.empty() && (name.back() == '.' || name.back() == '_')) name.pop_back();
+    return (name.empty() ? "" : name + "_") + "yue2_joint_" + half + "_step" + std::to_string(step) + ".safetensors";
 }
 
 struct ResumePlan { yue2_aitk::ResumeRecord record; std::vector<size_t> order; size_t cursor = 0; int completed = 0; std::string sampler; };
@@ -144,6 +160,8 @@ bool parse_resume_meta(const std::string & text, const std::string & checkpoint,
       if(yyjson_val * v=yyjson_obj_get(root,"beta1")) { if(!yyjson_is_num(v)) return fail(error,"resume beta1 field is malformed"); b1=float(yyjson_get_num(v)); }
       if(yyjson_val * v=yyjson_obj_get(root,"beta2")) { if(!yyjson_is_num(v)) return fail(error,"resume beta2 field is malformed"); b2=float(yyjson_get_num(v)); }
       if(b1!=config.beta1 || b2!=config.beta2) return fail(error,"resume Adam betas mismatch; start a new run"); }
+    { float eps=0.0f; if(yyjson_val * v=yyjson_obj_get(root,"adam_eps")) { if(!yyjson_is_num(v)) return fail(error,"resume adam_eps field is malformed"); eps=float(yyjson_get_num(v)); }
+      if(eps!=config.adam_eps) return fail(error,"resume --adam-eps mismatch; start a new run"); }
     { std::string was="tuned"; if(yyjson_val * v=yyjson_obj_get(root,"ar_targets")) str_field(v,&was); if(was!=config.ar_targets) return fail(error,"resume ar_targets mismatch; start a new run"); }
     { yyjson_val * v=yyjson_obj_get(root,"ar_loss_weight"); const double was=v&&yyjson_is_num(v)?yyjson_get_num(v):1.0; if(was!=double(config.ar_loss_weight)) std::fprintf(stderr,"[yue2-aitk] resume note: ar-loss-weight changed from %.9g to %.9g; the run continues with the new value\n", was, (double)config.ar_loss_weight); }
     { yyjson_val * v=yyjson_obj_get(root,"grad_accum"); const int was=v&&yyjson_is_int(v)?int(yyjson_get_sint(v)):1; if(was!=config.grad_accum) std::fprintf(stderr,"[yue2-aitk] resume note: grad-accum changed from %d to %d; the run continues with the new value\n", was, config.grad_accum); }
@@ -198,6 +216,7 @@ std::string make_resume_meta(const std::string & cp, const std::string & ds, con
     // Only LoKr records carry these keys, so a LoRA record is byte-identical
     // to one written before LoKr existed (the reader defaults to lora).
     if (config.adapter_type=="lokr") { yyjson_mut_obj_add_strcpy(doc,root,"adapter_type","lokr"); yyjson_mut_obj_add_int(doc,root,"lokr_dim",config.lokr_dim); yyjson_mut_obj_add_int(doc,root,"lokr_factor",config.lokr_factor); }
+    else if (config.adapter_type=="dora") yyjson_mut_obj_add_strcpy(doc,root,"adapter_type","dora");
     if (config.cautious) yyjson_mut_obj_add_bool(doc,root,"cautious",true);
     yyjson_mut_obj_add_real(doc,root,"kl_weight",config.kl_weight); yyjson_mut_obj_add_real(doc,root,"abc_dropout",config.abc_dropout); yyjson_mut_obj_add_real(doc,root,"caption_dropout",config.caption_dropout); yyjson_mut_obj_add_real(doc,root,"planner_lr_scale",config.planner_lr_scale); yyjson_mut_obj_add_real(doc,root,"target_kl",config.target_kl);
     // Only runs with a target stop carry these, so other records are unchanged.
@@ -211,6 +230,7 @@ std::string make_resume_meta(const std::string & cp, const std::string & ds, con
     if (config.ar_loss_weight!=1.0f) yyjson_mut_obj_add_real(doc,root,"ar_loss_weight",config.ar_loss_weight);
     if (config.beta1!=0.9f) yyjson_mut_obj_add_real(doc,root,"beta1",config.beta1);
     if (config.beta2!=0.999f) yyjson_mut_obj_add_real(doc,root,"beta2",config.beta2);
+    if (config.adam_eps>0.0f) yyjson_mut_obj_add_real(doc,root,"adam_eps",config.adam_eps);
     if (config.ar_targets!="tuned") yyjson_mut_obj_add_strcpy(doc,root,"ar_targets",config.ar_targets.c_str());
     if (config.grad_accum!=1) yyjson_mut_obj_add_int(doc,root,"grad_accum",config.grad_accum);
     if (config.text_dropout>0.0f) yyjson_mut_obj_add_real(doc,root,"text_dropout",config.text_dropout);
@@ -231,8 +251,8 @@ std::string make_resume_meta(const std::string & cp, const std::string & ds, con
     if (config.optimizer!="adamw") {
         yyjson_mut_obj_add_int(doc,root,"opt_iter",opt_iter);
         if (config.optimizer=="prodigy") {
-            yyjson_mut_obj_add_real(doc,root,"prodigy_d",float(prodigy_d));
-            yyjson_mut_obj_add_real(doc,root,"prodigy_r",float(prodigy_r));
+            yyjson_mut_obj_add_real(doc,root,"prodigy_d",prodigy_d);
+            yyjson_mut_obj_add_real(doc,root,"prodigy_r",prodigy_r);
         }
     }
     size_t n=0; char * raw=yyjson_mut_write(doc,0,&n); std::string out=raw?std::string(raw,n):std::string(); std::free(raw); yyjson_mut_doc_free(doc); return out;
@@ -315,6 +335,11 @@ static int run_impl(Config config, std::string * error) {
         // only — a HALF-honoured split is worse than a refused one.
         fail(error, "--planner-lr-scale / --nar-lr-scale are not supported with --optimizer muon"); return 1;
     }
+    if (config.adam_eps > 0.0f && config.optimizer != "adamw-lm" && config.optimizer != "muon") {
+        // The 8-bit kernel keeps its own eps (1e-6) and Prodigy its own; a
+        // flag they would ignore is refused instead.
+        fail(error, "--adam-eps needs the LmOptim AdamW rule: --optimizer adamw-lm or muon"); return 1;
+    }
     if (config.lr_schedule != "cosine" && config.optimizer == "adamw") {
         // The native AdamW8bit branch has always been flat after warmup; a
         // schedule it would silently ignore is refused instead.
@@ -324,7 +349,8 @@ static int run_impl(Config config, std::string * error) {
         fail(error, "--cautious needs an LmOptim optimizer: --optimizer adamw-lm, prodigy or muon (the native AdamW8bit kernel has no update tensor to mask)"); return 1;
     }
     const bool lokr = config.adapter_type == "lokr";
-    if (!lokr && config.adapter_type != "lora") { fail(error, "invalid runtime configuration"); return 1; }
+    const bool dora = config.adapter_type == "dora";
+    if (!lokr && !dora && config.adapter_type != "lora") { fail(error, "invalid runtime configuration"); return 1; }
     if (lokr) {
         if (config.lokr_dim < 1 || config.lokr_dim > 65536 || config.lokr_factor < 1 || config.lokr_factor > 65536) {
             fail(error, "--lokr-dim and --lokr-factor must be within [1, 65536]"); return 1;
@@ -384,6 +410,7 @@ static int run_impl(Config config, std::string * error) {
         if (with_abc && config.abc_dropout < 1.0f) cot += cot.empty() ? "full" : ",full";
         if (!cot.empty()) adapter_meta.push_back({"cot", cot});
         if (!config.style_norms.empty()) adapter_meta.push_back({"style_norms", config.style_norms});
+        if (!dataset.trigger.empty()) adapter_meta.push_back({"style_template", dataset.style_template});
     }
     yue2_aitk::Yue2NativeSampler sampler(config.seed);
     std::vector<size_t> order(dataset.items.size()); std::iota(order.begin(), order.end(), 0);
@@ -437,7 +464,7 @@ static int run_impl(Config config, std::string * error) {
     {
         // Fused training attention where the backend has it (CUDA, CPU); the
         // exact math attention elsewhere.
-        ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
         ggml_context * probe = ggml_init(ip);
         ggml_tensor * q = ggml_new_tensor_4d(probe, GGML_TYPE_F32, 128, 16, 16, 1);
         ggml_tensor * k = ggml_new_tensor_4d(probe, GGML_TYPE_F32, 128, 16, 8, 1);
@@ -445,10 +472,35 @@ static int run_impl(Config config, std::string * error) {
         ggml_tensor * m = ggml_new_tensor_2d(probe, GGML_TYPE_F16, 16, 16);
         yue2_aitk_graph::math_attention() = !ggml_backend_supports_op(backend.value, ggml_flash_attn_train(probe, q, k, v, m, 1.0f)) ||
                                             std::getenv("YUE2_AITK_MATH_ATTENTION") != nullptr;
+        // S2c: BF16 attention only where the backend takes BOTH directions of
+        // the op as the graph builds them: contiguous BF16 Q/K/V at D = 128
+        // with GGML_PREC_BF16. CUDA says yes on sm_80+ only; CPU and Vulkan
+        // refuse, and the graph keeps today's F32/TF32 dispatch.
+        if (!yue2_aitk_graph::math_attention()) {
+            ggml_tensor * qb = ggml_new_tensor_4d(probe, GGML_TYPE_BF16, 128, 16, 16, 1);
+            ggml_tensor * kb = ggml_new_tensor_4d(probe, GGML_TYPE_BF16, 128, 16, 8, 1);
+            ggml_tensor * vb = ggml_new_tensor_4d(probe, GGML_TYPE_BF16, 128, 16, 8, 1);
+            ggml_tensor * fwd = ggml_flash_attn_train(probe, qb, kb, vb, m, 1.0f);
+            ggml_flash_attn_train_set_prec(fwd, GGML_PREC_BF16);
+            ggml_tensor * bwd = ggml_flash_attn_train_back(probe, qb, kb, vb, m, fwd, fwd, 1.0f);
+            ggml_flash_attn_train_set_prec(bwd, GGML_PREC_BF16);
+            yue2_aitk_graph::bf16_attention_supported() =
+                ggml_backend_supports_op(backend.value, fwd) && ggml_backend_supports_op(backend.value, bwd);
+        }
         ggml_free(probe);
     }
     std::fprintf(stderr, "[yue2-aitk] training device %s via %s; attention %s\n", ggml_backend_dev_name(device), reg_name,
                  yue2_aitk_graph::math_attention() ? "exact (no fused training kernel on this backend)" : "fused");
+    if (!yue2_aitk_graph::precision_valid()) {
+        fail(error, (std::string("YUE2_AITK_PRECISION must be bf16 or strict-f32, not ") + yue2_aitk_graph::precision_name()).c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "[yue2-aitk] training precision %s: GEMM %s, attention %s\n",
+                 yue2_aitk_graph::strict_f32() ? "strict-f32" : "bf16",
+                 yue2_aitk_graph::strict_f32() ? "F32 (GGML_PREC_F32, the pre-S2a path)"
+                                               : "BF16 tensor-core, FP32 accumulate (quantized GGUF weights stay F32)",
+                 !yue2_aitk_graph::strict_f32() && yue2_aitk_graph::bf16_attention_supported()
+                     ? "BF16 Q/K/V (unless YUE2_AITK_STRICT_F32/BASELINE)" : "dispatch unchanged");
     using AttentionPrecision = const char * (*)(int);
     const auto attention_precision = reinterpret_cast<AttentionPrecision>(ggml_backend_reg_get_proc_address(
         ggml_backend_dev_backend_reg(device), "ggml_backend_cuda_fattn_train_last_prec"));
@@ -529,7 +581,12 @@ static int run_impl(Config config, std::string * error) {
             return 0;
         }
         if (!state.initialize(backend.value, static_cast<uint32_t>(config.seed), error,cursor_weight>0,config.rank,config.alpha,
-                              lokr ? config.lokr_dim : 0, lokr ? config.lokr_factor : 0)) return 1;
+                              lokr ? config.lokr_dim : 0, lokr ? config.lokr_factor : 0, dora)) return 1;
+        if (dora) {
+            if (!state.init_dora(model, error)) return 1;
+            std::fprintf(stderr, "[yue2-aitk] adapter dora: rank %d alpha %.4g, %zu trainable parameters, norm pass %.0f ms\n",
+                         config.rank, (double) config.alpha, state.parameter_count(), state.dora_refresh_ms());
+        }
         if (gguf_base) std::fprintf(stderr, "[yue2-aitk] base: GGUF %s\n", config.checkpoint.c_str());
         if (model.companion()) std::fprintf(stderr, "[yue2-aitk] companion decoder adapter: %s (frozen)\n", config.companion.c_str());
         if (lokr) std::fprintf(stderr, "[yue2-aitk] adapter lokr: dim %d factor %d alpha %.4g, %zu trainable parameters\n",
@@ -628,6 +685,10 @@ static int run_impl(Config config, std::string * error) {
                 o.weight_decay = config.weight_decay;
                 o.grad_clip = 0.0f;  // state.clip_gradients(1.0) is the only clipper
                 o.adam_beta1 = config.beta1; o.adam_beta2 = config.beta2;
+                if (config.adam_eps > 0.0f) {
+                    o.adam_eps = config.adam_eps;
+                    std::fprintf(stderr, "[yue2-aitk] AdamW eps %.3g\n", (double) o.adam_eps);
+                }
                 o.prodigy_d0 = config.prodigy_d0;
                 o.muon.lr_scale = config.muon_lr_scale;
                 o.muon.ns_steps = config.muon_ns_steps;
@@ -706,7 +767,10 @@ static int run_impl(Config config, std::string * error) {
         }
         if (!config.resume.empty()) {
             if (use_lm) {
-                if (resume_plan.record.version != 2) { fail(error, ("resume record format is not compatible with --optimizer " + config.optimizer).c_str()); return 1; }
+                if (resume_plan.record.version != 2 && resume_plan.record.version != 3) { fail(error, ("resume record format is not compatible with --optimizer " + config.optimizer).c_str()); return 1; }
+                // Older records stored the moments 8-bit; they still load, but
+                // the run drifts from an uninterrupted one from the next step.
+                if (resume_plan.record.version == 2) std::fprintf(stderr, "[yue2-aitk] resume note: this record predates exact optimizer state (8-bit moments); the run continues, but will not match an uninterrupted one\n");
                 const auto & snap = resume_plan.record.state;
                 const auto named = state.named_tensors();
                 if (snap.names.size() != named.size() || snap.step != resume_plan.completed) { fail(error, "resume record does not match the run shape"); return 1; }
@@ -718,7 +782,7 @@ static int run_impl(Config config, std::string * error) {
                     *present_out = f || q;
                     if (!*present_out) return !required;
                     if (f) {
-                        if (n >= 4096 || fp32.size() != n) return false;
+                        if (fp32.size() != n) return false;
                         for (float v : fp32) if (!std::isfinite(v)) return false;
                         return true;
                     }
@@ -775,6 +839,8 @@ static int run_impl(Config config, std::string * error) {
                 if (adamw->step() != resume_plan.completed) { fail(error, "resume optimizer step does not match completed step"); return 1; }
                 resume_plan.record = {};
             }
+            // The restored A/B are not the ones init_dora normed.
+            if (dora && !state.refresh_dora(model, error)) return 1;
         }
         // A frozen record resumes frozen: its planner weights, just restored,
         // are the held ones.
@@ -811,6 +877,76 @@ static int run_impl(Config config, std::string * error) {
             std::cout << meters.str() << std::flush;
             return 0;
         }
+        if (config.eval_adapted) {
+            // --eval-adapted: the restored adapters scored on a held-out set.
+            // Same recipe as --eval-base-loss (per-item seeded crop, t = 250 /
+            // 500 / 750, full prompt, no dropout, no update), once with the base
+            // and once with the adapters, on identical samples. The adapted
+            // decoder is conditioned by the ADAPTED planner prefix, as at
+            // generation and in a training step.
+            if (config.resume.empty()) { fail(error, "--eval-adapted needs --resume (the checkpoint whose adapters are scored)"); return 1; }
+            yue2_aitk::Dataset held_out;
+            if (!config.eval_dataset.empty() && !yue2_aitk::read_dataset(config.eval_dataset, &held_out, error)) return 1;
+            const auto & items = config.eval_dataset.empty() ? dataset.items : held_out.items;
+            if (items.empty()) { fail(error, "the evaluation dataset has no items"); return 1; }
+            event("eval");
+            std::ofstream out(std::filesystem::u8path(config.output) / "adapted-loss.jsonl", std::ios::binary);
+            if (!out) { fail(error, "cannot create adapted-loss JSONL"); return 1; }
+            const auto esc = [](const std::string & v) { std::string r; for (char c : v) { if (c == '"' || c == '\\') r += '\\'; if ((unsigned char) c >= 0x20) r += c; } return r; };
+            const float levels[3] = {250.0f, 500.0f, 750.0f};
+            double ar_b = 0.0, ar_a = 0.0, nar_b = 0.0, nar_a = 0.0, arw_b = 0.0, arw_a = 0.0; size_t tokens_total = 0;
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (yue2_aitk_cancel_requested()) { fail(error, "cancelled"); return 1; }
+                const auto & item = items[i];
+                size_t window = config.nar_crop_frames > 0 ? (size_t) config.nar_crop_frames : item.song.semantic_tokens.size();
+                {
+                    const auto & p = item.prompt;
+                    const size_t used = std::max({p.retained_prefix_ids.size() + p.abc_ids.size(), p.dropped_prefix_ids.size(),
+                                                  p.retained_nocap_prefix_ids.size() + p.abc_ids.size(), p.dropped_nocap_prefix_ids.size()}) + 5;
+                    const size_t fit = used < yue2_aitk::dataset_detail::kMaxFrames ? (yue2_aitk::dataset_detail::kMaxFrames - used) / 2 : 1;
+                    window = std::max<size_t>(1, std::min(window, fit));
+                }
+                double ce_b = 0.0, ce_a = 0.0, mse_b[3] = {0, 0, 0}, mse_a[3] = {0, 0, 0}; size_t tokens = 0;
+                Yue2AitkPrefixHost prefix_b, prefix_a;
+                for (int k = 0; k < 3; ++k) {
+                    yue2_aitk::Yue2NativeSampler item_sampler(config.seed * 1000003ull + 104729ull * (i + 1));
+                    auto sampled = item_sampler.sample(item.song, item.prompt, window, std::vector<float>{levels[k]}, 0.0f, 0, 0, 0.0f, base_targets);
+                    if (k == 0) {
+                        if (!yue2_aitk_joint::base_ar_ce(backend.value, model, sampled.batch, &ce_b, &tokens, error) ||
+                            !yue2_aitk_joint::base_ar_ce(backend.value, model, sampled.batch, &ce_a, nullptr, error, &state.ar_adapters()) ||
+                            !yue2_aitk_joint::nar_probe_prefix(backend.value, model, sampled.batch, &prefix_b, error) ||
+                            !yue2_aitk_joint::nar_probe_prefix(backend.value, model, sampled.batch, &prefix_a, error, &state.ar_adapters())) return 1;
+                    }
+                    for (int adapted = 0; adapted < 2; ++adapted) {
+                        std::vector<float> prediction;
+                        if (!yue2_aitk_joint::nar_probe_predict(backend.value, model, adapted ? &state.nar_adapters() : nullptr, adapted ? prefix_a : prefix_b,
+                                                                sampled.noisy_bf16, sampled.timestep_bf16, &prediction, error)) return 1;
+                        double sq = 0.0;
+                        for (size_t j = 0; j < prediction.size(); ++j) { const double d = double(prediction[j]) - sampled.target_f32[j]; sq += d * d; }
+                        (adapted ? mse_a : mse_b)[k] = prediction.empty() ? 0.0 : sq / double(prediction.size());
+                    }
+                }
+                const double m_b = (mse_b[0] + mse_b[1] + mse_b[2]) / 3.0, m_a = (mse_a[0] + mse_a[1] + mse_a[2]) / 3.0;
+                if (!std::isfinite(ce_a) || !std::isfinite(m_a) || !std::isfinite(m_b)) { fail(error, "nonfinite held-out loss"); return 1; }
+                ar_b += ce_b; ar_a += ce_a; nar_b += m_b; nar_a += m_a; arw_b += ce_b * double(tokens); arw_a += ce_a * double(tokens); tokens_total += tokens;
+                std::ostringstream line; line.precision(9);
+                line << "{\"stage\":\"eval_adapted\",\"item\":" << i << ",\"id\":\"" << esc(item.id) << "\",\"window\":" << window << ",\"ar_tokens\":" << tokens
+                     << ",\"ar_ce_base\":" << ce_b << ",\"ar_ce_adapted\":" << ce_a << ",\"nar_mse_base\":" << m_b << ",\"nar_mse_adapted\":" << m_a
+                     << ",\"nar_mse_adapted_t\":[" << mse_a[0] << "," << mse_a[1] << "," << mse_a[2] << "]}\n";
+                out << line.str() << std::flush; std::cout << line.str() << std::flush;
+            }
+            const double n = double(items.size());
+            std::ostringstream summary; summary.precision(9);
+            summary << "{\"stage\":\"eval_adapted_summary\",\"items\":" << items.size() << ",\"adapter\":\"" << config.adapter_type << "\",\"step\":" << completed
+                    << ",\"held_out\":" << (config.eval_dataset.empty() ? "false" : "true")
+                    << ",\"ar_ce_token_mean_base\":" << (tokens_total ? arw_b / tokens_total : 0.0) << ",\"ar_ce_token_mean_adapted\":" << (tokens_total ? arw_a / tokens_total : 0.0)
+                    << ",\"ar_ce_mean_base\":" << ar_b / n << ",\"ar_ce_mean_adapted\":" << ar_a / n
+                    << ",\"nar_mse_mean_base\":" << nar_b / n << ",\"nar_mse_mean_adapted\":" << nar_a / n
+                    << ",\"nar_timesteps\":[250,500,750],\"nar_window\":" << config.nar_crop_frames << ",\"ar_targets\":\"" << config.ar_targets << "\"}\n";
+            out << summary.str() << std::flush; std::cout << summary.str() << std::flush;
+            event("done");
+            return 0;
+        }
         std::ofstream jsonl(std::filesystem::u8path(config.output) / "train.jsonl", std::ios::binary);
         if (!jsonl) { fail(error, "cannot create training JSONL"); return 1; }
         // The planner's KL at the moment a checkpoint is written, for meters.json.
@@ -842,6 +978,15 @@ static int run_impl(Config config, std::string * error) {
         // 0: the stops, the rungs, the checkpoint meters. Otherwise the joint
         // step skips the frozen teacher forward (yue2-aitk-joint-step.h).
         const bool measure_kl = config.target_kl > 0.0f || config.kl_checkpoint_every > 0.0f || config.nar_drift || config.target_loss > 0.0f;
+        if (!config.fixture_replay.empty()) {
+            yue2_aitk_fixture::Args fa;
+            fa.dir = std::filesystem::u8path(config.fixture_replay);
+            fa.kl_weight = config.kl_weight; fa.ar_loss_weight = config.ar_loss_weight;
+            fa.beta1 = config.beta1; fa.beta2 = config.beta2; fa.lr = config.lr; fa.weight_decay = config.weight_decay;
+            if (!yue2_aitk_fixture::run(fa, backend.value, model, state, use_lm ? nullptr : adamw.get(),
+                                        use_lm ? &lm->opt : nullptr, use_lm ? lm->osched : nullptr, error)) return 1;
+            return 0;
+        }
         // wsd: start the tail now (idempotent). The stop that asked for it acts
         // when the tail ends.
         auto start_tail = [&](const char * why) {
@@ -889,7 +1034,7 @@ static int run_impl(Config config, std::string * error) {
             const std::string metadata = make_resume_meta(checkpoint_hash.hex(), dataset_hash.hex(), source_hash.hex(), config.seed, config.cuda_index, step, cursor, order, sampler_state, cursor_weight,
                 config, use_lm ? lm->opt.opt_iter : 0, use_lm ? lm->opt.prodigy_d : 0.0, use_lm ? lm->opt.prodigy_r : 0.0, kl_window, loss_window, planner_frozen_at, gnorm_window, spike_steps, recon_history, kl_mark_last, unfrozen_at, rung_lr_mult, lr_decaying_from);
             if (metadata.empty()) return false;
-            if (!state.export_snapshot(adapter.u8string().c_str(), step, error, (temp_dir / "native-ar.safetensors").u8string().c_str(), (temp_dir / "native-nar.safetensors").u8string().c_str(), dataset.trigger, config.caption_dropout, adapter_meta)) return false;
+            if (!state.export_snapshot(adapter.u8string().c_str(), step, error, (temp_dir / std::filesystem::u8path(joint_weight_name(dataset.trigger, "ar", step))).u8string().c_str(), (temp_dir / std::filesystem::u8path(joint_weight_name(dataset.trigger, "nar", step))).u8string().c_str(), dataset.trigger, config.caption_dropout, adapter_meta)) return false;
             if (use_lm) {
                 yue2_aitk::HostStateSnapshot snap; snap.step = step;
                 const auto named = state.named_tensors();
@@ -910,22 +1055,12 @@ static int run_impl(Config config, std::string * error) {
                         ggml_backend_tensor_get(t, values.data(), 0, values.size() * sizeof(float));
                         ggml_backend_synchronize(backend.value);
                         for (float v : values) if (!std::isfinite(v)) return false;
-                        if (n >= 4096) {
-                            std::vector<uint8_t> q; std::vector<float> am;
-                            if (!yue2_aitk::resume_detail::quantize_f32(values, &q, &am)) return false;
-                            switch (slot) {
-                                case 1: snap.state1_u8[i] = std::move(q); snap.absmax1[i] = std::move(am); break;
-                                case 2: snap.state2_u8[i] = std::move(q); snap.absmax2[i] = std::move(am); break;
-                                case 3: snap.state3_u8[i] = std::move(q); snap.absmax3[i] = std::move(am); break;
-                                default: snap.state4_u8[i] = std::move(q); snap.absmax4[i] = std::move(am); break;
-                            }
-                        } else {
-                            switch (slot) {
-                                case 1: snap.state1_fp32[i] = std::move(values); break;
-                                case 2: snap.state2_fp32[i] = std::move(values); break;
-                                case 3: snap.state3_fp32[i] = std::move(values); break;
-                                default: snap.state4_fp32[i] = std::move(values); break;
-                            }
+                        // F32 as held: 8-bit storage zeroed small second moments.
+                        switch (slot) {
+                            case 1: snap.state1_fp32[i] = std::move(values); break;
+                            case 2: snap.state2_fp32[i] = std::move(values); break;
+                            case 3: snap.state3_fp32[i] = std::move(values); break;
+                            default: snap.state4_fp32[i] = std::move(values); break;
                         }
                         return true;
                     };
@@ -964,6 +1099,7 @@ static int run_impl(Config config, std::string * error) {
             auto stage_start = step_start;
             std::string previous_stage;
             std::vector<std::pair<std::string,double>> stage_times;
+            const yue2_aitk_graph::GemmCounts gemm_seen = yue2_aitk_graph::gemm_counts();
             const auto finish_stage = [&]() {
                 const auto now = Clock::now();
                 if (!previous_stage.empty()) {
@@ -1089,6 +1225,9 @@ static int run_impl(Config config, std::string * error) {
                    << ",\"cursor_frames\":" << metrics.cursor_frames;
             line
                    << ",\"step_ms\":" << step_ms
+                   << ",\"gemm\":\"" << (yue2_aitk_graph::strict_f32() ? "strict-f32" : "bf16")
+                   << "\",\"gemm_bf16\":" << (yue2_aitk_graph::gemm_counts().bf16 - gemm_seen.bf16)
+                   << ",\"gemm_f32\":" << (yue2_aitk_graph::gemm_counts().f32 - gemm_seen.f32)
                    << ",\"attention_forward\":\"" << (attention_precision?attention_precision(0):"unknown")
                    << "\",\"attention_backward\":\"" << (attention_precision?attention_precision(1):"unknown")
                    << "\",\"stage_ms\":{";
@@ -1099,6 +1238,15 @@ static int run_impl(Config config, std::string * error) {
             line << "}}\n";
             jsonl << line.str();
             std::cout << line.str() << std::flush;
+            if (yue2_aitk_prof::on()) {
+                std::ostringstream prof;
+                prof << std::setprecision(6) << "{\"stage\":\"host_profile\",\"step\":" << metrics.step << ",\"ms\":{";
+                bool first = true;
+                for (const auto & kv : yue2_aitk_prof::totals()) { prof << (first ? "" : ",") << '"' << kv.first << "\":" << kv.second; first = false; }
+                prof << "}}\n";
+                std::cerr << prof.str() << std::flush;
+                yue2_aitk_prof::totals().clear();
+            }
             if (!jsonl.flush()) { fail(error, "training JSONL write failed"); return 1; }
             if (config.spike_factor > 0.0f) {
                 if (metrics.skipped) {

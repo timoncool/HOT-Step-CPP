@@ -7,7 +7,9 @@ export function extractCaptionTags(tracks: readonly Pick<Yue2SourceTrack, 'style
     const seen = new Set<string>();
     const source = track.styled?.trim() || track.caption || '';
     for (const raw of source.split(/[,.]/)) {
-      const phrase = raw.trim();
+      // "…, bored, and volatile" lists end in "and <tag>"; the chips join
+      // with commas, so the conjunction would read twice.
+      const phrase = raw.trim().replace(/^and\s+/i, '').trim();
       if (!phrase || phrase.length > 40
         || /^\d+(?:\.\d+)?(?:\s*BPM)?$/i.test(phrase)
         || /^key of\b/i.test(phrase)

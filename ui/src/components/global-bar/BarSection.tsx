@@ -13,18 +13,19 @@ import { Toggle, type ToggleAccent } from '../shared/Toggle';
 // Tailwind JIT can't compile dynamic class names like `bg-${color}-500/10`,
 // so we map accent names to concrete classes.
 
-const ACCENT_STYLES: Record<string, {
+export const ACCENT_STYLES: Record<string, {
   bg: string;        // resting background tint
   bgHover: string;   // hover/active background tint (stronger)
+  hoverBg: string;   // full static hover: class so Tailwind emits it
   border: string;    // active bottom border
   iconColor: string; // icon color when active
 }> = {
-  pink:    { bg: 'bg-pink-500/5',    bgHover: 'bg-pink-500/10',    border: 'border-pink-500',    iconColor: 'text-pink-400' },
-  emerald: { bg: 'bg-emerald-500/5', bgHover: 'bg-emerald-500/10', border: 'border-emerald-500', iconColor: 'text-emerald-400' },
-  sky:     { bg: 'bg-sky-500/5',     bgHover: 'bg-sky-500/10',     border: 'border-sky-500',     iconColor: 'text-sky-400' },
-  purple:  { bg: 'bg-purple-500/5',  bgHover: 'bg-purple-500/10',  border: 'border-purple-500',  iconColor: 'text-purple-400' },
-  amber:   { bg: 'bg-amber-500/5',   bgHover: 'bg-amber-500/10',   border: 'border-amber-500',   iconColor: 'text-amber-400' },
-  violet:  { bg: 'bg-violet-500/5',  bgHover: 'bg-violet-500/10',  border: 'border-violet-500',  iconColor: 'text-violet-400' },
+  pink:    { bg: 'bg-pink-500/5',    bgHover: 'bg-pink-500/10', hoverBg: 'hover:bg-pink-500/10',    border: 'border-pink-500',    iconColor: 'text-pink-400' },
+  emerald: { bg: 'bg-emerald-500/5', bgHover: 'bg-emerald-500/10', hoverBg: 'hover:bg-emerald-500/10', border: 'border-emerald-500', iconColor: 'text-emerald-400' },
+  sky:     { bg: 'bg-sky-500/5',     bgHover: 'bg-sky-500/10', hoverBg: 'hover:bg-sky-500/10',     border: 'border-sky-500',     iconColor: 'text-sky-400' },
+  purple:  { bg: 'bg-purple-500/5',  bgHover: 'bg-purple-500/10', hoverBg: 'hover:bg-purple-500/10',  border: 'border-purple-500',  iconColor: 'text-purple-400' },
+  amber:   { bg: 'bg-amber-500/5',   bgHover: 'bg-amber-500/10', hoverBg: 'hover:bg-amber-500/10',   border: 'border-amber-500',   iconColor: 'text-amber-400' },
+  violet:  { bg: 'bg-violet-500/5',  bgHover: 'bg-violet-500/10', hoverBg: 'hover:bg-violet-500/10',  border: 'border-violet-500',  iconColor: 'text-violet-400' },
 };
 
 interface BarSectionProps {
@@ -204,7 +205,7 @@ export const BarSection: React.FC<BarSectionProps> = ({
         onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); handleClick(); } }}
         className={`
           absolute inset-0 w-full px-3 pt-1 flex items-center gap-2 transition-all duration-150 cursor-pointer
-          border-b-2 ${isOpen ? `${accent.bgHover} ${accent.border}` : `${accent.bg} border-transparent hover:${accent.bgHover}`}
+          border-b-2 ${isOpen ? `${accent.bgHover} ${accent.border}` : `${accent.bg} border-transparent ${accent.hoverBg}`}
         `}
       >
         <span className={`flex-shrink-0 transition-colors duration-150 ${isOpen ? accent.iconColor : 'text-zinc-500'}`}>

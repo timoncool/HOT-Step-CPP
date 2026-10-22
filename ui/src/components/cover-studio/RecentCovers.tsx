@@ -1,10 +1,14 @@
 // RecentCovers.tsx — Recent covers sub-component for Cover Studio
-import React, { useState, useEffect } from 'react';
+
+import { useQuery } from '@tanstack/react-query';
+import { coverSongsOptions, deleteCovers } from '../../queries/cover-lyrics/songs';
+import { queryClient } from '../../queries/client';
+import { queryManager } from '../../queries/invalidation';
+import React, { useState, useEffect, useRef } from 'react';
 import { Music, Play, Pause, Loader2, Trash2 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { songApi } from '../../services/api';
 import type { Song } from '../../types';
-import { playFromList, songToTrack, usePlaybackSelector } from '../../stores/playbackStore';
+import { playFromList, togglePlay, songToTrack, usePlaybackSelector } from '../../stores/playbackStore';
 
 interface RecentCoversProps {
   refreshTrigger: number;
@@ -14,66 +18,34 @@ export const RecentCovers: React.FC<RecentCoversProps> = ({ refreshTrigger }) =>
   const { token } = useAuth();
   const currentTrackId = usePlaybackSelector(s => s.currentTrack?.id ?? null);
   const isPlaying = usePlaybackSelector(s => s.isPlaying);
-  const [covers, setCovers] = useState<Song[]>([]);
-  const [loading, setLoading] = useState(false);
+  const options = coverSongsOptions();
+  const snapshot = useQuery({ ...options, enabled: !!token });
+  const covers = (snapshot.data?.songs ?? []).slice().sort((a, b) =>
+    new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime()).slice(0, 20);
+  const loading = !!token && snapshot.isPending;
   const [clearing, setClearing] = useState(false);
-
+  const previousRefresh = useRef(refreshTrigger);
   useEffect(() => {
-    if (!token) return;
-    setLoading(true);
-    fetch('/api/songs?source=cover-studio', {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then(res => res.json())
-      .then(data => {
-        const allSongs = data.songs || [];
-        setCovers(
-          allSongs
-            .map((s: any): Song => ({
-              id: s.id,
-              title: s.title || 'Untitled Cover',
-              lyrics: s.lyrics || '',
-              style: s.style || '',
-              caption: s.caption || '',
-              audioUrl: s.audio_url || '',
-              masteredAudioUrl: s.mastered_audio_url || '',
-              mastered_audio_url: s.mastered_audio_url || '',
-              noAdapterAudioUrl: s.noadapter_audio_url || '',
-              noadapter_audio_url: s.noadapter_audio_url || '',
-              duration: s.duration && s.duration > 0
-                ? `${Math.floor(s.duration / 60)}:${String(Math.floor(s.duration % 60)).padStart(2, '0')}`
-                : '0:00',
-              tags: s.tags || [],
-              createdAt: new Date(s.created_at),
-              generationParams: typeof s.generation_params === 'string'
-                ? JSON.parse(s.generation_params || '{}')
-                : (s.generation_params || {}),
-            }))
-            .sort((a: Song, b: Song) => {
-              const aTime = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
-              const bTime = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
-              return bTime - aTime;
-            })
-            .slice(0, 20)
-        );
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, [token, refreshTrigger]);
+    if (previousRefresh.current !== refreshTrigger) {
+      previousRefresh.current = refreshTrigger;
+      void queryManager.keys(queryClient, options.queryKey);
+    }
+  }, [refreshTrigger, options.queryKey]);
 
   const handleClearAll = async () => {
     if (!token || covers.length === 0) return;
     if (!window.confirm(`Delete all ${covers.length} covers?`)) return;
     setClearing(true);
     try {
-      await songApi.bulkDelete(covers.map(c => c.id), token);
-      setCovers([]);
+      await deleteCovers(covers.map(c => c.id));
     } finally {
       setClearing(false);
     }
   };
 
   const handlePlay = (cover: Song) => {
+    // The current track pauses/resumes in place; reloading it would restart it.
+    if (cover.id === currentTrackId) { togglePlay(); return; }
     playFromList(songToTrack(cover), covers.map(songToTrack), 'cover-studio');
   };
 

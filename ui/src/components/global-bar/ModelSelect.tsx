@@ -80,6 +80,8 @@ interface ModelSelectProps {
   /** Hide the filter box. Pointless for short, fixed option lists. */
   filterable?: boolean;
   disabled?: boolean;
+  /** An unavailable option stays visible, with this explanation. */
+  disabledReason?: (name: string) => string | undefined;
 }
 
 export const ModelSelect: React.FC<ModelSelectProps> = ({
@@ -92,6 +94,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
   formatOf = getModelFormat,
   filterable = true,
   disabled = false,
+  disabledReason,
 }) => {
   const [open, setOpen] = useState(false);
   const [focusIdx, setFocusIdx] = useState(-1);
@@ -123,7 +126,8 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
   useEffect(() => {
     if (open) {
       setQuery('');
-      setFocusIdx(Math.max(0, options.indexOf(value)));
+      setFocusIdx(options.includes(value) && !disabledReason?.(value)
+        ? options.indexOf(value) : options.findIndex(o => !disabledReason?.(o)));
       const t = setTimeout(() => inputRef.current?.focus(), 0);
       return () => clearTimeout(t);
     }
@@ -144,15 +148,21 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
       switch (e.key) {
         case 'ArrowDown':
           e.preventDefault();
-          setFocusIdx((i) => Math.min(i + 1, filtered.length - 1));
+          setFocusIdx((i) => {
+            const next = filtered.findIndex((o, idx) => idx > i && !disabledReason?.(o));
+            return next < 0 ? i : next;
+          });
           break;
         case 'ArrowUp':
           e.preventDefault();
-          setFocusIdx((i) => Math.max(i - 1, 0));
+          setFocusIdx((i) => {
+            for (let idx = i - 1; idx >= 0; idx--) if (!disabledReason?.(filtered[idx])) return idx;
+            return i;
+          });
           break;
         case 'Enter':
           e.preventDefault();
-          if (focusIdx >= 0 && focusIdx < filtered.length) {
+          if (focusIdx >= 0 && focusIdx < filtered.length && !disabledReason?.(filtered[focusIdx])) {
             onChange(filtered[focusIdx]);
             setOpen(false);
           }
@@ -163,7 +173,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
           break;
       }
     },
-    [focusIdx, filtered, onChange]
+    [focusIdx, filtered, onChange, disabledReason]
   );
 
   // Trigger-button keys: opens the dropdown. When the filter box is hidden
@@ -193,7 +203,7 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
         onClick={() => !disabled && setOpen(!open)}
         onKeyDown={handleTriggerKeyDown}
         disabled={disabled}
-        title={value || undefined}
+        title={(value && disabledReason?.(value)) || value || undefined}
         className="w-full flex items-center gap-2 px-3 py-2 rounded-xl
                    bg-zinc-100 dark:bg-zinc-800
                    border border-zinc-300 dark:border-white/10
@@ -234,7 +244,12 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
                 ref={inputRef}
                 type="text"
                 value={query}
-                onChange={(e) => { setQuery(e.target.value); setFocusIdx(0); }}
+                onChange={(e) => {
+                  const nextQuery = e.target.value.trim().toLowerCase();
+                  setQuery(e.target.value);
+                  setFocusIdx(options.filter(o => o.toLowerCase().includes(nextQuery)
+                    || formatLabel(o).toLowerCase().includes(nextQuery)).findIndex(o => !disabledReason?.(o)));
+                }}
                 onKeyDown={handleInputKeyDown}
                 placeholder="Filter models…"
                 className="w-full pl-7 pr-2 py-1.5 rounded-lg
@@ -256,25 +271,32 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
                 const fmt = formatOf ? formatOf(opt) : null;
                 const selected = opt === value;
                 const focused = i === focusIdx;
+                const reason = disabledReason?.(opt);
                 return (
                   <button
                     key={opt}
                     type="button"
                     role="option"
                     aria-selected={selected}
+                    aria-disabled={!!reason}
+                    disabled={!!reason}
                     onClick={() => {
+                      if (reason) return;
                       onChange(opt);
                       setOpen(false);
                     }}
-                    onMouseEnter={() => setFocusIdx(i)}
-                    title={opt}
+                    onMouseEnter={() => { if (!reason) setFocusIdx(i); }}
+                    title={reason ? `${opt}: ${reason}` : opt}
                     className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors
                       ${focused ? 'bg-pink-500/10 dark:bg-pink-500/15' : ''}
                       ${selected ? 'text-pink-400' : 'text-zinc-700 dark:text-zinc-200'}
-                      hover:bg-pink-500/10 dark:hover:bg-pink-500/15`}
+                      ${reason ? 'opacity-50 cursor-not-allowed' : 'hover:bg-pink-500/10 dark:hover:bg-pink-500/15'}`}
                   >
                     {fmt && <FormatBadge format={fmt} />}
-                    <span className="truncate flex-1">{middleEllipsis(formatLabel(opt), 48)}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{middleEllipsis(formatLabel(opt), 48)}</span>
+                      {reason && <span className="block text-[10px] text-zinc-500 dark:text-zinc-400">{reason}</span>}
+                    </span>
                     {selected && <Check size={14} className="shrink-0 text-pink-400" />}
                   </button>
                 );

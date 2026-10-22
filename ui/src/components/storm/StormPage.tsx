@@ -1,14 +1,21 @@
+import { useQuery } from '@tanstack/react-query';
+import { studioPluginsOptions } from '../../queries/studios/shared';
 // StormPage.tsx — Full-width STORM Streaming performance page
 // MDMAchine / A&E Concepts 2026
 
 import React, { useState, useEffect } from 'react';
 import { Zap, Square, Play, Music } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
+import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { usePersistedState } from '../../hooks/usePersistedState';
 import { useStreamAudio } from '../../hooks/useStreamAudio';
 import { StormLiveControls, type LyricsMode, type SlotMeta } from './StormLiveControls';
+import { DriftPanel } from './DriftPanel';
 import { expandWildcards, hasWildcards } from '../../utils/wildcardUtils';
 import { BackendCapabilityGate } from '../shared/BackendCapabilityGate';
+import { useBackendStore } from '../../stores/backendStore';
+import type { BackendExtensionParam } from '../../stores/backendStore';
+import { useCapabilities } from '../../hooks/useCapabilities';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -131,7 +138,7 @@ const DeckPanel: React.FC<DeckProps> = ({ id, label, otherCamelot, crossfadeGain
   const allSlots  = Array.from({ length: slotCount }, (_, i) => i);
 
   return (
-    <div className={`flex flex-col flex-1 min-w-0 rounded-xl border p-3 gap-2.5 overflow-y-auto hide-scrollbar ${sa.isPlaying ? 'border-red-500/40 bg-zinc-900/60' : 'border-zinc-700 bg-zinc-900/30'}`}>
+    <div className={`flex flex-col flex-1 min-w-0 shrink-0 lg:shrink rounded-xl border p-3 gap-2.5 lg:overflow-y-auto hide-scrollbar ${sa.isPlaying ? 'border-red-500/40 bg-zinc-900/60' : 'border-zinc-700 bg-zinc-900/30'}`}>
       {/* Deck header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -289,20 +296,16 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
   const [liveScheduler,    setLiveScheduler]    = usePersistedState('hs-storm-scheduler', gp.scheduler ?? '');
   const [liveGuidanceMode, setLiveGuidanceMode] = usePersistedState('hs-storm-guidance-mode', gp.guidanceMode ?? '');
   // Plugin registry for dropdowns
-  const [pluginRegistry, setPluginRegistry] = React.useState<{
-    solvers:   { name: string; display: string }[];
-    schedulers:{ name: string; display: string }[];
-    guidance:  { name: string; display: string }[];
-  }>({ solvers: [], schedulers: [], guidance: [] });
-  React.useEffect(() => {
-    fetch('/api/plugins').then(r => r.json()).then(data => {
-      setPluginRegistry({
-        solvers:    (data.solvers    ?? []).map((p: any) => ({ name: p.name, display: p.display ?? p.name })),
-        schedulers: (data.schedulers ?? []).map((p: any) => ({ name: p.name, display: p.display ?? p.name })),
-        guidance:   (data.guidance   ?? []).map((p: any) => ({ name: p.name, display: p.display ?? p.name })),
-      });
-    }).catch(() => {}); // silent fail — dropdowns just stay empty until engine is up
-  }, []);
+  const pluginsQuery = useQuery({
+    ...studioPluginsOptions(),
+    refetchInterval: false,
+    select: registry => ({
+      solvers: registry.solvers.map(p => ({ name: p.name, display: p.display ?? p.name })),
+      schedulers: registry.schedulers.map(p => ({ name: p.name, display: p.display ?? p.name })),
+      guidance: registry.guidance.map(p => ({ name: p.name, display: p.display ?? p.name })),
+    }),
+  });
+  const pluginRegistry = pluginsQuery.data ?? { solvers: [], schedulers: [], guidance: [] };
   // Live params from StormLiveControls (shared between seq + cont)
   const [liveParams, setLiveParams] = React.useState({ guidance_scale: gp.guidanceScale??7, inference_steps: gp.inferenceSteps??20, duration: 120, bpm: 120 });
   const [selectedSlot, setSelectedSlot] = React.useState<number | null>(null);
@@ -310,6 +313,24 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
   const [extraSolverParams,    setExtraSolverParams]    = usePersistedState<Record<string, number>>('hs-storm-solver-extra', {});
   const [extraSchedulerParams, setExtraSchedulerParams] = usePersistedState<Record<string, number|string>>('hs-storm-scheduler-extra', {});
   const [extraGuiderParams,    setExtraGuiderParams]    = usePersistedState<Record<string, number|string>>('hs-storm-guider-extra', {});
+
+  // Backend detection for YuE2 control set
+  const gpBackendParams = useGlobalParamsStore((s: any) => s.backendParams as Record<string, unknown>) ?? {};
+  const gpSetBackendParam = useGlobalParamsStore((s: any) => s.setBackendParam as (key: string, v: unknown) => void);
+  const activeBackendId = useBackendStore(s => s.activeBackendId);
+  const { capabilities } = useCapabilities();
+  const isYue2 = activeBackendId === 'yue2';
+  const isSa3  = activeBackendId === 'sa3';
+  // YuE2 extension params from capabilities manifest (solver/scheduler/wasserstein/nar)
+  const yue2Extensions: BackendExtensionParam[] = capabilities?.extensions?.filter(e =>
+    ['yue2OdeSteps','yue2NarCacheRatio','yue2NarSolver','yue2NarScheduler',
+     'yue2WassTau','yue2WassSpectral','yue2WassRmsWeight','yue2WassRmsTarget',
+     'yue2WassGate','yue2WassIterations','yue2WassProject','yue2WassLatentRms',
+     'yue2HtKinetic','yue2HtDamping','yue2HtCritical','yue2HtIntensity',
+     'yue2HtWell','yue2HtFloor','yue2HtPoly','yue2HtBlend','yue2HtSmooth',
+     'yue2HtDense','yue2HtShift',
+    ].includes(e.key)
+  ) ?? [];
 
   // DJ deck refs (for nudge + quantized start)
   const deckARef = React.useRef<ReturnType<typeof useStreamAudio>|null>(null);
@@ -366,9 +387,19 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
     };
     if (mode === 'sequential') {
       onGenerate({ ...params, guidanceScale: liveParams.guidance_scale, inferenceSteps: liveParams.inference_steps, duration: liveParams.duration, bpm: liveParams.bpm });
-    } else if (mode === 'continuous') {
+    } else if (mode === 'continuous' || mode === 'drift') {
       sa.setXfadeBeats(xfadeBeats); // sync xfadeBeatsRef before stream starts
-      sa.start(params);
+      if (mode === 'drift') {
+        // Read persisted drift pressure from localStorage
+        let driftPressure: Record<string, unknown> = {};
+        try {
+          const stored = localStorage.getItem('hs-storm-drift-pressure');
+          if (stored) driftPressure = JSON.parse(stored);
+        } catch { /* ignore */ }
+        sa.start({ ...params, drift: driftPressure });
+      } else {
+        sa.start(params);
+      }
     }
   };
 
@@ -593,7 +624,7 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
     <BackendCapabilityGate feature="streaming">
     <div className="h-full flex flex-col bg-zinc-950 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-6 py-3 border-b border-zinc-800 shrink-0">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 lg:px-6 py-3 border-b border-zinc-800 shrink-0">
         <div className="flex items-center gap-3">
           <Zap size={18} className="text-red-400" />
           <span className="text-sm font-bold text-white tracking-wide">STORM</span>
@@ -607,7 +638,7 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
         </div>
         {/* Global start/stop for seq/cont */}
         {/* Always reserve right-side space so tabs stay centered in all modes */}
-        <div className="w-[120px] flex justify-end">
+        <div className="lg:w-[120px] flex justify-end">
           {(mode==='sequential'||mode==='continuous') && (
             <button
               onClick={sa.isPlaying ? handleStop : handleStart}
@@ -680,10 +711,10 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
             </div>
 
             {/* ── Three-column body ───────────────────────────────── */}
-            <div className="flex-1 flex overflow-hidden">
+            <div className="flex-1 flex flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
 
               {/* Left — Compose */}
-              <div className="w-[380px] shrink-0 overflow-y-auto hide-scrollbar p-4 space-y-3 border-r border-zinc-800/60">
+              <div className="w-full lg:w-[380px] shrink-0 lg:overflow-y-auto hide-scrollbar p-4 space-y-3 border-b lg:border-b-0 lg:border-r border-zinc-800/60">
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <ParamLabel label="Style" className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider"
@@ -804,9 +835,83 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
               </div>
 
               {/* Middle — Sampler */}
-              <div className="w-[310px] shrink-0 overflow-y-auto hide-scrollbar p-4 space-y-2.5 border-r border-zinc-800/60">
-                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Sampler</span>
-                {/* Unified solver params — swaps automatically based on dropdown selection */}
+              <div className="w-full lg:w-[310px] shrink-0 lg:overflow-y-auto hide-scrollbar p-4 space-y-2.5 border-b lg:border-b-0 lg:border-r border-zinc-800/60">
+                <span className="text-[10px] text-zinc-500 uppercase tracking-wider">{isYue2 ? 'YuE2 NAR' : isSa3 ? 'Stable Audio 3' : 'Sampler'}</span>
+                {/* YuE2-specific controls */}
+                {isYue2 && (() => {
+                  const bpVal = gpBackendParams;
+                  const visibleExts = yue2Extensions.filter(e => {
+                    if (!e.visible_when) return true;
+                    const current = String(bpVal[e.visible_when.key] ?? '');
+                    return current === e.visible_when.equals;
+                  });
+                  // Primary sliders and dropdowns: ode_steps, nar_cache_ratio, solver, scheduler first
+                  const PRIMARY_KEYS = ['yue2OdeSteps','yue2NarCacheRatio','yue2NarSolver','yue2NarScheduler'];
+                  const primaryExts = yue2Extensions.filter(e => PRIMARY_KEYS.includes(e.key));
+                  return (
+                    <div className="space-y-2">
+                      {primaryExts.map(e => {
+                        const val = bpVal[e.key];
+                        const defVal = e.default ?? (e.type === 'slider' ? (e.min ?? 0) : '');
+                        const current = val !== undefined ? val : defVal;
+                        if (e.type === 'slider') {
+                          return (
+                            <div key={e.key} className="flex items-center gap-2">
+                              <ParamLabel label={e.label} info={e.hint} className="text-[10px] text-zinc-500" rootClassName="w-20 shrink-0" />
+                              <input type="range" min={e.min} max={e.max} step={e.step}
+                                value={Number(current)}
+                                onChange={ev => gpSetBackendParam(e.key, Number(ev.target.value))}
+                                className="flex-1 accent-red-500 h-1"/>
+                              <span className="text-[11px] text-zinc-300 w-9 text-right tabular-nums">{Number(current).toFixed((e.step??1)<1?2:0)}</span>
+                            </div>
+                          );
+                        }
+                        if (e.type === 'select' && e.options) {
+                          return (
+                            <div key={e.key} className="flex items-center gap-1.5">
+                              <ParamLabel label={e.label} info={e.hint} className="text-[10px] text-zinc-500" rootClassName="w-20 shrink-0" />
+                              <StyledSelect accent="pink" size="sm"
+                                value={String(current)}
+                                onChange={v => gpSetBackendParam(e.key, v)}
+                                options={e.options.map(o => ({value:o.value, label:o.label}))}
+                                className="flex-1 min-w-0"/>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })}
+                      {/* Wasserstein / HT V3 conditional params */}
+                      {visibleExts.filter(e => !PRIMARY_KEYS.includes(e.key)).map(e => {
+                        const val = bpVal[e.key];
+                        const defVal = e.default ?? (e.type === 'slider' ? (e.min ?? 0) : e.type === 'toggle' ? false : '');
+                        const current = val !== undefined ? val : defVal;
+                        if (e.type === 'toggle') {
+                          return (
+                            <div key={e.key} className="flex items-center gap-2">
+                              <ParamLabel label={e.label} info={e.hint} className="text-[10px] text-zinc-500" rootClassName="w-20 shrink-0" />
+                              <Toggle accent="pink" size="sm" checked={Boolean(current)} onChange={v => gpSetBackendParam(e.key, v)} label="" />
+                            </div>
+                          );
+                        }
+                        if (e.type === 'slider') {
+                          return (
+                            <div key={e.key} className="flex items-center gap-2">
+                              <ParamLabel label={e.label} info={e.hint} className="text-[10px] text-zinc-500" rootClassName="w-20 shrink-0" />
+                              <input type="range" min={e.min} max={e.max} step={e.step}
+                                value={Number(current)}
+                                onChange={ev => gpSetBackendParam(e.key, Number(ev.target.value))}
+                                className="flex-1 accent-red-500 h-1"/>
+                              <span className="text-[11px] text-zinc-300 w-9 text-right tabular-nums">{Number(current).toFixed((e.step??1)<1?2:0)}</span>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })}
+                    </div>
+                  );
+                })()}
+                {/* ACE-only sampler controls */}
+                {!isYue2 && !isSa3 && (<>
                 {activeSolverParams.map(s => {
                   const isStormParam = activeSolverKey === 'storm';
                   const stormSetters: Record<string, (v: number) => void> = {
@@ -967,6 +1072,7 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
                     ))}
                   </div>
                 )}
+                </>)}
                 {/* XFade */}
                 <div className="flex items-center gap-2">
                   <ParamLabel label="XFade" className="text-[10px] text-zinc-500" rootClassName="w-20 shrink-0"
@@ -1007,7 +1113,7 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
               </div>
 
               {/* Right — Live Controls */}
-              <div className="flex-1 min-w-0 overflow-y-auto hide-scrollbar">
+              <div className="lg:flex-1 min-w-0 lg:overflow-y-auto hide-scrollbar">
                 <StormLiveControls
                   sa={sa}
                   lyrics={lyrics}
@@ -1030,6 +1136,7 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
                   activeSolver={liveInferMethod?(pluginRegistry.solvers.find(p=>p.name===liveInferMethod)?.display??liveInferMethod.replace(/^md_/,'').replace(/_/g,' ')):undefined}
                   activeScheduler={liveScheduler?(pluginRegistry.schedulers.find(p=>p.name===liveScheduler)?.display??liveScheduler.replace(/^md_/,'').replace(/_/g,' ')):undefined}
                   activeGuidanceMode={liveGuidanceMode?(pluginRegistry.guidance.find(p=>p.name===liveGuidanceMode)?.display??liveGuidanceMode.replace(/^md_/,'').replace(/_/g,' ')):undefined}
+                  hideAceControls={isYue2 || isSa3}
                   onSlotMetaUpdate={setSlotMeta}
                 />
               </div>
@@ -1041,14 +1148,14 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
 
       {/* ── DJ Mode ── */}
       {mode==='dj' && (
-        <div className="flex-1 flex overflow-hidden p-4">
-          <div className="flex gap-4 w-full h-full">
+        <div className="flex-1 flex overflow-y-auto lg:overflow-hidden p-4">
+          <div className="flex flex-col lg:flex-row gap-4 w-full lg:h-full">
             {/* Deck A */}
             <DeckPanel id="deck-a" label="Deck A" otherCamelot={camelotB} crossfadeGain={gainA}
               onRegister={sa => { deckARef.current = sa; setDeckAKey(sa.detectedKey); }} />
 
             {/* Crossfader center column */}
-            <div className="flex flex-col items-center justify-start pt-4 gap-4 w-48 shrink-0">
+            <div className="flex flex-col items-center justify-start pt-4 gap-4 w-full lg:w-48 shrink-0">
               {/* Camelot compatibility */}
               {camelotA && camelotB && (
                 <div className={`text-center px-3 py-2 rounded-lg border text-xs font-medium ${
@@ -1135,21 +1242,9 @@ export const StormPage: React.FC<StormPageProps> = ({ onGenerate, activeJobCount
         </div>
       )}
 
-      {/* ── Drift placeholder ── */}
+      {/* ── Directed Drift panel ── */}
       {mode==='drift' && (
-        <div className="flex-1 flex overflow-hidden p-4">
-          <div className="flex-1 flex items-start justify-center pt-16">
-            <div className="text-center space-y-3 max-w-md px-6">
-              <div className="text-4xl">🌊</div>
-              <h2 className="text-xl font-bold text-white">Directed Drift</h2>
-              <p className="text-sm text-zinc-400 leading-relaxed">
-                The stream never stops. It evolves forever. Inputs are pressure — not commands.
-                You're not programming it, you're steering it.
-              </p>
-              <p className="text-xs text-zinc-600">Coming soon — Plank H</p>
-            </div>
-          </div>
-        </div>
+        <DriftPanel sa={sa} isYue2={isYue2} isSa3={isSa3} />
       )}
     </div>
     </BackendCapabilityGate>

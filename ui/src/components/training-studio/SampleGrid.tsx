@@ -36,7 +36,7 @@ const BASE_COLS: ColDef[] = [
   { id: 'duration',     labelKey: 'trainingStudio.grid.duration',     defaultW: 64,  minW: 44,  align: 'left',   resizable: true },
   { id: 'caption',      labelKey: 'trainingStudio.grid.caption',      defaultW: 360, minW: 120, align: 'left',   resizable: true },
   { id: 'genre',        labelKey: 'trainingStudio.grid.genre',        defaultW: 140, minW: 60,  align: 'left',   resizable: true },
-  { id: 'bpm',          labelKey: 'trainingStudio.grid.bpm',          defaultW: 64,  minW: 44,  align: 'left',   resizable: true },
+  { id: 'bpm',          labelKey: 'trainingStudio.grid.bpm',          defaultW: 150, minW: 125, align: 'left',   resizable: true },
   { id: 'key',          labelKey: 'trainingStudio.grid.key',          defaultW: 110, minW: 50,  align: 'left',   resizable: true },
   { id: 'signature',    labelKey: 'trainingStudio.grid.signature',    defaultW: 60,  minW: 44,  align: 'left',   resizable: true },
   { id: 'language',     labelKey: 'trainingStudio.grid.language',     defaultW: 60,  minW: 44,  align: 'left',   resizable: true },

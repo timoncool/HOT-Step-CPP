@@ -5,14 +5,17 @@
  * Download uses cover-specific filename: Target Artist - Track Name (Source Artist Cover)
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { coverSongsOptions, deleteCovers } from '../../queries/cover-lyrics/songs';
+import { queryClient } from '../../queries/client';
+import { queryManager } from '../../queries/invalidation';
+import React, { useEffect, useCallback, useRef } from 'react';
 import { Play, Loader2, Music, ListPlus, Check } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
-import { songApi } from '../../services/api';
 import type { Song } from '../../types';
 import { downloadTrack } from '../../utils/downloadTrack';
 import { usePlaylist } from '../lyric-studio/playlistStore';
-import { playFromList, songToTrack, usePlaybackSelector } from '../../stores/playbackStore';
+import { playFromList, togglePlay, songToTrack, usePlaybackSelector } from '../../stores/playbackStore';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { SongActionsMenu } from '../shared/SongActionsMenu';
 
@@ -21,116 +24,43 @@ interface CoverRecentSongsProps {
   refreshKey?: number;
 }
 
-// ── Module-level cache ───────────────────────────────────────────────────────
-
-let _cachedCovers: Song[] = [];
-
-// Post-processing state changes have to reach this cache too, and at module
-// scope: it outlives every mount, so patching it only from a mounted instance
-// leaves a stale mastered URL behind whenever a pass (or a revert) happens
-// while Cover Studio is closed. A stale flag here both hides the removal
-// action and re-offers a run the server will refuse.
-function _patchCachedCover(songId: string, masteredAudioUrl: string): void {
-  _cachedCovers = _cachedCovers.map(s =>
-    s.id === songId ? { ...s, masteredAudioUrl, mastered_audio_url: masteredAudioUrl } : s
-  );
-}
-
-window.addEventListener('song-postprocessed', (e: Event) => {
-  const { songId, masteredAudioUrl } = (e as CustomEvent).detail || {};
-  if (songId && masteredAudioUrl) _patchCachedCover(songId, masteredAudioUrl);
-});
-
-window.addEventListener('song-postprocess-reverted', (e: Event) => {
-  const { songId } = (e as CustomEvent).detail || {};
-  if (songId) _patchCachedCover(songId, '');
-});
-let _cachedRefreshKey = -1;
-let _fetchInFlight = false;
-
-// ── Component ────────────────────────────────────────────────────────────────
 
 export const CoverRecentSongs: React.FC<CoverRecentSongsProps> = ({ showToast, refreshKey = 0 }) => {
   const { token } = useAuth();
   const currentTrackId = usePlaybackSelector(s => s.currentTrack?.id ?? null);
-  const [songs, setSongs] = useState<Song[]>(_cachedCovers);
-  const [loading, setLoading] = useState(_cachedCovers.length === 0);
-  const mountedRef = useRef(true);
+  const options = coverSongsOptions();
+  const snapshot = useQuery({ ...options, enabled: !!token });
+  const songs = (snapshot.data?.songs ?? []).filter(s => !!s.audioUrl).slice().sort((a, b) =>
+    new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime()).slice(0, 50);
+  const loading = !!token && snapshot.isPending;
   const { disguiseArtist, disguiseTitle } = useDisguiseMode();
-
+  const previousRefresh = useRef(refreshKey);
   useEffect(() => {
-    mountedRef.current = true;
+    if (previousRefresh.current !== refreshKey) {
+      previousRefresh.current = refreshKey;
+      void queryManager.keys(queryClient, options.queryKey);
+    }
+  }, [refreshKey, options.queryKey]);
+  useEffect(() => {
+    const refresh = () => { void queryManager.keys(queryClient, options.queryKey); };
+    window.addEventListener('song-postprocessed', refresh);
+    window.addEventListener('song-postprocess-reverted', refresh);
     return () => {
-      mountedRef.current = false;
-      _cachedRefreshKey = -1;
+      window.removeEventListener('song-postprocessed', refresh);
+      window.removeEventListener('song-postprocess-reverted', refresh);
     };
-  }, []);
-
-  useEffect(() => {
-    if (!token) { setLoading(false); return; }
-    if (_cachedRefreshKey === refreshKey && _cachedCovers.length > 0) return;
-    if (_fetchInFlight) return;
-    if (_cachedCovers.length === 0) setLoading(true);
-
-    _fetchInFlight = true;
-    fetch('/api/songs?source=cover-studio', {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-      .then(res => res.json())
-      .then(data => {
-        const allSongs: Song[] = (data.songs || [])
-          .filter((s: any) => !!s.audio_url)
-          .map((s: any): Song => ({
-            id: s.id,
-            title: s.title || 'Untitled Cover',
-            lyrics: s.lyrics || '',
-            style: s.style || '',
-            caption: s.caption || '',
-            audioUrl: s.audio_url || '',
-            masteredAudioUrl: s.mastered_audio_url || '',
-            mastered_audio_url: s.mastered_audio_url || '',
-            noAdapterAudioUrl: s.noadapter_audio_url || '',
-            noadapter_audio_url: s.noadapter_audio_url || '',
-            latentUrl: s.latent_url || '',
-            latent_url: s.latent_url || '',
-            duration: s.duration || 0,
-            tags: s.tags || [],
-            createdAt: new Date(s.created_at),
-            artistName: s.artist || '',
-            generationParams: typeof s.generation_params === 'string'
-              ? JSON.parse(s.generation_params || '{}')
-              : (s.generation_params || {}),
-          }))
-          .sort((a: Song, b: Song) => {
-            const aTime = a.createdAt instanceof Date ? a.createdAt.getTime() : 0;
-            const bTime = b.createdAt instanceof Date ? b.createdAt.getTime() : 0;
-            return bTime - aTime;
-          })
-          .slice(0, 50);
-        _cachedCovers = allSongs;
-        _cachedRefreshKey = refreshKey;
-        _fetchInFlight = false;
-        if (mountedRef.current) { setSongs(allSongs); setLoading(false); }
-      })
-      .catch(() => {
-        _fetchInFlight = false;
-        if (mountedRef.current) setLoading(false);
-      });
-  }, [refreshKey, token]);
+  }, [token]);
 
   const handlePlay = useCallback((song: Song) => {
+    // The current track pauses/resumes in place; reloading it would restart it.
+    if (song.id === currentTrackId) { togglePlay(); return; }
     playFromList(songToTrack(song), songs.map(songToTrack), 'cover-studio');
-  }, [songs]);
+  }, [songs, currentTrackId]);
 
   const handleDelete = useCallback(async (song: Song) => {
     if (!token) return;
     try {
-      await songApi.delete(song.id, token);
-      setSongs(prev => {
-        const updated = prev.filter(s => s.id !== song.id);
-        _cachedCovers = updated;
-        return updated;
-      });
+      await deleteCovers([song.id]);
       showToast('Cover deleted');
     } catch {
       showToast('Failed to delete', 'error');

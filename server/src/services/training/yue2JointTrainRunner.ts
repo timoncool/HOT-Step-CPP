@@ -8,12 +8,14 @@ import { buildGpuEnv, selectedGpuMemoryMB } from '../gpuDevices.js';
 
 const PARALLEL_PREVIEW_MIN_VRAM_MB = 28 * 1024;
 import { log, runYue2AceTrain, YUE2_IDLE_MS, type RelayState } from './yue2TrainRunner.js';
-import { checkpointRecords, listYue2AitkRuns, recordYue2AitkRun } from './yue2AitkRuns.js';
+import { checkpointRecords, isCheckpointLadder, listYue2AitkRuns, recordYue2AitkRun, yue2JointWeight } from './yue2AitkRuns.js';
 import { runYue2PlanCheck, type Yue2PlanCheckOptions } from './yue2PlanCheck.js';
 import { renderYue2JointPreview, listYue2JointPreviews, Yue2PreviewCleanupError } from './yue2JointPreview.js';
 import { yue2Unload } from '../backends/yue2/client.js';
 import { yue2StyleNormsForRun } from '../backends/yue2/scoreHealth.js';
 import { ensureYue2PreparedDataset } from './yue2AutoPrepare.js';
+import { FIXED_RECIPE_CAPTION_GRAMMAR } from './fixedRecipeCaption.js';
+import { YUE2_JOINT_FIXED_RECIPE_DROPOUTS } from '../../contracts/trainingRecipes.js';
 import { getDataset } from './datasetsRepo.js';
 import { getDb } from '../../db/database.js';
 import { config } from '../../config.js';
@@ -101,10 +103,11 @@ export interface ResolvedYue2JointTrainOptions {
    *  LoKr dim, i.e. scale 1). */
   rank?: number;
   alpha?: number;
-  /** 'lora' (default) or 'lokr': kron-factor sites, dim/factor as in the DiT
+  /** 'lora' (default), 'dora' (LoRA pairs plus a trained magnitude per output
+   *  row; rank/alpha as LoRA) or 'lokr': kron-factor sites, dim/factor as in the DiT
    *  trainer. Engine defaults dim 32 / factor 8 (the DiT's 512/6 is larger
    *  than a rank-64 LoRA at YuE2's dims). */
-  adapterType?: 'lora' | 'lokr';
+  adapterType?: 'lora' | 'lokr' | 'dora';
   lokrDim?: number;
   lokrFactor?: number;
   /** 'loss' trains until the windowed composite loss <= targetLoss; 'kl' until
@@ -193,7 +196,7 @@ export interface ResolvedYue2JointTrainOptions {
    *  base was trained (docs/plans/yue2/31-base-matched-training.md), through
    *  the knobs below, applied by applyBaseMatchedRecipe. Recorded so the run
    *  index and the adapter card can say which. */
-  method?: 'tuned' | 'base-matched';
+  method?: 'tuned' | 'base-matched' | 'fixed-recipe';
   /** Dataset-Calibrated Training (opt-in): how the album's profile resized
    *  steps and saveEvery. Absent on every run that did not opt in. */
   calibration?: Yue2Calibration;
@@ -303,6 +306,31 @@ export function applyBaseMatchedRecipe(body: Record<string, unknown>): Record<st
   return { ...out, ...BASE_MATCHED_FORCED };
 }
 
+/** The retained NAR-only and AR-only endpoints train plain LoRA. DoRA exists
+ *  only in the joint trainer, so a request for it there is refused, not dropped. */
+export function legacyYue2DoraError(body: Record<string, unknown>): string | null {
+  return body.adapterType === 'dora' || body.dora === true
+    ? 'DoRA is only available in joint YuE2 training; this legacy endpoint trains LoRA.' : null;
+}
+
+/** Fixed joint-training recipe: bf16 base, rank-64 LoRA, one song per update. */
+export function applyFixedRecipe(body: Record<string, unknown>): Record<string, unknown> {
+  // bf16 is the default and the ear-tested base; a chosen GGUF or ConvRot base is kept.
+  return { ...body, method: 'fixed-recipe', base: typeof body.base === 'string' && body.base ? body.base : 'bf16', steps: 1500, seed: 42, saveEvery: 200, adapterType: 'lora',
+    rank: 64, alpha: 64, optimizer: 'adamw-lm', cautious: false,
+    lr: 1e-4, weightDecay: 0.01, beta1: 0.9, beta2: 0.999,
+    lrSchedule: 'constant', warmup: 0, plannerLrScale: 0.5, narLrScale: 1,
+    stopMode: 'steps', targetLoss: undefined, targetKl: undefined,
+    arLossWeight: 0.5, klWeight: 0.2, arTargets: 'tuned',
+    gradAccum: 1, arCropFrames: 0, narCropFrames: 1500,
+    ...YUE2_JOINT_FIXED_RECIPE_DROPOUTS,
+    lyricTiming: false, alignmentEnabled: false, cursorWeight: 0,
+    narExtraSteps: 0, spikeFactor: 0, reconStop: 0, reconTarget: 0,
+    planCheck: undefined, autoRefine: false, lrScale: 1,
+    refine: undefined, refinePlanner: undefined, freezePlannerNow: undefined,
+    unfreezePlanner: undefined, klCheckpointEvery: undefined };
+}
+
 /** The Refine tab's defaults, as one request body. Kept here so the
  *  automatic chain and the tab start the same job. */
 export function autoRefineRequest(sourceJobId: string, lastStep: number): Record<string, unknown> {
@@ -327,9 +355,10 @@ export function buildYue2JointTrainArgs(o: ResolvedYue2JointTrainOptions): strin
   // ~5 s a reading. The flag also keeps the frozen-teacher forward running
   // for the planner's KL to base, about 7% of every update; base-matched
   // pays it too, for reference (2026-10-06).
-  args.push('--nar-drift');
+  if (o.method !== 'fixed-recipe') args.push('--nar-drift');
   if (o.rank !== undefined) args.push('--rank', String(o.rank));
   if (o.alpha !== undefined) args.push('--alpha', String(o.alpha));
+  if (o.adapterType === 'dora') args.push('--adapter-type', 'dora');
   if (o.adapterType === 'lokr') {
     args.push('--adapter-type', 'lokr');
     if (o.lokrDim !== undefined) args.push('--lokr-dim', String(o.lokrDim));
@@ -345,6 +374,7 @@ export function buildYue2JointTrainArgs(o: ResolvedYue2JointTrainOptions): strin
       if (o.muonNsSteps !== undefined) args.push('--muon-ns-steps', String(o.muonNsSteps));
     }
   }
+  if (o.method === 'fixed-recipe') args.push('--adam-eps', '1e-6');
   if (o.stopMode === 'loss' && o.targetLoss !== undefined) args.push('--target-loss', String(o.targetLoss));
   if (o.stopMode === 'kl' && o.targetKl !== undefined) args.push('--target-kl', String(o.targetKl));
   if (o.stopMode === 'kl' && o.targetKlMode === 'trend') args.push('--target-kl-mode', 'trend');
@@ -439,6 +469,11 @@ function validateOptions(o: ResolvedYue2JointTrainOptions): string | null {
   if (!o.checkpoint || !fs.existsSync(o.checkpoint) || !fs.statSync(o.checkpoint).isFile()) return `base checkpoint is missing or is not a file: ${o.checkpoint || '(empty)'}`;
   const manifestError = preparedManifest(o.dataset);
   if (manifestError) return `${manifestError}: ${o.dataset || '(empty)'}`;
+  if (o.method === 'fixed-recipe') {
+    const prepared = JSON.parse(fs.readFileSync(o.dataset, 'utf8')) as Record<string, unknown>;
+    if (prepared.caption_grammar !== FIXED_RECIPE_CAPTION_GRAMMAR)
+      return 'Fixed recipe needs a dataset prepared with its caption grammar.';
+  }
   if (!o.outDir) return 'Joint training requires a new output directory';
   if (fs.existsSync(o.outDir)) return `output directory already exists; choose a new directory: ${o.outDir}`;
   if (!fs.existsSync(path.dirname(o.outDir))) return `parent directory for joint-training output is missing: ${path.dirname(o.outDir)}`;
@@ -452,7 +487,7 @@ function validateOptions(o: ResolvedYue2JointTrainOptions): string | null {
   if (o.cautious && (o.optimizer ?? 'adamw') === 'adamw') return 'cautious needs optimizer adamw-lm, prodigy or muon';
   if (o.rank !== undefined && (!Number.isInteger(o.rank) || o.rank < 1 || o.rank > 65536)) return 'rank must be an integer between 1 and 65536';
   if (o.alpha !== undefined && (!Number.isFinite(o.alpha) || o.alpha <= 0)) return 'alpha must be a positive finite number';
-  if (o.adapterType !== undefined && o.adapterType !== 'lora' && o.adapterType !== 'lokr') return 'adapterType must be lora or lokr';
+  if (o.adapterType !== undefined && o.adapterType !== 'lora' && o.adapterType !== 'lokr' && o.adapterType !== 'dora') return 'adapterType must be lora, lokr or dora';
   if (o.lokrDim !== undefined && (!Number.isInteger(o.lokrDim) || o.lokrDim < 1 || o.lokrDim > 65536)) return 'lokrDim must be an integer between 1 and 65536';
   if (o.lokrFactor !== undefined && (!Number.isInteger(o.lokrFactor) || o.lokrFactor < 1 || o.lokrFactor > 65536)) return 'lokrFactor must be an integer between 1 and 65536';
   if (o.prodigyD0 !== undefined && (!Number.isFinite(o.prodigyD0) || o.prodigyD0 <= 0)) return 'prodigyD0 must be a positive finite number';
@@ -462,7 +497,7 @@ function validateOptions(o: ResolvedYue2JointTrainOptions): string | null {
   if (o.stopMode === 'loss' && (o.targetLoss === undefined || !Number.isFinite(o.targetLoss) || o.targetLoss < 0)) return 'targetLoss must be a non-negative finite number when stopMode is loss';
   if (o.stopMode === 'kl' && (o.targetKl === undefined || !Number.isFinite(o.targetKl) || o.targetKl <= 0)) return 'targetKl must be a positive finite number when stopMode is kl';
   if (o.reconKeepDelta !== undefined && (!Number.isFinite(o.reconKeepDelta) || o.reconKeepDelta < 0 || o.reconKeepDelta > 1)) return 'reconKeepDelta must be between 0 and 1';
-  if (o.method !== undefined && o.method !== 'tuned' && o.method !== 'base-matched') return 'method must be tuned or base-matched';
+  if (o.method !== undefined && o.method !== 'tuned' && o.method !== 'base-matched' && o.method !== 'fixed-recipe') return 'method must be tuned, base-matched or fixed-recipe';
   if (o.warmup !== undefined && (!Number.isInteger(o.warmup) || o.warmup < 0 || o.warmup > o.steps)) return 'warmup must be an integer between 0 and steps';
   if (o.arLossWeight !== undefined && (!Number.isFinite(o.arLossWeight) || o.arLossWeight <= 0 || o.arLossWeight > 10)) return 'arLossWeight must be in (0, 10]';
   for (const [key, v] of [['beta1', o.beta1], ['beta2', o.beta2]] as const) if (v !== undefined && (!Number.isFinite(v) || v < 0 || v >= 1)) return `${key} must be in [0, 1)`;
@@ -554,6 +589,8 @@ function relayJsonLine(job: TrainingJob, line: string, state: RelayState, clock?
     state.lastLoss = event.loss ?? state.lastLoss;
     pushEvent(job, { type: 'metric', metric: 'step', ts: Date.now(), step,
       totalSteps: state.totalSteps, ...(event.loss === undefined ? {} : { loss: event.loss }),
+      ...(event.arCe === undefined ? {} : { arCe: event.arCe }),
+      ...(event.cursorCe === undefined ? {} : { cursorCe: event.cursorCe }),
       ...(event.arKl === undefined ? {} : { arKl: event.arKl }),
       ...(event.narMse === undefined ? {} : { narMse: event.narMse }),
       ...(event.plannerFrozen ? { plannerFrozen: true } : {}),
@@ -570,7 +607,7 @@ function relayJsonLine(job: TrainingJob, line: string, state: RelayState, clock?
         loss: state.lastLoss, path: saved.dir });
       // KL rungs preview on kl_mark; once the planner is frozen the KL stops
       // moving, so the decoder phase previews every step-cadence save.
-      if (saved && (opts.method === 'base-matched' || !(opts.klCheckpointEvery! > 0) || state.frozenAt !== undefined)) state.onRung?.(step);
+      if (saved && (isCheckpointLadder(opts) || !(opts.klCheckpointEvery! > 0) || state.frozenAt !== undefined)) state.onRung?.(step);
       if (thinning?.pendingDrop?.step === step) {
         // The folder exists under its final name now (see pendingDrop).
         if (saved) thinning.disposable = { step, dir: saved.dir, recon: thinning.pendingDrop.recon };
@@ -646,7 +683,7 @@ function persistAitkCatalogue(
 
 /** Pure contract helper kept exportable for server-side event tests. */
 export function parseYue2JointEvent(line: string, totalSteps: number): {
-  stage: string; step?: number; loss?: number; arKl?: number; narMse?: number; plannerFrozen?: boolean; gradNorm?: number; lr?: number; stepMs?: number; totalSteps: number;
+  stage: string; step?: number; loss?: number; arCe?: number; cursorCe?: number; arKl?: number; narMse?: number; plannerFrozen?: boolean; gradNorm?: number; lr?: number; stepMs?: number; totalSteps: number;
 } | null {
   try {
     const event = JSON.parse(line) as Record<string, unknown>;
@@ -660,6 +697,8 @@ export function parseYue2JointEvent(line: string, totalSteps: number): {
     const stepMs = finite(event.step_ms) && event.step_ms >= 0 ? event.step_ms : undefined;
     return { stage: event.stage, ...(step === undefined ? {} : { step }),
       ...(loss === undefined ? {} : { loss }),
+      ...(finite(event.ar_ce) ? { arCe: event.ar_ce } : {}),
+      ...(finite(event.cursor_ce) ? { cursorCe: event.cursor_ce } : {}),
       ...(finite(event.ar_kl) ? { arKl: event.ar_kl } : {}),
       ...(finite(event.nar_mse) ? { narMse: event.nar_mse } : {}),
       ...(event.planner_frozen === true ? { plannerFrozen: true } : {}),
@@ -720,7 +759,7 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
     // rung: a KL rung of a planner refinement, or, for a run without KL rungs
     // (base-matched, or Legacy without a refinement), every saved checkpoint,
     // which the relay fires onRung for (2026-09-27, Legacy 2026-10-06).
-    const preview = withGeneratedPreviewLyrics(job, o.preview?.enabled && (o.preview.everySteps > 0 || o.preview.parallel || (o.klCheckpointEvery ?? 0) > 0 || o.method === 'base-matched') ? o.preview : undefined);
+    const preview = withGeneratedPreviewLyrics(job, o.preview?.enabled && (o.preview.everySteps > 0 || o.preview.parallel || (o.klCheckpointEvery ?? 0) > 0 || isCheckpointLadder(o)) ? o.preview : undefined);
     // Plan checks pause the run like previews do; the pause cadence is the
     // check's while the planner is live, the preview's once it is frozen.
     const planCheck = o.planCheck && o.planCheck.every > 0 && (o.narExtraSteps ?? 0) > 0 ? o.planCheck : undefined;
@@ -798,8 +837,8 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
           const expect = wanted();
           const checkpoint = path.join(segmentOut, `checkpoint-step${expect}`);
           if (!fs.existsSync(checkpoint)) return `Joint-training checkpoint-step${expect} is missing`;
-          if (['adapter.safetensors', 'optimizer.resume', 'native-ar.safetensors', 'native-nar.safetensors']
-            .some(name => !fs.existsSync(path.join(checkpoint, name)))) return `Joint-training checkpoint-step${expect} is incomplete`;
+          if (['adapter.safetensors', 'optimizer.resume'].some(name => !fs.existsSync(path.join(checkpoint, name)))
+            || !yue2JointWeight(checkpoint, 'ar') || !yue2JointWeight(checkpoint, 'nar')) return `Joint-training checkpoint-step${expect} is incomplete`;
           return null;
         }, (line, current) => relayJsonLine(job, line, current, clock, thinning), state, o.spawnEnv, o.stopEngine !== false);
       if (intoOutDir) yue2StyleNormsForRun(o.outDir, o.dataset);

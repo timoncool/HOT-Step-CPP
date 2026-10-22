@@ -43,6 +43,9 @@
 #include <string>
 #include <vector>
 
+#include <cfloat>
+
+#include "dora-common.h"
 #include "train/mm3-dit-train-graph.h"
 #include "train/mm3-dit-train-ckpt.h"
 #include "train/lm-optim.h"
@@ -106,6 +109,9 @@ struct MM3TrainArgs {
     // attention V + to_out; no q,k (structure poison), no proj heads (fuzz).
     std::string target        = "all";
     std::string only_song;          // restrict to one song (overfit test)
+    // DoRA: learn a per-output magnitude on every site (see MM3TrainLora).
+    // The CLI flag is wired by the Stage A integration slice.
+    bool        dora          = false;
 };
 
 // ── Cache loading ──────────────────────────────────────────────────────────
@@ -232,7 +238,7 @@ static bool mm3_train_read_crop(const MM3TrainSong & s, int64_t start, int64_t c
 // via out_mask. Filtering at export would waste the optimizer's budget on
 // deltas we discard; excluding here concentrates ALL fitting in what ships.
 static bool mm3_train_make_adapters(ggml_context * ctx, const MM3Model & m, int64_t rank, float alpha,
-                                    bool mlpv, MM3TrainAdapters * ad,
+                                    bool mlpv, bool dora, MM3TrainAdapters * ad,
                                     std::vector<ggml_tensor *> * params) {
     const MM3DitConfig & c = m.synth_cfg.dit;
     const int64_t E = (int64_t) c.embedding_length, FI = (int64_t) c.ff_inner;
@@ -249,6 +255,16 @@ static bool mm3_train_make_adapters(ggml_context * ctx, const MM3Model & m, int6
         ggml_set_param(lo->b);
         params->push_back(lo->a);
         params->push_back(lo->b);
+        if (dora) {
+            // After A/B in params, and m is not named "...A", so the init loop's
+            // rng stream (and with it every A) matches a plain LoRA run.
+            lo->m   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out);
+            lo->nrm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out);
+            ggml_set_name(lo->m, (std::string(tag) + ".dora_m").c_str());
+            ggml_set_name(lo->nrm, (std::string(tag) + ".dora_nrm").c_str());
+            ggml_set_param(lo->m);
+            params->push_back(lo->m);
+        }
     };
 
     // ONE shared V-only mask for every block's qkv (identical shape [3E, 1]):
@@ -261,6 +277,10 @@ static bool mm3_train_make_adapters(ggml_context * ctx, const MM3Model & m, int6
         vmask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * E, 1);
         ggml_set_name(vmask, "dit.qkv_vmask");
         ad->qkv_vmask = vmask;
+        if (dora) {
+            ad->qkv_vkeep = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3 * E, 1);
+            ggml_set_name(ad->qkv_vkeep, "dit.qkv_vkeep");
+        }
     }
 
     ad->blk.assign(m.synth.dit.blk.size(), MM3TrainBlockAdapters{});
@@ -268,6 +288,7 @@ static bool mm3_train_make_adapters(ggml_context * ctx, const MM3Model & m, int6
         const std::string p = "dit.blk." + std::to_string(i);
         mk(&ad->blk[i].qkv,      E,  3 * E,      (p + ".attn_qkv").c_str());
         ad->blk[i].qkv.out_mask = vmask;   // nullptr unless mlpv
+        ad->blk[i].qkv.keep     = ad->qkv_vkeep;
         mk(&ad->blk[i].attn_out, E,  E,          (p + ".attn_output").c_str());
         mk(&ad->blk[i].ff_in,    E,  2 * FI,     (p + ".ffn_in").c_str());
         mk(&ad->blk[i].ff_out,   FI, E,          (p + ".ffn_out").c_str());
@@ -277,6 +298,53 @@ static bool mm3_train_make_adapters(ggml_context * ctx, const MM3Model & m, int6
         mk(&ad->proj_out, E,  IC, "dit.proj_out");
     }
     return true;
+}
+
+// ── DoRA norm refresh ──────────────────────────────────────────────────────
+//
+// nrm = max(||W + s*BA||_col, floor) for every DoRA site. A/B only move at
+// optimizer steps, so refreshing after each step is exact for the next window
+// and for any eval or export in between. One graph per SITE: the [in, out] F32
+// transients are the whole cost, they land in the optimizer scheduler's buffer
+// (which keeps its high-water mark), and one site at a time keeps that at the
+// largest single projection instead of a whole block.
+//
+// Zero-norm policy: the floor keeps an all-zero row finite. Its output is 0
+// whatever m is, where 0/0 would be NaN. mm3-adapter.h's merge uses the same
+// floor, so trainer and merge agree on that row too.
+static const float MM3_DORA_NRM_FLOOR = 1e-12f;
+
+static bool mm3_train_dora_refresh(const MM3Model & m, const MM3TrainAdapters & ad, ggml_backend_sched_t sched,
+                                   std::string * err) {
+    const size_t         n_nodes = 32;
+    std::vector<uint8_t> arena(ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false));
+    auto run = [&](const MM3TrainLora & lo, ggml_tensor * w) -> bool {
+        if (!lo.m) return true;
+        ggml_init_params ip  = { arena.size(), arena.data(), true };
+        ggml_context *   ctx = ggml_init(ip);
+        if (!ctx) { *err = "DoRA norm pass: cannot create context"; return false; }
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes, false);
+        // B is an F32 param; the F16 base is cast here, as in mm3-lm-dora.h.
+        ggml_tensor * nr = dora_col_norm(ctx, ggml_cast(ctx, w, GGML_TYPE_F32), lo.a, lo.b, lo.scale);
+        nr               = ggml_clamp(ctx, nr, MM3_DORA_NRM_FLOOR, FLT_MAX);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, nr, ggml_reshape_2d(ctx, lo.nrm, 1, lo.nrm->ne[0])));
+        ggml_backend_sched_reset(sched);
+        const bool ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        ggml_free(ctx);
+        if (!ok) *err = std::string("DoRA norm pass: graph compute failed on ") + ggml_get_name(lo.m) +
+                        " (out of VRAM?)";
+        return ok;
+    };
+    const MM3DitWeights & w = m.synth.dit;
+    for (size_t i = 0; i < ad.blk.size(); i++) {
+        const MM3TrainBlockAdapters & b  = ad.blk[i];
+        const MM3DitBlock &           wb = w.blk[i];
+        if (!run(b.qkv, wb.attn_qkv) || !run(b.attn_out, wb.attn_output) || !run(b.ff_in, wb.ffn_in_w) ||
+            !run(b.ff_out, wb.ffn_out_w)) {
+            return false;
+        }
+    }
+    return run(ad.proj_in, w.proj_in) && run(ad.proj_out, w.proj_out);
 }
 
 // ── Sigma / target ─────────────────────────────────────────────────────────
@@ -538,13 +606,13 @@ static int mm3_train_dit_run(const MM3TrainArgs & a) {
     if (!tsched) { fprintf(stderr, "[mm3-train] scheduler alloc failed\n"); return 1; }
 
     // Adapter parameters in their own context + backend buffer.
-    const size_t     n_sites = (m.synth.dit.blk.size() * 4 + 2) * 2;
+    const size_t     n_sites = (m.synth.dit.blk.size() * 4 + 2) * 4;   // A, B, m, nrm
     ggml_init_params aip     = { (n_sites + 16) * ggml_tensor_overhead(), nullptr, true };
     ggml_context *   actx    = ggml_init(aip);
     MM3TrainAdapters ad;
     std::vector<ggml_tensor *> params;
     const bool target_mlpv = (a.target == "mlpv");
-    mm3_train_make_adapters(actx, m, a.rank, a.alpha, target_mlpv, &ad, &params);
+    mm3_train_make_adapters(actx, m, a.rank, a.alpha, target_mlpv, a.dora, &ad, &params);
     // THE SEED GRADIENT. LmOptim::t_lossgrad defaults to nullptr and is NOT
     // created by lm_optim_init — ACE builds it itself (dit-train-run.h) and
     // assigns it. Leaving it null makes lm_optim_fill_gacc hand a null
@@ -619,9 +687,30 @@ static int mm3_train_dit_run(const MM3TrainArgs & a) {
         std::vector<float> mv((size_t) E3, 0.0f);
         for (int64_t i = 2 * (E3 / 3); i < E3; i++) mv[(size_t) i] = 1.0f;   // v rows only
         ggml_backend_tensor_set(ad.qkv_vmask, mv.data(), 0, mv.size() * sizeof(float));
+        if (ad.qkv_vkeep) {
+            for (float & x : mv) x = 1.0f - x;
+            ggml_backend_tensor_set(ad.qkv_vkeep, mv.data(), 0, mv.size() * sizeof(float));
+        }
     }
-    fprintf(stderr, "[mm3-train] %zu LoRA tensors, rank %lld, alpha %.1f, target %s\n", params.size(),
-            (long long) a.rank, (double) a.alpha, a.target.c_str());
+    // DoRA init: B is zero, so the refresh yields ||W||_col, and m starts there.
+    // The ratio is then exactly 1 and the first forward is the plain one.
+    if (a.dora) {
+        if (!mm3_train_dora_refresh(m, ad, osched, &err)) {
+            fprintf(stderr, "[mm3-train] %s\n", err.c_str()); return 1;
+        }
+        std::vector<float> col;
+        for (ggml_tensor * t : params) {
+            const char * nm = ggml_get_name(t);
+            const size_t ln = strlen(nm);
+            if (ln < 7 || strcmp(nm + ln - 7, ".dora_m") != 0) continue;
+            ggml_tensor * nrm = ggml_get_tensor(actx, (std::string(nm, ln - 1) + "nrm").c_str());
+            col.resize((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(nrm, col.data(), 0, col.size() * sizeof(float));
+            ggml_backend_tensor_set(t, col.data(), 0, col.size() * sizeof(float));
+        }
+    }
+    fprintf(stderr, "[mm3-train] %zu %s tensors, rank %lld, alpha %.1f, target %s\n", params.size(),
+            a.dora ? "DoRA" : "LoRA", (long long) a.rank, (double) a.alpha, a.target.c_str());
 
     // Report the sigma distribution this run will actually see, by sampling it
     // rather than by quoting logit_mean. sigma near 0 means the crop is mostly
@@ -929,6 +1018,9 @@ static int mm3_train_dit_run(const MM3TrainArgs & a) {
         if (!lm_optim_step(&opt, osched, &st)) {
             fprintf(stderr, "[mm3-train] optimizer step failed\n"); return 1;
         }
+        if (a.dora && !mm3_train_dora_refresh(m, ad, osched, &err)) {
+            fprintf(stderr, "[mm3-train] %s\n", err.c_str()); return 1;
+        }
         if (getenv("MM3_TRAIN_TRACE")) fprintf(stderr, "[trace] %s\n", "post optim step");
         fprintf(stderr, "[mm3-train] step %4lld  loss %.5f  |g| %.4f  lr %.2e\n", (long long) step,
                 acc / (double) a.grad_accum, (double) st.grad_norm, (double) st.lr);
@@ -975,13 +1067,37 @@ static int mm3_train_dit_run(const MM3TrainArgs & a) {
 // b:[rank, out] IS torch [out, rank] — the bytes need no transposition.
 static bool mm3_train_export(const MM3TrainAdapters & ad, const MM3Model & m, int64_t rank, float alpha,
                              const std::string & path, std::string * err) {
-    struct Ent { std::string name; const ggml_tensor * t; };
+    // shape is torch order; a 0-dim entry is a scalar.
+    struct Ent { std::string name; std::vector<int64_t> shape; std::vector<float> data; };
     std::vector<Ent> ents;
+    bool             dora = false;
 
+    auto fetch = [](const ggml_tensor * t) {
+        std::vector<float> v((size_t) ggml_nelements(t));
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
     auto add_site = [&](const MM3TrainLora & lo, const std::string & mod) {
         if (!lo.on()) return;
-        ents.push_back({ mod + ".lora_A.weight", lo.a });
-        ents.push_back({ mod + ".lora_B.weight", lo.b });
+        // ggml ne reversed is the torch shape
+        ents.push_back({ mod + ".lora_A.weight", { lo.a->ne[1], lo.a->ne[0] }, fetch(lo.a) });
+        ents.push_back({ mod + ".lora_B.weight", { lo.b->ne[1], lo.b->ne[0] }, fetch(lo.b) });
+        if (!lo.m) return;
+        dora = true;
+        // PEFT name and layout: F32 [out]. A row the forward holds at factor 1
+        // (the mlpv q,k rows) exports its own norm, so the merge leaves it at
+        // the base even though weight decay has moved the unused m.
+        std::vector<float> mv = fetch(lo.m);
+        if (lo.keep) {
+            const std::vector<float> nv = fetch(lo.nrm), kv = fetch(lo.keep);
+            for (size_t r = 0; r < mv.size(); r++) {
+                if (kv[r] != 0.0f) mv[r] = nv[r];
+            }
+        }
+        ents.push_back({ mod + ".lora_magnitude_vector.weight", { lo.m->ne[0] }, std::move(mv) });
+        // The loader takes alpha from per-module scalars, else adapter_config,
+        // else scaling 1. A DoRA norm is only right at the trained scaling.
+        ents.push_back({ mod + ".alpha", {}, { alpha } });
     };
     const std::string P = "diffusion_model.diffusion_transformer.";
     for (size_t i = 0; i < ad.blk.size(); i++) {
@@ -997,27 +1113,26 @@ static bool mm3_train_export(const MM3TrainAdapters & ad, const MM3Model & m, in
     // header + payload
     std::string hdr = "{";
     size_t      off = 0;
-    std::vector<std::vector<float>> blobs;
-    blobs.reserve(ents.size());
     for (const Ent & e : ents) {
-        const int64_t n0 = e.t->ne[0], n1 = e.t->ne[1];   // ggml
-        const size_t  nb = (size_t) (n0 * n1) * sizeof(float);
-        blobs.emplace_back((size_t) (n0 * n1), 0.0f);
-        ggml_backend_tensor_get(e.t, blobs.back().data(), 0, nb);
+        const size_t nb = e.data.size() * sizeof(float);
+        std::string  shp;
+        for (int64_t d : e.shape) shp += (shp.empty() ? "" : ",") + std::to_string(d);
         char buf[512];
-        // torch shape is the ggml ne reversed
         snprintf(buf, sizeof(buf),
-                 "%s\"%s\":{\"dtype\":\"F32\",\"shape\":[%lld,%lld],\"data_offsets\":[%zu,%zu]}",
-                 off ? "," : "", e.name.c_str(), (long long) n1, (long long) n0, off, off + nb);
+                 "%s\"%s\":{\"dtype\":\"F32\",\"shape\":[%s],\"data_offsets\":[%zu,%zu]}",
+                 off ? "," : "", e.name.c_str(), shp.c_str(), off, off + nb);
         hdr += buf;
         off += nb;
     }
-    // Per-module alpha, so the loader's alpha/rank scaling matches training.
     {
-        char buf[256];
+        char buf[384];
+        // DoRA files carry the format tag mm3-adapter.h validates against:
+        // W' = m * (W + s*BA) / max(||W + s*BA||_col, 1e-12), s = alpha/rank,
+        // strength u gives W0 + u*(W' - W0).
         snprintf(buf, sizeof(buf), ",\"__metadata__\":{\"format\":\"pt\",\"hot_step_mm3_lora\":\"1\","
-                                   "\"rank\":\"%lld\",\"alpha\":\"%.6f\"}",
-                 (long long) rank, (double) alpha);
+                                   "\"rank\":\"%lld\",\"alpha\":\"%.6f\"%s}",
+                 (long long) rank, (double) alpha,
+                 dora ? ",\"use_dora\":\"true\",\"hot_step_mm3_dora\":\"dit-dora-v1\"" : "");
         hdr += buf;
     }
     hdr += "}";
@@ -1028,7 +1143,7 @@ static bool mm3_train_export(const MM3TrainAdapters & ad, const MM3Model & m, in
     const uint64_t hlen = (uint64_t) hdr.size();
     fwrite(&hlen, sizeof(hlen), 1, f);
     fwrite(hdr.data(), 1, hdr.size(), f);
-    for (const auto & b : blobs) fwrite(b.data(), sizeof(float), b.size(), f);
+    for (const Ent & e : ents) fwrite(e.data.data(), sizeof(float), e.data.size(), f);
     fclose(f);
     fprintf(stderr, "[mm3-train] exported %zu tensors -> %s\n", ents.size(), path.c_str());
     (void) m;

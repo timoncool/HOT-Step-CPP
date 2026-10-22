@@ -1,5 +1,9 @@
 # Model Management — Reference
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Deep detail backing [SKILL.md](SKILL.md). All line numbers verified against the working tree on 2026-07-02; re-verify after large refactors.
 
 ## 1. Engine startup scan — exact order and rules (`engine/src/model-registry.h`)
@@ -117,7 +121,7 @@ UI: `ui/src/components/model-manager/ModelCatalogueTab.tsx:18-28` defines 7 tabs
 
 ## 10. convert.py specifics (`engine/convert.py`)
 
-- Hardcoded I/O: `engine/checkpoints/` → `engine/models/` (lines 14-16); no CLI args. Neither dir exists in this working tree — create them before running, then move output to repo-root `models/`.
+- Hardcoded I/O: `engine/checkpoints/` → `engine/models/` (lines 14-16); no CLI args. Neither dir exists in this working tree — create them before running, then move output to repo-root `<data root>/models/`.
 - Classification by checkpoint directory name (lines 55-64): `acestep-5Hz-lm*` → `acestep-lm`, `acestep-v15*` → `acestep-dit`, `Qwen3-Embedding*` → `acestep-text-enc`, and the directory named **exactly `vae`** → `acestep-vae`. Anything else is skipped.
 - Handles single-file, sharded-index, and diffusers safetensors layouts (`find_sf_files`, lines 31-45). Output GGUFs are self-contained (weights + config + tokenizer + silence_latent). Skips outputs that already exist.
 

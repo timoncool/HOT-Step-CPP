@@ -54,7 +54,8 @@ static bool sampler_parse_custom_timesteps(
 static void sampler_build_scheduler_override(
     std::vector<float> & out_schedule,
     int                  num_steps,
-    const float *        existing_schedule
+    const float *        existing_schedule,
+    const LuaModelContext & model_ctx = LuaModelContext{}
 ) {
     out_schedule.resize(num_steps);
 
@@ -106,8 +107,8 @@ static void sampler_build_scheduler_override(
 
             std::vector<float> va(num_steps), vb(num_steps);
             auto & pp = g_hotstep_params.plugin_params;
-            lua_call_scheduler(*sa, va.data(), num_steps, shift_val, pp);
-            lua_call_scheduler(*sb, vb.data(), num_steps, shift_val, pp);
+            lua_call_scheduler(*sa, va.data(), num_steps, shift_val, pp, model_ctx);
+            lua_call_scheduler(*sb, vb.data(), num_steps, shift_val, pp, model_ctx);
 
             float zone_lo = split - crossover * 0.5f;
             float zone_hi = split + crossover * 0.5f;
@@ -147,7 +148,7 @@ static void sampler_build_scheduler_override(
             }
         } else {
             auto & pp = g_hotstep_params.plugin_params;
-            lua_call_scheduler(*sched, out_schedule.data(), num_steps, shift_val, pp);
+            lua_call_scheduler(*sched, out_schedule.data(), num_steps, shift_val, pp, model_ctx);
             fprintf(stderr, "[DiT] Custom schedule: %s (%s), shift=%.2f\n",
                     sched->display_name.c_str(), sched->name.c_str(), shift_val);
         }

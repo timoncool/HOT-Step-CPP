@@ -1,5 +1,3 @@
-import { Yue2OptimizerFields } from './Yue2OptimizerFields';
-import type { Yue2OptimOptions } from '../../services/trainingApi';
 // Yue2TrainCard.tsx — Training Studio phase 3, YuE2 branch: stages 1 and 4.
 //
 // Two of the five YuE2 stages Yue2TrainStages.tsx renders in order: stage 1,
@@ -29,25 +27,31 @@ import type { Yue2OptimOptions } from '../../services/trainingApi';
 // services/backends/yue2, is shipped by the status route, and is never
 // retyped, truncated or paraphrased on this side.
 
-import React, { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   AlertTriangle, ChevronDown, ChevronRight, Cpu, FileCode2, History, Loader2, PauseCircle,
   Play,
 } from 'lucide-react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useReload } from '../../queries/training-runs/hooks';
+import { runQueries } from '../../queries/training-runs/queries';
+import type { Yue2OptimOptions } from '../../services/trainingApi';
+import { assertRecipeWorker, resolveTrainingRecipe } from '../../services/trainingRecipesApi';
+import { Yue2OptimizerFields } from './Yue2OptimizerFields';
 
 import {
-  estimateYue2PeakMb, listYue2Runs,
+  estimateYue2PeakMb,
   type Yue2CaptionMode, type Yue2NarTarget, type Yue2PresetName, type Yue2RunSummary,
-  type Yue2Status, type Yue2TrainRequest,
+  type Yue2Status, type Yue2TrainRequest
 } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { formatDurationMs } from '../../utils/trainingEta';
-import { JobProgress } from './JobProgress';
-import { TrainingChart } from './TrainingChart';
+import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
-import { ParamLabel } from '../shared/ParamLabel';
+import { JobProgress } from './JobProgress';
+import { Yue2SplitChart } from './Yue2SplitChart';
 import { Yue2StageCard } from './Yue2StageCard';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
@@ -225,50 +229,20 @@ export const Yue2PreprocessCard: React.FC<{ status: Yue2Status; done: boolean; o
 
       {!blocked && (
         <>
-          {/* What the FLAT scan sees, beside what the dataset holds. The engine
-              takes --audio <folder> and no manifest, so subfolders and the
-              dataset's excluded rows genuinely cannot reach it — and a user
-              training on tracks they excluded, without being told, is the
-              failure worth spending three lines on. */}
-          <div className="text-[11px] text-zinc-500 leading-relaxed mb-3">
-            {t('trainingStudio.yue2.ppScan',
-              '{{files}} audio file(s) directly in the source folder; the dataset has {{samples}} sample(s)'
-              + '{{excluded}}.',
-              {
-                files: status.scannableFiles,
-                samples: status.datasetSamples,
-                excluded: status.datasetExcluded > 0
-                  ? t('trainingStudio.yue2.ppExcluded', ' and {{n}} excluded', { n: status.datasetExcluded })
-                  : '',
-              })}
-            {cache && (
-              <>
-                {' '}
-                <span className="text-emerald-500">
-                  {t('trainingStudio.yue2.ppCache',
-                    'Cached: {{clips}} clip(s) of {{frames}} frames from {{sources}} track(s).',
-                    { clips: cache.clips, frames: cache.clipFrames, sources: cache.sources })}
-                </span>
-                {(cache.skipped > 0 || cache.failed > 0) && (
-                  <span className="text-amber-500">
-                    {' '}
-                    {t('trainingStudio.yue2.ppCacheProblems', '{{skipped}} skipped, {{failed}} failed.',
-                      { skipped: cache.skipped, failed: cache.failed })}
-                  </span>
-                )}
-              </>
-            )}
-          </div>
-
-          {(status.scannableFiles !== status.datasetSamples || status.recursive) && (
-            <div className="flex items-start gap-2 text-[11px] text-amber-600 dark:text-amber-400 mb-3">
-              <AlertTriangle size={13} className="mt-0.5 flex-shrink-0" />
-              <span>
-                {t('trainingStudio.yue2.ppFlatScan',
-                  'This stage scans the source folder FLAT. Subfolders are not searched whatever the '
-                  + 'dataset\'s recursive setting says, and rows excluded in the dataset are still '
-                  + 'encoded — the engine takes a folder, not the dataset manifest.')}
+          {cache && (
+            <div className="text-[11px] text-zinc-500 leading-relaxed mb-3">
+              <span className="text-emerald-500">
+                {t('trainingStudio.yue2.ppCache',
+                  'Cached: {{clips}} clip(s) of {{frames}} frames from {{sources}} track(s).',
+                  { clips: cache.clips, frames: cache.clipFrames, sources: cache.sources })}
               </span>
+              {(cache.skipped > 0 || cache.failed > 0) && (
+                <span className="text-amber-500">
+                  {' '}
+                  {t('trainingStudio.yue2.ppCacheProblems', '{{skipped}} skipped, {{failed}} failed.',
+                    { skipped: cache.skipped, failed: cache.failed })}
+                </span>
+              )}
             </div>
           )}
 
@@ -516,20 +490,13 @@ const OUTCOME: Record<Yue2RunSummary['outcome'], { label: string; tone: string }
  *  picking which rung to load — the adapter picker takes the file path. */
 export const Yue2RunsList: React.FC<{ datasetId: string; reloadKey: unknown }> = ({ datasetId, reloadKey }) => {
   const { t } = useTranslation();
-  const [runs, setRuns] = useState<Yue2RunSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const query = useQuery(runQueries.narRuns(datasetId));
+  const runs = query.data?.runs ?? null;
+  const error = query.error?.message ?? null;
+  useReload(runQueries.narRuns(datasetId).queryKey, reloadKey);
   const [open, setOpen] = useState<string | null>(null);
   const [copied, setCopied] = useState('');
 
-  React.useEffect(() => {
-    let cancelled = false;
-    listYue2Runs(datasetId)
-      .then(r => { if (!cancelled) { setRuns(r.runs); setError(null); } })
-      .catch(err => {
-        if (!cancelled) { setError(err instanceof Error ? err.message : String(err)); setRuns([]); }
-      });
-    return () => { cancelled = true; };
-  }, [datasetId, reloadKey]);
 
   if (error) return <div className={`${CARD} text-xs text-rose-500`}>{error}</div>;
   if (!runs || runs.length === 0) return null;
@@ -692,8 +659,6 @@ export const Yue2NarTrainCard: React.FC<{
   const yue2Live = useTrainingStore(s => s.yue2Live);
   const trainStepSeries = useTrainingStore(s => s.trainStepSeries);
   const trainMilestones = useTrainingStore(s => s.trainMilestones);
-  const trainLmEpochs = useTrainingStore(s => s.trainLmEpochs);
-  const trainMaxEpochs = useTrainingStore(s => s.trainMaxEpochs);
 
   const [busy, setBusy] = useState(false);
   const [advanced, setAdvanced] = useState(false);
@@ -795,28 +760,12 @@ export const Yue2NarTrainCard: React.FC<{
     if (!form) return;
     setBusy(true);
     try {
-      const body: Yue2TrainRequest = {
-        // Informational: the fields below already carry the recipe, and the
-        // route lays a named preset UNDER them. It only tells a log reader
-        // which recipe the user started from.
-        ...(activePreset === 'custom' ? {} : { preset: activePreset }),
-        lmType: form.lmType,
-        rank: form.rank, alpha: form.alpha, target: form.target,
-        optimizer: form.optimizer, prodigyD0: form.prodigyD0,
-        muonLrScale: form.muonLrScale, muonNsSteps: form.muonNsSteps,
-        lr: form.lr, lrScheduler: form.lrScheduler,
-        steps: form.steps, warmup: form.warmup,
-        saveEvery: form.saveEvery, logEvery: form.logEvery,
-        gradAccum: form.gradAccum, maxGradNorm: form.maxGradNorm,
-        weightDecay: form.weightDecay, captionDropout: form.captionDropout,
-        abcDropout: form.abcDropout,
-        tSampling: form.tSampling, seed: form.seed, kvCache: form.kvCache,
-        clipBlock: form.clipBlock,
-        // Sent only when there is one: the route falls back to the dataset's
-        // own trigger word, and sending '' would look like an answer.
-        ...(form.trigger.trim() ? { trigger: form.trigger.trim() } : {}),
-      };
+      const recipe = await resolveTrainingRecipe<Record<string, unknown>>('yue2-nar', { ...form, activePreset });
+      const body = recipe.execution as Yue2TrainRequest;
+      assertRecipeWorker(recipe);
       await startYue2Train(body);
+    } catch (err) {
+      useTrainingStore.setState({ error: err instanceof Error ? err.message : String(err) });
     } finally {
       setBusy(false);
       reload();
@@ -1190,17 +1139,12 @@ export const Yue2NarTrainCard: React.FC<{
               ))}
             </div>
           )}
-          {trainStepSeries.length > 1 && (
+          {trainStepSeries.length > 0 && (
             <div className="mt-3">
               {/* target 0 hides the target line: the YuE2 trainer has no
                   stop-on-loss mode, so there is never a line to draw. */}
-              <TrainingChart
-                epochs={trainLmEpochs}
-                steps={trainStepSeries}
-                milestones={trainMilestones}
-                target={0}
-                maxEpochs={trainMaxEpochs}
-              />
+              <Yue2SplitChart mode="nar" points={trainStepSeries.map(s => ({ ...s, ep: s.step }))}
+                milestones={trainMilestones} vramMb={yue2Live?.usedMb} totalSteps={activeJob.total} />
             </div>
           )}
         </div>

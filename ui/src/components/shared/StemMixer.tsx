@@ -288,7 +288,7 @@ export const StemMixer: React.FC<StemMixerProps> = ({ jobId, stems, controls, on
   }, []);
 
   const content = (
-    <div style={{ ...styles.container, width: '100%', maxWidth: '600px', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }}>
+    <div style={{ ...styles.container, width: '100%', maxWidth: '600px', maxHeight: '90vh', display: 'flex', flexDirection: 'column', overflowX: 'auto' }}>
       <div style={styles.header}>
                 <h3 style={styles.title}>🎛️ Stem Mixer</h3>
         {onClose && (
@@ -329,7 +329,7 @@ export const StemMixer: React.FC<StemMixerProps> = ({ jobId, stems, controls, on
         </div>
       )}
 
-      <div style={{ ...styles.stemList, overflowY: 'auto' }}>
+      <div style={{ ...styles.stemList, overflowY: 'auto', minWidth: 380 }}>
         {groupedStems.map(({ category, stems: catStems }) => (
           <div key={category} style={styles.categoryGroup}>
             <div style={{

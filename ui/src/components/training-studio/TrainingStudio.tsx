@@ -159,7 +159,7 @@ export const TrainingStudio: React.FC = () => {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="max-w-6xl mx-auto px-6 py-8 flex flex-col gap-6">
+      <div className="max-w-6xl mx-auto max-[1023px]:px-3 min-[1024px]:px-6 py-8 flex flex-col gap-6">
         {/* Title */}
         <div className="flex items-start gap-3">
           <GraduationCap size={26} className="text-amber-500 mt-0.5 flex-shrink-0" />

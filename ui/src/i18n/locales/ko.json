@@ -142,6 +142,8 @@
     "settings.ai.unslothUsernameDesc": "Unsloth 인증을 위한 사용자 이름입니다.",
     "settings.ai.unslothPassword": "Unsloth 비밀번호",
     "settings.ai.unslothPasswordDesc": "Unsloth 인증을 위한 비밀번호입니다.",
+    "settings.ai.unslothKeyless": "키리스 로컬 Studio",
+    "settings.ai.unslothKeylessDesc": "로컬 Unsloth Studio가 \"keyless API access\" 설정을 활성화한 상태로 실행 중이면 켜세요. 그러면 사용자 이름과 비밀번호가 필요 없습니다. 그렇지 않으면 꺼둔 채 두세요. 이 항목을 켜거나 인증 정보 둘 다를 설정할 때까지 제공자는 숨겨집니다.",
     "settings.ai.llamacppUrl": "llama.cpp URL",
     "settings.ai.llamacppUrlDesc": "llama.cpp 서버 (llama-server) 기본 URL입니다.",
     "settings.ai.openaiCompatUrl": "호환 엔드포인트 URL",

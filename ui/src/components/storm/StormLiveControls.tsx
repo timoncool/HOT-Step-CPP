@@ -4,7 +4,6 @@
 
 import React from 'react';
 import { Loader2 } from 'lucide-react';
-import { useAuth } from '../../context/AuthContext';
 import { runLlmInspire } from '../../services/inspireApi';
 import { AiContinuePresetModal, loadTemplate, DEFAULT_TEMPLATE, type AiPreset, type PresetCategory } from './AiContinuePresetModal';
 import { SeedManagerDrawer } from '../global-bar/SeedManagerDrawer';
@@ -91,6 +90,8 @@ export interface StormLiveControlsProps {
   activeScheduler?: string;
   activeGuidanceMode?: string;
   onSlotMetaUpdate?: (meta: Map<number, SlotMeta>) => void;
+  /** When true, hides ACE-only controls (Steps, Key, BPM). Pass for YuE2. */
+  hideAceControls?: boolean;
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -113,10 +114,9 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
   activeSolver,
   activeScheduler,
   activeGuidanceMode,
+  hideAceControls = false,
   onSlotMetaUpdate,
 }) => {
-  const { token } = useAuth();
-
   const received = sa.currentSlot || 0;
   const playing  = sa.playingSlot || 0;
 
@@ -281,7 +281,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
             .replace('{direction}', aiContinueDir ? `\n\nDirection: ${aiContinueDir}.` : '')
             .replace('{lyrics}', contextLyrics)
             .replace('{style}', caption),
-        }, token || undefined),
+        }),
         new Promise<never>((_, r) => setTimeout(() => r(new Error('AI timeout')), 30000)),
       ]);
       if (result?.lyrics) {
@@ -326,7 +326,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
         setAiStatus({ msg: '3 failures — re-enable to retry', type: 'err' });
       }
     } finally { setAiContinuePending(false); }
-  }, [lyrics, caption, aiContinueDir, token, sa, slotMeta]);
+  }, [lyrics, caption, aiContinueDir, sa, slotMeta]);
 
   React.useEffect(() => {
     if (!sa.isPlaying || !aiContinueEnabled || aiWarnDisabled) return;
@@ -372,7 +372,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
         subject: caption || 'song continuation',
         language: 'en',
         systemPrompt: continuationPrompt,
-      }, token || undefined),
+      }),
       new Promise<never>((_, r) => setTimeout(() => r(new Error('timeout')), 30000)),
     ]).then(result => {
       if (result?.lyrics) {
@@ -383,7 +383,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
         }]);
       }
     }).catch(() => {}).finally(() => setAiContinuePending(false));
-  }, [aiTemplate, lyrics, caption, token, sa, received, slotMeta]);
+  }, [aiTemplate, lyrics, caption, sa, received, slotMeta]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
   const fireControl = (key: SlotKey, val: number) => {
@@ -562,7 +562,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
         )}
 
         {/* Next-slot sliders */}
-        {NEXT_SLOT_PARAMS.filter(s => s.key !== 'bpm').map(s => (
+        {NEXT_SLOT_PARAMS.filter(s => s.key !== 'bpm' && !(hideAceControls && s.key === 'inference_steps')).map(s => (
           <div key={s.key} className="flex items-center gap-2">
             <span className={`text-[10px] w-14 ${s.color}`}>{s.emoji} {s.label}</span>
             <input type="range" min={s.min} max={s.max} step={s.step}
@@ -626,8 +626,8 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
           onLoadRandom={handleSeedLoadRandom}
         />
 
-        {/* Key control row */}
-        <div className="flex items-center gap-2">
+        {/* Key control row — ACE only */}
+        {!hideAceControls && <div className="flex items-center gap-2">
           <span className="text-[10px] text-zinc-500 w-14">🎹 Key</span>
           <button onClick={() => setKeyMode(keyMode === 'auto' ? 'manual' : 'auto')}
             className={`text-[8px] px-1.5 py-0.5 rounded font-medium transition-colors shrink-0 ${
@@ -645,10 +645,10 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
               placeholder="e.g. Cm, F#, Bbm"
               className="flex-1 text-[10px] bg-zinc-800 border border-zinc-700 rounded px-1.5 py-0.5 text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-violet-500/40 transition-colors" />
           )}
-        </div>
+        </div>}
 
-        {/* BPM auto row */}
-        <div className="flex items-center gap-2">
+        {/* BPM auto row — ACE only */}
+        {!hideAceControls && <div className="flex items-center gap-2">
           <span className="text-[10px] text-zinc-500 w-14">🥁 BPM</span>
           <button onClick={() => setBpmMode(bpmMode === 'auto' ? 'manual' : 'auto')}
             className={`text-[8px] px-1.5 py-0.5 rounded font-medium transition-colors shrink-0 ${
@@ -668,7 +668,7 @@ export const StormLiveControls: React.FC<StormLiveControlsProps> = ({
               <span className="text-[10px] text-orange-400 w-8 text-right tabular-nums">{sliderVals['bpm']}</span>
             </>
           )}
-        </div>
+        </div>}
 
         {/* AI Continuation */}
         <div className="space-y-1">

@@ -566,6 +566,44 @@ static bool mm3_flow_sample_chunk(const MM3Model & m, const float * noise, const
         }
     }
 
+    // HOT-Step diagnostic: final-latent statistics, per window, same format as
+    // sa3-refine.h so the numbers line up. This is what LuaModelContext
+    // latent_rms wants to be set to for MM3 (mm3-plugins.h) -- the Lua
+    // rms_target servos default to it. Cheap: one pass over the window.
+    // For windows after the first (overlap > 0), the leading [0, overlap)
+    // frames were just overwritten with the previous window's carry above,
+    // not produced by this window's sampling -- measure [overlap, L) instead
+    // so the stats reflect what this window actually generated. The first
+    // window (overlap == 0) has no carry to exclude, so it measures [0, L).
+    if (C > 0 && L > 0) {
+        const int64_t stat_start = (overlap > 0) ? overlap : 0;
+        const int64_t stat_cnt   = L - stat_start;
+        double sum_sq = 0.0, sum_abs = 0.0;
+        float  vmin = out_latents[stat_start], vmax = vmin;
+        double ch_min = 1e30, ch_max = 0.0;
+        for (int64_t cidx = 0; cidx < C; cidx++) {
+            double csq = 0.0;
+            const float * row = out_latents.data() + cidx * L;
+            for (int64_t li = stat_start; li < L; li++) {
+                const double d = (double) row[li];
+                csq     += d * d;
+                sum_abs += std::fabs(d);
+                if (row[li] < vmin) vmin = row[li];
+                if (row[li] > vmax) vmax = row[li];
+            }
+            sum_sq += csq;
+            const double r = std::sqrt(csq / (double) stat_cnt);
+            if (r < ch_min) ch_min = r;
+            if (r > ch_max) ch_max = r;
+        }
+        const double n_all = (double) C * stat_cnt;
+        fprintf(stderr, "[MM3-Flow] final latent: rms=%.4f mean|x|=%.4f min=%.3f max=%.3f "
+                        "per-ch rms [%.4f .. %.4f]  frames=[%lld,%lld) (C=%lld L=%lld ov=%lld)\n",
+                std::sqrt(sum_sq / n_all), sum_abs / n_all, vmin, vmax, ch_min, ch_max,
+                (long long) stat_start, (long long) L,
+                (long long) C, (long long) L, (long long) overlap);
+    }
+
     const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_all).count();
     // Multi-eval solvers and post_step() add forwards that a flat 2/step count
     // would hide, making a Heun run look as cheap as an Euler one.

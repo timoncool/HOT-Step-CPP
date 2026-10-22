@@ -1,9 +1,10 @@
 // downloadTrack.ts — Instant download utility using settings-page preferences
 //
 // Reads format, bitrate, version, and latent settings from AppSettings (localStorage).
-// Triggers browser downloads via hidden <a> element clicks.
+// Saves into the DOWNLOAD_DIR folder when one is set, else triggers browser downloads via hidden <a> clicks.
 
 import type { Song } from '../types';
+import { resolveExports } from '../services/exportImportApi';
 
 type AudioFormat = 'wav' | 'flac' | 'opus' | 'mp3';
 type DownloadVersion = 'original' | 'mastered' | 'both';
@@ -54,11 +55,39 @@ function triggerBrowserDownload(url: string): void {
   document.body.removeChild(a);
 }
 
+/**
+ * Download one /api/download URL. With a download folder set (DOWNLOAD_DIR) the
+ * server saves the file there and the path is announced to the app shell as a
+ * `hotstep:download-saved` event; with none set (409) it is the browser download.
+ */
+async function triggerDownload(url: string): Promise<void> {
+  const [pathname, query] = url.split('?');
+  let res: Response;
+  try {
+    res = await fetch(`${pathname}/save${query ? `?${query}` : ''}`, { method: 'POST' });
+  } catch {
+    triggerBrowserDownload(url);
+    return;
+  }
+  if (res.status === 409) { triggerBrowserDownload(url); return; }
+  const body = await res.json().catch(() => null);
+  window.dispatchEvent(new CustomEvent('hotstep:download-saved', {
+    detail: res.ok ? { path: body?.path } : { error: body?.error || `HTTP ${res.status}` },
+  }));
+}
+
 /** Small delay helper — used between multiple downloads so the browser doesn't block them. */
 const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 /** A specific rendered variant of a track, matching the playbar's variant switch. */
 export type TrackVersion = 'original' | 'mastered' | 'noadapter';
+
+function artistFor(song: Song, options?: { artistName?: string }): string {
+  return options?.artistName || song.artistName
+    || (song.generationParams as any)?.artist || (song.generation_params as any)?.artist
+    // Cover Studio records the covering band as artistName.
+    || (song.generationParams as any)?.artistName || (song.generation_params as any)?.artistName || '';
+}
 
 /**
  * Build the /api/download query string for one version of a track.
@@ -75,8 +104,7 @@ function buildDownloadParams(
   const isLossy = format === 'mp3' || format === 'opus';
   const bitrate = format === 'opus' ? settings.downloadOpusBitrate : settings.downloadMp3Bitrate;
 
-  const finalArtist = options?.artistName || song.artistName
-    || (song.generationParams as any)?.artist || (song.generation_params as any)?.artist || '';
+  const finalArtist = artistFor(song, options);
   const finalPrepend = options?.prepend || readFilenamePrepend();
 
   // The no-adapter render may live only on a queue item, not in the songs row —
@@ -108,7 +136,7 @@ export async function downloadTrackVersion(
   options?: { artistName?: string; prepend?: string },
 ): Promise<void> {
   const params = buildDownloadParams(song, version, readSettings(), options);
-  triggerBrowserDownload(`/api/download/${song.id}?${params}`);
+  await triggerDownload(`/api/download/${song.id}?${params}`);
 }
 
 /**
@@ -129,33 +157,69 @@ export async function downloadTrack(
   // Determine which audio version(s) to download
   const versionPref = settings.downloadVersion;
   if (versionPref === 'both' && hasMastered) {
-    triggerBrowserDownload(`/api/download/${song.id}?${buildParams('original')}`);
+    await triggerDownload(`/api/download/${song.id}?${buildParams('original')}`);
     await delay(500);
-    triggerBrowserDownload(`/api/download/${song.id}?${buildParams('mastered')}`);
+    await triggerDownload(`/api/download/${song.id}?${buildParams('mastered')}`);
   } else if (versionPref === 'mastered' && hasMastered) {
-    triggerBrowserDownload(`/api/download/${song.id}?${buildParams('mastered')}`);
+    await triggerDownload(`/api/download/${song.id}?${buildParams('mastered')}`);
   } else {
-    triggerBrowserDownload(`/api/download/${song.id}?${buildParams('original')}`);
+    await triggerDownload(`/api/download/${song.id}?${buildParams('original')}`);
   }
 
   // Latent download — if enabled and the song has a latent file
   if (settings.downloadIncludeLatent && (song.latentUrl || song.latent_url)) {
     await delay(500);
     const latentParams = new URLSearchParams({ version: 'latent' });
-    triggerBrowserDownload(`/api/download/${song.id}?${latentParams}`);
+    await triggerDownload(`/api/download/${song.id}?${latentParams}`);
   }
 }
 
 /**
- * Bulk-download multiple tracks sequentially.
- * Stagers downloads 800ms apart so the browser doesn't throttle/block them.
+ * Bulk-download multiple tracks. The server resolves which versions exist and
+ * which files to fetch; the browser only triggers the returned URLs, 800ms
+ * apart so it doesn't throttle/block them.
+ *
+ * @returns one message per item the server could not resolve
  */
 export async function downloadAll(
   songs: Song[],
   options?: { artistName?: string; prepend?: string },
-): Promise<void> {
-  for (let i = 0; i < songs.length; i++) {
-    if (i > 0) await delay(800);
-    await downloadTrack(songs[i], options);
+): Promise<string[]> {
+  const settings = readSettings();
+  const format = settings.downloadFormat;
+  const bitrate = format === 'opus' ? settings.downloadOpusBitrate
+    : format === 'mp3' ? settings.downloadMp3Bitrate : undefined;
+  const prepend = options?.prepend || readFilenamePrepend();
+
+  // ponytail: one request per artist because the contract takes a single artist
+  // and songs has no artist column; a per-item artist field would collapse this.
+  const byArtist = new Map<string, Song[]>();
+  for (const song of songs) {
+    const artist = artistFor(song, options);
+    byArtist.set(artist, [...(byArtist.get(artist) || []), song]);
   }
+
+  const failures: string[] = [];
+  let triggered = 0;
+  for (const [artist, group] of byArtist) {
+    for (let offset = 0; offset < group.length; offset += 100) {
+      const batch = group.slice(offset, offset + 100);
+      const results = await resolveExports(
+        batch.map(song => ({ songId: song.id, ...(song.audioUrl ? { audioUrl: song.audioUrl } : {}) })),
+        {
+          format, bitrate, downloadVersion: settings.downloadVersion, includeLatent: settings.downloadIncludeLatent,
+          ...(artist ? { artist } : {}), ...(prepend ? { prepend } : {}),
+        },
+      );
+      for (const result of results) {
+        if (!result.url) {
+          failures.push(`${batch[result.index]?.title || result.songId}: ${result.error || 'not available'}`);
+          continue;
+        }
+        if (triggered++ > 0) await delay(800);
+        await triggerDownload(result.url);
+      }
+    }
+  }
+  return failures;
 }

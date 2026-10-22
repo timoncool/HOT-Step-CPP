@@ -37,6 +37,9 @@
  */
 
 import { useBackendStore } from '../stores/backendStore';
+import { apiClient } from '../services/httpClient';
+import { queryClient } from '../queries/client';
+import { serverKey } from '../queries/keys';
 
 /** The registered id of the YuE2 backend (server/src/services/backends/yue2/index.ts). */
 export const YUE2_BACKEND_ID = 'yue2';
@@ -174,7 +177,7 @@ export function cacheYue2SourceTracks(datasetId: string, tracks: Yue2SourceTrack
   sourceTracks.set(datasetId, tracks);
 }
 
-function readYue2DatasetForLyricsSet(lyricsSetId: number): string {
+export function readYue2DatasetForLyricsSet(lyricsSetId: number): string {
   return _read<string>(YUE2_DATASET_FOR_LYRICS_SET_PREFIX + lyricsSetId) ?? '';
 }
 
@@ -218,11 +221,15 @@ export async function fetchYue2CaptionSource(
   else return { datasetId: '', datasetName: '', tracks: [] };
 
   try {
-    const res = await fetch(`/api/training/yue2-dataset-captions?${params.toString()}`);
-    if (!res.ok) return { datasetId: '', datasetName: '', tracks: [] };
-    const data = await res.json() as {
-      datasetId?: string; datasetName?: string; tracks?: Yue2SourceTrack[];
-    };
+    // Query owns the read (fresh each time, concurrent asks share one
+    // request); a failure is caught here, never cached as an empty answer.
+    const data = await queryClient.query({
+      queryKey: serverKey('shell-queue/yue2-captions', { filters: Object.fromEntries(params) }),
+      queryFn: ({ signal }) => apiClient.get<{
+        datasetId?: string; datasetName?: string; tracks?: Yue2SourceTrack[];
+      }>(`/training/yue2-dataset-captions?${params.toString()}`, { signal }),
+      staleTime: 0,
+    });
     const datasetId = data.datasetId || '';
     const datasetName = data.datasetName || '';
     const tracks = (data.tracks ?? []).filter(t => t && t.name && (t.styled || t.caption));
@@ -457,7 +464,7 @@ export function yue2PickAtEnqueue(
   const defaults = (useBackendStore.getState().models[YUE2_BACKEND_ID]?.defaults ?? {}) as Record<string, unknown>;
   const pick: Record<string, string | number> = {};
   for (const [k, v] of Object.entries(defaults)) {
-    if (/^lmAdapter(Ar|Nar)(Scale(Attn|Mlp|Early|Mid|Late)?)?$/.test(k) && (typeof v === 'string' || typeof v === 'number')) {
+    if (/^lmAdapter(Ar|Nar)(Scale(Attn|Mlp|Early|Mid|Late|Plan)?)?$/.test(k) && (typeof v === 'string' || typeof v === 'number')) {
       pick[k] = v;
     }
   }

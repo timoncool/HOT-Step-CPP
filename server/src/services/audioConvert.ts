@@ -10,10 +10,11 @@
  *
  * Converted files are cached alongside the original so re-runs skip conversion.
  */
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
+import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
-import { getFFmpegPath } from '../config.js';
+import { config, getFFmpegPath } from '../config.js';
 
 
 /** Extensions the C++ engine can decode natively */
@@ -151,6 +152,31 @@ export function ensureEngineFormat(filePath: string, cacheDir?: string): Buffer 
 }
 
 /**
+ * A 320 kbps MP3 copy of `filePath` in `cacheDir`, for sources too big to use
+ * as they are. Keyed by name, size and mtime so a replaced upload is redone.
+ * The source is only read, never written beside.
+ */
+export async function cachedMp3(filePath: string, cacheDir: string): Promise<string> {
+  const stat = fs.statSync(filePath);
+  const out = path.join(cacheDir, `${path.basename(filePath)}.${stat.size}.${Math.trunc(stat.mtimeMs)}.mp3`);
+  if (fs.existsSync(out)) return out;
+  const ffmpegPath = getFFmpegPath();
+  if (!ffmpegPath) throw new Error('ffmpeg not available — cannot convert large audio to MP3');
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const part = `${out}.part`;
+  console.log(`[audioConvert] ${path.basename(filePath)} is ${(stat.size / 1024 / 1024).toFixed(1)} MB → 320 kbps MP3...`);
+  try {
+    await promisify(execFile)(ffmpegPath, ['-y', '-v', 'error', '-i', filePath, '-vn', '-c:a', 'libmp3lame', '-ar', '48000', '-b:a', '320k', '-f', 'mp3', part],
+      { timeout: 300_000, maxBuffer: 16 * 1024 * 1024 });
+    fs.renameSync(part, out);
+  } catch (err: any) {
+    fs.rmSync(part, { force: true });
+    throw new Error(`ffmpeg MP3 conversion failed: ${err.stderr?.toString()?.slice(-500) || err.message}`);
+  }
+  return out;
+}
+
+/**
  * Apply tempo-scaling and/or pitch-shifting to a WAV buffer.
  *
  * The C++ engine doesn't support these natively (the Python ACE-Step backend
@@ -173,7 +199,7 @@ export function timeStretchPitchShift(
   }
 
   // Write source to temp file
-  const tmpDir = path.join(process.cwd(), 'data', 'tmp');
+  const tmpDir = path.join(config.data.dir, 'tmp');
   if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   const tmpIn = path.join(tmpDir, `stretch_in_${id}.wav`);

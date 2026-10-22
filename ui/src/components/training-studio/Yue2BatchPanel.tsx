@@ -8,12 +8,16 @@
 // the batch trains must not drag them back. Rows link to their datasets, and
 // the running stage shows its job progress.
 
-import React, { useEffect, useState } from 'react';
-import { ArrowRight, Check, CircleDashed, Loader2, ListChecks, Pause, Play, StopCircle, X, XCircle } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { ArrowRight, Check, CircleDashed, ListChecks, Loader2, Pause, Play, StopCircle, X, XCircle } from 'lucide-react';
+import React, { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Toggle } from '../shared/Toggle';
+import { pollWhile } from '../../queries/contract';
+import { trainingQueries } from '../../queries/training-data/queries';
+import { useRunJob } from '../../queries/training-runs/hooks';
+import { type Yue2BatchItem, type Yue2BatchSummary } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
-import { getJob, type TrainingJobSummary, type Yue2BatchItem, type Yue2BatchSummary } from '../../services/trainingApi';
+import { Toggle } from '../shared/Toggle';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
 const STAGE_LABEL: Record<string, string> = { captions: 'captions', cache: 'latent cache', codes: 'codes', sheet: 'lead sheets', stems: 'vocal stems', align: 'lyric timing', train: 'joint training', refine: 'refinement', nar: 'NAR further training', finish: 'link + cleanup' };
@@ -35,10 +39,12 @@ let lastFollowed: string | null = null;
 
 export const Yue2BatchPanel: React.FC = () => {
   const { t } = useTranslation();
-  const batches = useTrainingStore(s => s.yue2Batches);
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const batchesQuery = useQuery({ ...trainingQueries.yue2Batches(worker),
+    refetchInterval: pollWhile<Yue2BatchSummary[]>(data => !data || data.some(isActive), 3000) });
+  const batches = batchesQuery.data ?? [];
   const follow = useTrainingStore(s => s.yue2BatchFollow);
   const setFollow = useTrainingStore(s => s.setYue2BatchFollow);
-  const load = useTrainingStore(s => s.loadYue2Batches);
   const pause = useTrainingStore(s => s.pauseYue2Batch);
   const resume = useTrainingStore(s => s.resumeYue2Batch);
   const cancel = useTrainingStore(s => s.cancelYue2Batch);
@@ -49,23 +55,9 @@ export const Yue2BatchPanel: React.FC = () => {
   // Only a running or paused batch has anything to act on; a finished one
   // (done, failed, cancelled) is history and its datasets say how it went.
   const batch = batches.find(isActive);
-  const active = !!batch;
   const runningJobId = batch?.items.find(i => i.status === 'running')?.stages.find(s => s.status === 'running')?.jobId || '';
-  const [job, setJob] = useState<TrainingJobSummary | null>(null);
-
-  useEffect(() => { void load(); }, [load]);
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => void load(), 3000);
-    return () => window.clearInterval(id);
-  }, [active, load]);
-  useEffect(() => {
-    if (!runningJobId) { setJob(null); return; }
-    const tick = () => void getJob(runningJobId).then(setJob).catch(() => {});
-    tick();
-    const id = window.setInterval(tick, 3000);
-    return () => window.clearInterval(id);
-  }, [runningJobId]);
+  const jobQuery = useRunJob(worker, runningJobId);
+  const job = jobQuery.data ?? null;
   // Follow the batch: when it moves to a new dataset, open it so the training
   // card (job adoption + SSE chart) shows the live run. Once per move.
   const current = batch?.status === 'running' ? batch.currentDatasetId : null;

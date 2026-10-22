@@ -8,8 +8,12 @@
 // and the other backends' caches. A toggle deletes the core too.
 
 import React, { useEffect, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Trash2 } from 'lucide-react';
-import { clearPreparedData, getPreparedData, type PreparedCache } from '../../services/trainingApi';
+import { clearPreparedData } from '../../services/trainingApi';
+import { trainingQueries } from '../../queries/training-data/queries';
+import { queryManager } from '../../queries/invalidation';
+import { useTrainingStore } from '../../stores/trainingStore';
 import { Toggle } from '../shared/Toggle';
 import { FORM_KEY, PREP_KEY } from './Yue2AitkTrainCard';
 
@@ -17,13 +21,17 @@ const CARD = 'rounded-xl border border-red-500/20 bg-white dark:bg-suno-card p-4
 const mib = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MiB`;
 
 export const Yue2ClearPreparedCard: React.FC<{ datasetId: string; disabled: boolean }> = ({ datasetId, disabled }) => {
-  const [info, setInfo] = useState<{ slug: string; caches: PreparedCache[]; busy: boolean } | null>(null);
+  const queryClient = useQueryClient();
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const prepared = trainingQueries.preparedData(worker, datasetId);
+  // A failed read shows nothing to clear, as before.
+  const info = useQuery(prepared).data ?? null;
   const [clearing, setClearing] = useState(false);
   const [includeCore, setIncludeCore] = useState(false);
   const [note, setNote] = useState('');
 
-  const load = () => getPreparedData(datasetId).then(setInfo).catch(() => setInfo(null));
-  useEffect(() => { setIncludeCore(false); void load(); }, [datasetId]);
+  const load = () => queryManager.keys(queryClient, prepared.queryKey);
+  useEffect(() => { setIncludeCore(false); }, [datasetId]);
 
   const targets = info ? info.caches.filter(c => includeCore || !c.core) : [];
   const kept = info ? info.caches.filter(c => c.core && !includeCore) : [];
@@ -34,7 +42,7 @@ export const Yue2ClearPreparedCard: React.FC<{ datasetId: string; disabled: bool
     if (!window.confirm(`Clear prepared data for ${info.slug}?\n\n${summary}${keptLine}\n\nSource tracks, sidecars, labels and adapters will remain.`)) return;
     setClearing(true); setNote('');
     try {
-      await clearPreparedData(datasetId, info.slug, includeCore);
+      await clearPreparedData(datasetId, info.slug, includeCore, { worker });
       if (includeCore) {
         // The prepared manifest the form points at is gone with the core.
         try {

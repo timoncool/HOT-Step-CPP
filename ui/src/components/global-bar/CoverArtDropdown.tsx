@@ -1,9 +1,14 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { localOptions } from '../../queries/global-models/options';
+import { pollWhile } from '../../queries/contract';
+import { keysPlan, writeAndInvalidate } from '../../queries/writes';
+import { apiClient } from '../../services/httpClient';
 // CoverArtDropdown.tsx — AI cover art toggle + download status
 //
 // Renders as an accordion section inside PostProcessingDropdown.
 // Shows: toggle, installation status, download progress, model info.
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useCallback } from 'react';
 import { Image, Download, X, Check, Loader2 } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
 import { useAuth } from '../../context/AuthContext';
@@ -53,65 +58,26 @@ const formatSpeed = (bytesPerSec: number): string => {
 export const CoverArtContent: React.FC = () => {
   const gp = useGlobalParams();
   const { token } = useAuth();
-  const [status, setStatus] = useState<CoverArtStatusResponse | null>(null);
-  const [polling, setPolling] = useState(false);
-
-  // Poll status
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await fetch('/api/cover-art/status');
-      if (res.ok) {
-        const data = await res.json();
-        setStatus(data);
-        return data;
-      }
-    } catch {}
-    return null;
-  }, []);
-
-  // Initial fetch + polling during download
-  useEffect(() => {
-    fetchStatus();
-  }, [fetchStatus]);
-
-  useEffect(() => {
-    if (!polling) return;
-    const interval = setInterval(async () => {
-      const data = await fetchStatus();
-      if (data && data.download.phase !== 'downloading') {
-        setPolling(false);
-      }
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [polling, fetchStatus]);
-
-  // Start download
+  const client = useQueryClient();
+  const options = localOptions<CoverArtStatusResponse>('cover-art', '/cover-art/status');
+  const { data: status } = useQuery({ ...options,
+    refetchInterval: pollWhile<CoverArtStatusResponse>(data => data?.download.phase === 'downloading'),
+  });
+  // Start download (the write dirties the status it polls)
   const handleDownload = useCallback(async () => {
     if (!token) return;
     try {
-      await fetch('/api/cover-art/download', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      });
-      setPolling(true);
-      fetchStatus();
-    } catch (err) {
-      console.error('[CoverArt] Download failed:', err);
-    }
-  }, [token, fetchStatus]);
+      await writeAndInvalidate(client, () => apiClient.post('/cover-art/download'), keysPlan(options.queryKey));
+    } catch { /* transport failure already toasted by the global handler */ }
+  }, [token, client, options.queryKey]);
 
   // Cancel download
   const handleCancel = useCallback(async () => {
     if (!token) return;
     try {
-      await fetch('/api/cover-art/download/cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      });
-      setPolling(false);
-      fetchStatus();
-    } catch {}
-  }, [token, fetchStatus]);
+      await writeAndInvalidate(client, () => apiClient.post('/cover-art/download/cancel'), keysPlan(options.queryKey));
+    } catch { /* transport failure already toasted by the global handler */ }
+  }, [token, client, options.queryKey]);
 
   const isDownloading = status?.download?.phase === 'downloading';
   const isInstalled = status?.installed ?? false;

@@ -1,36 +1,31 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, RefreshCw } from 'lucide-react';
+import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { pollWhile } from '../../queries/contract';
+import { trainingQueries } from '../../queries/training-data/queries';
+import { runCommand, runQueries } from '../../queries/training-runs/queries';
 import {
-  cancelWorkerUpdate, getWorkerUpdate, listTrainingWorkers, startWorkerUpdate,
-  type TrainingWorkerStatus, type WorkerUpdateStatus,
+  cancelWorkerUpdate,
+  startWorkerUpdate
 } from '../../services/trainingApi';
 
 export const WorkersPanel: React.FC = () => {
   const { t } = useTranslation();
-  const [workers, setWorkers] = useState<TrainingWorkerStatus[]>([]);
-  const [updates, setUpdates] = useState<Record<string, WorkerUpdateStatus | null>>({});
-  const [error, setError] = useState('');
-  const refresh = useCallback(async () => {
-    try {
-      const rows = await listTrainingWorkers();
-      setWorkers(rows);
-      const jobs = await Promise.all(rows.map(w => getWorkerUpdate(w.name).catch(() => null)));
-      setUpdates(Object.fromEntries(rows.map((w, i) => [w.name, jobs[i]])));
-      setError('');
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-  }, []);
-  useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => void refresh(), 5000);
-    return () => window.clearInterval(id);
-  }, [refresh]);
+  const client = useQueryClient();
+  const workersQuery = useQuery({ ...trainingQueries.workers(), refetchInterval: pollWhile(() => true, 5000) });
+  const workers = workersQuery.data ?? [];
+  const updateQueries = useQueries({ queries: workers.map(w => runQueries.workerUpdate(w.name)) });
+  const updates = Object.fromEntries(workers.map((w, i) => [w.name, updateQueries[i]?.data ?? null]));
+  const [commandError, setError] = useState('');
+  const error = commandError || workersQuery.error?.message || updateQueries.find(q => q.error)?.error?.message || '';
+  const refresh = async () => { await workersQuery.refetch(); await Promise.all(updateQueries.map(q => q.refetch())); };
   const update = async (name: string) => {
-    try { const job = await startWorkerUpdate(name); setUpdates(old => ({ ...old, [name]: job })); setError(''); }
+    try { await runCommand(client, null, () => startWorkerUpdate(name)); setError(''); }
     catch (err) { setError(err instanceof Error ? err.message : String(err)); }
   };
   const cancel = async (name: string) => {
-    try { await cancelWorkerUpdate(name); await refresh(); }
+    try { await runCommand(client, null, () => cancelWorkerUpdate(name)); await refresh(); }
     catch (err) { setError(err instanceof Error ? err.message : String(err)); }
   };
   return (

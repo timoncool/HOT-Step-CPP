@@ -6,6 +6,8 @@ import { dedupeBySidecar, scanAudioFiles } from './training/datasetScan.js';
 import { sampleIdFor } from './training/paths.js';
 import type { TrainingDatasetRow } from './training/types.js';
 import { writeAbcSidecar } from './training/abcSidecar.js';
+import { sidecarPathFor } from './training/paths.js';
+import { readSidecar } from './training/sidecarIO.js';
 
 export interface CoverDatasetSource {
   datasetId: string;
@@ -96,4 +98,18 @@ export function saveDatasetCoverAbc(
   try { datasetSource = match(audioPath); }
   catch { return false; }
   return datasetSource ? writeAbcSidecar(datasetSource.audioPath, abc) : false;
+}
+
+/** Use stored musical details only for an unambiguous dataset source. */
+export function readCoverDatasetAnalysis(
+  audioPath: string, datasets: TrainingDatasetRow[] = listDatasets(),
+): { bpm: number; key: string; scale: string } | null {
+  const match = resolveCoverDatasetSource(audioPath, datasets);
+  if (!match) return null;
+  const fields = readSidecar(sidecarPathFor(match.audioPath));
+  const bpm = Number(fields.bpm);
+  const key = fields.key?.trim() || '';
+  const parts = key.match(/^([A-G](?:#|b)?)\s+(major|minor)$/i);
+  if (!Number.isFinite(bpm) || bpm < 20 || bpm > 300 || !parts) return null;
+  return { bpm, key, scale: parts[2].toLowerCase() };
 }

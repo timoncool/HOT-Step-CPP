@@ -96,3 +96,20 @@ static void yue2_apply_gain_db(float * planar, int T, double gain_db) {
     const float g = (float) std::pow(10.0, gain_db / 20.0);
     for (size_t k = 0, n = (size_t) T * 2; k < n; k++) planar[k] *= g;
 }
+
+// Over full scale → the whole clip scaled to -0.3 dBFS peak, not clamped. The
+// YuE2 VAE decoder overshoots loud material by ~4 dB, and a clamp flat-tops
+// it; so would clamping a source with overs before encoding. A clip peaking at
+// or under 1.0 comes out bit-identical. Non-finite samples become 0 (they used
+// to slip through or be clamped). Returns the gain applied, in dB (0 if none).
+static double yue2_peak_scale(float * x, size_t n) {
+    float peak = 0.0f;
+    for (size_t k = 0; k < n; k++) {
+        if (!std::isfinite(x[k])) x[k] = 0.0f;
+        else peak = std::max(peak, std::fabs(x[k]));
+    }
+    if (peak <= 1.0f) return 0.0;
+    const float g = 0.96605088f / peak;  // 10^(-0.3/20)
+    for (size_t k = 0; k < n; k++) x[k] *= g;
+    return 20.0 * std::log10((double) g);
+}

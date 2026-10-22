@@ -259,6 +259,7 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
             ggml_tensor * a_t    = ggml_cont(ctx, ggml_transpose(ctx, p.a));            // [r, in] f16
             ggml_tensor * b32    = ggml_cast(ctx, p.b, GGML_TYPE_F32);                  // [r, out]
             ggml_tensor * delta  = ggml_mul_mat(ctx, a_t, b32);                         // [in, out] f32
+            ggml_mul_mat_set_prec(delta, GGML_PREC_F32);
             ggml_tensor * basef  = ggml_cast(ctx, w, GGML_TYPE_F32);                    // [in, out]
             ggml_tensor * merged = nullptr;
             if (p.has_loha()) {
@@ -267,6 +268,7 @@ static bool mm3_lm_merge_apply(MM3Model * m, const MM3LmAdapter * ad, const MM3L
                 ggml_tensor * a2t = ggml_cont(ctx, ggml_transpose(ctx, p.a2));
                 ggml_tensor * b2f = ggml_cast(ctx, p.b2, GGML_TYPE_F32);
                 ggml_tensor * d2  = ggml_mul_mat(ctx, a2t, b2f);
+                ggml_mul_mat_set_prec(d2, GGML_PREC_F32);
                 merged = ggml_add(ctx, basef, ggml_scale(ctx, ggml_mul(ctx, delta, d2), s));
             } else if (ad->is_hira) {
                 // HiRA: W' = W + W (.) (s*BA). Modulating the update by the base

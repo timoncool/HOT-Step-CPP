@@ -59,7 +59,17 @@ export interface ChartMilestone {
 
 /** What a step point may carry beyond the store's own shape: the 20-step stop
  *  mean (computed by the AITK card) and the AR KL term of a joint run. */
-export type ChartStepPoint = TrainStepPoint & { ma20?: number; arKl?: number; klStop?: number; narMse?: number; narRecon?: number };
+export type ChartStepPoint = TrainStepPoint & { ma20?: number; arKl?: number; klStop?: number; narMse?: number; narRecon?: number; arCe?: number; cursorCe?: number; narDrift?: number };
+
+export interface ChartConfig {
+  series: string[];
+  labels?: Record<string, string>;
+  tooltips?: Record<string, string>;
+  defaults?: string[];
+  more?: string[];
+  markers?: Array<{ step: number; label: string }>;
+  xMax?: number;
+}
 
 const VB = 100;
 /** Vertical breathing room so the target line and the extremes clear the edges. */
@@ -165,22 +175,27 @@ interface Props {
    *  reading (`klStop` on the steps) that is compared against it. */
   klTarget?: number;
   klStopLabel?: string;
+  config?: ChartConfig;
 }
 
 export const TrainingChart: React.FC<Props> = ({
-  epochs, steps = [], milestones = [], target, maxEpochs = 0, evals = [], klTarget = 0, klStopLabel, xMin = 0,
+  epochs, steps = [], milestones = [], target, maxEpochs = 0, evals = [], klTarget = 0, klStopLabel, xMin = 0, config,
 }) => {
   const { t } = useTranslation();
   /** Cursor position as a fraction of the plot width, null when not hovering. */
   const [hoverFrac, setHoverFrac] = useState<number | null>(null);
   /** Metrics the user has toggled away from their default visibility. */
   const [flipped, setFlipped] = useState<Record<string, boolean>>({});
+  const [showMore, setShowMore] = useState(false);
 
   const epochPts = epochs.filter(e => Number.isFinite(e.loss));
   // A step without a loss still carries a gradient norm and a step time (the
   // YuE2 decoder-only phase after the planner freezes): keep it, each series
   // filters its own values.
-  const stepPts = steps.filter(s => Number.isFinite(s.loss) || Number.isFinite(s.narMse) || Number.isFinite(s.narRecon) || Number.isFinite(s.gradNorm) || Number.isFinite(s.stepMs));
+  const stepPts = steps.filter(s => config
+    ? Number.isFinite(s.ep) && Object.entries(s).some(([key, value]) =>
+      !['step', 'ep', 'elapsedMs'].includes(key) && typeof value === 'number' && Number.isFinite(value))
+    : Number.isFinite(s.loss) || Number.isFinite(s.narMse) || Number.isFinite(s.narRecon) || Number.isFinite(s.gradNorm) || Number.isFinite(s.stepMs));
   const evalPts = evals.filter(e => Number.isFinite(e.loss));
 
   // ── the metric table ──────────────────────────────────────────────────
@@ -201,7 +216,7 @@ export const TrainingChart: React.FC<Props> = ({
         const v = pick(s);
         if (typeof v === 'number' && Number.isFinite(v)) raw.push({ x: s.ep, v });
       }
-      if (raw.length < 2) return;
+      if (raw.length < (config ? 1 : 2)) return;
       // The trainer's own running mean where it publishes one — it is computed
       // over every step, not over the thinned series the chart holds.
       let trend: Array<{ x: number; v: number }> = [];
@@ -216,11 +231,16 @@ export const TrainingChart: React.FC<Props> = ({
         const ma = movingAverage(raw.map(p => p.v), w);
         trend = raw.map((p, i) => ({ x: p.x, v: ma[i] }));
       }
-      out.push({ key, label, raw, trend, colour, trendColour, offByDefault });
+      out.push({ key, label, raw, trend, colour, trendColour, offByDefault, dots: !!config && (raw.length === 1 || key === 'narRecon' || key === 'narDrift') });
     };
 
     fromSteps('loss', t('trainingStudio.chart.mLoss', 'loss'),
       s => s.loss, '#5eead4', '#14b8a6', false, s => s.ma5);
+    if (config) {
+      fromSteps('arCe', t('trainingStudio.split.arCe', 'AR CE'), s => s.arCe, '#5eead4', '#14b8a6');
+      fromSteps('cursorCe', t('trainingStudio.split.cursorCe', 'Cursor CE'), s => s.cursorCe, '#93c5fd', '#2563eb', true);
+      fromSteps('narDrift', t('trainingStudio.split.drift', 'Drift'), s => s.narDrift, '#fda4af', '#e11d48', true);
+    }
     fromSteps('arKl', t('trainingStudio.chart.mArKl', 'ar_kl'),
       s => s.arKl, '#fcd34d', '#d97706');
     // The decoder's own loss: the one series that continues after the YuE2
@@ -257,10 +277,11 @@ export const TrainingChart: React.FC<Props> = ({
       const stop = stepPts
         .filter(s => typeof s.klStop === 'number' && Number.isFinite(s.klStop))
         .map(s => ({ x: s.ep, v: s.klStop as number }));
-      if (stop.length >= 2 && out.some(m => m.key === 'arKl')) {
+      if (stop.length >= (config ? 1 : 2) && out.some(m => m.key === 'arKl')) {
         out.push({
           key: 'klStop', label: klStopLabel ?? t('trainingStudio.chart.mKlStop', 'KL stop reading'),
-          raw: [], trend: stop, colour: '#ea580c', trendColour: '#ea580c', dashed: true, axis: 'arKl',
+          raw: config && stop.length === 1 ? stop : [], trend: stop, dots: !!config && stop.length === 1,
+          colour: '#ea580c', trendColour: '#ea580c', dashed: true, axis: 'arKl',
         });
       }
     }
@@ -282,8 +303,11 @@ export const TrainingChart: React.FC<Props> = ({
         raw, trend: raw, colour: '#34d399', trendColour: '#059669', dots: true,
       });
     }
-    return out;
-  }, [epochPts, stepPts, evalPts, t, klStopLabel]);
+    return config ? out.filter(m => config.series.includes(m.key)).map(m => ({ ...m,
+      label: config.labels?.[m.key] ?? m.label,
+      offByDefault: config.defaults ? !config.defaults.includes(m.key) : m.offByDefault,
+    })) : out;
+  }, [epochPts, stepPts, evalPts, t, klStopLabel, config]);
 
   /** On unless the user said otherwise — `flipped` holds the exceptions, so a
    *  metric that appears mid-run (the first eval, say) arrives at its default. */
@@ -299,10 +323,10 @@ export const TrainingChart: React.FC<Props> = ({
   // average is real, not a layout bug.
   const lastEpoch = epochPts.length ? epochPts[epochPts.length - 1].epoch : 0;
   const lastStepEp = stepPts.length ? stepPts[stepPts.length - 1].ep : 0;
-  const xMax = Math.max(lastEpoch, lastStepEp, xMin + 1);
+  const xMax = Math.max(lastEpoch, lastStepEp, config?.xMax ?? 0, xMin + 1);
   /** No epoch series at all: the step layer is carrying its own step numbers as
    *  x (see the store's epPos fallback), so the axis is steps, not epochs. */
-  const stepAxis = epochPts.length === 0 && stepPts.length > 0;
+  const stepAxis = epochPts.length === 0 && (stepPts.length > 0 || !!config);
   const xFor = (x: number) => ((x - xMin) / (xMax - xMin)) * VB;
 
   // ── per-metric scales ─────────────────────────────────────────────────
@@ -464,6 +488,8 @@ export const TrainingChart: React.FC<Props> = ({
             )}
 
             {/* milestone ticks, along the bottom edge */}
+            {config?.markers?.map(m => <line key={m.step} x1={xFor(m.step)} x2={xFor(m.step)} y1={0} y2={VB}
+              stroke="#d97706" strokeDasharray="3 3" vectorEffect="non-scaling-stroke"><title>{m.label}</title></line>)}
             {ticks.map(m => (
               <line
                 key={m.path}
@@ -594,7 +620,8 @@ export const TrainingChart: React.FC<Props> = ({
           user does not want is one click away, which is the only way a card
           this size can offer six series honestly. */}
       <div className="flex items-center gap-x-3 gap-y-1 flex-wrap text-[10px] text-zinc-500">
-        {metrics.map(m => {
+        {config?.more?.length ? <button type="button" aria-expanded={showMore} onClick={() => setShowMore(v => !v)}>{t('trainingStudio.chart.more', 'More')}</button> : null}
+        {metrics.filter(m => showMore || !config?.more?.includes(m.key)).map(m => {
           const on = isOn(m);
           return (
             <button
@@ -602,7 +629,7 @@ export const TrainingChart: React.FC<Props> = ({
               type="button"
               onClick={() => setFlipped(f => ({ ...f, [m.key]: !f[m.key] }))}
               className={`flex items-center gap-1 rounded px-1 -mx-1 hover:bg-black/5 dark:hover:bg-white/10 transition-colors ${on ? '' : 'opacity-40'}`}
-              title={t('trainingStudio.chart.toggle', 'Show or hide this series')}
+              title={config?.tooltips?.[m.key] ?? t('trainingStudio.chart.toggle', 'Show or hide this series')}
             >
               <span
                 className="w-2.5 h-2.5 rounded-[2px] border"

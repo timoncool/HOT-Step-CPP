@@ -34,21 +34,21 @@ export const ContentTabs: React.FC<ContentTabsProps> = ({
     <div className="flex flex-col h-full">
       {/* Tab bar */}
       <div className="flex-shrink-0 border-b border-zinc-200 dark:border-white/5 bg-zinc-50/30 dark:bg-zinc-950/30">
-        <div className="flex">
+        <div className="flex overflow-x-auto scrollbar-none">
           {tabs.map(tab => {
             const isActive = tab.id === activeTab;
             return (
               <button
                 key={tab.id}
                 onClick={() => onTabChange(tab.id)}
-                className={`flex items-center gap-2 px-5 py-3 text-sm font-medium transition-all border-b-2 ${
+                className={`flex items-center gap-2 px-4 py-3 text-sm font-medium transition-all border-b-2 flex-shrink-0 ${
                   isActive
                     ? 'text-pink-400 border-pink-500 bg-pink-500/5'
                     : 'text-zinc-600 dark:text-zinc-400 border-transparent hover:text-zinc-800 dark:hover:text-zinc-200 hover:bg-white/[0.02]'
                 }`}
               >
                 {tab.icon}
-                <span className="hidden sm:inline">{tab.label}</span>
+                <span className="max-[1023px]:hidden">{tab.label}</span>
                 {tab.badge != null && tab.badge > 0 && (
                   <span className={`min-w-[20px] h-5 px-1.5 rounded-full text-[11px] font-bold flex items-center justify-center ${
                     isActive ? 'bg-pink-500/20 text-pink-300' : 'bg-white/10 text-zinc-600 dark:text-zinc-400'

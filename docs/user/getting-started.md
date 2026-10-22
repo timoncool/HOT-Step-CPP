@@ -140,17 +140,35 @@ Everything stays inside the folder you extracted.
 
 | Path | Contents |
 |---|---|
-| `models/` | Model weights. ACE-Step 1.5 files sit directly in this folder; MiniMax-Music3 and YuE2 files go in `models/mm3/` and `models/yue2/`. |
-| `adapters/` | LoRA and LoKr adapters. |
-| `engine/` | The engine binaries, plus the CUDA runtime DLLs the first launch downloads. |
-| `server/data/` | The song library database (`hotstep.db`), the Lyric Studio database (`lireek.db`) and generated audio (`audio/`). |
-| `logs/` | One folder per app session. See [Troubleshooting](troubleshooting.md#where-the-logs-are). |
-| `.env` | Settings, created from `.env.example` on first launch. The Environment tab of Settings edits it. |
+| `HOT-Step-Data/models/` | Downloaded models, beside the app by default. |
+| `HOT-Step-Data/adapters/` | LoRA and LoKr adapters. |
+| `HOT-Step-Data/library/` | Databases, audio, references, training and MuScriptor data. |
+| `HOT-Step-Data/logs/` | One folder per app session. |
+| `HOT-Step-Data/settings/.env` | Saved settings and service credentials. |
+| App `engine/`, `server/data/` | Shipped binaries and immutable catalogues. Downloaded runtimes go in the data folder's `tools/runtime/`. |
 
-The models and adapters folders can be moved elsewhere with **Models directory** and
-**Adapters directory** on the Environment tab of Settings. Both need a restart.
+The saved location survives a fresh unzip. Change it through Settings with a move or
+repoint action. See [Data folder and upgrades](data-folder.md) for imports and recovery.
+Development checkouts keep their existing paths; see [Configuration](../dev/config.md).
 
-<!-- TODO(verify): the supported way to move to a new release while keeping the library: copy server/data/ and .env into the new folder, or keep one folder and overwrite? Database migrations run on startup, but no upgrade procedure is documented anywhere. -->
+
+## Install on your phone
+
+The production UI (`LAUNCH.bat` or a release launcher, not `dev.bat`) is an installable web app.
+Phone PWA installation needs a secure origin. Open the production UI through an
+HTTPS address reachable from your phone, with a certificate the browser trusts,
+then:
+
+- **Android (Chrome):** menu, then **Install app** or **Add to Home screen**.
+- **iPhone / iPad (Safari):** Share, then **Add to Home Screen**.
+
+It opens full screen with its own icon. Only the app shell (page, scripts, icons) is cached;
+songs, audio and every `/api` call always come from your server, so the server must be running.
+The `localhost` secure-origin exception refers to the device running the browser,
+so it does not cover your computer's LAN or Tailscale address when viewed on a
+phone. A plain `http://` address does not enable the service worker or offline
+shell; the browser may still offer a home-screen shortcut. A Tailscale connection
+alone does not turn an HTTP URL into HTTPS.
 
 ## Running from source
 
@@ -159,6 +177,7 @@ The models and adapters folders can be moved elsewhere with **Models directory**
 
 ## Related
 
+- [Running on Google Colab](colab.md), if you have no suitable GPU
 - [Model Manager](studios/model-manager.md)
 - [Backends](backends.md)
 - [Generation](generation.md)

@@ -431,6 +431,9 @@ static void mm3_lm_free(MM3LmGraph * g) {
 // BETWEEN generations: an adapter swap mid-sequence would splice two different
 // models' hidden-state streams through one KV cache.
 static void mm3_lm_set_adapter(MM3LmGraph * g, const MM3LmAdapter * ad, const MM3LmAdapterScales & sc) {
+    // Before the early return: a re-run norm pass (base reload) resets nrm to
+    // the trained scale while the dials stay put.
+    mm3_lm_dora_set_scales(ad, sc);
     if (g->adapter == ad && g->adapter_scales == sc) {
         return;
     }
@@ -630,9 +633,11 @@ static ggml_tensor * mm3_lm_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
                 ggml_tensor * d = ggml_mul_mat(ctx, p.b, ggml_mul_mat(ctx, p.a, x));
                 y               = ggml_add(ctx, y, ggml_scale(ctx, d, s));
                 if (p.has_dora()) {
-                    // DoRA: y <- y * (m / ||W + s*BA||_col). The norm was
-                    // computed once at adapter load (mm3-lm-dora.h) — W, A and B
-                    // are all frozen here, so it is exact rather than an
+                    // DoRA: y <- y * (m / ||W + s*BA||_col). The norm comes from
+                    // the load-time pass (mm3-lm-dora.h); with dora_renorm,
+                    // mm3_lm_set_adapter moves it to this request's s. W, A
+                    // and B are all frozen
+                    // here, so it is exact rather than an
                     // approximation. m/nrm is [out] and broadcasts over the
                     // token and batch axes.
                     y = ggml_mul(ctx, y, ggml_div(ctx, p.m, p.nrm));

@@ -1,0 +1,84 @@
+name: RunPod image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: runpod-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Select release image tags
+        id: version
+        shell: bash
+        env:
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != tag || ! "$GITHUB_REF_NAME" =~ ^v[0-9][0-9A-Za-z._-]*$ || ${#GITHUB_REF_NAME} -gt 128 ]]; then
+            echo "::error::Run this workflow on a v* release tag, not a branch."
+            exit 1
+          fi
+          # Under the release event GITHUB_REF is refs/tags/<release tag>, same as a tag push.
+          # Prereleases and hyphenated tags (-CI-Test) get their own tag but never move :latest.
+          images="ghcr.io/scragnog/hot-step-cpp:$GITHUB_REF_NAME"
+          if [[ "$RELEASE_PRERELEASE" != true && "$GITHUB_REF_NAME" != *-* ]]; then
+            images+=$'\n'"ghcr.io/scragnog/hot-step-cpp:latest"
+          fi
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          { echo "images<<EOF"; echo "$images"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Initialize required submodules
+        run: |
+          git submodule update --init engine/ggml engine/vendor/vst3sdk
+          git -C engine/vendor/vst3sdk submodule update --init base cmake pluginterfaces public.sdk
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          docker system prune --all --force
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish RunPod image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: runpod
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.version.outputs.images }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/scragnog/HOT-Step-CPP
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            CUDA_ARCHS=75-virtual;80-virtual;86-real;89-real;90-real;120a-real
+            ENABLE_TRT=0
+            BUILD_JOBS=2
+          cache-from: type=gha,scope=runpod
+          cache-to: type=gha,mode=max,scope=runpod

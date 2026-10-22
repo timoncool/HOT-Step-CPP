@@ -65,8 +65,9 @@
 --   look_back_lambda   — max smoothing weight (0.55=25-step, 0.35=35-step)
 --   look_back_snr_power — falloff exponent (1.3=25-step, 1.5=35-step)
 --   rms_servo          — energy ceiling toggle
---   rms_target_min     — servo floor at low sigma (audio: ~0.3, image: ~0.75)
---   rms_target_max     — servo ceiling at high sigma (audio: ~0.7, image: ~0.97)
+--   rms_target_min     — servo floor at low sigma. 0 = auto (1.0, scaled to the
+--                         active model's latent RMS -- ACE ~2.0, SA3 ~0.685)
+--   rms_target_max     — servo ceiling at high sigma. 0 = auto (2.2, scaled)
 --   rms_servo_gain     — correction aggressiveness (0.6=default, 1.0=hard snap)
 --   seed               — RNG seed
 -- ============================================================================
@@ -149,21 +150,21 @@ solver = {
             key     = "rms_target_min",
             type    = "slider",
             label   = "RMS Target Min",
-            default = 1.0,
-            min     = 0.1,
+            default = 0,
+            min     = 0.0,
             max     = 3.0,
             step    = 0.05,
-            hint    = "RMS ceiling at low sigma (late steps). Active when RMS Servo is on. ACE-Step latents ~2.0 RMS. Start at 1.2-1.8.",
+            hint    = "RMS ceiling at low sigma (late steps). Active when RMS Servo is on. 0 = auto (1.0, scaled to the active model's latent RMS -- ACE ~2.0, SA3 ~0.685).",
         },
         {
             key     = "rms_target_max",
             type    = "slider",
             label   = "RMS Target Max",
-            default = 2.2,
-            min     = 0.5,
+            default = 0,
+            min     = 0.0,
             max     = 4.0,
             step    = 0.05,
-            hint    = "RMS ceiling at high sigma (early steps). Active when RMS Servo is on. ACE-Step latents ~2.0 RMS. Start at 2.0-2.5.",
+            hint    = "RMS ceiling at high sigma (early steps). Active when RMS Servo is on. 0 = auto (2.2, scaled to the active model's latent RMS).",
         },
         {
             key     = "rms_servo_gain",
@@ -209,6 +210,26 @@ local EPSILON = 1e-8
 local function clamp(v, lo, hi)
     if v < lo then return lo end
     if v > hi then return hi end
+    return v
+end
+
+-- ACE latents measure ~2.0 RMS; SA3 ~0.685; MM3 TBD. model_context is
+-- injected by the engine (lua-plugin.h) before every step() call.
+local function latent_rms_base()
+    local v = model_context and tonumber(model_context.latent_rms)
+    if not v or v <= 0 then v = 2.0 end
+    return v
+end
+
+local function rms_scale()
+    return latent_rms_base() / 2.0
+end
+
+-- 0/nil means "auto": ace_default scaled by rms_scale(). Nonzero user value
+-- wins unchanged.
+local function rms_scaled(p, key, ace_default)
+    local v = tonumber(p and p[key]) or 0
+    if v == 0 then return ace_default * rms_scale() end
     return v
 end
 
@@ -265,8 +286,8 @@ function step(xt, vt, t_curr, t_prev, n)
     local lb_lambda      = (params and params.look_back_lambda)      or 0.55
     local lb_snr_power   = (params and params.look_back_snr_power)   or 1.3
     local rms_servo_on   = (params and params.rms_servo)             or true
-    local rms_tgt_min    = (params and params.rms_target_min)        or 1.2
-    local rms_tgt_max    = (params and params.rms_target_max)        or 2.2
+    local rms_tgt_min    = rms_scaled(params, "rms_target_min", 1.0)
+    local rms_tgt_max    = rms_scaled(params, "rms_target_max", 2.2)
     local rms_servo_gain = (params and params.rms_servo_gain)        or 0.6
     local seed           = math.floor((params and params.seed)       or 42)
 

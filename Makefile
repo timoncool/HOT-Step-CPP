@@ -4,6 +4,9 @@
 # Configuration
 REPO_DIR = .
 BACKEND ?=
+# Explicit URL for 'make open'. Leave empty (default) to auto-pick: the Vite
+# dev UI on :3000 while it's running (hot reload), otherwise the app on :3001.
+OPEN_URL ?=
 
 # Detect if running inside WSL
 IS_WSL := $(shell grep -qi microsoft /proc/version 2>/dev/null && echo 1 || echo 0)
@@ -42,7 +45,7 @@ endif
 
 NODE_MAJOR := $(shell node -v 2>/dev/null | sed 's/^v\([0-9]*\).*/\1/')
 
-.PHONY: check-config check-node setup submodules build install run clean help
+.PHONY: check-config check-node setup submodules build build-ui install run open dev dev-ui clean help
 
 check-config: ## Check current configuration before building
 	@echo "========================================"
@@ -97,9 +100,46 @@ install: check-node ## Install Node.js dependencies for server and UI
 	@echo "==> Installing Node.js dependencies for UI..."
 	cd $(REPO_DIR)/ui && npm install
 
+build-ui: check-node ## Build (or rebuild) the UI bundle into ui/dist
+	@echo "==> Building UI (tsc type-check + vite build)..."
+	@test -d "$(REPO_DIR)/ui/node_modules" || { echo "ERROR: ui/node_modules missing — run 'make install' first."; exit 1; }
+	cd $(REPO_DIR)/ui && npm run build
+
 run: ## Launch the application
 	@echo "==> Launching application..."
 	cd $(REPO_DIR) && ./launch.sh
+
+open: ## Open the app in your browser (auto: Vite dev UI on :3000 if running, else :3001; override with OPEN_URL=...)
+	@URL="$(OPEN_URL)"; \
+	if [ -z "$$URL" ]; then \
+	  if command -v curl >/dev/null 2>&1 && curl -s -o /dev/null --max-time 1 http://localhost:3000; then \
+	    URL="http://localhost:3000"; \
+	  else \
+	    URL="http://localhost:3001"; \
+	  fi; \
+	fi; \
+	if [ "$(IS_WSL)" = "1" ] && command -v cmd.exe >/dev/null 2>&1; then \
+		echo "🌐 Opening $$URL in your Windows browser..."; \
+		cmd.exe /c start "" "$$URL" || echo "   Could not auto-open — open manually: $$URL"; \
+	elif command -v xdg-open >/dev/null 2>&1; then \
+		xdg-open "$$URL" 2>/dev/null || echo "Open manually: $$URL"; \
+	elif command -v open >/dev/null 2>&1; then \
+		open "$$URL"; \
+	else \
+		echo "No browser launcher found. Open manually: $$URL"; \
+	fi
+
+dev: check-node ## Run API server (tsx watch) + Vite UI (HMR) together — :3001 + :3000
+	@echo "==> Dev mode:  API http://localhost:3001   |   UI http://localhost:3000"
+	@echo "    Both stop when you Ctrl-C here."
+	@test -x ./dev.sh || { echo "ERROR: dev.sh is not executable — fix with: chmod +x dev.sh"; exit 1; }
+	./dev.sh
+
+dev-ui: check-node ## Run ONLY the Vite UI dev server (HMR) on http://localhost:3000
+	@echo "==> Starting UI dev server: http://localhost:3000"
+	@echo "    Start the API too with 'make dev', or in another terminal: cd server && npm run dev."
+	@test -d "$(REPO_DIR)/ui/node_modules" || { echo "ERROR: ui/node_modules missing — run 'make install' first."; exit 1; }
+	cd $(REPO_DIR)/ui && npm run dev
 
 clean: ## Clean build artifacts (requires CONFIRM=1 - CUDA rebuild takes 20+ min)
 ifneq ($(CONFIRM),1)

@@ -6,7 +6,7 @@
 // and cover art (when available), and streams it back with a
 // Content-Disposition header for browser download.
 
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -14,6 +14,7 @@ import { promisify } from 'util';
 import { config, getFFmpegPath } from '../config.js';
 import { getDb } from '../db/database.js';
 import { markDownloadedByAudioUrl } from '../db/lireekDb.js';
+import { saveIntoDir } from '../services/downloadSave.js';
 import {
   gatherSongMetadata, buildMetadataArgs, buildCoverArtArgs,
   type AudioMetadata,
@@ -25,9 +26,7 @@ const router = Router();
 /** Get mp3-codec binary path (platform-aware: no .exe on macOS/Linux) */
 function getMp3CodecPath(): string {
   const ext = process.platform === 'win32' ? '.exe' : '';
-  const aceExe = config.aceServer.exe;
-  if (aceExe) return path.join(path.dirname(aceExe), `mp3-codec${ext}`);
-  return path.resolve(process.cwd(), '..', 'engine', 'build', 'Release', `mp3-codec${ext}`);
+  return path.join(path.dirname(config.aceServer.exe), `mp3-codec${ext}`);
 }
 
 /** Convert WAV to target format with optional metadata embedding */
@@ -133,11 +132,48 @@ const mimeTypes: Record<string, string> = {
   opus: 'audio/ogg',
 };
 
+/**
+ * Hand the finished file to the caller: stream it as an attachment, or, in
+ * save mode, copy it into the DOWNLOAD_DIR folder and answer with the path.
+ * `tempFile` (when set) is removed once delivered.
+ */
+function deliver(
+  res: Response, save: boolean, filePath: string, filename: string, mime: string, tempFile?: string,
+): void {
+  const cleanup = () => {
+    if (!tempFile) return;
+    try { fs.unlinkSync(tempFile); } catch {}
+    try { fs.rmdirSync(path.dirname(tempFile)); } catch {}
+  };
+  if (save) {
+    try {
+      const saved = saveIntoDir(config.data.downloadDir, filename, filePath);
+      res.json({ path: saved, filename: path.basename(saved) });
+    } catch (err: any) {
+      console.error('[Download] Save failed:', err.message);
+      res.status(500).json({ error: err.message });
+    } finally { cleanup(); }
+    return;
+  }
+  res.setHeader('Content-Type', mime);
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-Length', fs.statSync(filePath).size);
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+  if (tempFile) { stream.on('end', cleanup); stream.on('error', cleanup); }
+}
+
 // GET /api/download/:id?format=wav&bitrate=192&version=original&artist=Name&prepend=Prefix
 // version: original | mastered | noadapter | latent.  srcUrl is an optional explicit
 // source override (used by the playbar's per-variant download buttons for tracks whose
 // songs row is missing) — resolved by basename inside the audio dir, same as audioUrl.
-router.get('/:id', async (req, res) => {
+// POST /api/download/:id/save takes the same query and writes the file into the
+// DOWNLOAD_DIR setting instead of streaming it; 409 when no folder is set.
+const downloadHandler = (save: boolean) => async (req: Request, res: Response) => {
+  if (save && !config.data.downloadDir) {
+    res.status(409).json({ error: 'No download folder is set' });
+    return;
+  }
   const { id } = req.params;
   const format = (req.query.format as string || 'wav').toLowerCase();
   const bitrate = parseInt(req.query.bitrate as string) || 192;
@@ -180,10 +216,7 @@ router.get('/:id', async (req, res) => {
         const titleParts = [cleanPrepend, cleanArtist, 'Untitled'].filter(Boolean);
         const downloadFilename = `${titleParts.join(' - ')}${titleSuffix}.${format}`;
         if (format === 'wav' && sourcePath.endsWith('.wav')) {
-          res.setHeader('Content-Type', mimeTypes.wav);
-          res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
-          res.setHeader('Content-Length', fs.statSync(sourcePath).size);
-          fs.createReadStream(sourcePath).pipe(res);
+          deliver(res, save, sourcePath, downloadFilename, mimeTypes.wav);
           return;
         }
         // Convert
@@ -191,13 +224,7 @@ router.get('/:id', async (req, res) => {
         fs.mkdirSync(tempDir, { recursive: true });
         const tempFile = path.join(tempDir, `dl_${Date.now().toString(36)}.${format}`);
         await convertAudio(sourcePath, format, bitrate, tempFile);
-        const stat = fs.statSync(tempFile);
-        res.setHeader('Content-Type', mimeTypes[format] || 'application/octet-stream');
-        res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
-        res.setHeader('Content-Length', stat.size);
-        const stream = fs.createReadStream(tempFile);
-        stream.pipe(res);
-        stream.on('end', () => { try { fs.unlinkSync(tempFile); } catch {} });
+        deliver(res, save, tempFile, downloadFilename, mimeTypes[format] || 'application/octet-stream', tempFile);
         return;
       }
     }
@@ -220,10 +247,7 @@ router.get('/:id', async (req, res) => {
     }
     const rawTitle = song.title || 'track';
     const downloadName = `${rawTitle.replace(/[^a-zA-Z0-9 _()-]/g, '').trim() || 'track'}.latent`;
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
-    res.setHeader('Content-Length', fs.statSync(latentPath).size);
-    fs.createReadStream(latentPath).pipe(res);
+    deliver(res, save, latentPath, downloadName, 'application/octet-stream');
     return;
   }
 
@@ -277,7 +301,12 @@ router.get('/:id', async (req, res) => {
   const songTitle = rawTitle.replace(/[^a-zA-Z0-9 _()-]/g, '').trim();
 
   const suffix = versionSuffix(version);
-  const resolvedArtist = artistName || (song.artist || '').replace(badPrefixes, '').replace(/[^a-zA-Z0-9 _()-]/g, '').trim();
+  // The caller's artist, else the one the song was made with (a cover's
+  // covering band is recorded as artistName).
+  let gp: { artist?: unknown; artistName?: unknown } = {};
+  try { gp = JSON.parse(song.generation_params || '{}') || {}; } catch { /* no params */ }
+  const savedArtist = [gp.artist, gp.artistName, song.artist].find(v => typeof v === 'string' && v.trim()) as string | undefined;
+  const resolvedArtist = artistName || (savedArtist || '').replace(badPrefixes, '').replace(/[^a-zA-Z0-9 _()-]/g, '').trim();
 
   // Strip leading "Artist - " prefix from title if it duplicates the resolved artist.
   // generate.ts stores titles as "Artist - Song Title", so without this the artist
@@ -296,10 +325,7 @@ router.get('/:id', async (req, res) => {
   try {
     if (format === 'wav' && sourcePath.endsWith('.wav') && !metadata) {
       // Source is already WAV with no metadata to embed — stream directly
-      res.setHeader('Content-Type', mimeTypes.wav);
-      res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
-      res.setHeader('Content-Length', fs.statSync(sourcePath).size);
-      fs.createReadStream(sourcePath).pipe(res);
+      deliver(res, save, sourcePath, downloadFilename, mimeTypes.wav);
       return;
     }
 
@@ -310,26 +336,14 @@ router.get('/:id', async (req, res) => {
 
     await convertAudio(sourcePath, format, bitrate, tempFile, metadata);
 
-    const stat = fs.statSync(tempFile);
-    res.setHeader('Content-Type', mimeTypes[format] || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
-    res.setHeader('Content-Length', stat.size);
-
-    const stream = fs.createReadStream(tempFile);
-    stream.pipe(res);
-
-    // Clean up temp file after stream completes
-    stream.on('end', () => {
-      try { fs.unlinkSync(tempFile); } catch {}
-      try { fs.rmdirSync(tempDir); } catch {}
-    });
-    stream.on('error', () => {
-      try { fs.unlinkSync(tempFile); } catch {}
-    });
+    deliver(res, save, tempFile, downloadFilename, mimeTypes[format] || 'application/octet-stream', tempFile);
   } catch (err: any) {
     console.error(`[Download] Conversion failed:`, err.message);
     res.status(500).json({ error: err.message });
   }
-});
+};
+
+router.get('/:id', downloadHandler(false));
+router.post('/:id/save', downloadHandler(true));
 
 export default router;

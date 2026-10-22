@@ -1,9 +1,11 @@
+import { useQuery } from '@tanstack/react-query';
+import { monitorOptions } from '../../queries/global-models/options';
 // MonitorBar.tsx – Persistent VST monitor status strip
 //
 // Always polls /api/vst/monitor/status (slow when idle, fast when active)
 // so it self-activates after page reload even if monitor was already running.
 
-import React, { useEffect } from 'react';
+import React from 'react';
 import { Square, Pause, Play } from 'lucide-react';
 import { useVstChainStore } from '../../stores/vstChainStore';
 import { usePlaybackSelector } from '../../stores/playbackStore';
@@ -19,19 +21,12 @@ export const MonitorBar: React.FC = () => {
     monitoring, monitorPaused,
     monitorPosition, monitorDuration,
     stopMonitor, pauseMonitor, resumeMonitor,
-    seekMonitor, pollMonitorStatus,
+    seekMonitor,
   } = useVstChainStore();
 
   const currentTrack = usePlaybackSelector(s => s.currentTrack);
 
-  // Always poll — discovers monitor running after page reload.
-  // Slow (2s) when idle to save requests, fast (300ms) when active.
-  useEffect(() => {
-    // Fire once immediately so we don't wait for first interval tick
-    pollMonitorStatus();
-    const id = setInterval(() => pollMonitorStatus(), monitoring ? 300 : 2000);
-    return () => clearInterval(id);
-  }, [monitoring, pollMonitorStatus]);
+  useQuery(monitorOptions());
 
   if (!monitoring) return null;
 

@@ -1,5 +1,11 @@
 // SourcePanel.tsx — Left panel: source audio upload + metadata + analysis
-import React, { useCallback, useState, useEffect } from 'react';
+
+import { serverKey } from '../../queries/keys';
+import { useQuery } from '@tanstack/react-query';
+import { snapshotOptions } from '../../queries/cover-lyrics/reads';
+import { queryClient } from '../../queries/client';
+import { queryManager } from '../../queries/invalidation';
+import React, { useCallback, useState } from 'react';
 import { Upload, Music, Loader2, X, Layers, Volume2, FolderOpen } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { AudioMetadata, AudioAnalysis } from './coverStudioUtils';
@@ -82,30 +88,20 @@ export const SourcePanel: React.FC<SourcePanelProps> = ({
   const [isTimbreUploading, setIsTimbreUploading] = useState(false);
   const [showTimbreBrowser, setShowTimbreBrowser] = useState(false);
   interface ReferenceTrack { name: string; size: number; url: string; }
-  const [timbreRefs, setTimbreRefs] = useState<ReferenceTrack[]>([]);
+  const referenceOptions = { ...snapshotOptions<{ references: ReferenceTrack[] }>('cover', '/mastering/references'), queryKey: serverKey('global-models/references') };
+  const referenceQuery = useQuery({ ...referenceOptions, enabled: showTimbreBrowser });
+  const timbreRefs = referenceQuery.data?.references ?? [];
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const timbreFileRef = React.useRef<HTMLInputElement>(null);
-
-  // Load references when browser opens
-  useEffect(() => {
-    if (showTimbreBrowser) {
-      masteringApi.listReferences()
-        .then(data => setTimbreRefs(data.references))
-        .catch(() => {});
-    }
-  }, [showTimbreBrowser]);
 
   const handleTimbreUpload = useCallback(async (file: File) => {
     if (!token) return;
     try {
       setIsTimbreUploading(true);
-      const result = await masteringApi.uploadReference(file, token);
+      const result = await masteringApi.uploadReference(file);
       onTimbreOverridePathChange(result.name);
       // Refresh list if browser is open
-      if (showTimbreBrowser) {
-        const data = await masteringApi.listReferences();
-        setTimbreRefs(data.references);
-      }
+      await queryManager.keys(queryClient, referenceOptions.queryKey);
     } catch (err) {
       console.error('[Timbre] Upload failed:', err);
     } finally {
@@ -483,7 +479,7 @@ export const SourcePanel: React.FC<SourcePanelProps> = ({
       )}
 
       {/* Advanced Mode */}
-      <div className="border-t border-zinc-200 dark:border-white/5 pt-4 space-y-3">
+      {!yue2Mode && <div className="border-t border-zinc-200 dark:border-white/5 pt-4 space-y-3">
         <button
           onClick={() => onAdvancedModeChange(!advancedMode)}
           className={`w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
@@ -556,7 +552,7 @@ export const SourcePanel: React.FC<SourcePanelProps> = ({
             )}
           </div>
         )}
-      </div>
+      </div>}
 
       {/* Caption LLM */}
       {!yue2Mode && <div className="border-t border-zinc-200 dark:border-white/5 pt-4 space-y-2">

@@ -35,7 +35,7 @@ const TERMINAL = new Set<Yue2AitkRunRecord['status']>(['done', 'failed', 'cancel
 const SAFE_NAME = /^[A-Za-z0-9._-]{1,128}$/;
 /** Every path a worker may hand over, relative to the run folder. Anything
  *  else in a manifest is refused, never joined onto a local path. */
-const MIRROR_REL = /^(?:train\.jsonl|style-norms\.json|segments\/segment-\d{6}\/train\.jsonl|(?:segments\/segment-\d{6}\/)?checkpoint-step\d+\/(?:native-ar\.safetensors|native-nar\.safetensors|meters\.json)|previews\/[A-Za-z0-9._-]+\.(?:wav|score\.abc))$/;
+const MIRROR_REL = /^(?:train\.jsonl|style-norms\.json|segments\/segment-\d{6}\/train\.jsonl|(?:segments\/segment-\d{6}\/)?checkpoint-step\d+\/(?:native-ar\.safetensors|native-nar\.safetensors|(?:[A-Za-z0-9-][A-Za-z0-9._-]{0,47}_)?yue2_joint_n?ar_step\d+\.safetensors|meters\.json)|previews\/[A-Za-z0-9._-]+\.(?:wav|score\.abc))$/;
 const SAFE_PREVIEW = /^[A-Za-z0-9._-]+\.wav$/i;
 const errorText = (err: unknown) => (err as any)?.cause?.code || (err as any)?.message || String(err);
 

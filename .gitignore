@@ -17,6 +17,7 @@ server/server/data/
 /adapters/
 # Local machine config
 /.mcp.json
+/.codegraph/
 /SafeSettings.json
 *.db
 *.db-shm
@@ -77,10 +78,16 @@ models/onnx/dit-stream/
 
 # Downloaded tools (whisper.cpp, etc.)
 tools/*
+!tools/cg
+!tools/cg.cmd
+!tools/codegraph/
+tools/codegraph/node_modules/
 !tools/listening-save.mjs
 !tools/listening-save.test.mjs
+!tools/engine-smoke.mjs
 !tools/yue2-aitk-reference/
 !tools/yue2-aitk-reference/**
+!tools/yue2-vae-train/
 !tools/onnx-export/
 !tools/mcp-lyricstudio/
 tools/mcp-lyricstudio/node_modules/
@@ -135,9 +142,8 @@ Thumbs.db
 # person's machine, not the project's.
 .codex/
 
-# Dev-only scripts (local only, not needed by end users)
+# Local dev-only scripts (dev-rebuild.bat is shared and tracked)
 dev.bat
-dev-rebuild.bat
 server/restart-loop.cmd
 
 # Local-only content
@@ -207,3 +213,12 @@ agentcoordination.md
 # tools/essentia/ is the Essentia BUILD RECIPE (scripts), not a binary drop like Essentia/
 !tools/essentia/
 tools/vocal-end/out/
+
+# Local agent runtime (Multica) and scratch
+.multica/
+.scratch/
+.playwright-mcp/
+.claude/skills/multica-platform/
+server/tsconfig.tsbuildinfo
+# Project rules file kept on disk, not tracked
+AGENTS.md

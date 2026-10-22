@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { fixedRecipeTrigger } from './fixedRecipeCaption.js';
 import {
   buildYue2AitkPrepareArgs, parseYue2AitkModels,
   type ResolvedYue2AitkPrepareOptions,
@@ -26,6 +27,15 @@ test('AITK preparation CLI keeps stable paths and repeatable model arguments', (
 test('AITK preparation passes the dataset trigger before native tokenization', () => {
   assert.deepEqual(buildYue2AitkPrepareArgs({ ...options, trigger: 'artist_album' }).slice(-4),
     ['--lyric-timing', '1', '--trigger', 'artist_album']);
+});
+
+test('Fixed recipe prepares bare caption-dropout twins with the same trigger or slug as its captions', () => {
+  for (const trigger of ['sample_style', ' custom_tag ', '', '  ', undefined]) {
+    const prefix = fixedRecipeTrigger(trigger, 'sample_slug');
+    const args = buildYue2AitkPrepareArgs({ ...options, trigger: prefix, captionGrammar: 'fixed-recipe', lyricTiming: false });
+    assert.equal(args.includes('--trigger'), false);
+    assert.deepEqual(args.slice(-4), ['--lyric-timing', '0', '--caption-dropout-trigger', prefix]);
+  }
 });
 
 test('request parser accepts concrete model map and repeatable model fields', () => {

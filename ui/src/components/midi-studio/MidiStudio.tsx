@@ -8,22 +8,28 @@
 // Model weights are gated on Hugging Face and downloaded in-app with the
 // user's read token.
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useMemo, useRef, useState } from 'react';
 import {
   Piano, FolderOpen, Search, X, Download, Trash2, ChevronDown, ChevronUp,
   CheckCircle2, ExternalLink, Music, KeyRound, Loader2, AlertTriangle,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../context/AuthContext';
-import { songApi } from '../../services/api';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { midiJobsOptions, midiStatusOptions, removeMidiJob } from '../../queries/studios/midi';
+import { queryManager } from '../../queries/invalidation';
+import { useStudioSongs } from '../../queries/studios/shared';
 import type { Song } from '../../types';
 import {
-  getMidiStatus, submitTranscription, listMidiJobs, deleteMidiJob,
-  getMidiFileUrl, saveHfToken, startModelDownload, getMidiProgress,
-  HF_MODEL_URLS, HF_TOKEN_SETTINGS_URL,
-  type MidiStudioStatus, type MidiJobSummary, type MuscriptorModel,
+  submitTranscription,
+  getMidiFileUrl, saveHfToken, startModelDownload,
+  HF_MODEL_URLS, HF_TOKEN_SETTINGS_URL, BEAT_MODEL,
+  type MuscriptorModel,
 } from '../../services/midiStudioApi';
 import { MidiPlayer } from './MidiPlayer';
+import { MidiExportPanel } from './MidiExportPanel';
+import { ParamLabel } from '../shared/ParamLabel';
+import { useUpload } from '../../queries/writes';
 
 const MODEL_INFO: Array<{ id: MuscriptorModel; params: string }> = [
   { id: 'small', params: '103M' },
@@ -33,9 +39,17 @@ const MODEL_INFO: Array<{ id: MuscriptorModel; params: string }> = [
 
 export const MidiStudio: React.FC = () => {
   const { t } = useTranslation();
-  const { token } = useAuth();
+  const { sessionEpoch } = useAuth();
+  void sessionEpoch;
+  const client = useQueryClient();
+  const statusQuery = useQuery(midiStatusOptions());
+  const jobsQuery = useQuery(midiJobsOptions());
+  const status = statusQuery.data;
+  const jobs = jobsQuery.data ?? [];
+  const refreshStatus = () => queryManager.keys(client, midiStatusOptions().queryKey);
+  const refreshJobs = () => queryManager.keys(client, midiJobsOptions().queryKey);
+  const deletion = useMutation({ mutationFn: (id: string) => removeMidiJob(client, id), retry: false });
 
-  const [status, setStatus] = useState<MidiStudioStatus | null>(null);
 
   // ── HF access token (gated weights) ──
   const [hfTokenInput, setHfTokenInput] = useState('');
@@ -47,7 +61,8 @@ export const MidiStudio: React.FC = () => {
   // ── Source selection ──
   const [showLibrary, setShowLibrary] = useState(false);
   const [librarySearch, setLibrarySearch] = useState('');
-  const [librarySongs, setLibrarySongs] = useState<Song[]>([]);
+  const songsQuery = useStudioSongs(showLibrary);
+  const librarySongs = (songsQuery.data?.songs ?? []).filter(song => song.audioUrl);
   const [sourceAudioUrl, setSourceAudioUrl] = useState('');
   const [sourceName, setSourceName] = useState('');
   const [sourceSongId, setSourceSongId] = useState<string | undefined>(undefined);
@@ -55,60 +70,8 @@ export const MidiStudio: React.FC = () => {
     (localStorage.getItem('hs-midi-model') as MuscriptorModel) || 'small');
 
   // ── Jobs ──
-  const [jobs, setJobs] = useState<MidiJobSummary[]>([]);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState('');
-  const pollRef = useRef<number | null>(null);
-
-  const refreshStatus = useCallback(() => {
-    getMidiStatus().then(setStatus).catch(() => {});
-  }, []);
-  const refreshJobs = useCallback(() => {
-    listMidiJobs().then(setJobs).catch(() => {});
-  }, []);
-
-  useEffect(() => { refreshStatus(); refreshJobs(); }, [refreshStatus, refreshJobs]);
-
-  // Poll status while any model download is in flight
-  const anyDownloading = !!status && Object.values(status.models).some(ms => ms.downloading);
-  useEffect(() => {
-    if (!anyDownloading) return;
-    const iv = window.setInterval(refreshStatus, 1500);
-    return () => window.clearInterval(iv);
-  }, [anyDownloading, refreshStatus]);
-
-  // Poll progress of active transcription jobs
-  const hasActiveJobs = jobs.some(j => j.status === 'queued' || j.status === 'transcribing');
-  useEffect(() => {
-    if (!hasActiveJobs) { if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; } return; }
-    pollRef.current = window.setInterval(async () => {
-      let anyFinished = false;
-      const updated = await Promise.all(jobs.map(async (j) => {
-        if (j.status !== 'queued' && j.status !== 'transcribing') return j;
-        try {
-          const p = await getMidiProgress(j.id);
-          if (p.status === 'done' || p.status === 'failed' || p.status === 'cancelled') anyFinished = true;
-          return {
-            ...j, status: p.status, error: p.error, gated: p.gated,
-            noteCount: p.noteCount ?? j.noteCount,
-            chunksDone: p.chunksDone, chunksTotal: p.chunksTotal,
-          };
-        } catch { return j; }
-      }));
-      setJobs(updated);
-      if (anyFinished) refreshJobs();
-    }, 1500);
-    return () => { if (pollRef.current) { window.clearInterval(pollRef.current); pollRef.current = null; } };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasActiveJobs, jobs.map(j => `${j.id}:${j.status}`).join(',')]);
-
-  // Load library songs when picker opens
-  useEffect(() => {
-    if (showLibrary && token) {
-      songApi.list(token).then(({ songs }) => setLibrarySongs(songs.filter(s => s.audioUrl))).catch(() => {});
-    }
-  }, [showLibrary, token]);
-
   const filteredSongs = useMemo(() => {
     if (!librarySearch.trim()) return librarySongs;
     const q = librarySearch.toLowerCase();
@@ -128,27 +91,23 @@ export const MidiStudio: React.FC = () => {
   }, []);
 
   // ── Upload a track from the user's PC (same endpoint Repaint uses) ──
-  const [isUploading, setIsUploading] = useState(false);
+  const { mutate: uploadAudio, isPending: isUploading } = useUpload<{ audio_url?: string }>();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const handleFileUpload = useCallback(async (file: File) => {
+  const handleFileUpload = useCallback((file: File) => {
     setSubmitError('');
-    setIsUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append('audio', file);
-      const res = await fetch('/api/upload/audio', { method: 'POST', body: fd });
-      if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-      const { audio_url } = await res.json();
-      setSourceAudioUrl(audio_url);
-      setSourceName(file.name);
-      setSourceSongId(undefined);
-      setShowLibrary(false);
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setIsUploading(false);
-    }
-  }, []);
+    uploadAudio({
+      path: '/upload/audio',
+      files: [{ field: 'audio', file }],
+      onSuccess: data => {
+        if (!data.audio_url) return;
+        setSourceAudioUrl(data.audio_url);
+        setSourceName(file.name);
+        setSourceSongId(undefined);
+        setShowLibrary(false);
+      },
+      onError: err => setSubmitError(err instanceof Error ? err.message : String(err)),
+    });
+  }, [uploadAudio]);
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     const file = e.dataTransfer.files?.[0];
@@ -188,22 +147,21 @@ export const MidiStudio: React.FC = () => {
 
   const handleDelete = async (jobId: string) => {
     try {
-      await deleteMidiJob(jobId);
+      await deletion.mutateAsync(jobId);
       if (expandedJob === jobId) setExpandedJob(null);
-      setJobs(js => js.filter(j => j.id !== jobId));
-    } catch { /* refresh will reconcile */ }
-    refreshJobs();
+    } catch (err) { setSubmitError(err instanceof Error ? err.message : String(err)); }
   };
 
   const engineMissing = !!status && !status.engineAvailable;
   const modelState = status?.models?.[model];
+  const beatState = status?.models?.[BEAT_MODEL];
   const canTranscribe = !!status?.engineAvailable && !!modelState?.downloaded && !!sourceAudioUrl && !isUploading;
 
   const fmtGB = (b: number) => `${(b / 1e9).toFixed(2)} GB`;
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-6">
+    <div className="h-full w-full overflow-y-auto">
+      <div className="max-w-4xl mx-auto max-[1023px]:px-3 min-[1024px]:px-6 py-8 flex flex-col gap-6">
 
         {/* ── Header ── */}
         <div>
@@ -275,7 +233,7 @@ export const MidiStudio: React.FC = () => {
                 value={hfTokenInput}
                 onChange={e => setHfTokenInput(e.target.value)}
                 placeholder={t('midiStudio.hfTokenPlaceholder')}
-                className="flex-1 min-w-[220px] px-3 py-2 rounded-lg text-xs bg-zinc-100 dark:bg-black/30 border border-zinc-200 dark:border-white/10 text-zinc-900 dark:text-white placeholder-zinc-400 outline-none focus:border-purple-500/40"
+                className="flex-1 min-[1024px]:min-w-[220px] min-w-0 px-3 py-2 rounded-lg text-xs bg-zinc-100 dark:bg-black/30 border border-zinc-200 dark:border-white/10 text-zinc-900 dark:text-white placeholder-zinc-400 outline-none focus:border-purple-500/40"
               />
               <button
                 onClick={() => handleSaveHfToken(hfTokenInput)}
@@ -433,6 +391,32 @@ export const MidiStudio: React.FC = () => {
               })}
             </div>
             <p className="text-[11px] text-zinc-400 dark:text-zinc-500 mt-2">{t('midiStudio.firstRunNote')}</p>
+
+            {/* Beat This!: optional, gives the MIDI tempo, time signature and bar lines */}
+            <div className="mt-3 flex items-center gap-2 flex-wrap text-xs">
+              <ParamLabel label={t('midiStudio.tempoModel')} info={t('midiStudio.tempoModelInfo')} />
+              {beatState?.downloaded ? (
+                <span className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                  <CheckCircle2 size={11} /> {t('midiStudio.tempoModelReady')}
+                </span>
+              ) : beatState?.downloading ? (
+                <span className="flex items-center gap-1 text-[11px] text-purple-500">
+                  <Loader2 size={11} className="animate-spin" />
+                  {t('midiStudio.downloading')} {beatState.totalBytes ? Math.round(100 * beatState.receivedBytes / beatState.totalBytes) : 0}%
+                </span>
+              ) : (
+                <button
+                  onClick={() => startModelDownload(BEAT_MODEL).then(refreshStatus).catch(err =>
+                    setSubmitError(err instanceof Error ? err.message : String(err)))}
+                  className="flex items-center gap-1 text-[11px] text-purple-600 dark:text-purple-400 hover:underline"
+                >
+                  <Download size={11} /> {t('midiStudio.tempoModelDownload')}
+                </button>
+              )}
+              {beatState?.error && !beatState.downloading && (
+                <span className="text-[11px] text-red-500 dark:text-red-400">{beatState.error.slice(0, 120)}</span>
+              )}
+            </div>
           </div>
 
           {/* Primary action morphs with the selected model's state:
@@ -491,6 +475,8 @@ export const MidiStudio: React.FC = () => {
           <div className="flex flex-col gap-2">
             {jobs.map(job => {
               const running = job.status === 'queued' || job.status === 'transcribing';
+              // A failed job can still hold a partial .mid (the failed badge stays).
+              const hasMidi = job.status === 'done' || (job.status === 'failed' && !!job.partial);
               const pct = job.chunksTotal ? Math.round(100 * (job.chunksDone || 0) / job.chunksTotal) : 0;
               return (
                 <div key={job.id} className="rounded-lg border border-zinc-200 dark:border-white/5 bg-zinc-50 dark:bg-black/20 px-3 py-2.5">
@@ -541,7 +527,7 @@ export const MidiStudio: React.FC = () => {
                       )}
                     </div>
                     <div className="flex items-center gap-1 flex-shrink-0">
-                      {job.status === 'done' && (
+                      {hasMidi && (
                         <>
                           <button
                             onClick={() => setExpandedJob(e => e === job.id ? null : job.id)}
@@ -572,8 +558,11 @@ export const MidiStudio: React.FC = () => {
                   {job.status === 'transcribing' && (
                     <MidiPlayer key={`${job.id}-live`} jobId={job.id} sourceAudioUrl={job.sourceAudioUrl} live />
                   )}
-                  {expandedJob === job.id && job.status === 'done' && (
-                    <MidiPlayer key={`${job.id}-done`} jobId={job.id} sourceAudioUrl={job.sourceAudioUrl} live={false} />
+                  {expandedJob === job.id && hasMidi && (
+                    <>
+                      <MidiPlayer key={`${job.id}-done`} jobId={job.id} sourceAudioUrl={job.sourceAudioUrl} live={false} />
+                      {job.status === 'done' && <MidiExportPanel jobId={job.id} initial={job.exportOptions} />}
+                    </>
                   )}
                 </div>
               );

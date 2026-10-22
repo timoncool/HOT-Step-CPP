@@ -23,6 +23,16 @@ const EMPTY: AudioMetaResult = { duration: 0, artist: '', title: '', album: '', 
  *  plus DEL. Built from escapes so the source file stays plain ASCII. */
 const CONTROL_CHARS = new RegExp('[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]', 'g');
 
+function bpmTag(rawBpm: unknown): number | null {
+  return typeof rawBpm === 'number' && Number.isFinite(rawBpm) && rawBpm > 0 ? Math.trunc(rawBpm) : null;
+}
+
+/** BPM tag only; analysis routes do not need a full duration scan. */
+export async function readBpmTag(audioPath: string): Promise<number | null> {
+  try { return bpmTag((await parseFile(audioPath, { skipCovers: true })).common.bpm); }
+  catch { return null; }
+}
+
 /** Strip NULs and control chars (keeping \n and \t), trim, cap at 300 (§7.6). */
 export function sanitizeTag(value: unknown): string {
   if (typeof value !== 'string') return '';
@@ -34,9 +44,7 @@ export async function read(audioPath: string): Promise<AudioMetaResult> {
   try {
     const md = await parseFile(audioPath, { duration: true, skipCovers: true });
     const rawBpm = (md.common as { bpm?: unknown }).bpm;
-    const bpm = typeof rawBpm === 'number' && Number.isFinite(rawBpm) && rawBpm > 0
-      ? Math.trunc(rawBpm)
-      : null;
+    const bpm = bpmTag(rawBpm);
     return {
       duration: md.format.duration && Number.isFinite(md.format.duration) ? md.format.duration : 0,
       artist: sanitizeTag(md.common.artist),

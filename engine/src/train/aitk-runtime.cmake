@@ -9,6 +9,7 @@ if(GGML_CUDA AND TARGET ggml-cuda)
     target_sources(yue2-aitk-kernels PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/adamw8bit_cuda.cu
         ${CMAKE_CURRENT_LIST_DIR}/joint_loss_cuda.cu
+        ${CMAKE_CURRENT_LIST_DIR}/clip_cuda.cu
     )
     set_target_properties(yue2-aitk-kernels PROPERTIES
         CUDA_STANDARD 17
@@ -26,3 +27,5 @@ else()
 endif()
 
 target_link_libraries(ace-train PRIVATE yue2-aitk-kernels)
+# The clip test reaches the CUDA clip kernels through the same library.
+target_link_libraries(yue2-clip-non-finite-test PRIVATE yue2-aitk-kernels)

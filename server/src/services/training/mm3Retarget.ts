@@ -21,7 +21,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 
-import { config } from '../../config.js';
+import { config, getFFmpegPath } from '../../config.js';
 import { ensureEngineFormat } from '../audioConvert.js';
 import { parseWavHeader } from '../audioCrop.js';
 import { aceTrainExe } from './aceTrain.js';
@@ -208,7 +208,7 @@ export function runRetarget(o: RetargetOptions): Promise<RetargetResult> {
   if (o.maxCost !== undefined) args.push('--max-cost', String(o.maxCost));
   if (o.protectHead !== undefined) args.push('--protect-head', String(o.protectHead));
   if (o.protectTail !== undefined) args.push('--protect-tail', String(o.protectTail));
-  const ffmpeg = findFfmpeg();
+  const ffmpeg = getFFmpegPath();
   if (ffmpeg) args.push('--ffmpeg', ffmpeg);
 
   return new Promise((resolve, reject) => {
@@ -259,14 +259,4 @@ export async function retargetDataset(
   // outcome — it stays excluded, exactly as it is today — so a failure here does not fail the whole pass.
   const result = await runRetarget({ ...opts, outDir, vocalDir });
   return { ...result, vocalFailed: failed };
-}
-
-function findFfmpeg(): string | null {
-  const candidates = [
-    path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
-    path.join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg'),
-    path.join(process.cwd(), 'server', 'node_modules', 'ffmpeg-static', 'ffmpeg.exe'),
-    path.join(process.cwd(), 'server', 'node_modules', 'ffmpeg-static', 'ffmpeg'),
-  ];
-  return candidates.find(p => fs.existsSync(p)) ?? null;
 }

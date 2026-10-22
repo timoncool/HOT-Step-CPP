@@ -1,5 +1,9 @@
 # Performance, caches and streaming
 
+Resolve runtime paths first using [Finding the data folder](../../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 > Reference for the `mm3-backend` skill. Read only when the task needs it.
 
 ## Alternative composer LMs (depth-pruned + guidance-distilled) — 2026-08-22
@@ -13,7 +17,7 @@ consumes a 4096-wide hidden and the 200 k audio vocabulary is what makes it a mu
 so those cannot move.
 
 ```
-python engine/tools/convert-mm3.py --src <arm-dir> --out models/mm3 \
+python engine/tools/convert-mm3.py --src <arm-dir> --out <data root>/models/mm3 \
   --components lm --quant q8_0 --lm-layers 21 --ar-cfg-scale 1.0 \
   --suffix=-d21-lr6e5 --tokenizer <official>/tokenizer/tokenizer.json
 ```

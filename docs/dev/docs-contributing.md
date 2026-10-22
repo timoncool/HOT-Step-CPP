@@ -2,9 +2,10 @@
 
 The docs live in this repo, under `docs/`, so they version with the code. A code change
 that alters behaviour a user or developer can see is not finished until the matching page
-is updated. The ownership table in [AGENTS.md](../../AGENTS.md#documentation-is-part-of-the-change)
+is updated. The ownership table in the local `AGENTS.md`
 says which page each source area owns, and `node tools/docs/check-docs.mjs` fails when a
-studio has no page, a generated table is stale, or a link is broken.
+studio has no page, a generated table is stale, or a link is broken. Missing gitignored
+link targets produce warnings because local agent files are absent from public checkouts.
 
 ## Layout
 

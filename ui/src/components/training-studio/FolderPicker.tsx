@@ -4,11 +4,13 @@
 // `trainingAudio` filter so audio files show up as context while the user
 // picks the containing directory. The last-visited dir is remembered.
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { hashKey, type QueryKey } from '@tanstack/react-query';
 import { createPortal } from 'react-dom';
 import { ChevronUp, Folder, FileAudio, Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { adapterApi } from '../../services/api';
+import { queryClient } from '../../queries/client';
+import { trainingQueries as tq } from '../../queries/training-data/queries';
 import type { BrowseEntry } from '../../types';
 
 const LAST_DIR_KEY = 'hs-training-lastDir';
@@ -34,20 +36,27 @@ export const FolderPicker: React.FC<FolderPickerProps> = ({ open, onClose, onSel
   const [error, setError] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
 
+  // Only the newest navigation lands; the one it replaces is cancelled.
+  const lastKey = useRef<QueryKey | null>(null);
   const loadDir = useCallback(async (dir: string) => {
+    const options = tq.browse(dir, 'trainingAudio');
+    // A repeat of the same request joins it instead.
+    if (lastKey.current && hashKey(lastKey.current) !== hashKey(options.queryKey)) void queryClient.cancelQueries({ queryKey: lastKey.current, exact: true });
+    lastKey.current = options.queryKey;
     setLoading(true);
     setError(null);
     try {
-      const result = await adapterApi.browse(dir, 'trainingAudio');
+      const result = await queryClient.query(options);
+      if (lastKey.current !== options.queryKey) return;
       setCurrentDir(result.current);
       setPathInput(result.current);
       setEntries(result.entries);
       saveLastDir(result.current);
     } catch (err) {
+      if (lastKey.current !== options.queryKey) return;
       setError(err instanceof Error ? err.message : 'Failed to list directory');
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   }, []);
 
   useEffect(() => {

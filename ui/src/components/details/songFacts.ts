@@ -11,7 +11,7 @@
 import type { Song } from '../../types';
 import { formatDitModel, formatLmModel } from '../global-bar/modelLabels';
 
-export type Backend = 'ace' | 'minimax-m3' | 'yue2';
+export type Backend = 'ace' | 'minimax-m3' | 'yue2' | 'sa3';
 
 export interface Fact {
   label: string;
@@ -33,6 +33,7 @@ export const BACKEND_LABELS: Record<Backend, string> = {
   'ace': 'ACE-Step 1.5',
   'minimax-m3': 'MiniMax-Music3',
   'yue2': 'YuE2',
+  'sa3': 'Stable Audio 3',
 };
 
 export function songBackend(song: Song): Backend {
@@ -40,6 +41,7 @@ export function songBackend(song: Song): Backend {
   const raw = String(song.backend || gp?.backend || 'ace');
   if (raw === 'minimax-m3' || raw === 'mm3' || raw === 'minimax') return 'minimax-m3';
   if (raw === 'yue2') return 'yue2';
+  if (raw === 'sa3' || raw === 'stable-audio-3') return 'sa3';
   return 'ace';
 }
 
@@ -218,10 +220,11 @@ function mm3Facts(gp: any): FactGroup[] {
 function yue2Facts(gp: any): FactGroup[] {
   const y = gp.yue2 || {};
   const req = gp.yue2Request || {};
+  const cot = req.cot ?? gp.yue2Cot;
   const groups: FactGroup[] = [];
 
   const plan: Fact[] = [];
-  if (gp.yue2Cot || req.cot) add(plan, 'Chain of thought', pretty(String(gp.yue2Cot || req.cot)));
+  if (cot) add(plan, 'Chain of thought', pretty(String(cot)));
   if (y.abc_supplied !== undefined) add(plan, 'Score', y.abc_supplied ? 'Supplied (ABC)' : 'Planned by LM');
   const health = y.score_health;
   if (health?.verdict) {
@@ -267,6 +270,20 @@ function yue2Facts(gp: any): FactGroup[] {
     // "plan: skipped" alongside "Score: Supplied (ABC)" is the same fact twice,
     // and the second phrasing reads like a failure. Drop it.
     if (stage === 'plan' && reason === 'skipped' && y.abc_supplied) continue;
+    // An app-planned score (auto re-plan, instrumental move) also reaches the
+    // engine finished, so the engine says "skipped" though a plan did run.
+    if (stage === 'plan' && reason === 'skipped' && y.abc_planned) {
+      add(outcome, 'Plan stage', 'Planned by the app');
+      continue;
+    }
+    // The orchestrator can plan first, then render with that ABC. The render's
+    // skipped result describes only its own job; abc_supplied records whether
+    // the score came from the caller before that separate planning pass.
+    if (stage === 'plan' && reason === 'skipped' && y.abc_supplied === false
+      && req.abc && cot !== 'off') {
+      add(outcome, 'Plan stage', 'Planned by LM');
+      continue;
+    }
     const mapped = STAGE_REASON[String(reason)];
     add(outcome, `${pretty(stage)} stage`, mapped?.text ?? pretty(String(reason)),
       mapped?.tone ? { tone: mapped.tone } : {});
@@ -295,7 +312,13 @@ function yue2Facts(gp: any): FactGroup[] {
   const seeds: Fact[] = [];
   const seed = gp.seed ?? req.seed;
   const noise = y.noise_seed ?? req.noise_seed;
-  add(seeds, 'Seed', num(seed), { mono: true });
+  // baseSeed is what the user typed; seed is what rendered (base + variation
+  // index, or a re-plan seed). Rows before baseSeed existed show only one.
+  const base = gp.baseSeed;
+  add(seeds, 'Seed', num(base ?? seed), { mono: true });
+  if (base !== undefined && seed !== undefined && String(base) !== String(seed)) {
+    add(seeds, 'Rendered seed', num(seed), { mono: true });
+  }
   // Only worth a line when it is actually a second seed.
   if (noise !== undefined && String(noise) !== String(seed)) {
     add(seeds, 'Noise seed', num(noise), { mono: true });
@@ -307,15 +330,89 @@ function yue2Facts(gp: any): FactGroup[] {
   return groups;
 }
 
+/** Stable Audio 3. gp is the whole global blob, so ditModel, lmModel,
+ *  inferenceSteps and friends are ACE leftovers. Only sa3Request (the wire as
+ *  sent) and sa3 (render stamp) are truth. The solver/scheduler/guidance
+ *  pickers only reach the wire when plugins were enabled; when absent the
+ *  render ran the native sampler, and on rows that predate sa3Request we say
+ *  "Unknown" rather than guess from the ACE keys. */
+function sa3Facts(gp: any): FactGroup[] {
+  const req = gp.sa3Request;
+  const s = gp.sa3 || {};
+  const groups: FactGroup[] = [];
+
+  const models: Fact[] = [];
+  add(models, 'Model', 'Stable Audio 3');
+  const adapters: any[] = Array.isArray(req?.adapters) ? req.adapters : [];
+  for (const a of adapters) {
+    if (!a?.name) continue;
+    add(models, 'Adapter', `${basename(String(a.name))}${a.scale !== undefined && a.scale !== 1 ? ` @ ${a.scale}` : ''}`,
+      { title: String(a.name) });
+  }
+  groups.push({ title: 'Models', facts: models });
+
+  const sampling: Fact[] = [];
+  if (!req) {
+    add(sampling, 'Parameters', 'Unknown (older render)');
+  } else {
+    add(sampling, 'Steps', num(req.steps ?? s.steps));
+    const native = !req.solver && !req.scheduler && !req.guidanceMode;
+    add(sampling, 'Sampler', native ? pretty(String(req.sampler ?? s.sampler ?? 'pingpong')) : 'Plugins');
+    if (req.solver) add(sampling, 'Solver', pretty(String(req.solver)));
+    if (req.scheduler) add(sampling, 'Schedule', pretty(String(req.scheduler)));
+    if (req.guidanceMode) add(sampling, 'Guidance', pretty(String(req.guidanceMode)));
+    if (req.guidanceScale !== undefined) add(sampling, 'CFG scale', num(req.guidanceScale));
+    if (req.postprocessPlugin) add(sampling, 'Decode', pretty(String(req.postprocessPlugin)));
+    if (req.nTokens ?? s.prompt_tokens) add(sampling, 'Prompt tokens', num(req.nTokens ?? s.prompt_tokens), { mono: true });
+  }
+  if (s.sample_rate) add(sampling, 'Sample rate', `${(Number(s.sample_rate) / 1000).toFixed(1)} kHz`);
+  if (sampling.length) groups.push({ title: 'Sampling', facts: sampling });
+
+  const seeds: Fact[] = [];
+  add(seeds, 'Seed', num(req?.seed ?? gp.seed), { mono: true });
+  if (seeds.length) groups.push({ title: 'Reproduction', facts: seeds });
+  return groups;
+}
+
 /** Everything the panel shows under "How it was made", for this song's backend. */
 export function buildFactGroups(song: Song): FactGroup[] {
   const gp = params(song);
   if (!gp) return [];
-  switch (songBackend(song)) {
-    case 'minimax-m3': return mm3Facts(gp);
-    case 'yue2': return yue2Facts(gp);
-    default: return aceFacts(gp);
+  const backend = songBackend(song);
+  const cover = coverFacts(gp, backend);
+  let groups: FactGroup[];
+  switch (backend) {
+    case 'minimax-m3': groups = mm3Facts(gp); break;
+    case 'yue2': groups = yue2Facts(gp); break;
+    case 'sa3': groups = sa3Facts(gp); break;
+    default: groups = aceFacts(gp);
   }
+  return cover.length ? [{ title: 'Cover Studio', facts: cover }, ...groups] : groups;
+}
+
+function coverFacts(gp: any, backend: Backend): Fact[] {
+  const cover = backend === 'yue2' ? gp.yue2Cover : undefined;
+  if (!cover && gp.source !== 'cover-studio') return [];
+  const facts: Fact[] = [];
+  add(facts, 'Workflow', 'Cover Studio');
+  if (gp.artistName) add(facts, 'Covering band', String(gp.artistName));
+  if (gp.sourceArtist) add(facts, 'Source artist', String(gp.sourceArtist));
+  if (cover) {
+    add(facts, 'Source type', cover.sourceKind === 'musicxml' ? 'MusicXML' : 'Audio');
+    if (cover.sourceLabel) add(facts, 'Source', String(cover.sourceLabel));
+    if (cover.sourceId) add(facts, 'Source ID', String(cover.sourceId), { mono: true });
+    if (cover.voices) add(facts, 'Score voices', cover.voices === 'both' ? 'Vocal and accompaniment' : 'Vocal');
+    if (cover.keepChords !== undefined) add(facts, 'Keep chords', cover.keepChords ? 'On' : 'Off');
+    if (cover.tempo !== undefined) add(facts, 'Tempo', typeof cover.tempo === 'number' ? `${cover.tempo} bpm` : pretty(String(cover.tempo)));
+    if (cover.key) add(facts, 'Key', String(cover.key));
+    if (cover.keyShift !== undefined) add(facts, 'Key shift', `${cover.keyShift} semitones`);
+    add(facts, 'Cover CFG', num(cover.cfgScale));
+  } else {
+    if (gp.sourceAudioUrl) add(facts, 'Source ID', String(gp.sourceAudioUrl), { mono: true });
+    add(facts, 'Structure fidelity', num(gp.audioCoverStrength));
+    add(facts, 'Source preservation', num(gp.coverNoiseStrength));
+  }
+  return facts;
 }
 
 /** The handful of musical facts shown as chips above the parameters. Only the

@@ -30,6 +30,14 @@ import { EditableSlider } from '../shared/EditableSlider';
 import { StyledSelect } from '../shared/StyledSelect';
 import { GLOBAL_PARAM_DEFAULTS } from '../../stores/globalParamsStore';
 
+// Registered plugin names for the SA3 Clean preset (verified against plugins/).
+const SA3_CLEAN_SOLVER    = 'md_wasserstein_flow_v121';
+const SA3_CLEAN_SCHEDULER = 'md_psychoacoustic';
+const SA3_CLEAN_GUIDANCE  = 'md_phase_inversion';
+const SA3_CLEAN_STEPS     = 24;
+// Engine-registered name for Bucket Brigade guidance.
+const BUCKET_BRIGADE_NAME = 'md_bucket_brigade';
+
 // This panel's own colour, matched to the StableStep Accordion's
 // accentColor="sky" in PostProcessingDropdown.tsx (the panel this mounts
 // inside). Every StyledSelect here shares it.
@@ -75,8 +83,31 @@ export const Sa3SamplerControls: React.FC = () => {
     gp.stableStepGuidanceMode && 'SA3 has no unconditional branch (it was trained without CFG), so guidance runs with the conditional prediction as both inputs. APG-style modes pass straight through unchanged; only plugins that enhance the conditional prediction on its own do anything here.',
   );
 
+  const applyCleanPreset = () => {
+    gp.setStableStepSolver(SA3_CLEAN_SOLVER);
+    gp.setStableStepScheduler(SA3_CLEAN_SCHEDULER);
+    gp.setStableStepGuidanceMode(SA3_CLEAN_GUIDANCE);
+    gp.setStableStepSteps(SA3_CLEAN_STEPS);
+  };
+
+  const bucketBrigadeActive = gp.stableStepGuidanceMode === BUCKET_BRIGADE_NAME;
+
   return (
     <div className="space-y-3 pt-1">
+      {/* SA3 Clean preset */}
+      <div className="flex items-center justify-between">
+        <ParamLabel label="Preset" underline={false}
+          className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider"
+          info="SA3 Clean: Wasserstein Flow solver, Psychoacoustic scheduler, Phase Inversion guidance, 24 steps. A tested combination that sounds clean on SA3 refine." />
+        <button
+          type="button"
+          onClick={applyCleanPreset}
+          className="text-[10px] font-semibold px-2 py-1 rounded-lg bg-sky-500/10 hover:bg-sky-500/20 text-sky-400 border border-sky-500/20 transition-colors"
+        >
+          SA3 Clean
+        </button>
+      </div>
+
       <EditableSlider
         label="Refine steps"
         value={gp.stableStepSteps}
@@ -167,6 +198,12 @@ export const Sa3SamplerControls: React.FC = () => {
           ]}
         />
       </div>
+
+      {bucketBrigadeActive && (
+        <p className="text-[10px] text-amber-400 leading-snug px-1">
+          Bucket Brigade tends to distort on SA3.
+        </p>
+      )}
 
       {gp.stableStepGuidanceMode && (
         <EditableSlider

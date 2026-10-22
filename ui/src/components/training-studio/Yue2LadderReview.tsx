@@ -7,50 +7,33 @@
 // and the Refine tab (KL-rung ladders of the earlier recipe). Extracted from
 // RefinePanel; the scoring maths mirrors server/src/services/training/
 // yue2BestRung.ts, so change both together.
+import { yue2SamplerSnapshot } from '../../stores/globalParamsStore';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronUp } from 'lucide-react';
-import { Toggle } from '../settings/SettingsPrimitives';
-import { PreviewPlayer } from './PreviewPlayer';
-import { ParamLabel } from '../shared/ParamLabel';
 import { usePersistedState, writePersistedState } from '../../hooks/usePersistedState';
+import { runCommand, runQueries } from '../../queries/training-runs/queries';
 import {
-  getYue2AlbumScore, getYue2CleanupPlan, linkYue2JointCheckpointPreset, listYue2RungScores, renderYue2JointPreviews, runYue2Cleanup, scoreYue2Album, scoreYue2Rung,
-  type Yue2AitkRunRecord, type Yue2AlbumScore, type Yue2TrainedDirection, type Yue2CleanupChoice, type Yue2CleanupPlan, type Yue2JointPreviewRecord, type Yue2RungScore,
+  renderYue2JointPreviews, scoreYue2Album, scoreYue2Rung,
+  type Yue2AitkRunRecord, type Yue2AlbumScore,
+  type Yue2CleanupChoice, type Yue2CleanupPlan, type Yue2JointPreviewRecord, type Yue2RungScore,
+  type Yue2TrainedDirection
 } from '../../services/trainingApi';
+import { Toggle } from '../settings/SettingsPrimitives';
+import { ParamLabel } from '../shared/ParamLabel';
+import { PreviewPlayer } from './PreviewPlayer';
+
+import { cleanupReviewRung, pickFromLadder, selectReviewRung, type ReviewPick } from '../../services/trainingReviewApi';
 
 const input = 'px-2 py-1.5 rounded-lg text-xs bg-white/70 dark:bg-black/20 border border-zinc-300/70 dark:border-white/10 text-zinc-800 dark:text-zinc-100';
-
-// A rung's overall score for the scoreboard: base is likeness and inverted
-// corruption averaged onto the same 1..5 scale as ((6 − corruption) mirrors
-// likeness's direction), then a soft penalty for replan load — the app
-// auto-replans on its own, so a high count is a smell, not a verdict — capped
-// at 1 point so it can never flip the ranking on its own.
-export function rungOverall(args: {
-  likeness: number | null | undefined;
-  corruption: number | null | undefined;
-  plannerReplans: number;
-  composerReplans: number;
-  takes: number;
-  /** Plan legibility flags on takes this rung planned itself (not a shared
-   *  sheet), and how many such takes there were. Weighted under replans. */
-  planFlags?: number;
-  ownTakes?: number;
-}): { overall: number; replansPerTake: number } | null {
-  const { likeness, corruption, plannerReplans, composerReplans, takes, planFlags = 0, ownTakes = takes } = args;
-  if (typeof likeness !== 'number' || typeof corruption !== 'number') return null;
-  const base = (likeness + (6 - corruption)) / 2;
-  const replansPerTake = (plannerReplans + composerReplans) / Math.max(1, takes);
-  const penalty = Math.min(1, 0.25 * replansPerTake + 0.1 * planFlags / Math.max(1, ownTakes));
-  return { overall: Math.round((base - penalty) * 100) / 100, replansPerTake };
-}
 
 /** Blind-ladder visibility for a run: labels pending (known locally, no blind
  *  letters yet) must never fall back to listing rungs in their real, revealing
  *  step order just because every label reads empty — no ladder renders, no
  *  scoring, until the labels land. Pure so it's unit-testable without React. */
 export function ladderVisibility(run: Yue2AitkRunRecord | undefined, blindRungs: boolean) {
-  const jointLadder = run?.options.method === 'base-matched';
+  const jointLadder = run?.options.method === 'base-matched' || run?.options.method === 'fixed-recipe';
   const labelsPending = !!jointLadder && blindRungs && run != null && !run.blindLabels;
   const blind = !!jointLadder && blindRungs && !labelsPending;
   const labelFor = (step: number) => run?.blindLabels?.[step] ?? '';
@@ -73,9 +56,7 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   run: Yue2AitkRunRecord | undefined;
   previews: Yue2JointPreviewRecord[];
   /** "Render more" settings. */
-  renderOpts: { seconds: number; takes: number; draft: boolean };
-  /** Called after a cleanup or a render, so the owner refreshes runs and previews. */
-  onChanged: () => void | Promise<void>;
+  renderOpts: { seconds: number; takes: number; arScale?: number; draft: boolean };
   /** Owner's take on "Use this rung". Resolve true when handled (nothing
    *  more happens here); false or absent = link the rung and open cleanup. */
   onUse?: (dir: string, step: number) => Promise<boolean>;
@@ -83,9 +64,12 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   onError?: (message: string) => void;
   /** Element id prefix for scoreboard scroll targets; unique per instance. */
   idPrefix?: string;
-}>(({ datasetId, datasetName, run, previews, renderOpts, onChanged, onUse, onPicked, onError, idPrefix = 'ladder-rung' }, ref) => {
+}>(({ datasetId, datasetName, run, previews, renderOpts, onUse, onPicked, onError, idPrefix = 'ladder-rung' }, ref) => {
   const { t } = useTranslation();
   const runId = run?.jobId ?? '';
+  const client = useQueryClient();
+  const reviewQuery = useQuery({ ...runQueries.ladder(datasetId, runId), enabled: !!datasetId && !!runId });
+  const review = reviewQuery.data ?? null;
   const [blindRungs] = usePersistedState('hs-yue2-blind-rungs', true);
   const { jointLadder, labelsPending, blind, labelFor, ladder, visibleLadder } = ladderVisibility(run, blindRungs);
   const rungName = (step: number) => blind
@@ -95,13 +79,17 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   const draftOpts = renderOpts.draft ? { odeSteps: 12, narCacheRatio: 0 } : {};
 
   // Scores per rung (by step); notes are saved on blur.
-  const [scores, setScores] = useState<Record<number, Yue2RungScore>>({});
+  const scoresQuery = useQuery({ ...runQueries.scores(datasetId, runId), enabled: !!datasetId && !!runId });
+  const scores = Object.fromEntries((scoresQuery.data?.scores ?? []).map(score => [score.step, score]));
+  const setScores = (update: Record<number, Yue2RungScore> | ((old: Record<number, Yue2RungScore>) => Record<number, Yue2RungScore>)) => {
+    client.setQueryData(runQueries.scores(datasetId, runId).queryKey, old => {
+      const previous = Object.fromEntries((old?.scores ?? []).map(score => [score.step, score]));
+      return { scores: Object.values(typeof update === 'function' ? update(previous) : update) };
+    });
+  };
   const scoreSeq = useRef<Record<number, number>>({});
   const [noteDraft, setNoteDraft] = useState<Record<number, string>>({});
-  useEffect(() => {
-    setScores({}); setNoteDraft({});
-    if (datasetId && runId) void listYue2RungScores(datasetId, runId).then(r => setScores(Object.fromEntries(r.scores.map(s => [s.step, s])))).catch(() => {});
-  }, [datasetId, runId]);
+  useEffect(() => { setNoteDraft({}); }, [datasetId, runId]);
   const score = async (step: number, patch: { likeness?: number | null; corruption?: number | null; notes?: string }) => {
     if (!datasetId || !runId) return;
     // Show the click at once: the save can queue behind other requests for
@@ -111,24 +99,23 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
     scoreSeq.current[step] = seq;
     setScores(prev => ({ ...prev, [step]: { ...prev[step], ...patch } as Yue2RungScore }));
     try {
-      const r = await scoreYue2Rung(datasetId, { refineRun: runId, step, ...patch, blind: !!blind, blindLabel: blind ? labelFor(step) : '' });
+      const r = await runCommand(client, null, () => scoreYue2Rung(datasetId, { refineRun: runId, step, ...patch, blind: !!blind, blindLabel: blind ? labelFor(step) : '' }));
       if (scoreSeq.current[step] === seq) setScores(prev => ({ ...prev, [step]: r.score }));
     } catch (err) {
       fail(err);
-      void listYue2RungScores(datasetId, runId).then(r => setScores(Object.fromEntries(r.scores.map(s => [s.step, s])))).catch(() => {});
+      void scoresQuery.refetch();
     }
   };
 
   // The album verdict: one score per run, beside the per-rung ones.
-  const [album, setAlbum] = useState<Yue2AlbumScore | null>(null);
+  const albumQuery = useQuery({ ...runQueries.album(datasetId, runId), enabled: !!datasetId && !!runId });
+  const album = albumQuery.data?.score ?? null;
+  const setAlbum = (value: Yue2AlbumScore | null) => client.setQueryData(runQueries.album(datasetId, runId).queryKey, { score: value });
   const [albumNote, setAlbumNote] = useState<string | undefined>(undefined);
-  useEffect(() => {
-    setAlbum(null); setAlbumNote(undefined);
-    if (datasetId && runId) void getYue2AlbumScore(datasetId, runId).then(r => setAlbum(r.score)).catch(() => {});
-  }, [datasetId, runId]);
+  useEffect(() => { setAlbumNote(undefined); }, [datasetId, runId]);
   const scoreAlbum = async (patch: { score?: number | null; instruments?: Yue2TrainedDirection | null; vocals?: Yue2TrainedDirection | null; notes?: string }) => {
     if (!datasetId || !runId) return;
-    try { setAlbum((await scoreYue2Album(datasetId, { refineRun: runId, ...patch })).score); }
+    try { setAlbum((await runCommand(client, null, () => scoreYue2Album(datasetId, { refineRun: runId, ...patch }))).score); }
     catch (err) { fail(err); }
   };
 
@@ -136,14 +123,14 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   const render = async (step: number) => {
     if (!datasetId || !runId) return;
     setRendering(step);
-    try { await renderYue2JointPreviews(datasetId, { run: runId, step, seconds: renderOpts.seconds, takes: renderOpts.takes, ...draftOpts }); await onChanged(); }
+    try { await runCommand(client, null, () => renderYue2JointPreviews(datasetId, { run: runId, step, seconds: renderOpts.seconds, takes: renderOpts.takes, arScale: renderOpts.arScale, sampler: yue2SamplerSnapshot(), ...draftOpts })); }
     catch (err) { fail(err); }
     finally { setRendering(null); }
   };
 
   // Cleanup modal after a rung is chosen: what else can go, with sizes.
   const [picked, setPicked] = useState('');
-  const [cleanup, setCleanup] = useState<{ run: string; step: number; plan: Yue2CleanupPlan; blind: boolean; blindLabel: string } | null>(null);
+  const [cleanup, setCleanup] = useState<{ pick: ReviewPick; plan: Yue2CleanupPlan; blind: boolean; blindLabel: string } | null>(null);
   const [choice, setChoice] = useState<Yue2CleanupChoice>({ caches: true, otherCheckpoints: true, otherRuns: true, resume: true, otherPreviews: true });
   const [cleaning, setCleaning] = useState(false);
   const [cleanupNote, setCleanupNote] = useState('');
@@ -151,9 +138,12 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   const mib = (b: number) => b >= 1073741824 ? `${(b / 1073741824).toFixed(2)} GiB` : `${(b / 1048576).toFixed(0)} MiB`;
   const finishPick = async (pickRun: string, dir: string, step: number) => {
     try {
-      await linkYue2JointCheckpointPreset(datasetId, dir); setPicked(dir); onPicked?.(dir);
-      const plan = await getYue2CleanupPlan(datasetId, pickRun, step);
-      setCleanup({ run: pickRun, step, plan, blind: !!blind, blindLabel: blind ? labelFor(step) : '' });
+      const fresh = await client.query({ ...runQueries.ladder(datasetId, pickRun), staleTime: 0 });
+      const pick = pickFromLadder(fresh, step);
+      if (pick.checkpointDir !== dir) throw new Error('The selected checkpoint changed. Reload the ladder.');
+      const { plan } = await runCommand(client, null, () => selectReviewRung(pick));
+      setPicked(dir); onPicked?.(dir);
+      setCleanup({ pick, plan, blind: !!blind, blindLabel: blind ? labelFor(step) : '' });
     } catch (err) { fail(err); }
   };
   useImperativeHandle(ref, () => ({ finishPick }), [datasetId]);
@@ -172,11 +162,10 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
     if (!cleanup) return;
     setCleaning(true);
     try {
-      const r = await runYue2Cleanup(datasetId, { run: cleanup.run, step: cleanup.step, blind: cleanup.blind, blindLabel: cleanup.blindLabel, ...(over ?? choice) });
+      const r = await runCommand(client, null, () => cleanupReviewRung(cleanup.pick, over ?? choice));
       if (r.finishError) { fail(r.finishError); return; }
-      setCleanupNote(`${t('trainingStudio.refine.cleanupDone', 'Removed {{what}}; about {{size}} freed.', { what: r.done.join(', ') || 'nothing', size: mib(r.freedBytes) })}${cleanup.blind ? ` ${t('trainingStudio.refine.blindReveal', 'Rung {{label}} was step {{step}}.', { label: cleanup.blindLabel, step: cleanup.step })}` : ''}`);
+      setCleanupNote(`${t('trainingStudio.refine.cleanupDone', 'Removed {{what}}; about {{size}} freed.', { what: r.done.join(', ') || 'nothing', size: mib(r.freedBytes) })}${cleanup.blind ? ` ${t('trainingStudio.refine.blindReveal', 'Rung {{label}} was step {{step}}.', { label: cleanup.blindLabel, step: cleanup.pick.step })}` : ''}`);
       setCleanup(null);
-      await onChanged();
     } catch (err) { fail(err); }
     finally { setCleaning(false); }
   };
@@ -197,25 +186,15 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
     // been checked against them.
     const flaggedTakes = doneTakes.filter(p => p.sheet !== 'shared' && p.score?.flags?.length);
     const flagReasons = flaggedTakes.flatMap(p => (p.score?.flags ?? []).map(f => `take ${mine.indexOf(p) + 1}: ${f}`)).join('\n');
-    const sc = scores[step];
     // A shared-sheet take's plan is not this rung's, so its flags do not count.
-    const ownPlanned = doneTakes.filter(p => p.sheet !== 'shared');
-    const planFlags = ownPlanned.reduce((sum, p) => sum + (p.score?.flags?.length ?? 0), 0);
-    const overall = rungOverall({ likeness: sc?.likeness, corruption: sc?.corruption, plannerReplans, composerReplans, takes: doneTakes.length, planFlags, ownTakes: ownPlanned.length });
+    const fact = review?.facts.find(f => f.step === step);
+    const overall = fact?.overall === null || fact?.overall === undefined ? null : { overall: fact.overall, replansPerTake: fact.replansPerTake };
     // Takes whose re-plan loop ran out without a clean plan (plan flags or a
     // broken verdict on every attempt): the checkpoint itself is suspect.
     const unclean = doneTakes.filter(p => p.plan && p.plan.clean === false);
     return { mine, doneTakes, plannerReplans, composerReplans, hasReplanData, flaggedTakes, flagReasons, overall, unclean };
   };
-  // Best rung by overall score, ties going to the earlier step (it drifted
-  // less). Ladder is sorted ascending, so only a strictly greater score
-  // replaces the best.
-  let bestStep: number | undefined;
-  let bestOverall = -Infinity;
-  for (const c of ladder) {
-    const o = rungStats(c.step).overall;
-    if (o && o.overall > bestOverall) { bestOverall = o.overall; bestStep = c.step; }
-  }
+  const bestStep = review?.best?.step;
   const scoreboardRows = ladder.map(c => {
     const stats = rungStats(c.step);
     const sc = scores[c.step];
@@ -241,7 +220,7 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
         <div className="w-full max-w-xl rounded-xl border border-zinc-300/70 dark:border-white/10 bg-white dark:bg-zinc-900 p-5 shadow-xl" onClick={e => e.stopPropagation()}>
           <div className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">{cleanup.blind
             ? t('trainingStudio.refine.blindCleanupTitle', 'Rung {{label}} is now the adapter. Clean up around it?', { label: cleanup.blindLabel })
-            : t('trainingStudio.refine.cleanupTitle', 'Step {{step}} is now the adapter. Clean up around it?', { step: cleanup.step })}</div>
+            : t('trainingStudio.refine.cleanupTitle', 'Step {{step}} is now the adapter. Clean up around it?', { step: cleanup.pick.step })}</div>
           <p className="mt-1 text-[12px] text-zinc-600 dark:text-zinc-400">{t('trainingStudio.refine.cleanupIntro', 'Everything below is app-generated and can be rebuilt. Source audio, sidecars, captions, labels and this rung\'s adapter files are never touched. Your rung scores are kept.')} {!cleanup.blind && t('trainingStudio.refine.cleanupMovesAnyway', 'Either way the adapter\'s run folder moves to yue2-joint-adapters\\refined.')}</p>
           <div className="mt-3 flex flex-col gap-2">
             {items.map(i => <label key={i.key} className="flex items-start gap-3 text-xs text-zinc-700 dark:text-zinc-300">

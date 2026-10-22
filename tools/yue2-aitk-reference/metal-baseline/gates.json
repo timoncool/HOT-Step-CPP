@@ -1,0 +1,70 @@
+{
+  "issue": "HOTSTEP-342",
+  "status": "frozen_pending_reviewer_signoff",
+  "baseline_parent": "1ca695cc73cb5570d99052cd5f00830d01dab15e",
+  "comparison_parent_at_task_start": "7652d959ca1f17ddd33a26784548e404085d0a30",
+  "ggml": "6d57c78a2c749cd7d9d58c2f7bd3178729171584",
+  "metric": "First update of a fresh seed-42 run after one identical warmup update in the same process; pipeline and frozen-teacher caches retained",
+  "warm_step1_seconds": [
+    36.133546667000005,
+    35.4531325,
+    35.36655625
+  ],
+  "warm_median_seconds": 35.4531325,
+  "warm_spread_max_minus_min_seconds": 0.7669904170000024,
+  "three_times_spread_seconds": 2.300971251000007,
+  "repeat_rule": "One paired run per slice; increase to three pairs if absolute delta is below three_times_spread_seconds. Batch acceptance always uses three pairs.",
+  "observed_logged_scalar_repeatability_max_abs": {
+    "ar_ce": 0,
+    "ar_kl": 0,
+    "nar_mse": 0,
+    "gradient_norm": 0
+  },
+  "a4_existing_thresholds": {
+    "step1_loss_flow_ar_ce_relative_error_max_inclusive": 0.005,
+    "each_sampled_B_gradient_relative_L2_max_exclusive": 0.03,
+    "each_sampled_post_update_B_relative_L2_max_exclusive": 0.05
+  },
+  "a4_replay": "not_run_missing_fixture_out_of_scope_separate_backlog",
+  "exact_copy_and_rounding": "bitwise_equality_required",
+  "always_reject": [
+    "nonfinite_results",
+    "wrong_shapes",
+    "wrong_backend_placement",
+    "unexplained_accumulating_drift"
+  ],
+  "scope": "Metal versus Metal; A4 recovery and replay are outside this batch",
+  "a4_existing_thresholds_note": "Historical archive only; not an acceptance gate for this batch",
+  "scalar_fields": [
+    "ar_ce",
+    "nar_mse",
+    "ar_kl",
+    "gradient_norm"
+  ],
+  "required_updates": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "exact_slices": [
+    "C",
+    "D",
+    "G",
+    "F"
+  ],
+  "exact_comparison": "Compare IEEE-754 binary64 bit patterns parsed from full-precision JSON scalars; no F32 cast, display rounding, averaging or epsilon. Require finite values first.",
+  "split_k_B": {
+    "absolute_tolerance": 1.1920928955078125e-07,
+    "relative_tolerance": 7.62939453125e-06,
+    "comparison": "abs(candidate - reference) <= absolute_tolerance + relative_tolerance * abs(reference)",
+    "derivation": "F32 epsilon = 2^-23. Choose one epsilon absolute floor plus 64 epsilons relative allowance. Observed baseline noise is zero; add no measured-noise allowance. This is a frozen engineering acceptance budget, not a proven bound on reduction error propagated through training.",
+    "repeatability": "Independent fresh-state repeats of the same B revision must be bit-identical for every scalar at every matched update; no floating atomics."
+  },
+  "comparison_controls": "Each slice alone versus original baseline; sequential slice versus immediate predecessor with identical earlier optimizations. Exact slices must pass exact equality in both isolated and incremental controls. All cumulative results versus original baseline use the single B budget if B is enabled, otherwise exact equality.",
+  "no_tolerance_growth": "Same limits at all seven updates and all later slices; no multiplication by update count, song length, number of slices or timing repeats. Report every signed difference and maximum absolute difference per field.",
+  "tensor_scope": "Scalar norm equality is not tensor equality. Retain slice-specific kernel/output/gradient probes; A4 tensor thresholds are not applied in this batch."
+}

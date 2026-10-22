@@ -1183,12 +1183,20 @@ static int dit_ggml_generate(DiTGGML *           model,
             return false;
         };
 
-        lua_call_solver_loop(*solver_plugin, xt.data(), vt.data(), schedule, num_steps,
+        const bool lua_ok = lua_call_solver_loop(*solver_plugin, xt.data(), vt.data(), schedule, num_steps,
             n_total, N, T, Oc, loop_model_fn, loop_on_step,
             g_hotstep_params.plugin_params, LuaModelContext{},
             solver_state.seeds ? solver_state.seeds[0] : 0);
 
         if (graph_alloc_failed) {
+            static_graph_release(&dit_graph, model->sched);
+            ggml_free(ctx);
+            return -1;
+        }
+
+        if (!lua_ok) {
+            fprintf(stderr, "[DiT] FATAL: full-loop solver '%s' failed (Lua error or missing sample())\n",
+                    solver_plugin->name.c_str());
             static_graph_release(&dit_graph, model->sched);
             ggml_free(ctx);
             return -1;

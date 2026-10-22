@@ -12,10 +12,11 @@
  * The recording is listed under the target album, not the song's own.
  */
 
+import { useQuery } from '@tanstack/react-query';
+import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Shuffle, Play, Send } from 'lucide-react';
-import { lireekApi } from '../../services/lireekApi';
 import type { Generation, LyricsSet, AlbumPreset } from '../../services/lireekApi';
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -56,31 +57,16 @@ export const RenderAcrossModal: React.FC<RenderAcrossModalProps> = ({
 }) => {
   const { t } = useTranslation();
   const { disguiseArtist } = useDisguiseMode();
-  const [albums, setAlbums] = useState<LyricsSet[]>([]);
-  const [presets, setPresets] = useState<Map<number, AlbumPreset>>(new Map());
-  const [allGens, setAllGens] = useState<Generation[]>([]);
+  const albumQuery = useQuery({ ...snapshotOptions<LyricsSet[]>('lireek', '/lireek/lyrics-sets'), enabled: !!mode });
+  const presetQuery = useQuery({ ...snapshotOptions<{ presets: AlbumPreset[] }>('lireek', '/lireek/presets'), enabled: !!mode });
+  const generationQuery = useQuery({ ...snapshotOptions<Generation[] | { generations: Generation[] }>('lireek', '/lireek/generations/all'), enabled: mode === 'from' });
+  const albums = albumQuery.data ?? [];
+  const presets = new Map((presetQuery.data?.presets ?? []).map(p => [p.lyrics_set_id, p]));
+  const allGens = Array.isArray(generationQuery.data) ? generationQuery.data : generationQuery.data?.generations ?? [];
   const [albumId, setAlbumId] = useState<number | ''>('');
   const [genId, setGenId] = useState<number | ''>('');
-  const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    if (!mode) return;
-    setAlbumId(''); setGenId('');
-    let live = true;
-    setLoading(true);
-    Promise.all([
-      lireekApi.listLyricsSets(),
-      lireekApi.listAllPresets().catch(() => ({ presets: [] as AlbumPreset[] })),
-      mode === 'from' ? lireekApi.listAllGenerations() : Promise.resolve(null),
-    ]).then(([ls, pr, gens]) => {
-      if (!live) return;
-      setAlbums(ls.lyrics_sets);
-      setPresets(new Map(pr.presets.map(p => [p.lyrics_set_id, p])));
-      // Server hands back a raw array; the declared type says { generations }.
-      if (gens) setAllGens(Array.isArray(gens) ? gens : (gens.generations || []));
-    }).catch(() => {}).finally(() => { if (live) setLoading(false); });
-    return () => { live = false; };
-  }, [mode]);
+  const loading = !!mode && (albumQuery.isPending || presetQuery.isPending || mode === 'from' && generationQuery.isPending);
+  useEffect(() => { setAlbumId(''); setGenId(''); }, [mode]);
 
   const albumLabel = (a: LyricsSet) => `${disguiseArtist(a.artist_name)} — ${a.album || 'Top Songs'}`;
 

@@ -17,6 +17,8 @@
 //   GET    /api/midi-studio/:jobId/progress       — poll a job
 //   GET    /api/midi-studio/:jobId/stream         — SSE: live note events
 //   GET    /api/midi-studio/:jobId/notes          — parsed notes (piano roll)
+//   POST   /api/midi-studio/:jobId/export         — re-export on a corrected / quantized grid
+//   POST   /api/midi-studio/:jobId/abc            — YuE2 ABC lead sheet from the transcription
 //   GET    /api/midi-studio/:jobId/file           — download the .mid
 //   DELETE /api/midi-studio/:jobId                — cancel/delete a job
 
@@ -30,17 +32,41 @@ import { config } from '../config.js';
 import {
   getHfToken, setHfToken, looksLikeGatedError, aceMidiExe,
   modelDir, isModelDownloaded, startModelDownload, getModelStates,
-  MUSCRIPTOR_MODELS, type MuscriptorModel,
+  MUSCRIPTOR_MODELS, type MuscriptorModel, partialMidiFromEvents,
+  BEAT_MODEL, readGrid, alignToAudio, exportArgs, type MidiExportOptions,
 } from '../services/muscriptor.js';
 import { parseMidiFile } from '../services/midiParser.js';
 import { addMidiLyrics } from '../services/midiLyrics.js';
+import { registerJobsBusyCheck, trackBusy } from '../dataroot/pointer.js';
+import { runOnGpuLane } from '../services/generation/gpuLane.js';
 
 const router = Router();
 
 const midiBaseDir = path.join(config.data.dir, 'midi');
 fs.mkdirSync(midiBaseDir, { recursive: true });
 
-const TRANSCRIBE_TIMEOUT_MS = 60 * 60 * 1000;
+/** Kill ace-midi if it prints nothing for this long (#227: a fixed total
+ *  timeout killed long songs that were still making chunk progress). */
+const TRANSCRIBE_IDLE_TIMEOUT_MS = 20 * 60 * 1000;
+/** Hard cap on one transcription, however steady its progress. */
+const TRANSCRIBE_MAX_MS = 6 * 60 * 60 * 1000;
+
+/** Fires onTimeout('idle') when touch() is not called for idleMs, or
+ *  onTimeout('cap') after capMs total. touch() on each line of output. */
+export function startStallTimer(onTimeout: (why: 'idle' | 'cap') => void, idleMs: number, capMs: number) {
+  let idle = setTimeout(() => onTimeout('idle'), idleMs);
+  const cap = setTimeout(() => onTimeout('cap'), capMs);
+  return {
+    touch() {
+      clearTimeout(idle);
+      idle = setTimeout(() => onTimeout('idle'), idleMs);
+    },
+    clear() {
+      clearTimeout(idle);
+      clearTimeout(cap);
+    },
+  };
+}
 
 interface MidiJob {
   id: string;
@@ -56,13 +82,21 @@ interface MidiJob {
   noteCount: number;
   error?: string;
   gated?: boolean;
+  /** A failed run whose streamed notes were saved as out.mid. */
+  partial?: boolean;
   createdAt: number;
   child?: ChildProcess;
   listeners: Set<Response>;
 }
 
 const jobs = new Map<string, MidiJob>();
-let queueTail: Promise<void> = Promise.resolve();
+registerJobsBusyCheck('MIDI', jobs);
+
+/** Run MIDI work on the shared GPU lane, behind any render or post-process
+ *  already running or queued (#227: running beside YuE2 starved both). */
+export function runOnMidiLane(jobId: string, fn: () => Promise<void>): Promise<void> {
+  return runOnGpuLane(fn, { label: 'midi:' + jobId, family: 'midi' });
+}
 
 /** Resolve a URL-style audio path to an absolute filesystem path */
 function resolveAudioPath(audioUrl: string): string {
@@ -80,6 +114,10 @@ function resolveAudioPath(audioUrl: string): string {
 
 function jobDir(id: string): string { return path.join(midiBaseDir, id); }
 function midPath(id: string): string { return path.join(jobDir(id), 'out.mid'); }
+/** ace-midi's note events, kept so the MIDI can be re-exported on a new grid */
+function eventsPath(id: string): string { return path.join(jobDir(id), 'events.jsonl'); }
+/** Tracked beats + the grid the MIDI was written on (ace-midi --beats-out) */
+function beatsPath(id: string): string { return path.join(jobDir(id), 'beats.json'); }
 
 function broadcast(job: MidiJob, ev: any): void {
   const line = `data: ${JSON.stringify(ev)}\n\n`;
@@ -122,11 +160,16 @@ async function runTranscription(job: MidiJob): Promise<void> {
     job.status = 'transcribing';
     console.log(`[MidiStudio] Job ${job.id}: ace-midi ${path.basename(srcPath)} (model=${job.model})`);
 
+    // With the beat model the MIDI gets tempo, time signature and bar lines
+    const beatArgs = isModelDownloaded(BEAT_MODEL)
+      ? ['--beat-model', modelDir(BEAT_MODEL), '--beats-out', beatsPath(job.id)]
+      : [];
     const child = spawn(exe, [
       '--model', modelDir(job.model),
       '--transcribe', srcPath,
       '--out', midPath(job.id),
       '--jsonl',
+      ...beatArgs,
     ], { windowsHide: true });
     job.child = child;
 
@@ -140,21 +183,22 @@ async function runTranscription(job: MidiJob): Promise<void> {
       }
     });
 
+    const killer = startStallTimer((why) => {
+      console.error(`[MidiStudio] Job ${job.id}: ${why === 'idle' ? 'no progress' : 'timed out'} — killing ace-midi`);
+      child.kill();
+    }, TRANSCRIBE_IDLE_TIMEOUT_MS, TRANSCRIBE_MAX_MS);
+
     const rl = readline.createInterface({ input: child.stdout! });
     rl.on('line', (line) => {
+      killer.touch();
       try { pushEvent(job, JSON.parse(line)); } catch { /* non-JSON noise */ }
     });
-
-    const killer = setTimeout(() => {
-      console.error(`[MidiStudio] Job ${job.id}: timed out — killing ace-midi`);
-      child.kill();
-    }, TRANSCRIBE_TIMEOUT_MS);
 
     const code: number | null = await new Promise((resolve, reject) => {
       child.on('error', (err) => reject(new Error(`Failed to launch ace-midi: ${err.message}`)));
       child.on('close', (c, signal) => resolve(signal ? null : c));
     }).finally(() => {
-      clearTimeout(killer);
+      killer.clear();
       job.child = undefined;
     }) as number | null;
 
@@ -164,51 +208,8 @@ async function runTranscription(job: MidiJob): Promise<void> {
     }
     if (!fs.existsSync(midPath(job.id))) throw new Error('ace-midi finished but produced no MIDI file');
 
-    const lrcPath = path.join(path.dirname(srcPath), `${path.parse(srcPath).name}.lrc`);
-    if (fs.existsSync(lrcPath)) {
-      const midiPath = midPath(job.id);
-      const tempPath = path.join(dir, 'out.lyrics.tmp');
-      try {
-        const original = fs.readFileSync(midiPath);
-        const withLyrics = addMidiLyrics(original, fs.readFileSync(lrcPath, 'utf8'));
-        if (withLyrics !== original) {
-          fs.writeFileSync(tempPath, withLyrics);
-          fs.renameSync(tempPath, midiPath);
-        }
-      } catch (err: any) {
-        console.warn(`[MidiStudio] Job ${job.id}: MIDI lyric post-pass skipped (${err.message})`);
-      } finally {
-        try {
-          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-        } catch (err: any) {
-          console.warn(`[MidiStudio] Job ${job.id}: MIDI lyric temp cleanup failed (${err.message})`);
-        }
-      }
-    }
-
-    // Parse for the piano-roll preview (preview failure is non-fatal)
-    let noteCount = job.noteCount;
-    let durationSec = 0;
-    try {
-      const parsed = parseMidiFile(fs.readFileSync(midPath(job.id)));
-      noteCount = parsed.noteCount;
-      durationSec = parsed.durationSec;
-      fs.writeFileSync(path.join(dir, 'notes.json'), JSON.stringify(parsed));
-    } catch (err: any) {
-      console.warn(`[MidiStudio] Job ${job.id}: MIDI parse for preview failed (${err.message})`);
-    }
-
-    fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({
-      id: job.id,
-      sourceAudioUrl: job.sourceAudioUrl,
-      sourceFileName: job.sourceFileName,
-      songId: job.songId,
-      model: job.model,
-      noteCount,
-      durationSec,
-      createdAt: new Date(job.createdAt).toISOString(),
-    }, null, 2));
-
+    addLyrics(job.id, srcPath);
+    const { noteCount, durationSec } = saveResult(job);
     job.status = 'done';
     console.log(`[MidiStudio] Job ${job.id}: done (${noteCount} notes, ${durationSec.toFixed(1)}s)`);
   } catch (err: any) {
@@ -217,10 +218,95 @@ async function runTranscription(job: MidiJob): Promise<void> {
       job.error = err.message || 'Unknown error';
       job.gated = looksLikeGatedError(job.error || '');
       console.error(`[MidiStudio] Job ${job.id}: FAILED — ${job.error}`);
+      savePartial(job);
     }
   } finally {
     endStream(job);
   }
+}
+
+/** Embed lyrics from an .lrc next to the source audio into out.mid, if any. */
+function addLyrics(jobId: string, srcPath: string): void {
+  const lrcPath = path.join(path.dirname(srcPath), `${path.parse(srcPath).name}.lrc`);
+  if (!fs.existsSync(lrcPath)) return;
+  const midiPath = midPath(jobId);
+  const tempPath = path.join(jobDir(jobId), 'out.lyrics.tmp');
+  try {
+    const original = fs.readFileSync(midiPath);
+    const withLyrics = addMidiLyrics(original, fs.readFileSync(lrcPath, 'utf8'));
+    if (withLyrics !== original) {
+      fs.writeFileSync(tempPath, withLyrics);
+      fs.renameSync(tempPath, midiPath);
+    }
+  } catch (err: any) {
+    console.warn(`[MidiStudio] Job ${jobId}: MIDI lyric post-pass skipped (${err.message})`);
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch (err: any) {
+      console.warn(`[MidiStudio] Job ${jobId}: MIDI lyric temp cleanup failed (${err.message})`);
+    }
+  }
+}
+
+/** Parse out.mid into notes.json for the piano roll. A bar-aligned MIDI is
+ *  moved back onto the audio's clock and carries its grid. */
+function writeNotesJson(jobId: string): { noteCount: number; durationSec: number } {
+  let parsed: any = parseMidiFile(fs.readFileSync(midPath(jobId)));
+  const grid = fs.existsSync(beatsPath(jobId)) ? readGrid(fs.readFileSync(beatsPath(jobId), 'utf-8')) : null;
+  if (grid) parsed = alignToAudio(parsed, grid);
+  fs.writeFileSync(path.join(jobDir(jobId), 'notes.json'), JSON.stringify(parsed));
+  return { noteCount: parsed.noteCount, durationSec: parsed.durationSec };
+}
+
+/** A failed run keeps the notes it streamed before it died (#227). */
+function savePartial(job: MidiJob): void {
+  try {
+    if (!fs.existsSync(midPath(job.id))) {
+      const mid = partialMidiFromEvents(job.events);
+      if (!mid) return;
+      fs.mkdirSync(jobDir(job.id), { recursive: true });
+      fs.writeFileSync(midPath(job.id), mid);
+    }
+    const { noteCount } = saveResult(job, true);
+    job.partial = true;
+    console.log(`[MidiStudio] Job ${job.id}: kept partial MIDI (${noteCount} notes, ${job.chunksDone}/${job.chunksTotal} chunks)`);
+  } catch (err: any) {
+    console.warn(`[MidiStudio] Job ${job.id}: could not keep partial MIDI (${err.message})`);
+  }
+}
+
+/** Write notes.json and _meta.json for out.mid; returns what the preview parsed. */
+function saveResult(job: MidiJob, partial = false): { noteCount: number; durationSec: number } {
+  const dir = jobDir(job.id);
+  // Parse for the piano-roll preview (preview failure is non-fatal)
+  let noteCount = job.noteCount;
+  let durationSec = 0;
+  try {
+    fs.writeFileSync(eventsPath(job.id), job.events
+      .filter(e => e?.type === 'note_start' || e?.type === 'note_end')
+      .map(e => JSON.stringify(e)).join('\n') + '\n');
+  } catch (err: any) {
+    console.warn(`[MidiStudio] Job ${job.id}: could not keep note events (${err.message})`);
+  }
+  try {
+    ({ noteCount, durationSec } = writeNotesJson(job.id));
+  } catch (err: any) {
+    console.warn(`[MidiStudio] Job ${job.id}: MIDI parse for preview failed (${err.message})`);
+  }
+
+  fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({
+    id: job.id,
+    sourceAudioUrl: job.sourceAudioUrl,
+    sourceFileName: job.sourceFileName,
+    songId: job.songId,
+    model: job.model,
+    noteCount,
+    durationSec,
+    createdAt: new Date(job.createdAt).toISOString(),
+    ...(partial ? { partial: true, error: job.error, chunksDone: job.chunksDone, chunksTotal: job.chunksTotal } : {}),
+  }, null, 2));
+  return { noteCount, durationSec };
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────
@@ -250,10 +336,10 @@ router.post('/hf-token', (req: Request, res: Response) => {
   }
 });
 
-/** POST /models/:size/download — begin downloading gated weights */
+/** POST /models/:size/download — begin downloading gated weights (or the beat model) */
 router.post('/models/:size/download', (req: Request, res: Response) => {
-  const size = req.params.size as MuscriptorModel;
-  if (!MUSCRIPTOR_MODELS.includes(size)) {
+  const size = req.params.size as MuscriptorModel | typeof BEAT_MODEL;
+  if (size !== BEAT_MODEL && !MUSCRIPTOR_MODELS.includes(size)) {
     res.status(400).json({ error: `Unknown model '${size}'` });
     return;
   }
@@ -297,7 +383,14 @@ router.post('/transcribe', (req: Request, res: Response) => {
     listeners: new Set(),
   };
   jobs.set(job.id, job);
-  queueTail = queueTail.then(() => runTranscription(job));
+  // Tracked from enqueue: a queued job deleted from the map still runs later.
+  void trackBusy('MIDI', runOnMidiLane(job.id, () => runTranscription(job))).catch((err: any) => {
+    // Only a queue reset rejects here; runTranscription settles its own errors.
+    if (job.status !== 'queued') return;
+    job.status = 'cancelled';
+    job.error = err.message || 'Queue reset';
+    endStream(job);
+  });
 
   console.log(`[MidiStudio] Job ${job.id} queued: ${job.sourceFileName} (model=${m})`);
   res.json({ id: job.id });
@@ -318,7 +411,8 @@ router.get('/jobs', (_req: Request, res: Response) => {
           onDisk.add(meta.id || entry.name);
           summaries.push({
             id: meta.id || entry.name,
-            status: 'done',
+            // A kept partial stays a failure, before and after a restart.
+            status: meta.partial ? 'failed' : 'done',
             sourceFileName: meta.sourceFileName || 'unknown',
             sourceAudioUrl: meta.sourceAudioUrl,
             songId: meta.songId,
@@ -326,6 +420,10 @@ router.get('/jobs', (_req: Request, res: Response) => {
             noteCount: meta.noteCount || 0,
             durationSec: meta.durationSec || 0,
             createdAt: meta.createdAt || '',
+            exportOptions: meta.export,
+            ...(meta.partial ? {
+              partial: true, error: meta.error, chunksDone: meta.chunksDone, chunksTotal: meta.chunksTotal,
+            } : {}),
           });
         } catch { /* skip corrupted meta */ }
       }
@@ -346,6 +444,7 @@ router.get('/jobs', (_req: Request, res: Response) => {
         createdAt: new Date(job.createdAt).toISOString(),
         error: job.error,
         gated: job.gated,
+        partial: job.partial,
       });
     }
     summaries.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
@@ -360,8 +459,11 @@ router.get('/:jobId/progress', (req: Request, res: Response) => {
   const jobId = req.params.jobId as string;
   const job = jobs.get(jobId);
   if (!job) {
-    if (fs.existsSync(path.join(jobDir(jobId), '_meta.json'))) {
-      res.json({ status: 'done' });
+    const metaPath = path.join(jobDir(jobId), '_meta.json');
+    if (fs.existsSync(metaPath)) {
+      let meta: any = {};
+      try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')); } catch { /* treat as done */ }
+      res.json(meta.partial ? { status: 'failed', partial: true, error: meta.error } : { status: 'done' });
       return;
     }
     res.status(404).json({ error: 'Job not found' });
@@ -374,6 +476,7 @@ router.get('/:jobId/progress', (req: Request, res: Response) => {
     noteCount: job.noteCount,
     error: job.error,
     gated: job.gated,
+    partial: job.partial,
   });
 });
 
@@ -413,14 +516,121 @@ router.get('/:jobId/notes', (req: Request, res: Response) => {
       return;
     }
     if (fs.existsSync(midPath(jobId))) {
-      const parsed = parseMidiFile(fs.readFileSync(midPath(jobId)));
-      fs.writeFileSync(notesPath, JSON.stringify(parsed));
-      res.json(parsed);
+      writeNotesJson(jobId);
+      res.setHeader('Content-Type', 'application/json');
+      fs.createReadStream(notesPath).pipe(res);
       return;
     }
     res.status(404).json({ error: 'No MIDI data for this job' });
   } catch (err: any) {
     res.status(500).json({ error: `MIDI parse failed: ${err.message}` });
+  }
+});
+
+/** POST /:jobId/export — rewrite out.mid on a corrected grid (tempo, meter,
+ *  downbeat, beat scale) and/or quantized, from the kept note events and
+ *  tracked beats. Grid maths only: no model, no GPU. */
+router.post('/:jobId/export', async (req: Request, res: Response) => {
+  const jobId = req.params.jobId as string;
+  const live = jobs.get(jobId);
+  if (live && (live.status === 'queued' || live.status === 'transcribing')) {
+    res.status(409).json({ error: 'Still transcribing' });
+    return;
+  }
+  if (!fs.existsSync(eventsPath(jobId)) || !fs.existsSync(beatsPath(jobId))) {
+    res.status(409).json({ error: 'This transcription has no beat grid. Download the tempo model and transcribe again.' });
+    return;
+  }
+  const exe = aceMidiExe();
+  if (!exe) {
+    res.status(503).json({ error: 'ace-midi engine binary not found' });
+    return;
+  }
+  const opts: MidiExportOptions = req.body || {};
+  const dir = jobDir(jobId);
+  const tmpMid = path.join(dir, 'out.export.tmp');
+  const tmpBeats = path.join(dir, 'beats.export.tmp');
+  try {
+    const stderr: string[] = [];
+    const code: number | null = await new Promise((resolve, reject) => {
+      const child = spawn(exe, [
+        '--export', eventsPath(jobId), '--beats-in', beatsPath(jobId),
+        '--out', tmpMid, '--beats-out', tmpBeats, ...exportArgs(opts),
+      ], { windowsHide: true });
+      child.stderr?.on('data', (b: Buffer) => stderr.push(b.toString('utf-8')));
+      child.on('error', reject);
+      child.on('close', c => resolve(c));
+    });
+    if (code !== 0 || !fs.existsSync(tmpMid)) {
+      throw new Error(`ace-midi export failed (${code}): ${stderr.join('').trim().split(/\r?\n/).slice(-3).join(' | ')}`);
+    }
+    fs.renameSync(tmpMid, midPath(jobId));
+    fs.renameSync(tmpBeats, beatsPath(jobId));
+
+    const metaPath = path.join(dir, '_meta.json');
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+    if (meta.sourceAudioUrl) addLyrics(jobId, resolveAudioPath(meta.sourceAudioUrl));
+    const { noteCount, durationSec } = writeNotesJson(jobId);
+    fs.writeFileSync(metaPath, JSON.stringify({ ...meta, noteCount, durationSec, export: opts }, null, 2));
+    console.log(`[MidiStudio] Job ${jobId}: re-exported (${exportArgs(opts).join(' ') || 'detected grid'})`);
+    res.json({ ok: true, grid: readGrid(fs.readFileSync(beatsPath(jobId), 'utf-8')), noteCount });
+  } catch (err: any) {
+    for (const p of [tmpMid, tmpBeats]) { try { fs.rmSync(p, { force: true }); } catch { /* ignore */ } }
+    console.error(`[MidiStudio] Job ${jobId}: export FAILED — ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** POST /:jobId/abc — the transcription as a YuE2 two-voice ABC lead sheet
+ *  (voice -> Vocal, one instrument -> Ins, estimated key and chords) on the
+ *  job's current grid. Body: { ins?: GM program, melodyOnly?: boolean }. */
+router.post('/:jobId/abc', async (req: Request, res: Response) => {
+  const jobId = req.params.jobId as string;
+  if (!fs.existsSync(eventsPath(jobId)) || !fs.existsSync(beatsPath(jobId))) {
+    res.status(409).json({ error: 'This transcription has no beat grid. Download the tempo model and transcribe again.' });
+    return;
+  }
+  const exe = aceMidiExe();
+  if (!exe) {
+    res.status(503).json({ error: 'ace-midi engine binary not found' });
+    return;
+  }
+  const dir = jobDir(jobId);
+  let opts: MidiExportOptions = {};
+  try { opts = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf-8')).export || {}; } catch { /* detected grid */ }
+  const ins = Number(req.body?.ins);
+  const abcPath = path.join(dir, 'score.abc');
+  const tmpMid = path.join(dir, 'abc.export.tmp');
+  try {
+    let stdout = '';
+    const stderr: string[] = [];
+    const code: number | null = await new Promise((resolve, reject) => {
+      const child = spawn(exe, [
+        '--export', eventsPath(jobId), '--beats-in', beatsPath(jobId), '--out', tmpMid, '--abc-out', abcPath,
+        ...exportArgs(opts),
+        ...(Number.isInteger(ins) && ins >= 0 && ins < 128 ? ['--abc-ins', String(ins)] : []),
+        ...(req.body?.melodyOnly ? ['--abc-melody-only'] : []),
+      ], { windowsHide: true });
+      child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf-8'); });
+      child.stderr?.on('data', (b: Buffer) => stderr.push(b.toString('utf-8')));
+      child.on('error', reject);
+      child.on('close', c => resolve(c));
+    });
+    fs.rmSync(tmpMid, { force: true });
+    const line = stdout.split(/\r?\n/).find(l => l.startsWith('{"type":"abc"'));
+    const summary = line ? JSON.parse(line) : null;
+    if (code !== 0 || !summary) {
+      throw new Error(`ace-midi failed (${code}): ${stderr.join('').trim().split(/\r?\n/).slice(-3).join(' | ')}`);
+    }
+    if (!summary.ok) {
+      res.status(422).json({ error: summary.error || 'The notes could not be written as ABC', summary });
+      return;
+    }
+    res.json({ abc: fs.readFileSync(abcPath, 'utf-8'), summary });
+  } catch (err: any) {
+    fs.rmSync(tmpMid, { force: true });
+    console.error(`[MidiStudio] Job ${jobId}: ABC FAILED — ${err.message}`);
+    res.status(500).json({ error: err.message });
   }
 });
 

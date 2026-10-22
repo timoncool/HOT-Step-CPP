@@ -42,6 +42,9 @@ async function capabilities(): Promise<BackendCapabilities> {
       // No auto: the LM is TOLD a length and the FSM aims for it — there is
       // no stop token that ends the song where it wants to end.
       duration: { max: 600, auto: false },
+      captionSource: 'none',
+      timeSignature: true,
+      languageMeans: 'vocal',
       bpm: true,
       keyscale: true,
       negativePrompt: true,
@@ -225,28 +228,31 @@ export const aceBackend: EngineBackend = {
    *  in-use ACE module so the other family isn't fighting it for VRAM. Uses
    *  the same GET /models/loaded + POST /models/unload pair the VRAM
    *  indicator's manual unload uses (routes/logs.ts:120-145) — one label per
-   *  call is all the engine's endpoint accepts. Best-effort throughout: this
-   *  runs fire-and-forget behind a backend switch and must never throw. */
+   *  call is all the engine's endpoint accepts. The next family loads only
+   *  after this resolves (services/generation/backendRelease.ts), so it
+   *  throws unless a second /models/loaded shows nothing left: an
+   *  unreachable engine, an error answer or a module still resident (in use,
+   *  or an unload that did not take) all count as unconfirmed. */
   async releaseVram() {
-    let loaded: Array<{ label: string; in_use?: boolean }> = [];
-    try {
+    type Loaded = { label: string; in_use?: boolean };
+    const resident = async (): Promise<Loaded[]> => {
       const res = await fetch(`${config.aceServer.url}/models/loaded`, {
         signal: AbortSignal.timeout(3000),
       });
-      if (!res.ok) return;
-      const body = await res.json() as { loaded?: Array<{ label: string; in_use?: boolean }> };
-      loaded = Array.isArray(body.loaded) ? body.loaded : [];
-    } catch {
-      return;   // engine unreachable — nothing resident that we can free anyway
+      if (!res.ok) throw new Error(`ACE /models/loaded answered HTTP ${res.status}`);
+      const body = await res.json() as { loaded?: Loaded[] };
+      if (!Array.isArray(body.loaded)) throw new Error('ACE /models/loaded returned no module list');
+      return body.loaded.filter(m => m?.label);
+    };
+    const before = await resident();
+    if (before.length === 0) return;
+    for (const m of before) {
+      if (!m.in_use) await aceClient.unloadLabel(m.label);   // in-use modules are skipped engine-side too
     }
-
-    const freed: string[] = [];
-    for (const m of loaded) {
-      if (!m?.label || m.in_use) continue;   // in-use modules are skipped engine-side too
-      if (await aceClient.unloadLabel(m.label)) freed.push(m.label);
+    const left = await resident();
+    if (left.length) {
+      throw new Error(`ACE modules still resident after unload: ${left.map(m => m.label + (m.in_use ? ' (in use)' : '')).join(', ')}`);
     }
-    if (freed.length) {
-      console.log(`[Backends] ACE-Step residency released: ${freed.join(', ')}`);
-    }
+    console.log(`[Backends] ACE-Step residency released: ${before.map(m => m.label).join(', ')}`);
   },
 };

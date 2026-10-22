@@ -1,5 +1,9 @@
 # Reference: Generation Request Flow — deep detail
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 Companion to [SKILL.md](SKILL.md). All line numbers verified against `master` (HEAD `168dcb5`, 2026-07-02) — re-verify after major refactors.
 
 ## 1. UI tier — where the request is born
@@ -42,7 +46,7 @@ Endpoints (all under `/api/generate`):
    - Source prep (~:446-530): cover tasks load source audio, apply tempo/pitch, VAE-encode via engine `/vae` with a disk latent cache (`sourceLatentCache.ts`, keyed on path+tempo+pitch+vae_model, :491-497); timbre reference likewise.
    - Format selection (:549-566): `wav32` if any post-processing active, `source === 'builder'`, or mastering-with-reference; else `wav16`. wav16 peak-normalizes to 0 dBFS in the engine; wav32 skips normalization (headroom for PP; stable levels across Song Builder appends).
    - Multipart decision (:814-826): multipart iff any of `srcAudioBuf | refAudioBuf | srcLatentBuf | refLatentBuf | seedLatentBuf` present → `submitSynthMultipart`; else plain-JSON `submitSynth`.
-7. After synth: audio saved to `server/data/audio/<uuid>.wav|mp3` (`config.data.audioDir`, :840); LRC lyrics from base64 `x-lrc-text` response header (:924); post-DiT latent fetched and stored alongside (~:1023).
+7. After synth: audio saved to `<data root>/library/audio/<uuid>.wav|mp3` (`config.data.audioDir`, :840); LRC lyrics from base64 `x-lrc-text` response header (:924); post-DiT latent fetched and stored alongside (~:1023).
 8. Auto-trim (before PP; needs `autoTrimEnabled` + `durationBuffer`, corrects duration metadata, :1057-1094) → post-processing chain (`postProcessing.ts`; raw WAV never modified, PP runs on a copy) → **SQLite insert** per track (:1152): `INSERT INTO songs (id, user_id, title, lyrics, style, caption, audio_url, duration, bpm, key_scale, time_signature, tags, dit_model, generation_params, ...)` — `generation_params` = `JSON.stringify(job.params)` (full UI params incl. resolved seed), `style` = the user's original style input, `caption` = the LM CoT caption.
 
 **Watchdogs** (`pollUntilDone`, ~:100-140):

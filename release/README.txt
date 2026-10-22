@@ -1,107 +1,45 @@
-==============================================================
-  HOT-Step 9000 — High-Performance AI Music Generation
-==============================================================
+HOT-Step CPP
+============
 
 QUICK START
------------
-1. Extract this folder anywhere you like.
-2. Double-click "HOT-Step.bat" to start.
-3. Your browser will open to http://localhost:3001 automatically.
-4. On first launch, go to Settings > Model Manager to download
-   the AI models (~7 GB). You'll need an internet connection.
+Extract the complete archive. Windows: double-click HOT-Step.bat.
+Linux or macOS: run ./HOT-Step.sh.
+Open http://localhost:3001 if the browser does not open automatically.
+Download models from the Model Manager.
 
-That's it! No installation required.
+DATA AND UPGRADES
+User data defaults to HOT-Step-Data beside the app folder. It includes library,
+audio, training, models, adapters, logs, tools and settings/.env. Engine binaries,
+UI, bundled runtime, shipped plugins and server/data catalogues stay in the app.
 
+Your profile saves the data location in data-location.json:
+  Windows: %LOCALAPPDATA%/HOT-Step
+  Linux: $XDG_CONFIG_HOME/hot-step or ~/.config/hot-step
+  macOS: ~/Library/Application Support/HOT-Step
 
-REQUIREMENTS
-------------
-- Windows 10/11 (64-bit)
-- NVIDIA GPU with recent drivers (RTX 2060 or newer recommended)
-  * CPU-only mode works but is significantly slower
-- ~10 GB free disk space (for models + generated audio)
-- Internet connection for first-run model downloads
+Stop the app, back up the data folder, and extract the next version separately.
+The new launcher reuses the saved location and downloaded weights.
+With no pointer, an older install launched in place migrates to the sibling folder.
+A fresh extraction elsewhere can import the old app folder through Settings.
 
+Settings > Environment > Data folder provides Move current data, Use existing
+folder, Create empty data folder and Import previous install. Preview the paths
+and space required, finish active work, then confirm and restart. External
+folder overrides stay external. Import needs an empty library and keeps the
+older install. Repoint copies and deletes nothing.
 
-GPU SUPPORT
------------
-CUDA Build (NVIDIA):
-  Supports all NVIDIA GPUs with recent drivers:
-    - RTX 2000 series (Turing)
-    - RTX 3000 series (Ampere)
-    - RTX 4000 series (Ada Lovelace)
-    - RTX 5000 series (Blackwell)
-
-Vulkan Build (AMD / NVIDIA / Intel):
-  Uses Vulkan for GPU acceleration. Works with most modern GPUs
-  that have Vulkan 1.1+ support. Requires GPU drivers with the
-  Vulkan runtime installed (included with most driver packages).
-
-  IMPORTANT: Use the 4B LM model with the Vulkan build.
-  The 1.7B LM model produces corrupted output due to precision
-  issues in the Vulkan compute shaders. The 4B model works
-  correctly. This does not affect the DiT or VAE pipelines.
-
-CPU Build:
-  Runs entirely on CPU. No GPU required, but generation will be
-  significantly slower.
-
-Make sure your GPU drivers are up to date:
-  https://www.nvidia.com/en-us/drivers/
-
-
-STEM SEPARATION (Optional)
----------------------------
-Stem separation requires additional runtime files (~1.3 GB).
-When you first use Stem Studio, you'll be prompted to download
-them from the Model Manager.
-
-These files include ONNX Runtime and cuDNN libraries required
-for the neural network stem separator.
-
+If a drive is missing or a transfer stops, keep the pointer and data intact.
+Read the explanation page, fix the reported problem and restart to resume.
 
 CONFIGURATION
--------------
-To customize settings, copy ".env.example" to ".env" and edit it.
-Most settings can also be changed from the Settings page in the app.
+Settings writes <data folder>/settings/.env from the shipped .env.example.
+Leave managed paths unset. A process HOT_STEP_DATA_ROOT override selects another
+existing folder for that launch.
 
+REQUIREMENTS
+Use the platform and GPU variant matching your system. Node.js is bundled.
+Models require additional disk space and internet for the first download.
+Linux ROCm builds require compatible system ROCm libraries.
+If macOS blocks the unsigned app: xattr -cr /path/to/extracted-app/
 
-FOLDER STRUCTURE
-----------------
-  HOT-Step.bat        — Launch the application
-  runtime/            — Node.js runtime (do not modify)
-  engine/             — C++ inference engine
-  server/             — Application server
-  ui/                 — Web interface
-  models/             — AI model files (downloaded on first run)
-  adapters/           — LoRA adapters (optional)
-  Essentia/           — Audio analysis tool
-  noise_samples/      — Noise profiles for denoising (optional)
-
-
-TROUBLESHOOTING
----------------
-Q: The app won't start.
-A: Make sure you extracted the FULL zip. Don't move individual
-   files. Try running HOT-Step.bat from an elevated command prompt.
-
-Q: Generation is very slow.
-A: Check that your NVIDIA drivers are installed. The app will
-   fall back to CPU if no GPU is detected. See Settings > Health
-   for GPU status.
-
-Q: No sound / playback issues.
-A: Make sure your browser allows audio playback. Try a different
-   browser (Chrome or Edge recommended).
-
-Q: Model download fails.
-A: Check your internet connection. Downloads can be resumed —
-   just click the download button again.
-
-
-LICENSE & CREDITS
------------------
-Built on ACE-Step (MIT License) — https://github.com/ace-step
-GGML inference framework — https://github.com/ggml-org/ggml
-
-For support and updates:
-  https://github.com/scragnog/HOT-Step-CPP
+Documentation and support: https://github.com/scragnog/HOT-Step-CPP

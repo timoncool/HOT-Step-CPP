@@ -12,7 +12,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-import { config, PROJECT_ROOT, PORTABLE_MODE, APP_VERSION } from './config.js';
+import { config, PROJECT_ROOT, PORTABLE_MODE, APP_VERSION, DATA_ROOT } from './config.js';
 import { initLogger, closeLogger } from './services/logger.js';
 import { initDb, closeDb } from './db/database.js';
 // lireekDb is now part of the unified hotstep.db — no separate init needed
@@ -51,7 +51,20 @@ import { startYue2Mirror } from './services/training/yue2Mirror.js';
 import backendsRoutes from './routes/backends.js';
 import audioRoutes from './routes/audio.js';
 import yue2CoverRoutes from './routes/yue2Cover.js';
+import resolveRoutes from './routes/resolve.js';
+import audioQueueRoutes from './routes/audioQueue.js';
+import { startAudioIntentQueue } from './routes/audioQueue.js';
+import workflowRoutes from './routes/workflows.js';
+import { startWorkflowJobs } from './routes/workflows.js';
+import { registerRepaintLayerWorkflows } from './services/workflows/repaintLayerWorkflow.js';
 import listeningRoutes from './routes/listening.js';
+import preferencesRoutes from './routes/preferences.js';
+import studioDraftsRoutes from './routes/studioDrafts.js';
+import streamSessionsRoutes from './routes/streamSessions.js';
+import exportImportRoutes from './routes/exportImport.js';
+import compareRoutes from './routes/compare.js';
+import dawV1Routes from './routes/dawV1.js';
+import { dawBodyErrorHandler } from './routes/dawV1.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -117,6 +130,18 @@ app.use('/api/training/worker', workerRouter);
 app.use('/api/training', trainingRoutes);
 app.use('/api/audio', audioRoutes);
 app.use('/api/yue2-cover', yue2CoverRoutes);
+app.use('/api/resolve', resolveRoutes);
+app.use('/api/audio-queue', audioQueueRoutes);
+app.use('/api/workflows', workflowRoutes);
+app.use('/api/preferences', preferencesRoutes);
+app.use('/api/studio-drafts', studioDraftsRoutes);
+app.use('/api/stream-sessions', streamSessionsRoutes);
+app.use('/api/export-import', exportImportRoutes);
+// Repaint and Stem Builder kinds have no route of their own to register from.
+registerRepaintLayerWorkflows();
+app.use('/api/compare', compareRoutes);
+app.use('/api/v1/daw', dawV1Routes);
+app.use('/api/v1/daw', dawBodyErrorHandler);
 // Mounted at '/api' (not '/api/backends') — the router spells its own full
 // sub-paths (/backends, /backends/active, /capabilities) per the plan's
 // top-level /api/capabilities path (docs/plans/multi-backend-architecture.md §4.2).
@@ -157,7 +182,9 @@ if (fs.existsSync(uiDistPath)) {
   // Assets with content hashes get long cache; index.html always revalidates
   app.use(express.static(uiDistPath, {
     setHeaders: (res, filePath) => {
-      if (filePath.endsWith('.html')) {
+      if (filePath.endsWith('.webmanifest')) res.setHeader('Content-Type', 'application/manifest+json');
+      // index.html, the service worker and the manifest must revalidate so updates reach installed apps.
+      if (filePath.endsWith('.html') || filePath.endsWith('sw.js') || filePath.endsWith('.webmanifest')) {
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       } else {
         res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
@@ -182,7 +209,7 @@ import { setEngineReady } from './engineState.js';
 import { restoreMm3Selection } from './services/backends/minimax/index.js';
 import { restoreYue2Selection } from './services/backends/yue2/index.js';
 import { aceClient } from './services/aceClient.js';
-import { onEngineRestarted, startAceServer, stopAceServer } from './services/aceEngineProcess.js';
+import { onEngineRestarted, retryIfGaveUp, startAceServer, stopAceServer } from './services/aceEngineProcess.js';
 import { killActiveChildren } from './services/training/labelingQueue.js';
 
 // ── Required runtime DLL bootstrap ──────────────────────────────────
@@ -191,6 +218,7 @@ import { killActiveChildren } from './services/training/labelingQueue.js';
 // before starting ace-server, with clear progress and error messages.
 
 import { modelDownloadService } from './services/modelDownloadService.js';
+import { hasRuntimeFile } from './services/runtimeFiles.js';
 
 /** Detect CUDA major version from engine build marker */
 function detectCudaMajorVersion(): number {
@@ -213,7 +241,10 @@ function getRequiredRuntimeIds(): string[] {
 }
 
 async function ensureRequiredRuntime(): Promise<{ ok: boolean; missing: string[] }> {
-  const engineDir = path.dirname(config.aceServer.exe);
+  // Downloads land in the data folder's tools/runtime in a release
+  // (modelDownloadService.engineDir); older installs keep them beside the exe.
+  const runtimeDirs = [modelDownloadService.engineDir, path.dirname(config.aceServer.exe)];
+  const present = (filename: string) => hasRuntimeFile(runtimeDirs, filename);
   const registry = JSON.parse(
     fs.readFileSync(path.join(__dirname, 'data', 'model-registry.json'), 'utf-8')
   );
@@ -223,7 +254,7 @@ async function ensureRequiredRuntime(): Promise<{ ok: boolean; missing: string[]
   for (const id of REQUIRED_RUNTIME_IDS) {
     const file = registry.files.find((f: any) => f.id === id);
     if (!file) continue;
-    if (!fs.existsSync(path.join(engineDir, file.filename))) {
+    if (!present(file.filename)) {
       missing.push({ id, filename: file.filename });
     }
   }
@@ -306,7 +337,7 @@ async function ensureRequiredRuntime(): Promise<{ ok: boolean; missing: string[]
   // Re-check which files are actually present
   const stillMissing: string[] = [];
   for (const m of missing) {
-    if (!fs.existsSync(path.join(engineDir, m.filename))) {
+    if (!present(m.filename)) {
       stillMissing.push(m.filename);
     }
   }
@@ -348,6 +379,17 @@ async function ensureRequiredRuntime(): Promise<{ ok: boolean; missing: string[]
   setEngineReady(false, cudaReady ? 'Starting engine...' : 'Starting engine (CPU only — CUDA runtime missing)...');
   startAceServer();
   setEngineReady(true, cudaReady ? 'Ready' : 'Ready (CPU only — GPU runtime missing)');
+
+  // The engine scans models once at boot, so wait for the whole queue to
+  // drain before retrying — retrying after the first file can boot it on a
+  // VAE alone, blind to the DiT still downloading.
+  modelDownloadService.on('progress', () => {
+    const jobs = modelDownloadService.getJobs();
+    if (jobs.some(j => j.status === 'completed')
+        && !jobs.some(j => j.status === 'queued' || j.status === 'downloading')) {
+      retryIfGaveUp();
+    }
+  });
 
   // MiniMax-Music3 holds its chosen quant in engine memory, so a restart
   // reverts to the best-first default (f16) and silently discards the user's
@@ -425,10 +467,17 @@ const server = app.listen(config.server.port, config.server.host, () => {
   console.log(`[Server] HOT-Step CPP v${APP_VERSION}`);
   console.log(`[Server] Listening on http://localhost:${config.server.port}`);
   console.log(`[Server] ace-server URL: ${config.aceServer.url}`);
+  if (DATA_ROOT) console.log(`[Server] Data folder: ${DATA_ROOT}`);
   console.log(`[Server] Data directory: ${config.data.dir}`);
   console.log('');
   console.log(`  🎵 Open http://localhost:${config.server.port} in your browser`);
   console.log('');
+  // Durable audio queue: surface items a previous process left mid-submit,
+  // then start submitting pending ones.
+  startAudioIntentQueue();
+  // Workflow jobs: mark jobs a previous process left running as interrupted,
+  // then start pending ones.
+  startWorkflowJobs();
 });
 
 // Graceful shutdown

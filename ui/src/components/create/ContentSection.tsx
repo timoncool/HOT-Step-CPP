@@ -7,6 +7,8 @@ import { useTranslation } from 'react-i18next';
 import { hasWildcards, expandInPlace, randomWildcardSeed } from '../../utils/wildcardUtils';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
+import { Fold } from '../shared/Fold';
+import { usePersistedState } from '../../hooks/usePersistedState';
 import { StylePresetSelect } from './StylePresetSelect';
 
 interface ContentSectionProps {
@@ -40,6 +42,12 @@ interface ContentSectionProps {
    *  MM3 "caption source" control, which renders under a dataset track's own
    *  Structured Caption. Visibly dimmed, not merely inert. */
   captionReadOnly?: boolean;
+  /** YuE2 layout: no auto-expand, trigger or Beat I/O controls (YuE2 adapters
+   *  carry their trigger; the Adapters dropdown takes one for those that do
+   *  not), and the negative prompt folded away. */
+  yue2Mode?: boolean;
+  /** Rendered directly under the Style Description (YuE2: Dataset Caption Options). */
+  afterStyle?: React.ReactNode;
 }
 
 export const ContentSection: React.FC<ContentSectionProps> = ({
@@ -53,10 +61,12 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
   autoExpand, onAutoExpandChange,
   wildcardSeed,
   captionReadOnly = false,
+  yue2Mode = false,
+  afterStyle,
 }) => {
   const { t } = useTranslation();
   const hasMetadata = !!(title || artist || subject);
-  const [showMetadata, setShowMetadata] = React.useState(hasMetadata);
+  const [showMetadata, setShowMetadata] = usePersistedState('hs-create-fold-songInfo', hasMetadata);
   const styleRef = React.useRef<HTMLTextAreaElement>(null);
   const lyricsRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -115,13 +125,15 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
                 {'{·}'} {t('contentSection.expand')}
               </button>
             )}
-            {autoExpandBtn}
+            {!yue2Mode && autoExpandBtn}
+            {/* Style presets write an ensemble description straight into the caption. */}
+            {!captionReadOnly && <StylePresetSelect caption={caption} onCaptionChange={onCaptionChange} />}
           </div>
         </div>
         <textarea
           ref={styleRef}
           readOnly={captionReadOnly}
-          className={`w-full px-3 py-2.5 rounded-xl border border-zinc-300 dark:border-white/10 text-sm placeholder:text-zinc-400 dark:placeholder:text-zinc-600 outline-none resize-none transition-colors ${
+          className={`w-full px-3 py-2.5 rounded-xl border border-zinc-300 dark:border-white/10 text-sm placeholder:text-zinc-400 dark:placeholder:text-zinc-600 outline-none resize-vertical transition-colors ${
             captionReadOnly
               ? 'bg-zinc-100 dark:bg-zinc-900/50 text-zinc-500 dark:text-zinc-500 font-mono text-xs cursor-default'
               : 'bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200 focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20'
@@ -132,16 +144,12 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
           rows={captionReadOnly ? 8 : 3}
         />
 
-        {/* Style presets write an ensemble description straight into the caption. */}
-        {!captionReadOnly && (
-          <div className="mt-1.5">
-            <StylePresetSelect caption={caption} onCaptionChange={onCaptionChange} />
-          </div>
-        )}
       </div>
 
+      {afterStyle}
+
       {/* LoRA trigger word + Beat intro/outro — compose-time caption helpers */}
-      <div className="flex flex-col gap-2">
+      {!yue2Mode && <div className="flex flex-col gap-2">
         <div className="flex items-center gap-2">
           <span className="flex items-center gap-1 text-[10px] text-zinc-500 shrink-0 w-20">
             <Plug size={11} />
@@ -190,7 +198,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
             </div>
           )}
         </div>
-      </div>
+      </div>}
 
       {/* Song Metadata (Title / Artist / Subject) — collapsible */}
       <div>
@@ -296,7 +304,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
                   {'{·}'} {t('contentSection.expand')}
                 </button>
               )}
-              {autoExpandBtn}
+              {!yue2Mode && autoExpandBtn}
             </div>
           </div>
           <textarea
@@ -310,23 +318,35 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
         </div>
       )}
 
-      {/* Negative Prompt */}
-      <div>
-        <label className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5">
-          <ParamLabel
-            label="Negative Prompt"
-            className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
-            info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Sent to all backends.'
+      {/* Negative Prompt — folded away on YuE2 */}
+      {yue2Mode ? (
+        <Fold title="Negative Prompt" storageKey="hs-create-fold-negative">
+          <textarea
+            className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 outline-none resize-none transition-colors"
+            placeholder="jazz, acoustic, slow, ambient, piano, soft, classical..."
+            value={negativePrompt}
+            onChange={e => onNegativePromptChange(e.target.value)}
+            rows={2}
           />
-        </label>
-        <textarea
-          className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 outline-none resize-none transition-colors"
-          placeholder="jazz, acoustic, slow, ambient, piano, soft, classical..."
-          value={negativePrompt}
-          onChange={e => onNegativePromptChange(e.target.value)}
-          rows={2}
-        />
-      </div>
+        </Fold>
+      ) : (
+        <div>
+          <label className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5">
+            <ParamLabel
+              label="Negative Prompt"
+              className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
+              info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Sent to all backends.'
+            />
+          </label>
+          <textarea
+            className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 outline-none resize-none transition-colors"
+            placeholder="jazz, acoustic, slow, ambient, piano, soft, classical..."
+            value={negativePrompt}
+            onChange={e => onNegativePromptChange(e.target.value)}
+            rows={2}
+          />
+        </div>
+      )}
     </div>
   );
 };

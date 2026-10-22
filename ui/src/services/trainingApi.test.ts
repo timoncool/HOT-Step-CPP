@@ -4,9 +4,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  finishYue2Ladders, getJob, getWorkerMirror, listYue2AitkRuns, listYue2BatchesLocal,
-  listYue2JointPreviewsLocal, pickLadderRun, scoreYue2Rung, setTrainingWorker, syncWorkerMirror,
+  cancelJob, finishYue2Ladders, getDataset, getJob, getWorkerMirror, jobStreamUrl, listDatasets,
+  listYue2AitkRuns, listYue2BatchesLocal, listYue2JointPreviewsLocal, pickLadderRun, scoreYue2Rung,
+  setTrainingWorker, syncWorkerMirror,
 } from './trainingApi.js';
+import { ApiError } from './httpClient.js';
 
 function mockFetch(urls: string[]) {
   const real = globalThis.fetch;
@@ -68,4 +70,46 @@ test('pickLadderRun: an indexed active job, or else the live run, or else the ne
   assert.equal(pickLadderRun(runs, undefined, undefined)?.jobId, 'active');
   const withLive = [{ jobId: 'old', live: false, createdAt: 1 }, { jobId: 'live', live: true, createdAt: 2 }];
   assert.equal(pickLadderRun(withLive, undefined, undefined)?.jobId, 'live');
+});
+
+test('a captured target overrides the current selection; reads pass their signal', async () => {
+  const calls: Array<{ url: string; signal?: AbortSignal | null; method?: string }> = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    calls.push({ url: String(url), signal: init?.signal, method: init?.method });
+    return new Response(JSON.stringify({ datasets: [], jobs: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    setTrainingWorker('B');
+    const ctl = new AbortController();
+    await listDatasets({ worker: 'A', signal: ctl.signal });
+    await listDatasets({ worker: null });
+    await listDatasets();
+    await cancelJob('j1', { worker: 'A' });
+    await listYue2AitkRuns('ds1', { signal: ctl.signal });
+    assert.deepEqual(calls.map(c => c.url), [
+      '/api/workers/A/api/training/datasets',
+      '/api/training/datasets',
+      '/api/workers/B/api/training/datasets',
+      '/api/workers/A/api/training/jobs/j1',
+      '/api/training/datasets/ds1/yue2-joint-runs',
+    ]);
+    // P2: the transport composes the caller's signal with the instance timeout,
+    // so fetch sees a composite — aborting the controller must abort it.
+    ctl.abort();
+    assert.equal(calls[0].signal?.aborted, true);
+    assert.equal(calls[3].method, 'DELETE');
+    assert.equal(calls[4].signal?.aborted, true);
+    assert.equal(jobStreamUrl('j1', { worker: null }), '/api/training/jobs/j1/stream');
+    assert.equal(jobStreamUrl('j1'), '/api/workers/B/api/training/jobs/j1/stream');
+  } finally { globalThis.fetch = real; setTrainingWorker(null); }
+});
+
+test('a failed read throws ApiError with its status and the server message', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'no such dataset' }), { status: 404 })) as typeof fetch;
+  try {
+    await assert.rejects(getDataset('nope'), (e: unknown) =>
+      e instanceof ApiError && e.status === 404 && e.message === 'no such dataset');
+  } finally { globalThis.fetch = real; }
 });

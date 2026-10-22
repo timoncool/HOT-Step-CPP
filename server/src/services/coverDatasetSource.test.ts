@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { resolveCoverDatasetSource, saveDatasetCoverAbc } from './coverDatasetSource.js';
+import { readCoverDatasetAnalysis, resolveCoverDatasetSource, saveDatasetCoverAbc } from './coverDatasetSource.js';
 import { readAbcSidecar } from './training/abcSidecar.js';
 import { sampleIdFor } from './training/paths.js';
 import type { TrainingDatasetRow } from './training/types.js';
@@ -39,6 +39,26 @@ test('ambiguous byte matches do not choose a sidecar', () => {
     fs.writeFileSync(copied, 'same');
     const dataset = { id: 'dataset-1', sourceDir, recursive: false } as TrainingDatasetRow;
     assert.equal(resolveCoverDatasetSource(copied, [dataset]), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('cover analysis reads BPM and key from an exact dataset sidecar match', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cover-analysis-'));
+  try {
+    const sourceDir = path.join(root, 'dataset');
+    fs.mkdirSync(sourceDir);
+    const original = path.join(sourceDir, 'track.wav');
+    const uploaded = path.join(root, 'upload.wav');
+    fs.writeFileSync(original, 'matching audio bytes');
+    fs.copyFileSync(original, uploaded);
+    fs.writeFileSync(path.join(sourceDir, 'track.txt'), 'bpm: 132\nkey: D minor\n');
+    const dataset = { id: `analysis-${path.basename(root)}`, sourceDir, recursive: false } as TrainingDatasetRow;
+    assert.deepEqual(readCoverDatasetAnalysis(uploaded, [dataset]), { bpm: 132, key: 'D minor', scale: 'minor' });
+    fs.writeFileSync(uploaded, 'different audio bytes');
+    assert.equal(readCoverDatasetAnalysis(uploaded, [dataset]), null);
+    fs.copyFileSync(original, uploaded);
+    fs.writeFileSync(path.join(sourceDir, 'track.txt'), 'bpm: 132\n');
+    assert.equal(readCoverDatasetAnalysis(uploaded, [dataset]), null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

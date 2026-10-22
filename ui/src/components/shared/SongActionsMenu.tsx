@@ -22,8 +22,9 @@ import React, { useRef, useState, useLayoutEffect } from 'react';
 import ReactDOM from 'react-dom';
 import {
   MoreHorizontal, RotateCcw, Download, Disc3, Tags, Trash2, Upload,
-  Mic2, Image, ArrowLeftRight, ListPlus, Sparkles, Loader2, AlertCircle, Undo2,
+  Mic2, Image, ArrowLeftRight, ListPlus, Sparkles, Loader2, AlertCircle, Undo2, FileMusic,
 } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { Song, UnifiedRecentSong } from '../../types';
 import { songToTrack } from '../../stores/playbackStore';
@@ -32,6 +33,11 @@ import {
   startPostProcessing, canPostProcess, revertPostProcessing, dismissRun, usePostProcessRun,
 } from '../../stores/postProcessStore';
 import { openCoverArtPrompt } from '../library/CoverArtPromptModal';
+import { queryClient } from '../../queries/client';
+import { queryManager } from '../../queries/invalidation';
+import { invalidateSongs } from '../../queries/shell-queue/songs';
+import { scoreAbcOptions } from '../../queries/shell-queue/lyrics';
+import { BottomSheet, useIsMobile } from './BottomSheet';
 
 // ── Portal ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +50,14 @@ interface PortalMenuProps {
 const MENU_WIDTH = 220;
 const MENU_MAX_HEIGHT = 420;
 
-const PortalMenu: React.FC<PortalMenuProps> = ({ anchorRef, onClose, children }) => {
+const PortalMenu: React.FC<PortalMenuProps & { sheet?: boolean; title?: React.ReactNode }> = ({ anchorRef, onClose, children, sheet, title }) => {
+  if (sheet) {
+    return <BottomSheet open onClose={onClose} title={title} ariaLabel="Song actions">{children}</BottomSheet>;
+  }
+  return <DropdownMenu anchorRef={anchorRef} onClose={onClose}>{children}</DropdownMenu>;
+};
+
+const DropdownMenu: React.FC<PortalMenuProps> = ({ anchorRef, onClose, children }) => {
   const [pos, setPos] = useState({ top: 0, left: 0, flipped: false });
 
   useLayoutEffect(() => {
@@ -86,7 +99,7 @@ const PortalMenu: React.FC<PortalMenuProps> = ({ anchorRef, onClose, children })
 
 // ── Menu items ───────────────────────────────────────────────────────────────
 
-const ITEM_BASE = 'w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition-colors';
+const ITEM_BASE = 'w-full flex items-center gap-2 px-3 py-2 max-[1023px]:py-3 text-sm text-left transition-colors';
 
 interface ItemProps {
   icon: React.ReactNode;
@@ -250,11 +263,23 @@ function exportParams(song: Song): void {
   URL.revokeObjectURL(url);
 }
 
+/** Download YuE2's ABC lead sheet for this song. */
+function downloadScoreAbc(song: Song, abc: string): void {
+  const url = URL.createObjectURL(new Blob([abc], { type: 'text/vnd.abc' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${(song.title || 'song').slice(0, 40).replace(/[^a-zA-Z0-9]/g, '_').toLowerCase()}_lead_sheet.abc`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 async function retranscribe(song: Song): Promise<void> {
   try {
     const { retranscribeLyrics } = await import('../../services/api');
     const result = await retranscribeLyrics(song.id);
     console.log(`[Retranscribe] ${result.wordCount} words, ${result.lineCount} lines`);
+    void invalidateSongs(queryClient);
+    void queryManager.sidecars.all(queryClient);
   } catch (err: any) {
     console.error('[Retranscribe] Failed:', err.message);
   }
@@ -304,6 +329,7 @@ export const SongActionsMenu: React.FC<SongActionsMenuProps> = ({
 }) => {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const isMobile = useIsMobile();
   const btnRef = useRef<HTMLButtonElement>(null);
   const abTrackAId = useABCompareSelector(s => s.trackA?.id);
   const abTrackBId = useABCompareSelector(s => s.trackB?.id);
@@ -318,6 +344,9 @@ export const SongActionsMenu: React.FC<SongActionsMenuProps> = ({
   const act = (fn: () => void) => { fn(); close(); };
 
   const hasMastered = !!(song.masteredAudioUrl || (song as any).mastered_audio_url);
+  // Only YuE2 renders have a lead sheet; probe for it once the menu opens.
+  const audioUrl = song.audioUrl || song.audio_url || '';
+  const { data: scoreAbc } = useQuery({ ...scoreAbcOptions(audioUrl), enabled: open && !!audioUrl });
 
   const handleRevert = async () => {
     close();
@@ -368,7 +397,7 @@ export const SongActionsMenu: React.FC<SongActionsMenuProps> = ({
       </button>
 
       {open && (
-        <PortalMenu anchorRef={btnRef} onClose={close}>
+        <PortalMenu anchorRef={btnRef} onClose={close} sheet={isMobile} title={song.title}>
           {/* Post-processing — the reason this menu exists. Deliberately first
               and deliberately shown (disabled) rather than hidden when it can't
               run, so "why can't I master this?" has an answer on hover. */}
@@ -393,6 +422,14 @@ export const SongActionsMenu: React.FC<SongActionsMenuProps> = ({
               onClick={handleRevert}
               title="Deletes the processed file so the chain can be run again. The raw render is untouched."
               tone="text-amber-400 hover:bg-amber-500/10"
+            />
+          )}
+          {scoreAbc && (
+            <Item
+              icon={<FileMusic size={14} />}
+              label={t('songActions.downloadLeadSheet', 'Download ABC Lead Sheet')}
+              onClick={() => act(() => downloadScoreAbc(song, scoreAbc))}
+              title={t('songActions.downloadLeadSheetHint', 'The ABC score YuE2 planned this track from')}
             />
           )}
           {ppFailed && (

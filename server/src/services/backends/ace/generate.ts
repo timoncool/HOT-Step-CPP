@@ -273,6 +273,17 @@ export async function runAceGeneration(
           }
         }
 
+        // /lm always generates codes here, so a result without any means the
+        // planner failed (its output could not be parsed, e.g. non-finite
+        // logits on one backend). Rendering from the caption alone would look
+        // fine and quietly drop the plan, so fail with the reason instead.
+        const noCodes = lmResults.findIndex(r => !r.audio_codes);
+        if (noCodes >= 0) {
+          throw new Error(
+            `LM planner returned no audio codes (result ${noCodes + 1} of ${lmResults.length}): `
+            + 'its output could not be parsed, so there is no plan to render. See ace_engine.log.');
+        }
+
         // Store only LM-generated fields in cache (never DiT/adapter/DCW/etc.)
         if (useLmCache) {
           const lmOutputs: LmCacheEntry[] = lmResults.map(r => ({
@@ -1201,19 +1212,18 @@ export async function runAceGeneration(
         ? JSON.stringify(trackQualityScores)
         : '';
 
-      // Duration: the LM provides one for text2music, but repaint/cover skip the
-      // LM (firstResult.duration = 0). Backfill from the actual output WAV so the
-      // song has a real length — downstream features (e.g. Song Builder clip
-      // points) rely on it. Falls back to 0 for non-WAV / read failures.
-      let trackDuration = duration;
-      if (!(trackDuration > 0)) {
-        const wavPath = path.join(config.data.audioDir, path.basename(audioUrl));
-        const measured = wavDurationSec(wavPath);
-        if (measured > 0) trackDuration = Math.round(measured);
-        // The backfill only ever reached the song row; the job result and the
-        // "[Result] Duration" line kept the LM's 0 for cover and repaint (#124).
-        if (!(duration > 0) && trackDuration > 0) duration = trackDuration;
-      }
+      // Duration: the output WAV's real length, as the YuE2 and MM3 backends
+      // record it. The LM's figure is the requested length echoed back from its
+      // plan, not the audio: the DiT renders as many frames as the LM emitted
+      // codes, and the LM may end a little early (10 s asked, 47 codes, 9.4 s
+      // out). Repaint/cover skip the LM, so theirs is 0. Song Builder places
+      // its seams from this value. Falls back to the LM's figure, then 0, for
+      // non-WAV / read failures.
+      const measured = wavDurationSec(path.join(config.data.audioDir, path.basename(audioUrl)));
+      const trackDuration = measured > 0 ? Math.round(measured * 100) / 100 : duration;
+      // The job result and the "[Result] Duration" line keep the LM's figure,
+      // except where it had none (cover and repaint, #124).
+      if (!(duration > 0) && trackDuration > 0) duration = trackDuration;
 
       // Post-processing is done and this file will not change again, so build
       // its waveform now. The player reads peaks instead of downloading and

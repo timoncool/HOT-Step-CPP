@@ -31,12 +31,16 @@ namespace yue2_aitk {
 struct ResumeRecord {
     HostStateSnapshot state;
     std::string runner_metadata;
-    int version = 1;  // 1 = AdamW8bit two-state format, 2 = LmOptim up-to-four-state format
+    // 1 = AdamW8bit two-state format. 2 = LmOptim up-to-four-state format with
+    // 8-bit moments above 4096 elements (lossy; read-only now). 3 = the same
+    // layout with every state slot F32, so resume restores LmOptim exactly.
+    int version = 1;
 };
 
 namespace resume_detail {
-constexpr uint32_t kVersion = 2;
-constexpr size_t kMaxFileBytes = size_t(2) * 1024 * 1024 * 1024;
+constexpr uint32_t kVersion = 3;
+// F32 moments: Prodigy at rank 64 is ~2.4 GB, so the ceiling sits well above.
+constexpr size_t kMaxFileBytes = size_t(16) * 1024 * 1024 * 1024;
 constexpr size_t kMaxMetadataBytes = size_t(16) * 1024 * 1024;
 constexpr size_t kMaxParameters = 65536;
 constexpr size_t kMaxNameBytes = 4096;
@@ -70,12 +74,15 @@ inline bool publish_no_replace(const std::string & temp, const char * path) {
     return ::link(temp.c_str(), path) == 0 && ::unlink(temp.c_str()) == 0;
 #endif
 }
-inline bool read_file(const char * path, std::vector<uint8_t> * out) { FILE * file = hs_fopen(path, "rb"); if (!file) return false; if (std::fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; } const long end = std::ftell(file); if (end < 0 || size_t(end) > kMaxFileBytes) { fclose(file); return false; } if (std::fseek(file, 0, SEEK_SET) != 0) { fclose(file); return false; } out->resize(size_t(end)); const bool ok = out->empty() || std::fread(out->data(), 1, out->size(), file) == out->size(); fclose(file); return ok; }
+// hs_stat is 64-bit on Windows, where ftell's long stops at 2 GB.
+inline bool read_file(const char * path, std::vector<uint8_t> * out) { HS_STAT_T st{}; if (hs_stat(path, &st) != 0 || !HS_ISREG(st.st_mode) || st.st_size < 0 || uint64_t(st.st_size) > kMaxFileBytes) return false; FILE * file = hs_fopen(path, "rb"); if (!file) return false; out->resize(size_t(st.st_size)); const bool ok = out->empty() || std::fread(out->data(), 1, out->size(), file) == out->size(); fclose(file); return ok; }
 
 // Version-2 state storage: symmetric 8-bit quantization per 256-element block
 // with a per-block absmax, decoding to F32 on restore. This is plain storage
 // compression for moments — unlike the v1 file it is NOT the AITK AdamW8bit
-// qmap representation, and it only ever round-trips through this header.
+// qmap representation. It is lossy: second moments under absmax/254 decode to
+// 0 and the next Adam step comes out near m/eps, so version 3 keeps F32. Only
+// legacy v2 records (and the tests that build them) still use it.
 inline bool quantize_f32(const std::vector<float> & in, std::vector<uint8_t> * q, std::vector<float> * absmax) {
     const size_t n = in.size();
     const size_t blocks = (n + kQuantizeBlock - 1) / kQuantizeBlock;
@@ -118,19 +125,20 @@ inline bool dequantize_f32(const std::vector<uint8_t> & q, const std::vector<flo
     return true;
 }
 
-// One version-2 state slot: absent, full F32 (n < 4096) or quantized (n >= 4096).
+// One version-2/3 state slot: absent, full F32 (any size in v3, n < 4096 in
+// v2) or quantized (v2 only, n >= 4096).
 struct V2Slot { const std::vector<float> * fp32; const std::vector<uint8_t> * u8; const std::vector<float> * absmax; };
-inline bool v2_slot_valid(const V2Slot & s, size_t n) {
+inline bool v2_slot_valid(const V2Slot & s, size_t n, bool legacy) {
     const bool has_fp32 = s.fp32 && !s.fp32->empty();
     const bool has_u8 = s.u8 && !s.u8->empty();
     if (has_fp32 && has_u8) return false;
     if (!has_fp32 && !has_u8) return true;  // absent slot
     if (has_fp32) {
-        if (n >= 4096 || s.fp32->size() != n) return false;
+        if ((legacy && n >= 4096) || s.fp32->size() != n) return false;
         for (float value : *s.fp32) if (!std::isfinite(value)) return false;
         return true;
     }
-    if (n < 4096 || s.u8->size() != n) return false;
+    if (!legacy || n < 4096 || s.u8->size() != n) return false;
     if (s.absmax->size() != (n + kQuantizeBlock - 1) / kQuantizeBlock) return false;
     for (float value : *s.absmax) if (!std::isfinite(value) || value < 0) return false;
     return true;
@@ -178,11 +186,15 @@ inline bool yue2_aitk_write_resume(const char * path, const HostStateSnapshot & 
     const std::string temp = temporary_path(path); FILE * output = hs_fopen(temp.c_str(), "wbx"); if (!output) return false; const bool written = std::fwrite(file.data(), 1, file.size(), output) == file.size() && std::fflush(output) == 0; const bool closed = std::fclose(output) == 0; if (!written || !closed || !publish_no_replace(temp, path)) { hs_remove(temp); return false; } return true;
 }
 
-// Version-2 writer (LmOptim state). Parameters are always F32; each of the
-// four state slots is absent, full F32 (n < 4096) or 8-bit quantized above.
+// LmOptim state writer. Parameters are always F32; each of the four state
+// slots is absent or full F32 (version 3). A snapshot carrying 8-bit slots is
+// written in the legacy version-2 layout, kept so tests can build old records;
+// the trainer never produces one.
 inline bool yue2_aitk_write_resume_v2(const char * path, const HostStateSnapshot & state, const std::string & runner_metadata) {
     using namespace resume_detail;
     if (!path || !*path || state.step < 0 || runner_metadata.size() > kMaxMetadataBytes || state.names.size() == 0 || state.names.size() > kMaxParameters || state.names.size() != state.elements.size() || state.names.size() != state.parameters.size() || state.names.size() != state.state1_fp32.size() || state.names.size() != state.state2_fp32.size() || state.names.size() != state.state3_fp32.size() || state.names.size() != state.state4_fp32.size() || state.names.size() != state.state1_u8.size() || state.names.size() != state.state2_u8.size() || state.names.size() != state.state3_u8.size() || state.names.size() != state.state4_u8.size() || state.names.size() != state.absmax1.size() || state.names.size() != state.absmax2.size() || state.names.size() != state.absmax3.size() || state.names.size() != state.absmax4.size()) return false;
+    bool legacy = false;
+    for (size_t i = 0; i < state.names.size(); ++i) legacy = legacy || !state.state1_u8[i].empty() || !state.state2_u8[i].empty() || !state.state3_u8[i].empty() || !state.state4_u8[i].empty();
     std::vector<std::array<V2Slot, 4>> slotset;
     slotset.resize(state.names.size());
     std::unordered_set<std::string> names;
@@ -196,7 +208,7 @@ inline bool yue2_aitk_write_resume_v2(const char * path, const HostStateSnapshot
         const V2Slot three{ &state.state3_fp32[i], state.state3_u8[i].empty() ? nullptr : &state.state3_u8[i], state.absmax3[i].empty() ? nullptr : &state.absmax3[i] };
         const V2Slot four{ &state.state4_fp32[i], state.state4_u8[i].empty() ? nullptr : &state.state4_u8[i], state.absmax4[i].empty() ? nullptr : &state.absmax4[i] };
         slotset[i] = { one, two, three, four };
-        for (size_t k = 0; k < 4; ++k) if (!v2_slot_valid(slotset[i][k], n)) return false;
+        for (size_t k = 0; k < 4; ++k) if (!v2_slot_valid(slotset[i][k], n, legacy)) return false;
         size_t header = 0, params = 0, body = 0;
         if (!add_size(4, state.names[i].size(), &header) || !add_size(header, 8, &header) || !mul_size(n, 4, &params) || !add_size(header, params, &body)) return false;
         for (size_t k = 0; k < 4; ++k) { size_t part = 0; if (!v2_slot_bytes(slotset[i][k], n, &part) || !add_size(body, part, &body)) return false; }
@@ -224,10 +236,12 @@ inline bool yue2_aitk_write_resume_v2(const char * path, const HostStateSnapshot
         }
         if (payload.size() > kMaxFileBytes) return false;
     }
-    std::vector<uint8_t> metadata(runner_metadata.begin(), runner_metadata.end());
-    std::vector<uint8_t> file; file.insert(file.end(), kMagic.begin(), kMagic.end()); put_u32(file, kVersion); put_u64(file, uint64_t(payload.size())); put_u64(file, uint64_t(metadata.size())); put_u64(file, hash_bytes(payload.data(), payload.size(), hash_bytes(metadata.data(), metadata.size()))); put_u64(file, uint64_t(metadata.size())); file.insert(file.end(), metadata.begin(), metadata.end()); file.insert(file.end(), payload.begin(), payload.end());
-    if (file.size() > kMaxFileBytes) return false;
-    const std::string temp = temporary_path(path); FILE * output = hs_fopen(temp.c_str(), "wbx"); if (!output) return false; const bool written = std::fwrite(file.data(), 1, file.size(), output) == file.size() && std::fflush(output) == 0; const bool closed = std::fclose(output) == 0; if (!written || !closed || !publish_no_replace(temp, path)) { hs_remove(temp); return false; } return true;
+    const uint8_t * metadata = reinterpret_cast<const uint8_t *>(runner_metadata.data());
+    std::vector<uint8_t> header; header.insert(header.end(), kMagic.begin(), kMagic.end()); put_u32(header, legacy ? 2 : kVersion); put_u64(header, uint64_t(payload.size())); put_u64(header, uint64_t(runner_metadata.size())); put_u64(header, hash_bytes(payload.data(), payload.size(), hash_bytes(metadata, runner_metadata.size()))); put_u64(header, uint64_t(runner_metadata.size()));
+    if (header.size() + runner_metadata.size() + payload.size() > kMaxFileBytes) return false;
+    // Three writes, not one concatenated buffer: F32 moments make the payload
+    // GB-sized and a second full copy would double peak host memory.
+    const std::string temp = temporary_path(path); FILE * output = hs_fopen(temp.c_str(), "wbx"); if (!output) return false; const bool written = std::fwrite(header.data(), 1, header.size(), output) == header.size() && std::fwrite(metadata, 1, runner_metadata.size(), output) == runner_metadata.size() && std::fwrite(payload.data(), 1, payload.size(), output) == payload.size() && std::fflush(output) == 0; const bool closed = std::fclose(output) == 0; if (!written || !closed || !publish_no_replace(temp, path)) { hs_remove(temp); return false; } return true;
 }
 
 // Version-1 payload: step, count, then per tensor name, elements, one shared
@@ -240,9 +254,10 @@ inline bool read_resume_v1(const std::vector<uint8_t> & file, size_t pos, size_t
     if (pos != end) return false; return true;
 }
 
-// Version-2 payload: step, count, then per tensor name, elements, F32
-// parameters and four independent state slots, each absent or full.
-inline bool read_resume_v2(const std::vector<uint8_t> & file, size_t pos, size_t end, HostStateSnapshot * state) {
+// Version-2/3 payload: step, count, then per tensor name, elements, F32
+// parameters and four independent state slots, each absent or full. A legacy
+// (v2) slot of 4096+ elements is 8-bit; every v3 slot is F32.
+inline bool read_resume_v2(const std::vector<uint8_t> & file, size_t pos, size_t end, HostStateSnapshot * state, bool legacy) {
     using namespace resume_detail;
     uint32_t step = 0, count = 0; if (!get_u32(file, &pos, &step) || step > uint32_t(INT_MAX) || !get_u32(file, &pos, &count) || !count || count > kMaxParameters) return false; state->step = int(step); state->names.reserve(count); state->elements.reserve(count); state->parameters.resize(count); state->state1_fp32.resize(count); state->state2_fp32.resize(count); state->state3_fp32.resize(count); state->state4_fp32.resize(count); state->state1_u8.resize(count); state->state2_u8.resize(count); state->state3_u8.resize(count); state->state4_u8.resize(count); state->absmax1.resize(count); state->absmax2.resize(count); state->absmax3.resize(count); state->absmax4.resize(count); std::unordered_set<std::string> names;
     for (uint32_t i = 0; i < count; ++i) {
@@ -259,7 +274,7 @@ inline bool read_resume_v2(const std::vector<uint8_t> & file, size_t pos, size_t
             uint32_t len = 0; if (!get_u32(file, &pos, &len)) return false;
             if (len == 0) continue;
             if (size_t(len) != n) return false;
-            if (n < 4096) {
+            if (!legacy || n < 4096) {
                 if (n * 4 > end - pos) return false;
                 fp32s[k]->resize(n);
                 for (float & value : *fp32s[k]) if (!get_f32(file, &pos, &value) || !std::isfinite(value)) return false;
@@ -280,11 +295,12 @@ inline bool read_resume_v2(const std::vector<uint8_t> & file, size_t pos, size_t
 inline bool yue2_aitk_read_resume(const char * path, ResumeRecord * out) {
     using namespace resume_detail;
     if (!out) return false; std::vector<uint8_t> file; if (!read_file(path, &file) || file.size() < 8 + 4 + 8 + 8 + 8 + 8 || !std::equal(kMagic.begin(), kMagic.end(), file.begin())) return false;
-    size_t pos = 8; uint32_t version = 0; uint64_t payload_size = 0, metadata_size = 0, checksum = 0, metadata_prefix = 0; if (!get_u32(file, &pos, &version) || (version != 1 && version != 2) || !get_u64(file, &pos, &payload_size) || !get_u64(file, &pos, &metadata_size) || !get_u64(file, &pos, &checksum) || !get_u64(file, &pos, &metadata_prefix) || metadata_prefix != metadata_size || metadata_size > kMaxMetadataBytes || payload_size > kMaxFileBytes) return false;
+    size_t pos = 8; uint32_t version = 0; uint64_t payload_size = 0, metadata_size = 0, checksum = 0, metadata_prefix = 0; if (!get_u32(file, &pos, &version) || (version < 1 || version > 3) || !get_u64(file, &pos, &payload_size) || !get_u64(file, &pos, &metadata_size) || !get_u64(file, &pos, &checksum) || !get_u64(file, &pos, &metadata_prefix) || metadata_prefix != metadata_size || metadata_size > kMaxMetadataBytes || payload_size > kMaxFileBytes) return false;
     if (metadata_size > file.size() - pos) return false; const size_t payload_offset = pos + size_t(metadata_size); if (payload_size > file.size() - payload_offset || size_t(payload_size) != file.size() - payload_offset) return false; const uint64_t actual = hash_bytes(file.data() + payload_offset, size_t(payload_size), hash_bytes(file.data() + pos, size_t(metadata_size))); if (actual != checksum) return false;
     ResumeRecord record; record.runner_metadata.assign(reinterpret_cast<const char *>(file.data() + pos), size_t(metadata_size)); record.version = int(version);
     if (version == 1 && !read_resume_v1(file, payload_offset, file.size(), &record.state)) return false;
-    if (version == 2 && !read_resume_v2(file, payload_offset, file.size(), &record.state)) {
+    if (version == 3 && !read_resume_v2(file, payload_offset, file.size(), &record.state, false)) return false;
+    if (version == 2 && !read_resume_v2(file, payload_offset, file.size(), &record.state, true)) {
         // Older AdamW exports wrote a v1 payload under a v2 header. Their
         // checksum is valid; accept that exact legacy layout without altering
         // the saved checkpoint, then let the optimizer binding verify it.

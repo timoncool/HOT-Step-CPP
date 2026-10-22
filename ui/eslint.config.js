@@ -19,5 +19,16 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // fetchQuery is deprecated in TanStack Query v5 (removed next major);
+      // queryClient.query() has identical semantics. Keep the P1 sweep permanent.
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "CallExpression[callee.property.name='fetchQuery']",
+          message: 'queryClient.fetchQuery is deprecated — use queryClient.query() (docs/dev/tanstack-query.md).',
+        },
+      ],
+    },
   },
 ])

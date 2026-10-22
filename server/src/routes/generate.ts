@@ -16,10 +16,9 @@ import { config } from '../config.js';
 import { getUserId } from './auth.js';
 import { logGeneration, failGenerationLog } from '../services/logger.js';
 import { engineReady, engineBootStatus } from '../engineState.js';
-import { isEngineSuspended } from '../services/aceEngineProcess.js';
+import { isEngineSuspended, engineCrashSeq } from '../services/aceEngineProcess.js';
 import { pushLog } from './logs.js';
 import { getBackend, getActiveBackendId } from '../services/backends/registry.js';
-import { awaitBackendRelease } from '../services/generation/backendRelease.js';
 import { mm3StreamUrl } from '../services/backends/minimax/client.js';
 import {
   runOnGpuLane, gpuLaneBusy, gpuLaneDepth, gpuLaneOwner, gpuLaneNextFamily, releaseGpuLane, resetGpuLane,
@@ -28,22 +27,60 @@ import {
 import { isActiveJob, type GenerationJob } from '../services/generation/jobTypes.js';
 import { pollUntilDone } from '../services/generation/pollUntilDone.js';
 import { dropYue2BatchMember } from '../services/backends/yue2/generate.js';
+import { yue2Synth, splitMultipartMixed } from '../services/backends/yue2/client.js';
+import { tokenizeForSa3 } from '../services/sa3Tokenizer.js';
+import { buildSlotRequest, renderSlotOnLane, waitForSlotJob, type SlotJobEnd } from '../services/storm/slot.js';
+import { initDrift, updateDriftPressure, resolveStartDrift, defaultDriftPressure, snapshot as driftSnapshot } from '../services/storm/drift.js';
+import type { DriftRuntime, DriftPressure } from '../services/storm/drift.js';
 import { translateParams } from '../services/generation/translateParams.js';
 import { timbreReferenceMissing } from '../services/generation/sourceAudio.js';
 import { buildEnvelope, GenerationEnvelopeError } from '../services/generation/envelope.js';
-import { noteEnqueued, noteFinished } from '../services/generation/residency.js';
+import { isGenerationIntent, readBackendOverride } from '../contracts/generation.js';
+import { preparedParams } from '../contracts/yue2Prepare.js';
+import { GenerationIntentError, resolveGenerationIntent } from '../services/generation/intent.js';
+import { evictOtherFamilies, noteEnqueued, noteFinished } from '../services/generation/residency.js';
 import { runYue2PlanPreview } from '../services/backends/yue2/generate.js';
+import {
+  checkoutState, createGenerateCapture, generateCaptureDir, generateCaptureMode,
+} from '../services/generation/requestCapture.js';
 import type {
   GenerationAttempt,
   GenerationEndReason,
   GenerationOutcome,
 } from '../services/backends/types.js';
+import { openStreamSession, type StreamSession } from '../services/streamSessions/index.js';
+import { getDb } from '../db/database.js';
+import { GenerationJobLedger, ledgerStatusBody, type LedgerEntry } from '../services/generation/jobLedger.js';
+import { registerJobsBusyCheck, trackBusy } from '../dataroot/pointer.js';
 
 export type { GenerationJob, StageTiming } from '../services/generation/jobTypes.js';
 
 const router = Router();
 
 const jobs = new Map<string, GenerationJob>();
+registerJobsBusyCheck('generation', jobs);
+
+// Each job's outcome, kept in the database so /status can still answer after a
+// restart empties `jobs` (services/generation/jobLedger.ts). Best-effort: a
+// ledger failure is logged and never blocks or fails a generation.
+let ledgerInstance: GenerationJobLedger | null = null;
+function withLedger(what: string, fn: (ledger: GenerationJobLedger) => void): void {
+  try { fn(ledgerInstance ??= new GenerationJobLedger(getDb())); } catch (err) {
+    console.warn(`[Generate] job ledger ${what} failed: ${(err as Error).message}`);
+  }
+}
+
+/** Tests only: run the ledger on a test database instead of the app's. */
+export function setGenerationJobLedgerForTests(ledger: GenerationJobLedger | null): void {
+  ledgerInstance = ledger;
+}
+
+/** Mark a job cancelled, in memory and in the ledger. A pending job may never
+ *  reach its lane (a restart first), so the lane's own ledger write is not enough. */
+export function markGenerationJobCancelled(job: GenerationJob): void {
+  job.status = 'cancelled';
+  withLedger('cancel', ledger => ledger.finished(job));
+}
 
 // TTL cleanup: prune terminal jobs older than 1 hour every 10 minutes.
 // Prevents unbounded memory growth during long batch sessions.
@@ -128,8 +165,8 @@ async function runGeneration(
   if (!backend) throw new Error(`Captured generation backend '${backendId ?? '(missing)'}' is not registered`);
   if (!lease.isCurrent()) return emptyOutcome(job, 'reset');
   // A backend switch evicts the outgoing family in the background; no family
-  // loads weights until that eviction is confirmed.
-  await awaitBackendRelease();
+  // loads weights until that eviction, and every other family's, is confirmed.
+  await evictOtherFamilies(backendId);
   return backend.generate(job, {
     envelope: job.envelope,
     attempt,
@@ -158,7 +195,7 @@ function enqueueGeneration(job: GenerationJob): void {
     console.log(`[Generate] Job ${job.id} queued (${gpuLaneDepth() + 1} waiting)`);
   }
 
-  void runOnGpuLane(async (lease) => {
+  void trackBusy('generation', runOnGpuLane(async (lease) => {
     const retryPolicy = job.envelope.policy.retry;
     let attemptNumber = 0;
     let reseededForAttempt = false;
@@ -229,7 +266,10 @@ function enqueueGeneration(job: GenerationJob): void {
     // The retry loop above swallows every generation failure, so reaching here
     // means the lane itself broke. Never leave that silent.
     console.error(`[Generate] Job ${job.id} lane error:`, err?.message || err);
-  }).finally(() => noteFinished(family));
+  }).finally(() => {
+    noteFinished(family);
+    withLedger('finish', ledger => ledger.finished(job));
+  }));
 }
 
 // POST /api/generate — start a generation job
@@ -260,7 +300,10 @@ router.post('/yue2/plan', async (req, res) => {
   res.on('close', () => { if (!res.writableFinished) abort.abort(); });
   try {
     noteEnqueued('yue2');
-    const preview = await runOnGpuLane(() => runYue2PlanPreview(params, abort.signal), { label: 'yue2 score preview', family: 'yue2' });
+    const preview = await runOnGpuLane(async () => {
+      await evictOtherFamilies('yue2');
+      return runYue2PlanPreview(params, abort.signal);
+    }, { label: 'yue2 score preview', family: 'yue2' });
     res.json(preview);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -269,58 +312,130 @@ router.post('/yue2/plan', async (req, res) => {
   }
 });
 
-router.post('/', (req, res) => {
+// Dev-only fixture capture (HOTSTEP_GENERATE_CAPTURE; off by default). It runs
+// ahead of the handler, so the body is recorded exactly as the caller sent it,
+// and it needs the same token: an unauthenticated caller writes nothing.
+const generateCapture = createGenerateCapture({
+  mode: () => generateCaptureMode(),
+  userId: getUserId,
+  activeBackendId: getActiveBackendId,
+  dir: generateCaptureDir,
+  checkout: () => checkoutState(),
+});
+
+export type SubmitGenerationResult =
+  | { ok: true; jobId: string; status: GenerationJob['status'] }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
+/** A submission carrying a YuE2 Prepare document (`yue2Prepare`) passes the
+ *  shared check (contracts/yue2Prepare.ts) and is queued without it; any
+ *  other submission is returned as it came. */
+export function withoutPrepareDocument(submission: any): { submission: any } | { error: string } {
+  if (!submission || typeof submission !== 'object' || submission.yue2Prepare === undefined) return { submission };
+  const pair = preparedParams(submission);
+  if ('error' in pair) return pair;
+  const { yue2Prepare: _, ...rest } = submission;
+  return { submission: rest };
+}
+
+/** Validate and queue one generation, exactly as POST /api/generate does.
+ *  Exported so the durable audio intent queue (services/audioQueue) submits
+ *  through the same checks, job map and GPU lane instead of a second path. */
+export async function submitGeneration(raw: any, userId: string | null): Promise<SubmitGenerationResult> {
   // The engine is deliberately stopped while a training preprocess job owns the
   // GPU — say so instead of the generic "not ready" boot message.
   if (isEngineSuspended()) {
-    res.status(503).json({ error: 'Engine is paused for training preprocessing — try again when the job finishes' });
-    return;
+    return { ok: false, status: 503, body: { error: 'Engine is paused for training preprocessing — try again when the job finishes' } };
   }
 
   // Reject requests while engine is still bootstrapping (downloading DLLs, etc.)
   if (!engineReady) {
-    res.status(503).json({
+    return { ok: false, status: 503, body: {
       error: `Engine not ready: ${engineBootStatus}`,
       detail: 'The CUDA runtime is still being set up. Please wait a moment and try again.',
-    });
-    return;
+    } };
   }
 
-  const userId = getUserId(req);
-  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+  if (!userId) return { ok: false, status: 401, body: { error: 'Unauthorized' } };
 
   // An MCP (or other headless) caller asserts which backend it planned the
   // request for; the UI never sends this. `backend` stays log-only — only
   // `expectedBackend` can block a submit, so a caller that races a backend
   // switch fails loudly instead of training/rendering on the wrong one.
-  const mismatch = expectedBackendMismatch(req.body, getActiveBackendId());
-  if (mismatch) {
-    res.status(409).json({
-      error: `Expected backend '${mismatch.expectedBackend}' but the active backend is '${mismatch.activeBackend}'`,
-      ...mismatch,
-    });
-    return;
+  // With a backendOverride, `expectedBackend` is checked against the override
+  // (the backend the job will run on); without one, against the active
+  // backend. A malformed override is a 400 here; an unknown one skips this and
+  // gets its 400 below.
+  let checkedOverride: string | undefined;
+  try { checkedOverride = readBackendOverride(raw); } catch (err) {
+    return { ok: false, status: 400, body: { error: err instanceof Error ? err.message : 'Invalid backendOverride' } };
+  }
+  if (checkedOverride === undefined || getBackend(checkedOverride)) {
+    const mismatch = expectedBackendMismatch(
+      isGenerationIntent(raw) ? raw.input : raw,
+      checkedOverride ?? getActiveBackendId(),
+    );
+    if (mismatch) {
+      return { ok: false, status: 409, body: checkedOverride === undefined ? {
+        error: `Expected backend '${mismatch.expectedBackend}' but the active backend is '${mismatch.activeBackend}'`,
+        ...mismatch,
+      } : {
+        error: `Expected backend '${mismatch.expectedBackend}' but backendOverride selects '${checkedOverride}'`,
+        expectedBackend: mismatch.expectedBackend,
+        backendOverride: checkedOverride,
+        activeBackend: getActiveBackendId(),
+      } };
+    }
+  }
+
+  let submission = raw;
+  if (isGenerationIntent(raw)) {
+    try {
+      // An opt-in `backendOverride` resolves the intent for that backend;
+      // otherwise the active one, as before.
+      let override: string | undefined;
+      try { override = readBackendOverride(raw); } catch (err) {
+        throw new GenerationIntentError(err instanceof Error ? err.message : 'Invalid backendOverride');
+      }
+      if (override !== undefined && !getBackend(override)) {
+        throw new GenerationIntentError(`Unknown backendOverride '${override}'`);
+      }
+      const backendId = override ?? getActiveBackendId();
+      const backend = getBackend(backendId);
+      if (!backend) throw new Error(`Active generation backend '${backendId}' is not registered`);
+      const capabilities = await backend.capabilities();
+      if (override === undefined && getActiveBackendId() !== backendId) {
+        return { ok: false, status: 409, body: { error: `Active backend changed while resolving generation intent`, activeBackend: getActiveBackendId() } };
+      }
+      submission = resolveGenerationIntent(raw, backendId, capabilities.extensions);
+    } catch (err) {
+      return { ok: false, status: err instanceof GenerationIntentError ? 400 : 500, body: {
+        error: err instanceof Error ? err.message : 'Cannot resolve generation intent',
+      } };
+    }
   }
 
   // A profile can carry a timbre reference whose upload was deleted; the
   // synth phase would find that out minutes in. Refuse it at the form (#162).
-  if (!req.body?.backend || req.body.backend === 'ace') {
-    const missing = timbreReferenceMissing(req.body);
+  if (!submission?.backend || submission.backend === 'ace') {
+    const missing = timbreReferenceMissing(submission);
     if (missing) {
-      res.status(400).json({ error: `Timbre reference file is missing (${missing}). The upload it referred to is gone; re-upload it or clear the reference.` });
-      return;
+      return { ok: false, status: 400, body: { error: `Timbre reference file is missing (${missing}). The upload it referred to is gone; re-upload it or clear the reference.` } };
     }
   }
+
+  const prepared = withoutPrepareDocument(submission);
+  if ('error' in prepared) return { ok: false, status: 409, body: { error: prepared.error } };
+  submission = prepared.submission;
 
   const jobId = uuidv4();
   const enqueuedAt = Date.now();
   let envelope: ReturnType<typeof buildEnvelope>;
   try {
-    envelope = buildEnvelope(req.body, userId, jobId, enqueuedAt);
+    envelope = buildEnvelope(submission, userId, jobId, enqueuedAt);
   } catch (err) {
     const clientError = err instanceof GenerationEnvelopeError && err.code !== 'unknown_backend';
-    res.status(clientError ? 400 : 500).json({ error: err instanceof Error ? err.message : 'Cannot resolve generation request' });
-    return;
+    return { ok: false, status: clientError ? 400 : 500, body: { error: err instanceof Error ? err.message : 'Cannot resolve generation request' } };
   }
   const job: GenerationJob = {
     id: jobId,
@@ -329,7 +444,7 @@ router.post('/', (req, res) => {
     status: 'pending',
     stage: 'Queued',
     progress: 0,
-    params: structuredClone(req.body),
+    params: structuredClone(submission),
     attempts: [],
     createdAt: enqueuedAt,
   };
@@ -339,21 +454,37 @@ router.post('/', (req, res) => {
   }
 
   jobs.set(job.id, job);
+  withLedger('open', ledger => ledger.opened(job));
 
   // Enqueue — runs immediately if nothing else is generating,
   // otherwise waits until the current job finishes.
   enqueueGeneration(job);
 
-  res.json({
-    jobId: job.id,
-    status: job.status,
-  });
+  return { ok: true, jobId: job.id, status: job.status };
+}
+
+/** The in-memory job, while it is still held (terminal jobs go after an hour). */
+export function getGenerationJob(id: string): GenerationJob | undefined {
+  return jobs.get(id);
+}
+
+router.post('/', generateCapture, async (req, res) => {
+  const result = await submitGeneration(req.body, getUserId(req));
+  if (!result.ok) { res.status(result.status).json(result.body); return; }
+  res.json({ jobId: result.jobId, status: result.status });
 });
 
 // GET /api/generate/status/:id — poll job status
 router.get('/status/:id', (req, res) => {
   const job = jobs.get(req.params.id);
-  if (!job) { res.status(404).json({ error: 'Job not found' }); return; }
+  if (!job) {
+    // Gone from memory: a restart, or the one-hour prune. The ledger says how it ended.
+    let entry: LedgerEntry | null = null;
+    withLedger('read', ledger => { entry = ledger.get(req.params.id); });
+    if (entry) { res.json(ledgerStatusBody(entry)); return; }
+    res.status(404).json({ error: 'Job not found' });
+    return;
+  }
 
   res.json({
     jobId: job.id,
@@ -428,6 +559,7 @@ router.get('/mm3/stream/:id', async (req, res) => {
   // can be open at once and all advance together. Omitted means take 0, which
   // is what a one-take render has always served.
   const take = Math.max(0, Number(req.query.take) || 0);
+  let session: StreamSession | null = null;
 
   try {
     const engUrl = take > 0
@@ -442,12 +574,18 @@ router.get('/mm3/stream/:id', async (req, res) => {
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('X-Accel-Buffering', 'no');
+    // Node's copy for analysis and explicit recording (services/streamSessions).
+    // It sees only what this pipe forwards and can never hold the pipe up.
+    session = openStreamSession('mm3', { jobId: job.id, take });
+    if (session) res.setHeader('X-Stream-Session', session.id);
 
     const reader = eng.body.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (!res.write(Buffer.from(value))) {
+      const forwarded = res.write(Buffer.from(value));
+      session?.feed(value);
+      if (!forwarded) {
         // Respect backpressure: a browser that is not draining fast enough
         // must slow the pipe rather than grow an unbounded Node-side buffer.
         await new Promise<void>(resolve => res.once('drain', () => resolve()));
@@ -459,25 +597,31 @@ router.get('/mm3/stream/:id', async (req, res) => {
     console.warn(`[MM3 Stream] job ${job.id}: ${err?.message ?? err}`);
     if (!res.headersSent) res.status(502).json({ error: String(err?.message ?? err) });
     else { try { res.end(); } catch {} }
+  } finally {
+    session?.end();
   }
 });
 
 // POST /api/generate/cancel/:id — cancel a running job
-router.post('/cancel/:id', (req, res) => {
-  const job = jobs.get(req.params.id);
-  if (!job) { res.status(404).json({ error: 'Job not found' }); return; }
-
-  job.status = 'cancelled';
+/** Cancel one job; false when the id is unknown. Shared with the audio queue. */
+export function cancelGenerationJob(id: string): boolean {
+  const job = jobs.get(id);
+  if (!job) return false;
+  markGenerationJobCancelled(job);
   // One song of a running YuE2 batch: the engine drops it, the rest carry on.
-  if (dropYue2BatchMember(job)) { res.json({ success: true, jobId: job.id }); return; }
+  if (dropYue2BatchMember(job)) return true;
   if (job.aceJobId) {
     aceClient.cancelJob(job.aceJobId).catch(() => {});
   }
   if ((job as any)._abort) {
     (job as any)._abort.abort();
   }
+  return true;
+}
 
-  res.json({ success: true, jobId: job.id });
+router.post('/cancel/:id', (req, res) => {
+  if (!cancelGenerationJob(req.params.id)) { res.status(404).json({ error: 'Job not found' }); return; }
+  res.json({ success: true, jobId: req.params.id });
 });
 
 // POST /api/generate/cancel-all — cancel all running jobs
@@ -485,7 +629,7 @@ router.post('/cancel-all', (req, res) => {
   let cancelled = 0;
   for (const [, job] of jobs) {
     if (isActiveJob(job)) {
-      job.status = 'cancelled';
+      markGenerationJobCancelled(job);
       if (job.aceJobId) {
         aceClient.cancelJob(job.aceJobId).catch(() => {});
       }
@@ -532,6 +676,7 @@ router.post('/reset-queue', (_req, res) => {
       job.status = 'failed';
       job.error = 'Queue reset by user';
       job.stage = 'Reset';
+      withLedger('finish', ledger => ledger.finished(job));
       if (job.aceJobId) {
         aceClient.cancelJob(job.aceJobId).catch(() => {});
       }
@@ -586,6 +731,12 @@ interface StreamControlState {
   inferMethod: string | null;
   scheduler: string | null;
   guidanceMode: string | null;
+  /** Active drift runtime, set at stream start when baseParams.drift is present. */
+  drift?: DriftRuntime;
+  /** baseSeed resolved at stream start; used by /storm/control pre-stream drift seeding. */
+  baseSeed?: number;
+  /** True when ctrl.drift was set by /storm/control while no stream was live. */
+  driftPending?: boolean;
 }
 
 const streamRunning = new Map<string, boolean>();
@@ -609,7 +760,12 @@ function getStreamControl(streamId: string): StreamControlState {
 }
 
 function stopStream(streamId: string): void {
+  const wasRunning = streamRunning.get(streamId) === true;
   streamRunning.set(streamId, false);
+  // Drop the live drift runtime so it cannot leak into the next stream.
+  // A pending (idle-time) drift is left alone.
+  const c = streamControl.get(streamId);
+  if (c && wasRunning && !c.driftPending) c.drift = undefined;
   const aceJobId = streamAceJob.get(streamId);
   if (aceJobId) {
     aceClient.cancelJob(aceJobId).catch(() => {});
@@ -646,6 +802,11 @@ router.post('/storm/stream', async (req, res) => {
 
   res.setHeader('Content-Type', 'audio/wav');
   res.setHeader('Transfer-Encoding', 'chunked');
+  // Node's copy of each slot for analysis and explicit recording (services/streamSessions).
+  const session = openStreamSession('storm', { streamId });
+  if (session) res.setHeader('X-Stream-Session', session.id);
+  // Ends the session on every exit, including a throw before the slot loop's finally.
+  res.on('close', () => session?.end());
 
   // Browser tab closed / fetch aborted without POST /stop — stop generating.
   // Must watch res, not req: on Node >=16 the request stream emits 'close' as
@@ -664,9 +825,20 @@ router.post('/storm/stream', async (req, res) => {
   // "Keep DiT & VAE loaded" setting — same per-request ?keep_loaded=1 the
   // normal synth phase sends; without it the engine evicts between slots.
   const coResident = baseParams.coResident === true;
+  // Snapshot the active backend at stream start. Switching backends mid-stream
+  // is not supported; a new stream must be started after a backend switch.
+  const streamBackend = getActiveBackendId();
   let slotIdx = 0;
 
-  console.log(`[STORM ${streamId}] stream started (baseSeed=${baseSeed})`);
+  // Record the resolved baseSeed so pre-stream /storm/control calls can use it.
+  ctrl.baseSeed = baseSeed;
+
+  // Resolve the drift runtime. A pre-stream /storm/control drift is kept only
+  // when it is flagged pending; leftovers from a finished stream are dropped.
+  ctrl.drift = resolveStartDrift(ctrl.drift, ctrl.driftPending === true, baseParams.drift, baseSeed);
+  ctrl.driftPending = false;
+
+  console.log(`[STORM ${streamId}] stream started (baseSeed=${baseSeed}, backend=${streamBackend})`);
   pushLog(`[STORM ${streamId}] stream started`);
 
   try {
@@ -678,111 +850,134 @@ router.post('/storm/stream', async (req, res) => {
       }
       if (!streamRunning.get(streamId)) break;
 
-      const mergedPluginParams = {
-        ...(typeof baseParams.pluginParams === 'object' && baseParams.pluginParams !== null
-          ? baseParams.pluginParams as Record<string, unknown> : {}),
-        ...ctrl.extraPluginParams,
-      };
-
-      // NOTE: keys here must match what translateParams reads (camelCase for
-      // UI-facing params). An explicit per-slot seed also requires
-      // randomSeed=false or translateParams re-randomizes it.
-      const slotReq: Record<string, unknown> = {
-        ...baseParams,
-        randomSeed: false,
-        seed: ctrl.nextSeed !== null
-          ? ctrl.nextSeed
-          : (ctrl.seedLock ? baseSeed : baseSeed + slotIdx),
-        guidanceScale: ctrl.guidanceScale,
-        ...(ctrl.lssStrength > 0 ? { lssStrength: ctrl.lssStrength } : {}),
-        ...(ctrl.inferenceSteps > 0 ? { inferenceSteps: ctrl.inferenceSteps } : {}),
-        ...(ctrl.nextBpm !== null ? { bpm: ctrl.nextBpm } : ctrl.bpm > 0 ? { bpm: ctrl.bpm } : {}),
-        ...(ctrl.nextDuration !== null ? { duration: ctrl.nextDuration } : ctrl.duration > 0 ? { duration: ctrl.duration } : {}),
-        // Solver / scheduler / guidance live overrides — null keeps the snapshot value
-        ...(ctrl.inferMethod ? { inferMethod: ctrl.inferMethod } : {}),
-        ...(ctrl.scheduler ? { scheduler: ctrl.scheduler } : {}),
-        ...(ctrl.guidanceMode ? { guidanceMode: ctrl.guidanceMode } : {}),
-        ...(Object.keys(mergedPluginParams).length > 0 ? { pluginParams: mergedPluginParams } : {}),
-      };
-
-      // One-shot overrides (consumed after applying); Stick makes them base
+      // Log one-shot fields before buildSlotRequest reads them (they are
+      // cleared below after the helper returns).
       if (ctrl.nextPrompt !== null) {
-        slotReq.caption = ctrl.nextPrompt;
-        slotReq.prompt = ctrl.nextPrompt;
-        ctrl.nextPrompt = null;
         console.log(`[STORM ${streamId}] slot ${slotIdx}: applying queued prompt`);
-      } else if (ctrl.baseCaption !== null) {
-        slotReq.caption = ctrl.baseCaption;
-        slotReq.prompt = ctrl.baseCaption;
       }
       if (ctrl.nextLyrics !== null) {
-        slotReq.lyrics = ctrl.nextLyrics;
-        slotReq.instrumental = false;
+        console.log(`[STORM ${streamId}] slot ${slotIdx}: lyrics applied (one-shot), instrumental off`);
+      }
+
+      // Build the per-backend wire request via the shared slot helper.
+      // The helper reads ctrl but does not mutate it.
+      const slotResult = buildSlotRequest(baseParams, ctrl, slotIdx, baseSeed, streamBackend);
+
+      // Consume one-shot fields (same clearing the inline code did before).
+      if (ctrl.nextPrompt !== null) ctrl.nextPrompt = null;
+      if (ctrl.nextLyrics !== null) {
         ctrl.baseInstrumental = false;
         ctrl.nextLyrics = null;
-        console.log(`[STORM ${streamId}] slot ${slotIdx}: lyrics applied (one-shot), instrumental off`);
-      } else if (ctrl.baseLyrics !== null) {
-        slotReq.lyrics = ctrl.baseLyrics;
-        slotReq.instrumental = false;
-      } else if (ctrl.baseInstrumental === false) {
-        slotReq.instrumental = false;
       }
       if (ctrl.nextSeed !== null) ctrl.nextSeed = null;
       if (ctrl.nextBpm !== null) ctrl.nextBpm = null;
       if (ctrl.nextDuration !== null) ctrl.nextDuration = null;
 
-      const aceReq = translateParams(slotReq);
+      // Resolves only once the engine is done with the slot, so the lane is
+      // held through it. Stop/disconnect cancels an ACE/YuE2 job and waits for
+      // its terminal state; an SA3 slot (one synchronous fetch, no mid-render
+      // cancel) finishes. Either way the output is discarded.
+      const renderSlot = async (): Promise<Buffer | null> => {
+        if (slotResult.kind === 'sa3') {
+          const { ids, nTokens } = await tokenizeForSa3(slotResult.caption);
+          return aceClient.submitSa3Synth({
+            tokens: ids,
+            nTokens,
+            durationSec: slotResult.durationSec,
+            steps: slotResult.steps,
+            sampler: slotResult.sampler,
+            seed: slotResult.seed,
+            ...(slotResult.seedB !== undefined ? { seedB: slotResult.seedB, seedBlend: slotResult.seedBlend } : {}),
+            adapters: slotResult.adapters,
+            outFmt: 'f32',
+            ...(slotResult.solver        ? { solver:        slotResult.solver }        : {}),
+            ...(slotResult.scheduler     ? { scheduler:     slotResult.scheduler }     : {}),
+            ...(slotResult.guidanceMode  ? { guidanceMode:  slotResult.guidanceMode }  : {}),
+            ...(slotResult.guidanceScale !== undefined ? { guidanceScale: slotResult.guidanceScale } : {}),
+            ...(slotResult.pluginParams  ? { pluginParams:  slotResult.pluginParams }  : {}),
+            ...(slotResult.postprocessPlugin ? { postprocessPlugin: slotResult.postprocessPlugin } : {}),
+          });
+        }
 
-      // Inline poll — checks streamRunning every 300 ms so stop/disconnect
-      // cancels mid-render instead of waiting out the slot.
-      const synthJobId = await aceClient.submitSynth(aceReq, 'wav32', coResident);
-      streamAceJob.set(streamId, synthJobId);
-      const slotStart = Date.now();
-      let jobDone = false;
-      while (!jobDone) {
-        if (!streamRunning.get(streamId)) {
-          await aceClient.cancelJob(synthJobId).catch(() => {});
-          console.log(`[STORM ${streamId}] slot ${slotIdx}: cancelled mid-render`);
-          break;
-        }
-        if (Date.now() - slotStart > STREAM_SLOT_TIMEOUT_MS) {
-          await aceClient.cancelJob(synthJobId).catch(() => {});
-          console.warn(`[STORM ${streamId}] slot ${slotIdx}: render timeout — stopping stream`);
-          streamRunning.set(streamId, false);
-          break;
-        }
-        const status = await aceClient.pollJob(synthJobId);
-        if (status.status === 'done') { jobDone = true; break; }
-        if (status.status === 'failed' || status.status === 'cancelled') {
-          console.warn(`[STORM ${streamId}] slot ${slotIdx}: ${status.status}`);
-          break;
-        }
-        await new Promise(r => setTimeout(r, 300));
-      }
-      streamAceJob.delete(streamId);
-      if (!jobDone || !streamRunning.get(streamId)) break;
+        // Submit to the right backend and get a shared-job id.
+        const synthJobId = slotResult.kind === 'yue2'
+          ? (await yue2Synth(slotResult.yue2Req)).job_id
+          : await aceClient.submitSynth(slotResult.aceReq, 'wav32', coResident);
 
-      const audioRes = await aceClient.getJobResult(synthJobId);
-      if (!audioRes.ok) {
-        console.warn(`[STORM ${streamId}] slot ${slotIdx}: result fetch failed (${audioRes.status})`);
-        break;
-      }
-      const wavBuf = Buffer.from(await audioRes.arrayBuffer());
+        // Stop/disconnect cancels mid-render; the wait still lasts until the
+        // engine settles (poll errors are retried), so the lane is held.
+        streamAceJob.set(streamId, synthJobId);
+        let end: SlotJobEnd;
+        try {
+          end = await waitForSlotJob({
+            poll: () => aceClient.pollJob(synthJobId),
+            cancel: () => aceClient.cancelJob(synthJobId),
+            isRunning: () => streamRunning.get(streamId) === true,
+            onTimeout: () => streamRunning.set(streamId, false),
+            engineCrashSeq,
+            timeoutMs: STREAM_SLOT_TIMEOUT_MS,
+            log: msg => console.warn(`[STORM ${streamId}] slot ${slotIdx}: ${msg}`),
+          });
+        } finally {
+          streamAceJob.delete(streamId);
+        }
+        if (end !== 'done') {
+          console.warn(`[STORM ${streamId}] slot ${slotIdx}: ${end}`);
+          return null;
+        }
+        if (!streamRunning.get(streamId)) return null;
+
+        const audioRes = await aceClient.getJobResult(synthJobId);
+        if (!audioRes.ok) {
+          console.warn(`[STORM ${streamId}] slot ${slotIdx}: result fetch failed (${audioRes.status})`);
+          return null;
+        }
+        const audioBody = Buffer.from(await audioRes.arrayBuffer());
+        // YuE2 may return multipart/mixed (one WAV per track); take the first
+        // part. ACE always returns a single WAV so the same path works for both.
+        const contentType = audioRes.headers.get('content-type') || 'audio/wav';
+        return contentType.startsWith('multipart/mixed')
+          ? (splitMultipartMixed(audioBody, contentType)[0] ?? audioBody)
+          : audioBody;
+      };
+
+      const wavBuf = await renderSlotOnLane({
+        label: `storm ${streamId} slot ${slotIdx}`,
+        family: streamBackend,
+        isRunning: () => streamRunning.get(streamId) === true,
+        evict: () => evictOtherFamilies(streamBackend),
+        render: renderSlot,
+      });
+      if (!wavBuf) break;
       res.write(wavBuf);
+      session?.chunk(wavBuf);
       slotIdx++;
     }
   } catch (err) {
     console.error(`[STORM stream ${streamId}] error:`, err);
   } finally {
     stopStream(streamId);
+    // Keep a drift that a POST /storm/control set as pending after the stream
+    // ended; everything else (including live drift) is discarded.
+    const endCtrl = streamControl.get(streamId);
+    const pendingDrift = endCtrl?.driftPending ? endCtrl.drift : undefined;
     streamControl.delete(streamId);
+    session?.end();
+    if (pendingDrift) {
+      const fresh = getStreamControl(streamId);
+      fresh.drift = pendingDrift;
+      fresh.driftPending = true;
+    }
     console.log(`[STORM ${streamId}] stream ended after ${slotIdx} slot(s)`);
     pushLog(`[STORM ${streamId}] stream ended after ${slotIdx} slot(s)`);
     res.end();
   }
 });
 
-// POST /api/generate/storm/stop — stop a stream (cancels the in-flight slot)
+// POST /api/generate/storm/stop — stop a stream. No further slot starts. An
+// in-flight ACE/YuE2 slot is cancelled; an in-flight SA3 slot runs to the end
+// (no mid-render cancel). Its output is discarded either way, and the GPU lane
+// stays held until the engine has finished.
 router.post('/storm/stop', (req, res) => {
   const b = req.body as Record<string, unknown>;
   const streamId = typeof b.streamId === 'string' ? b.streamId : 'default';
@@ -821,6 +1016,25 @@ router.post('/storm/control', (req, res) => {
       if (typeof v === 'number' || typeof v === 'string') ctrl.extraPluginParams[k] = v;
     }
   }
+  // Drift pressure patch -- ignore bad fields, never throw.
+  if (b.drift && typeof b.drift === 'object' && !Array.isArray(b.drift)) {
+    const live = streamRunning.get(streamId) === true;
+    if (live && ctrl.drift) {
+      // Stream is live: merge into existing runtime.
+      updateDriftPressure(ctrl.drift, b.drift as Partial<DriftPressure>);
+    } else if (!live && ctrl.drift && ctrl.driftPending) {
+      // Already pending: merge further idle-time patches.
+      updateDriftPressure(ctrl.drift, b.drift as Partial<DriftPressure>);
+    } else {
+      // Fresh runtime. When idle it is stored as pending; state is re-seeded
+      // with the real baseSeed at stream start (resolveStartDrift).
+      const seed = ctrl.baseSeed ?? Math.floor(Math.random() * 2147483647);
+      const driftRuntime: DriftRuntime = { state: initDrift(seed), pressure: defaultDriftPressure() };
+      updateDriftPressure(driftRuntime, b.drift as Partial<DriftPressure>);
+      ctrl.drift = driftRuntime;
+      ctrl.driftPending = !live;
+    }
+  }
 
   res.json({ ok: true, streamId });
 });
@@ -828,9 +1042,12 @@ router.post('/storm/control', (req, res) => {
 // GET /api/generate/storm/control — read back a stream's live state
 router.get('/storm/control', (req, res) => {
   const streamId = typeof req.query.streamId === 'string' ? req.query.streamId : 'default';
+  const ctrl = getStreamControl(streamId);
+  const { drift: _drift, ...ctrlWithoutDrift } = ctrl;
   res.json({
     running: streamRunning.get(streamId) ?? false,
-    ...getStreamControl(streamId),
+    ...ctrlWithoutDrift,
+    ...(ctrl.drift ? { drift: driftSnapshot(ctrl.drift) } : {}),
   });
 });
 

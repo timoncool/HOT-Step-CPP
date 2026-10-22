@@ -125,6 +125,10 @@ struct Yue2VaeConfig {
     uint32_t    channels            = 0;  // 64 (base channel count both sides)
     std::vector<int32_t> strides;         // [2,2,4,4,5,6], encoder forward order
     std::vector<int32_t> res_dilations;   // [1,3,9]
+    // Decoder's own per-block dilations (yue2vae.dec_res_dilations). Absent in
+    // the shipped files, where it equals res_dilations; a grown fine-tuned
+    // decoder carries more units ([1,3,9] repeated) while its encoder stays at 3.
+    std::vector<int32_t> dec_res_dilations;
     bool        use_snake           = false;
     std::string snake_type;               // "vanilla" (SnakeBeta)
     float       snake_eps            = 0.0f;  // 1e-9
@@ -280,13 +284,20 @@ struct Yue2Variant {
     uint64_t    bytes = 0;
 };
 
-enum Yue2VaeVariant { YUE2_VAE_STANDARD = 0, YUE2_VAE_LEGACY = 1, YUE2_VAE_VARIANT_COUNT };
+// dec2x: a locally fine-tuned standard VAE whose decoder has 9 residual units per
+// block (tools/yue2-vae-train). Same encoder and latent space as standard.
+enum Yue2VaeVariant { YUE2_VAE_STANDARD = 0, YUE2_VAE_LEGACY = 1, YUE2_VAE_DEC2X = 2, YUE2_VAE_VARIANT_COUNT };
 
-static const char * const YUE2_VAE_VARIANT_NAME[YUE2_VAE_VARIANT_COUNT] = { "standard", "legacy" };
+static const char * const YUE2_VAE_VARIANT_NAME[YUE2_VAE_VARIANT_COUNT] = { "standard", "legacy", "dec2x" };
 
 // ── The model ────────────────────────────────────────────────────────────────
 
+struct Yue2VaeGraph;
+
 struct Yue2Model {
+    // The decoder supplies the deleter, keeping its graph definition out of
+    // the loader header. Destroy compute buffers before weights/backends.
+    std::shared_ptr<Yue2VaeGraph> vae_decode_cache;
     // discovery + probe (cheap, header-only)
     std::string               models_dir;
     std::vector<std::string>  search_dirs;
@@ -613,6 +624,10 @@ static void yue2_parse_vae_config(const GGUFModel & gf, Yue2VaeConfig * c) {
     c->channels             = gf_get_u32(gf, "yue2vae.channels");
     c->strides              = yue2_get_i32_arr(gf, "yue2vae.strides");
     c->res_dilations        = yue2_get_i32_arr(gf, "yue2vae.res_dilations");
+    c->dec_res_dilations    = yue2_get_i32_arr(gf, "yue2vae.dec_res_dilations");
+    if (c->dec_res_dilations.empty()) {
+        c->dec_res_dilations = c->res_dilations;
+    }
     c->use_snake            = gf_get_bool(gf, "yue2vae.use_snake");
     c->snake_type           = gf_get_str(gf, "yue2vae.snake_type");
     c->snake_eps            = gf_get_f32(gf, "yue2vae.snake_eps");
@@ -654,6 +669,8 @@ static void yue2_validate_vae_config(const Yue2VaeConfig & c, std::vector<std::s
     };
     need(!c.strides.empty(), "yue2vae.strides is empty or missing");
     need(c.res_dilations.size() == 3, "yue2vae.res_dilations is not 3 entries");
+    need(!c.dec_res_dilations.empty() && c.dec_res_dilations.size() <= 32,
+         "yue2vae.dec_res_dilations is empty or longer than 32 entries");
     need(c.channels > 0, "yue2vae.channels is 0 or missing");
     need(c.latent_dim > 0, "yue2vae.latent_dim is 0 or missing");
     need(c.audio_channels > 0, "yue2vae.audio_channels is 0 or missing");
@@ -1105,15 +1122,16 @@ static bool yue2_load_vae_tensors(Yue2Model * m, const GGUFModel & gf, bool want
                                   std::vector<std::string> * errs) {
     const Yue2VaeConfig & c  = m->vae_cfg;
     const size_t           NB = c.strides.size();
-    const size_t           NR = c.res_dilations.size();  // always 3
+    const size_t           NR = c.res_dilations.size();      // encoder: always 3
+    const size_t           NRD = c.dec_res_dilations.size();  // decoder: 3, or more when grown
 
     const std::vector<int64_t> ew = yue2_vae_encoder_widths(c);  // size NB+1, index 0..NB
     // Decoder widths are the exact reverse: dw[i] = ew[NB-i].
     auto dw = [&](size_t i) { return ew[NB - i]; };
 
-    // Budget: dec (2 conv_in + NB*(2 snake_pre + 2 upsample + NR*8) + 2 snake_out + 1 conv_out)
+    // Budget: dec (2 conv_in + NB*(2 snake_pre + 2 upsample + NRD*8) + 2 snake_out + 1 conv_out)
     // + optionally enc (mirror shape, minus the dec asymmetries).
-    const int n_dec = 2 + (int) NB * (2 + 2 + (int) NR * 8) + 2 + 1;
+    const int n_dec = 2 + (int) NB * (2 + 2 + (int) NRD * 8) + 2 + 1;
     const int n_enc = want_encoder ? 2 + (int) NB * ((int) NR * 8 + 2 + 2) + 2 + 2 : 0;
     wctx_init(&m->wctx_vae, n_dec + n_enc);
     Yue2Loader ld{ &m->wctx_vae, &gf, &m->tmap_vae, errs };
@@ -1137,8 +1155,8 @@ static bool yue2_load_vae_tensors(Yue2Model * m, const GGUFModel & gf, bool want
 
         // Dilation (1/3/9 across r=0..2) affects conv1's receptive field at
         // graph-build time, not its stored tensor shape — nothing to check here.
-        db.res.assign(NR, Yue2VaeResUnit{});
-        for (size_t r = 0; r < NR && errs->empty(); r++) {
+        db.res.assign(NRD, Yue2VaeResUnit{});
+        for (size_t r = 0; r < NRD && errs->empty(); r++) {
             Yue2VaeResUnit & ru = db.res[r];
             ru.snake1_alpha = ld.req(yue2_fmt2("dec.blk.%d.res.%d.snake1.alpha", b, (int) r), cout);
             ru.snake1_beta  = ld.req(yue2_fmt2("dec.blk.%d.res.%d.snake1.beta", b, (int) r), cout);
@@ -1279,6 +1297,7 @@ static void yue2_evict_half(Yue2Model * m, bool ar, bool nar) {
 }
 
 static void yue2_unload(Yue2Model * m) {
+    m->vae_decode_cache.reset();
     if (!m->backend_ref && !m->lm_resident && !m->nar_resident && !m->vae_resident && !m->wctx_lm.ctx &&
         !m->wctx_nar.ctx && !m->wctx_vae.ctx) {
         return;
@@ -1606,6 +1625,7 @@ static bool yue2_load_parts(Yue2Model * m, bool want_lm, bool want_vae, Yue2VaeV
 static bool yue2_load_parts(Yue2Model * m, bool want_ar, bool want_nar, bool want_vae, Yue2VaeVariant variant,
                             bool want_encoder, std::string * err_out) {
     if (want_vae && m->vae_resident && m->vae_loaded_variant != variant) {
+        m->vae_decode_cache.reset();
         wctx_free(&m->wctx_vae);
         m->vae             = Yue2VaeWeights{};
         m->tmap_vae.clear();
@@ -1787,7 +1807,7 @@ static bool yue2_load_parts(Yue2Model * m, bool want_ar, bool want_nar, bool wan
     fprintf(stderr, "[YuE2] Loaded%s%s%s: AR %.2f + NAR %.2f + VAE(%s) %.2f = %.2f GB in %.0f ms\n",
             need_ar ? " ar" : "", need_nar ? " nar" : "", need_vae ? " vae" : "",
             (double) m->vram_lm / (1024.0 * 1024.0 * 1024.0), (double) m->vram_nar / (1024.0 * 1024.0 * 1024.0),
-            YUE2_VAE_VARIANT_NAME[m->vae_loaded_variant], (double) m->vram_vae / (1024.0 * 1024.0 * 1024.0),
+            m->vae_resident ? YUE2_VAE_VARIANT_NAME[m->vae_loaded_variant] : "none", (double) m->vram_vae / (1024.0 * 1024.0 * 1024.0),
             (double) yue2_vram_bytes(*m) / (1024.0 * 1024.0 * 1024.0), m->load_ms);
     return true;
 }

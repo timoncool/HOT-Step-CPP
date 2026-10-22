@@ -14,7 +14,7 @@
 // WeightCtx::PendingCopy sources there costs no extra VRAM and needs no
 // second pass: wctx_alloc then uploads already-adapted weights.
 //
-// Deliberately NOT in scope: LoKr, DoRA, basin re-base, runtime (unmerged)
+// Deliberately NOT in scope: basin re-base, runtime (unmerged)
 // deltas, and an importer for the upstream ComfyUI-YuE2-Trainer's fused-qkv
 // layout (plan §4 calls that "a nice-to-have, not v1" — see "Fused qkv" below
 // for what this file does when it meets one).
@@ -163,6 +163,7 @@
 // merge is not quant-neutral.
 
 #include "adapter-merge.h"
+#include "dora-common.h"
 #include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
 #include "safetensors.h"
 #include "timer.h"
@@ -170,6 +171,9 @@
 #include "weight-source.h"
 
 #include <cctype>
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -299,6 +303,24 @@ static int yue2_lokr_suffix(const std::string & key, std::string & module_out) {
     }
     return 0;
 }
+
+// DoRA magnitude (the joint trainer's yue2-{ar,nar}-dora-v1 export, PEFT's
+// spelling): one F32 per output row of the module. Same module-path
+// convention as the LoRA suffixes.
+static bool yue2_magnitude_suffix(const std::string & key, std::string & module_out) {
+    for (const char * sfx : { ".lora_magnitude_vector.weight", ".lora_magnitude_vector" }) {
+        const size_t n = strlen(sfx);
+        if (key.size() > n && key.compare(key.size() - n, n, sfx) == 0) {
+            module_out = key.substr(0, key.size() - n);
+            return true;
+        }
+    }
+    return false;
+}
+
+// The DoRA norm floor, the trainer's (train/yue2-aitk-lora.h): an all-zero
+// row stays finite and merges to zero instead of 0/0.
+static const float kYue2DoraNormFloor = 1e-12f;
 
 // Which trainable half a site belongs to. YUE2_FAM_NONE is "not a site we
 // merge"; YUE2_FAM_ANY is only ever a REQUEST (an adapter that declares no
@@ -505,6 +527,8 @@ struct Yue2AdapterMeta {
     std::string targets;
     std::string trigger;
     std::string base_sha;
+    std::string use_dora;       // "" => absent; DoRA files write "true"
+    std::string dora_scaling;   // "" => absent; the only meaning is "alpha/rank"
     float       alpha = 0.0f;   // 0 => absent
     int64_t     rank  = 0;      // 0 => absent (informational only; rank always
                                 //      comes from the tensor shapes)
@@ -558,6 +582,8 @@ static Yue2AdapterMeta yue2_adapter_read_meta(const STFile & st) {
         yue2a_meta_str(meta, "targets", &md.targets);
         yue2a_meta_str(meta, "trigger", &md.trigger);
         yue2a_meta_str(meta, "base_sha", &md.base_sha);
+        yue2a_meta_str(meta, "use_dora", &md.use_dora);
+        yue2a_meta_str(meta, "dora_scaling", &md.dora_scaling);
         double d = 0.0;
         if (yue2a_meta_num(meta, "alpha", &d)) {
             md.alpha = (float) d;
@@ -647,6 +673,8 @@ struct Yue2LoraFactor {
     const STEntry * w2a   = nullptr;
     const STEntry * w2b   = nullptr;
     bool            lokr() const { return w1 != nullptr; }
+    // DoRA: the module's magnitude, F32 [out]; set only in a dora-v1 file.
+    const STEntry * mag   = nullptr;
     float           alpha = 0.0f;  // 0 => scaling 1.0
     // Carried from the target so the merge loop can price each tensor without
     // re-parsing its name: the loop iterates the gguf-name map, and the module
@@ -697,15 +725,17 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
     if (md.format.empty()) {
         fprintf(stderr, "[YuE2-Adapter] NOTE: no `format` in __metadata__ — merging on the strength of the "
                         "key names alone, and refusing the file if it names both halves\n");
-    } else if (yue2a_starts(md.format, "yue2-nar-lora") || yue2a_starts(md.format, "yue2-nar-lokr")) {
+    } else if (yue2a_starts(md.format, "yue2-nar-lora") || yue2a_starts(md.format, "yue2-nar-lokr") ||
+               yue2a_starts(md.format, "yue2-nar-dora")) {
         want_fam = YUE2_FAM_NAR;
-    } else if (yue2a_starts(md.format, "yue2-ar-lora") || yue2a_starts(md.format, "yue2-ar-lokr")) {
+    } else if (yue2a_starts(md.format, "yue2-ar-lora") || yue2a_starts(md.format, "yue2-ar-lokr") ||
+               yue2a_starts(md.format, "yue2-ar-dora")) {
         want_fam = YUE2_FAM_AR;
     } else if (!yue2a_starts(md.format, "yue2-")) {
         // Not ours at all. Refuse by name rather than by an empty merge.
         if (err_out) {
             *err_out = "adapter __metadata__ says format=\"" + md.format +
-                       "\"; this loader merges yue2-{nar,ar}-{lora,lokr}-v1 files only";
+                       "\"; this loader merges yue2-{nar,ar}-{lora,lokr,dora}-v1 files only";
         }
         return -1;
     } else {
@@ -715,6 +745,41 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
                 "[YuE2-Adapter] NOTE: unrecognised format=\"%s\" — merging on the key names alone, and "
                 "refusing the file if it names both halves\n",
                 md.format.c_str());
+    }
+    // DoRA is only ever the versioned yue2-{ar,nar}-dora-v1 format, and its
+    // metadata must not contradict it: magnitudes in any other file, or a
+    // DoRA file that says otherwise, are refused before anything is patched.
+    // Only the two v1 tags: a later DoRA revision may change what the
+    // magnitudes or the scaling mean, so it is refused, never merged as v1.
+    const bool dora_fmt = md.format == "yue2-nar-dora-v1" || md.format == "yue2-ar-dora-v1";
+    if (!dora_fmt && (yue2a_starts(md.format, "yue2-nar-dora") || yue2a_starts(md.format, "yue2-ar-dora"))) {
+        if (err_out) {
+            *err_out = "adapter __metadata__ says format=\"" + md.format +
+                       "\"; this loader merges DoRA as yue2-ar-dora-v1 / yue2-nar-dora-v1 only";
+        }
+        return -1;
+    }
+    if (dora_fmt ? (!md.use_dora.empty() && md.use_dora != "true") : md.use_dora == "true") {
+        if (err_out) {
+            *err_out = "adapter __metadata__ says format=\"" + md.format + "\" but use_dora=\"" + md.use_dora +
+                       "\" — contradictory DoRA metadata, refusing";
+        }
+        return -1;
+    }
+    // dora_scaling is "alpha/rank" or the trainer's number for it. A number
+    // is checked per module in the preflight, against the alpha and tensor
+    // rank the merge will actually use; anything else is refused here.
+    double dora_scaling = NAN;  // NaN: declared symbolically, or absent
+    if (dora_fmt && !md.dora_scaling.empty() && md.dora_scaling != "alpha/rank") {
+        char * end   = nullptr;
+        dora_scaling = strtod(md.dora_scaling.c_str(), &end);
+        if (end == md.dora_scaling.c_str() || *end || !std::isfinite(dora_scaling) || !(dora_scaling > 0.0)) {
+            if (err_out) {
+                *err_out = "DoRA adapter declares dora_scaling=\"" + md.dora_scaling +
+                           "\"; this loader merges alpha/rank scaling only";
+            }
+            return -1;
+        }
     }
     if (!md.base_sha.empty()) {
         // Nothing here knows the resident LM's sha, so this is a breadcrumb for
@@ -748,8 +813,19 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
     std::map<std::string, const STEntry *> a_by_module, b_by_module;
     struct LokrEntry { const STEntry * w1 = nullptr, * w2 = nullptr, * w2a = nullptr, * w2b = nullptr; };
     std::map<std::string, LokrEntry>       lokr_by_module;
+    std::map<std::string, const STEntry *> mag_by_module;
     for (const auto & e : st.entries) {
         std::string mod;
+        if (yue2_magnitude_suffix(e.name, mod)) {
+            if (mag_by_module.count(mod)) {
+                if (err_out) {
+                    *err_out = "adapter module \"" + mod + "\" carries two magnitude vectors";
+                }
+                return -1;
+            }
+            mag_by_module[mod] = &e;
+            continue;
+        }
         const char  which = yue2_lora_suffix(e.name, mod);
         if (which == 'A') {
             a_by_module[mod] = &e;
@@ -844,9 +920,44 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
         Yue2LoraFactor f;
         f.a = kv.second;
         f.b = bit->second;
+        if (dora_fmt) {
+            // Every DoRA module carries its magnitude. A pair without one is a
+            // truncated or mixed export, not "LoRA for this module".
+            auto mit = mag_by_module.find(mod);
+            if (mit == mag_by_module.end()) {
+                if (err_out) {
+                    *err_out = "DoRA adapter module \"" + mod + "\" has A/B factors but no lora_magnitude_vector — "
+                               "a truncated or half-written export";
+                }
+                return -1;
+            }
+            f.mag = mit->second;
+        }
         if (!bind(mod, f)) {
             return -1;
         }
+    }
+    if (!mag_by_module.empty() && !dora_fmt) {
+        if (err_out) {
+            *err_out = "adapter carries lora_magnitude_vector tensors (\"" + mag_by_module.begin()->first +
+                       "\") but its __metadata__ format is \"" + md.format +
+                       "\", not yue2-{ar,nar}-dora-v1 — merging it as LoRA would drop the magnitudes";
+        }
+        return -1;
+    }
+    for (const auto & kv : mag_by_module) {
+        if (!a_by_module.count(kv.first) || !b_by_module.count(kv.first)) {
+            if (err_out) {
+                *err_out = "DoRA magnitude for \"" + kv.first + "\" has no A/B pair — a truncated or half-written export";
+            }
+            return -1;
+        }
+    }
+    if (dora_fmt && !lokr_by_module.empty()) {
+        if (err_out) {
+            *err_out = "DoRA adapter carries LoKr factors (\"" + lokr_by_module.begin()->first + "\")";
+        }
+        return -1;
     }
     for (const auto & kv : lokr_by_module) {
         const std::string & mod = kv.first;
@@ -1062,6 +1173,43 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
                 }
                 return -1;
             }
+            if (f.mag) {
+                // F32 [out], present in the file and finite: everything the
+                // merge reads, checked before anything is patched.
+                bool mag_ok = f.mag->dtype == "F32" && f.mag->n_dims == 1 && f.mag->shape[0] == ne[1] &&
+                              yue2a_extent_ok(st, *f.mag, ne[1], sizeof(float));
+                if (mag_ok) {
+                    const float * mp = (const float *) st_data(st, *f.mag);
+                    for (int64_t i = 0; i < ne[1] && mag_ok; i++) {
+                        float v;
+                        memcpy(&v, mp + i, sizeof(v));
+                        mag_ok = std::isfinite(v);
+                    }
+                }
+                if (!mag_ok) {
+                    if (err_out) {
+                        *err_out = name + ": DoRA magnitude must be F32 [" + std::to_string((long long) ne[1]) +
+                                   "] (one per output row), inside the file and finite (" + f.mag->name + ", " +
+                                   f.mag->dtype + ")";
+                    }
+                    return -1;
+                }
+                // The scaling the merge loop below applies: this module's
+                // resolved alpha over its tensor rank. A declared number that
+                // disagrees means the norm the trainer took is not this one.
+                const double s_eff = f.alpha > 0.0f ? (double) f.alpha / (double) f.a->shape[0] : 1.0;
+                if (std::isfinite(dora_scaling) && !(std::fabs(dora_scaling - s_eff) <= 1e-6 + 1e-5 * s_eff)) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                             "%s: DoRA adapter declares dora_scaling=%s, but this module merges at alpha/rank = "
+                             "%g/%lld = %g",
+                             name.c_str(), md.dora_scaling.c_str(), (double) f.alpha, (long long) f.a->shape[0], s_eff);
+                    if (err_out) {
+                        *err_out = buf;
+                    }
+                    return -1;
+                }
+            }
             }  // LoRA-shaped checks
 
             if (ggml_quantize_requires_imatrix(ttype)) {
@@ -1162,7 +1310,7 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
         std::function<adapter_delta_build(struct ggml_context *)> build;
         // Host copies the build lambda uploads; declared out here so they
         // outlive the merge call whichever branch fills them.
-        std::vector<float> av, bv, w1v, w2v, w2av, w2bv;
+        std::vector<float> av, bv, w1v, w2v, w2av, w2bv, mv, w0v;
 
         if (f.lokr()) {
             // torch w1 [a, b], W2 [c, d] (= w2_a [c, r] @ w2_b [r, d] when
@@ -1251,6 +1399,59 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
                             "alpha, no adapter_config.json) — using scaling 1.0, i.e. alpha == rank\n");
         }
 
+        if (f.mag) {
+            // DoRA (yue2-*-dora-v1): W' = m (W0 + s BA) / max(||W0 + s BA||_row,
+            // floor), the trainer's forward weight. The delta handed to the
+            // merge is W' - W0, so strength u merges W0 + u (W' - W0): u = 0 is
+            // the base and u = 1 is W'. W0 is the running base, a prior adapter
+            // in this load included (the companion always is). It is decoded on
+            // the backend when it can be, on the host otherwise (NVFP4/MXFP4,
+            // whose split path computes this delta on the backend from F32).
+            mv.resize((size_t) out_feat);
+            memcpy(mv.data(), st_data(st, *f.mag), mv.size() * sizeof(float));
+            const bool host_w0 = !yue2_adapter_can_decode(backend, ttype);
+            if (host_w0) {
+                const struct ggml_type_traits * traits = ggml_get_type_traits(ttype);
+                if (!traits->to_float) {
+                    if (err_out) {
+                        *err_out = gguf_name + ": DoRA needs the base decoded, and " + ggml_type_name(ttype) +
+                                   " has no host dequant";
+                    }
+                    return -1;
+                }
+                w0v.resize((size_t) (in_feat * out_feat));
+                traits->to_float(base_ptr, w0v.data(), in_feat * out_feat);
+            }
+            const size_t w0_nb = ggml_row_size(ttype, in_feat) * (size_t) out_feat;
+            build = [=, &av, &bv, &mv, &w0v](struct ggml_context * ctx) {
+                struct ggml_tensor * ta    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in_feat, rank);
+                struct ggml_tensor * tb    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, out_feat);
+                struct ggml_tensor * tm    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, out_feat);
+                struct ggml_tensor * tw0n  = ggml_new_tensor_2d(ctx, host_w0 ? GGML_TYPE_F32 : ttype, in_feat, out_feat);
+                struct ggml_tensor * tw0   = host_w0 ? tw0n : ggml_cast(ctx, tw0n, GGML_TYPE_F32);
+                // Same BF16 rounding of A and B as the LoRA build below.
+                struct ggml_tensor * ta_br = ggml_cast(ctx, ggml_cast(ctx, ta, GGML_TYPE_BF16), GGML_TYPE_F32);
+                struct ggml_tensor * tb_br = ggml_cast(ctx, ggml_cast(ctx, tb, GGML_TYPE_BF16), GGML_TYPE_F32);
+                struct ggml_tensor * td    = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, ta_br)), tb_br);
+                ggml_mul_mat_set_prec(td, GGML_PREC_F32);
+                struct ggml_tensor * twd   = ggml_add(ctx, tw0, ggml_scale(ctx, td, scaling));
+                struct ggml_tensor * tn    = ggml_clamp(ctx, dora_col_norm(ctx, tw0, ta_br, tb_br, scaling),
+                                                        kYue2DoraNormFloor, FLT_MAX);
+                adapter_delta_build db;
+                db.tdelta = ggml_sub(ctx, ggml_mul(ctx, twd, ggml_div(ctx, tm, tn)), tw0);
+                db.upload = [=, &av, &bv, &mv, &w0v]() {
+                    ggml_backend_tensor_set(ta, av.data(), 0, av.size() * sizeof(float));
+                    ggml_backend_tensor_set(tb, bv.data(), 0, bv.size() * sizeof(float));
+                    ggml_backend_tensor_set(tm, mv.data(), 0, mv.size() * sizeof(float));
+                    if (host_w0) {
+                        ggml_backend_tensor_set(tw0n, w0v.data(), 0, w0v.size() * sizeof(float));
+                    } else {
+                        ggml_backend_tensor_set(tw0n, base_ptr, 0, w0_nb);
+                    }
+                };
+                return db;
+            };
+        } else
         build = [=, &av, &bv](struct ggml_context * ctx) {
             // The (tensor, data) pairs are captured EXPLICITLY rather than
             // re-derived at upload time. A is [rank, in] and B is [out, rank],
@@ -1370,8 +1571,10 @@ static std::string yue2_adapter_probe_family(const std::string & path) {
     if (!st_open(&st, sf_path.c_str())) return "";
     std::string fam;
     const Yue2AdapterMeta md = yue2_adapter_read_meta(st);
-    if (yue2a_starts(md.format, "yue2-nar-lora") || yue2a_starts(md.format, "yue2-nar-lokr")) fam = "nar";
-    else if (yue2a_starts(md.format, "yue2-ar-lora") || yue2a_starts(md.format, "yue2-ar-lokr")) fam = "ar";
+    if (yue2a_starts(md.format, "yue2-nar-lora") || yue2a_starts(md.format, "yue2-nar-lokr") ||
+        yue2a_starts(md.format, "yue2-nar-dora")) fam = "nar";
+    else if (yue2a_starts(md.format, "yue2-ar-lora") || yue2a_starts(md.format, "yue2-ar-lokr") ||
+             yue2a_starts(md.format, "yue2-ar-dora")) fam = "ar";
     else {
         bool has_nar = false, has_ar = false;
         for (const STEntry & e : st.entries) {

@@ -1,9 +1,10 @@
-import { barsIn, isVocalVoice, lyricSectionTags, scoreBarSegments } from './scoreHealth.js';
+import { barsIn, isScoreVocalVoice, lyricSectionTags, scoreBarSegments, vocalVoiceIds } from './scoreHealth.js';
 
 export interface Yue2ScoreSection { label: string; startBar: number }
 
 /** Count Vocal bars the same way scoreHealth does; Ins mirrors them. */
 export function scoreSections(abc: string): Yue2ScoreSection[] {
+  const vocalIds = vocalVoiceIds(abc);
   const sections: Yue2ScoreSection[] = [];
   let inVocal = false;
   let bars = 0;
@@ -16,7 +17,7 @@ export function scoreSections(abc: string): Yue2ScoreSection[] {
       continue;
     }
     if (/^V:/.test(line)) {
-      inVocal = isVocalVoice(line);
+      inVocal = isScoreVocalVoice(line, vocalIds);
       continue;
     }
     if (/^[A-Za-z]:/.test(line) || !inVocal) continue;

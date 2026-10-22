@@ -125,8 +125,14 @@ static void dit_resume_bf16_to_f32(const uint16_t * in, float * out, size_t n) {
 
 /** Fill one trainer tensor from the file if the entry exists.
  *  Returns 1 loaded, 0 absent, -1 shape/dtype error (err set). */
-static int dit_resume_fill(const STFile & st, const std::string & name, ggml_tensor * dst, std::string * err) {
+static int dit_resume_fill(const STFile & st, const std::string & name, ggml_tensor * dst, std::string * err,
+                           bool upload = true) {
     const STEntry * e = st_find(st, name.c_str());
+    if (!e && name.find(".lora_magnitude_vector.weight") != std::string::npos) {
+        const std::string bare = name.substr(0, name.size() - strlen(".weight"));
+        e = st_find(st, (bare + ".default.weight").c_str());
+        if (!e) e = st_find(st, bare.c_str());
+    }
     if (!e) {
         return 0;
     }
@@ -141,12 +147,21 @@ static int dit_resume_fill(const STFile & st, const std::string & name, ggml_ten
         *err = b;
         return -1;
     }
+    if (e->dtype != "F32" && e->dtype != "BF16" && e->dtype != "F16") {
+        *err = name + " has unsupported dtype " + e->dtype;
+        return -1;
+    }
+    if (!upload) return 1;
     const void * data = st_data(st, *e);
     if (e->dtype == "F32") {
         ggml_backend_tensor_set(dst, data, 0, (size_t) n * sizeof(float));
     } else if (e->dtype == "BF16") {
         std::vector<float> f((size_t) n);
         dit_resume_bf16_to_f32((const uint16_t *) data, f.data(), (size_t) n);
+        ggml_backend_tensor_set(dst, f.data(), 0, f.size() * sizeof(float));
+    } else if (e->dtype == "F16") {
+        std::vector<float> f((size_t) n);
+        ggml_fp16_to_fp32_row((const ggml_fp16_t *) data, f.data(), n);
         ggml_backend_tensor_set(dst, f.data(), 0, f.size() * sizeof(float));
     } else {
         *err = name + " has unsupported dtype " + e->dtype;
@@ -168,6 +183,35 @@ static bool dit_resume_load_lora(DitAdapterLora * ad, const std::string & dir, D
     if (!st_open(&st, path.c_str())) {
         *err = "cannot open " + path;
         return false;
+    }
+    // Preflight all sites, including m, before dit_resume_fill uploads A or B.
+    // A plain-LoRA source may still initialize a new DoRA run; a declared DoRA
+    // source must contain every magnitude rather than silently reinitialize it.
+    bool source_dora = false;
+    if (!adapter_dora_preflight(st, dir, nullptr, &source_dora)) {
+        *err = "malformed DoRA resume payload in " + path;
+        st_close(&st);
+        return false;
+    }
+    if (source_dora) {
+        // Validate destination shapes too. A later site's bad shape must not
+        // be discovered after uploading an earlier site's A/B/m tensors.
+        for (int l = ad->lo; l < ad->hi; ++l) {
+            for (int s = 0; s < ad->n_sites; ++s) {
+                const auto & pr = ad->layers[(size_t)(l-ad->lo)][(size_t)s];
+                if (!pr.A || !pr.B) continue;
+                const std::string stem = "base_model.model.layers." + std::to_string(l) + "." + dit_site_peft(s);
+                const int ra = dit_resume_fill(st,stem+".lora_A.weight",pr.A,err,false);
+                const int rb = dit_resume_fill(st,stem+".lora_B.weight",pr.B,err,false);
+                const int rm = ad->dora && pr.m && ra>0 ?
+                    dit_resume_fill(st,stem+".lora_magnitude_vector.weight",pr.m,err,false) : 1;
+                if (ra<0 || rb<0 || ra!=rb || rm!=1) {
+                    if (err->empty()) *err = "incomplete DoRA resume site " + stem;
+                    st_close(&st);
+                    return false;
+                }
+            }
+        }
     }
     // HRA keeps its reflection vectors in hra_vectors.safetensors beside the
     // rank-r LoRA the export wrote for the loaders; that is the resume source.

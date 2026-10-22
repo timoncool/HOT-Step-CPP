@@ -1032,6 +1032,89 @@ static void adapter_runtime_rebase(DiTLoRA *            lora,
 
 // ─── Main entry points ───
 
+// Materialize the existing merge algorithm on private pending weights, then
+// subtract the loaded base. This retains its epsilon, strength, precision and
+// sequential-stack semantics without modifying the inference weights. Only
+// metadata is cloned initially; the merger owns each changed weight's staging.
+static bool adapter_runtime_dora_stack(DiTLoRA * lora, WeightCtx * base,
+                                        const WeightSource & ws,
+                                        const std::vector<AdapterSpec> & stack,
+                                        ggml_backend_t backend,
+                                        const char * rebase_source, float rebase_beta,
+                                        const std::unordered_map<std::string,int> * rotations) {
+    WeightCtx shadow{};
+    wctx_init(&shadow, DIT_LORA_MAX_LAYERS * 11 + 32);
+    if (!shadow.ctx) return false;
+    struct Cleanup { WeightCtx * ctx; ~Cleanup() { wctx_free(ctx); } } cleanup{&shadow};
+    struct Original { const void * data; ggml_type type; };
+    // pending[i] pairs with originals[i]; the merger must not append or reorder pending.
+    std::vector<Original> originals;
+    std::vector<std::unique_ptr<float[]>> owned;
+    auto decode = [](const void * src, ggml_type type, int64_t n, float * dst) {
+        if (type == GGML_TYPE_F32) { memcpy(dst,src,(size_t)n*sizeof(float)); return true; }
+        const auto * traits=ggml_get_type_traits(type);
+        if (!traits->to_float) return false;
+        traits->to_float(src,dst,n);
+        return true;
+    };
+    for (ggml_tensor * t=ggml_get_first_tensor(base->ctx); t; t=ggml_get_next_tensor(base->ctx,t)) {
+        if (!dit_lora_slot(lora,t->name) || !ws.exists(t->name)) continue;
+        ggml_type type;
+        const void * src=ws.data(t->name,type);
+        int nd; int64_t ne[4]; ws.shape(t->name,nd,ne);
+        if (nd>2 || type!=t->type) {
+            // The loader has already permuted Conv1d or converted its dtype.
+            auto raw=std::make_unique<float[]>((ggml_nbytes(t)+3)/4);
+            ggml_backend_tensor_get(t,raw.get(),0,ggml_nbytes(t));
+            src=raw.get(); type=t->type; owned.push_back(std::move(raw));
+        }
+        if (rotations) {
+            auto it=rotations->find(t->name);
+            if (it!=rotations->end()) {
+                auto raw=std::make_unique<float[]>((size_t)ggml_nelements(t));
+                if (!decode(src,type,ggml_nelements(t),raw.get())) return false;
+                convrot_transform_rows(raw.get(),t->ne[1],t->ne[0],it->second);
+                src=raw.get(); type=GGML_TYPE_F32; owned.push_back(std::move(raw));
+            }
+        }
+        auto * copy=ggml_new_tensor_2d(shadow.ctx,type,t->ne[0],t->ne[1]);
+        ggml_set_name(copy,t->name);
+        shadow.pending.push_back({copy,src,ggml_nbytes(copy),0});
+        originals.push_back({src,type});
+    }
+    // Use HQ merge arithmetic. Runtime's own quant knob controls the final
+    // delta storage; a stale merge-low-VRAM setting must not affect this path.
+    // The merger retains its host-decode fallback for FP4 bases.
+    const bool promote=true;
+    for (size_t i=0; i<stack.size(); ++i) {
+        if (adapter_cancel_requested() || !adapter_merge(&shadow,ws,stack[i].path.c_str(),stack[i].scale,
+                backend,promote,i==0?rebase_source:nullptr,i==0?rebase_beta:0.0f)) return false;
+        // The merger retains its old staging allocations. Only the current
+        // pending sources are needed here; release superseded stack weights.
+        shadow.staging.erase(std::remove_if(shadow.staging.begin(),shadow.staging.end(),
+            [&](const std::unique_ptr<float[]> & buf) {
+                for (const auto & pc : shadow.pending) if (pc.src==buf.get()) return false;
+                return true;
+            }),shadow.staging.end());
+    }
+    for (size_t i=0; i<shadow.pending.size(); ++i) {
+        const auto & pc=shadow.pending[i];
+        if (pc.src==originals[i].data) continue; // projection untouched by the stack
+        const int64_t n=ggml_nelements(pc.tensor);
+        std::vector<float> delta((size_t)n), w((size_t)n);
+        if (!decode(pc.src,pc.tensor->type,n,delta.data()) ||
+            !decode(originals[i].data,originals[i].type,n,w.data())) return false;
+        for (int64_t j=0;j<n;++j) {
+            delta[(size_t)j]-=w[(size_t)j];
+            if (!std::isfinite(delta[(size_t)j])) return false;
+        }
+        adapter_stage_delta(lora,dit_lora_slot(lora,pc.tensor->name),pc.tensor->name,
+                            pc.tensor->ne[0],pc.tensor->ne[1],std::move(delta));
+    }
+    fprintf(stderr,"[Adapter-RT] DoRA opt-in: merge-equivalent effective deltas (%zu adapters)\n",stack.size());
+    return adapter_runtime_finalize(lora,backend);
+}
+
 // Multi-adapter stack: stage every adapter's deltas into one DiTLoRA, summing
 // per projection, then allocate + upload once. Per-step inference cost and VRAM
 // are independent of stack depth (deltas collapse into one set per projection).
@@ -1057,6 +1140,13 @@ static bool adapter_load_runtime_stack(DiTLoRA *                       lora,
         ~ProgressGuard() { g_adapter_progress.store(-1, std::memory_order_release); }
     } progress_guard;
 
+    bool has_dora=false;
+    for (const auto & a : stack) {
+        bool one=false;
+        if (!adapter_dora_preflight_file(a.path.c_str(),ws,&one)) return false;
+        has_dora=has_dora || one;
+    }
+
     // One context sized for the union of slots. Slots are shared across adapters
     // (deltas accumulate into the same tensor), so the per-adapter slot count
     // bounds the total — sizing as for a single adapter is sufficient.
@@ -1071,6 +1161,14 @@ static bool adapter_load_runtime_stack(DiTLoRA *                       lora,
     lora->ctx = ggml_init(params);
     if (!lora->ctx) {
         fprintf(stderr, "[Adapter-RT] FATAL: failed to init lora context\n");
+        return false;
+    }
+
+    if (has_dora && g_hotstep_params.adapter_runtime_dora) {
+        // Materialized deltas also cover runtime_lowrank: the magnitude/base
+        // correction is full rank, so factor-only storage cannot represent it.
+        if (adapter_runtime_dora_stack(lora,wctx,ws,stack,backend,rebase_source,rebase_beta,convrot_groups)) return true;
+        dit_lora_free(lora);
         return false;
     }
 

@@ -1,3 +1,7 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { localOptions } from '../../queries/global-models/options';
+import { queryManager } from '../../queries/invalidation';
+import { apiClient } from '../../services/httpClient';
 // SeedManagerDrawer.tsx — Seed save/load popover for STORM Live Controls
 // MDMAchine / A&E Concepts 2026
 // GPL v3 — safe for public repo
@@ -39,13 +43,6 @@ interface SeedManagerDrawerProps {
 
 // ─── API helpers ──────────────────────────────────────────────────────────────
 
-async function apiList(): Promise<SavedSeed[]> {
-  const res = await fetch('/api/seeds');
-  if (!res.ok) throw new Error('list failed');
-  const data = await res.json();
-  return data.seeds ?? [];
-}
-
 async function apiSave(name: string, seed: number, description: string): Promise<void> {
   const res = await fetch('/api/seeds', {
     method:  'POST',
@@ -68,9 +65,7 @@ async function apiToggleFavorite(name: string): Promise<boolean> {
 }
 
 async function apiRandom(): Promise<{ name: string; seed: number } | null> {
-  const res = await fetch('/api/seeds/random');
-  if (!res.ok) return null;
-  return res.json();
+  return apiClient.get('/seeds/random');
 }
 
 // ─── Subcomponents ────────────────────────────────────────────────────────────
@@ -87,8 +82,12 @@ function fmtDate(iso: string | null): string {
 export const SeedManagerDrawer: React.FC<SeedManagerDrawerProps> = ({
   isOpen, onClose, currentSeed, onLoad, onLoadRandom,
 }) => {
-  const [seeds,       setSeeds]       = React.useState<SavedSeed[]>([]);
-  const [loading,     setLoading]     = React.useState(false);
+  const client = useQueryClient();
+  const options = localOptions<{ seeds: SavedSeed[] }>('seeds', '/seeds');
+  const query = useQuery({ ...options, enabled: isOpen });
+  const seeds = query.data?.seeds ?? [];
+  const loading = query.isPending;
+  const refresh = () => queryManager.keys(client, options.queryKey);
   const [filter,      setFilter]      = React.useState('');
   const [saveName,    setSaveName]    = React.useState('');
   const [saveDesc,    setSaveDesc]    = React.useState('');
@@ -97,16 +96,7 @@ export const SeedManagerDrawer: React.FC<SeedManagerDrawerProps> = ({
   const [flashLoaded, setFlashLoaded] = React.useState<string | null>(null);
   const [error,       setError]       = React.useState<string | null>(null);
 
-  // Load list when drawer opens
-  React.useEffect(() => {
-    if (!isOpen) return;
-    setLoading(true);
-    setError(null);
-    apiList()
-      .then(setSeeds)
-      .catch(e => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [isOpen]);
+  React.useEffect(() => { if (query.error) setError(query.error.message); }, [query.error]);
 
   // Clear delete confirm when filter changes
   React.useEffect(() => { setDeleteConfirm(null); }, [filter]);
@@ -138,8 +128,7 @@ export const SeedManagerDrawer: React.FC<SeedManagerDrawerProps> = ({
     setError(null);
     try {
       await apiSave(name, currentSeed, saveDesc.trim());
-      const updated = await apiList();
-      setSeeds(updated);
+      await refresh();
       setSaveName('');
       setSaveDesc('');
     } catch (e: unknown) {
@@ -152,7 +141,7 @@ export const SeedManagerDrawer: React.FC<SeedManagerDrawerProps> = ({
     setDeleteConfirm(null);
     try {
       await apiDelete(name);
-      setSeeds(s => s.filter(x => x.name !== name));
+      await refresh();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'delete failed');
     }
@@ -160,8 +149,8 @@ export const SeedManagerDrawer: React.FC<SeedManagerDrawerProps> = ({
 
   const handleFavorite = async (name: string) => {
     try {
-      const nowFav = await apiToggleFavorite(name);
-      setSeeds(s => s.map(x => x.name === name ? { ...x, favorite: nowFav } : x));
+      await apiToggleFavorite(name);
+      await refresh();
     } catch {}
   };
 

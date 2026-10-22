@@ -136,7 +136,7 @@ export const RepaintWaveform: React.FC<RepaintWaveformProps> = ({
       </div>
 
       {/* Region range inputs + controls */}
-      <div className="flex items-center gap-3 px-1">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-1">
         {/* Playback controls */}
         <div className="flex items-center gap-1">
           <button

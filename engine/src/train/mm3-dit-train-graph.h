@@ -65,6 +65,14 @@ struct MM3TrainLora {
     // proj_in/out inject seed-dependent "radio tuning" fuzz, while MLP+V+out
     // carry timbre with clear lyrics.
     ggml_tensor * out_mask = nullptr;
+    // DoRA (both null for plain LoRA). m [out] is a PARAM; nrm [out] is
+    // ||W + s*BA||_col, refreshed once per optimizer window from frozen A/B and
+    // never differentiated (paper section 4.3). keep [out,1] is 1 - out_mask:
+    // masked rows get factor exactly 1, so their m takes no gradient and the
+    // mlpv q,k rows stay the base.
+    ggml_tensor * m        = nullptr;
+    ggml_tensor * nrm      = nullptr;
+    ggml_tensor * keep     = nullptr;
     float         scale = 1.0f;   // alpha / rank
     bool          on() const { return a && b; }
 };
@@ -80,6 +88,7 @@ struct MM3TrainAdapters {
     // filled once after buffer allocation (it is not a param, so the param
     // init loop never touches it).
     ggml_tensor *                      qkv_vmask = nullptr;
+    ggml_tensor *                      qkv_vkeep = nullptr;   // 1 - qkv_vmask, DoRA only
 };
 
 // y = W x  (+ scale * B(A x) when the site is active).
@@ -98,7 +107,17 @@ static ggml_tensor * mm3_dt_linear(ggml_context * ctx, ggml_tensor * w, ggml_ten
     if (lo.out_mask) {
         bx = ggml_mul(ctx, bx, lo.out_mask);   // broadcast [out,1] over S
     }
-    return ggml_add(ctx, y, ggml_scale(ctx, bx, lo.scale));
+    y = ggml_add(ctx, y, ggml_scale(ctx, bx, lo.scale));
+    if (lo.m) {
+        // DoRA: (W + s*BA) x * m / nrm, per output row. Callers add any bias
+        // after this, so bias never enters the rescale.
+        ggml_tensor * f = ggml_div(ctx, lo.m, lo.nrm);
+        if (lo.keep) {
+            f = ggml_add(ctx, ggml_mul(ctx, ggml_reshape_2d(ctx, f, f->ne[0], 1), lo.out_mask), lo.keep);
+        }
+        y = ggml_mul(ctx, y, f);
+    }
+    return y;
 }
 
 // ── LayerNorm, rebuilt from ops that HAVE a backward ────────────────────────

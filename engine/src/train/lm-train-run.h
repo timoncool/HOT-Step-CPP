@@ -1515,6 +1515,16 @@ static int lm_train_stage(const LmTrainArgs & a, LmExportMeta * meta, LmTrainOut
     if (low) {
         run.sched = sched;
     }
+    // Resume replaced A/B/m after init, but nrm still describes the fresh
+    // zero-delta weights. Refresh before the high-water probes or the first
+    // micro-batch; the existing post-step refresh only fixes later windows.
+    if (!a.init_adapter.empty() && lora.dora) {
+        std::string err;
+        if (!lm_lora_dora_refresh(&lora, sched, &err)) {
+            lm_fatal("resume", err);
+            return 1;
+        }
+    }
 
     // ── one micro-step ───────────────────────────────────────────────────
     LmVramTracker tracker;

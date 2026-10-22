@@ -6,6 +6,32 @@
 
 set -e
 
+# Persistent storage is opt-in; Compose keeps its existing bind mounts.
+if [ -n "${HOT_STEP_DATA_ROOT:-}" ]; then
+    case "$HOT_STEP_DATA_ROOT" in
+        /*) ;;
+        *) echo "HOT_STEP_DATA_ROOT must be an absolute path" >&2; exit 1 ;;
+    esac
+    for name in models adapters data logs; do
+        target="${HOT_STEP_DATA_ROOT%/}/$name"
+        case "$name" in
+            data) link=/app/server/data ;;
+            *) link="/app/$name" ;;
+        esac
+        mkdir -p "$target"
+        if [ -d "$link" ] && [ ! -L "$link" ]; then
+            rmdir "$link" 2>/dev/null || {
+                echo "Cannot link non-empty or mounted $link to $target" >&2
+                exit 1
+            }
+        elif [ -e "$link" ] && [ ! -L "$link" ]; then
+            echo "Cannot replace existing file $link" >&2
+            exit 1
+        fi
+        ln -sfnT "$target" "$link"
+    done
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║     HOT-Step 9000 ⚡ Docker             ║"

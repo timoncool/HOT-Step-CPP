@@ -1,8 +1,10 @@
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { registryOptions } from '../../queries/global-models/options';
+import { queryManager } from '../../queries/invalidation';
 // useModelRegistry.ts — Hook for fetching and querying the model registry
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { modelManagerApi } from '../../services/api';
-import type { ModelRegistry, RegistryFile } from '../../types';
+import { useCallback, useMemo } from 'react';
+import type { RegistryFile } from '../../types';
 
 export interface PackStatus {
   total: number;
@@ -13,29 +15,15 @@ export interface PackStatus {
 }
 
 export function useModelRegistry() {
-  const [registry, setRegistry] = useState<ModelRegistry | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchRegistry = useCallback(async (silent = false) => {
-    try {
-      if (!silent) setLoading(true);
-      setError(null);
-      const data = await modelManagerApi.registry();
-      setRegistry(data);
-    } catch (err: any) {
-      setError(err.message || 'Failed to fetch registry');
-    } finally {
-      if (!silent) setLoading(false);
-    }
-  }, []);
-
-  // Silent refresh — updates data without showing spinner
+  const client = useQueryClient();
+  const query = useQuery(registryOptions());
+  const registry = query.data ?? null;
+  const loading = query.isPending;
+  const error = query.error?.message ?? null;
+  const fetchRegistry = useCallback(async (_silent = false) => {
+    await queryManager.keys(client, registryOptions().queryKey);
+  }, [client]);
   const silentRefresh = useCallback(() => fetchRegistry(true), [fetchRegistry]);
-
-  useEffect(() => {
-    fetchRegistry();
-  }, [fetchRegistry]);
 
   const installedFiles = useMemo(() => {
     if (!registry) return new Set<string>();

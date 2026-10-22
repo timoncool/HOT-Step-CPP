@@ -5,6 +5,10 @@ description: Traces the full life of a music generation request (UI form → Nod
 
 # Generation Request Lifecycle & Param Plumbing
 
+Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#finding-the-data-folder).
+`<data root>/...` paths below describe the managed layout; environment overrides
+can place individual children elsewhere.
+
 This skill maps the end-to-end path of a generation request in HOT-Step CPP and catalogs every point where a parameter can be silently lost. Most historical bugs in this area are **param-plumbing bugs**: a value set in the UI never reaches the C++ sampler, and nothing errors.
 
 Terms used below:
@@ -29,7 +33,7 @@ Terms used below:
 5. **After any upstream sync, run `powershell -File engine\verify-hooks.ps1`.** WHY: `pipeline-synth-ops.cpp` losing its `hot-step-sampler.h` include is **SILENT** — everything compiles but all solvers/schedulers/guidance/sideband go dead (they read `g_hotstep_params`, which nothing consumes anymore).
 6. **Git: all work on `master`, stage explicit paths (never `git add -A`), push only with explicit user approval.** Any pushed `v*` tag triggers a full multi-platform CI release build.
 7. **Params consumed as GPU tensors inside `hot-step-sampler.h` (masks, encoder states, constants) must be re-uploaded EVERY step** — the GGML scheduler aliases input tensor buffers as scratch space; uploading once leaves them garbage from step 2 onward ([hot-step-sampler.h:591-601](../../../engine/src/hot-step-sampler.h), re-upload sites :936, :1091). Never hoist an upload out of the step loop as an "optimization".
-8. **Never delete generated audio artifacts (`server/data/audio/*`, test outputs) based on your own judgment of quality** — the user verifies results by ear.
+8. **Never delete generated audio artifacts (`<data root>/library/audio/*`, test outputs) based on your own judgment of quality** — the user verifies results by ear.
 9. **Node 20 to 24 LTS, 24 recommended** — `engines` enforces `<25`.
 
 ## THE LM ECHO SIDEBAND GOTCHA (read this before touching generate.ts)
@@ -136,7 +140,7 @@ Engine `task_type` (request.h:109, docs in engine/docs/ARCHITECTURE.md): `text2m
 | Param set in UI, engine behaves as default | Sideband dropped post-LM (gotcha), UI gate (checklist #3), or whole-number float → 0 (checklist #2). Do NOT trust the 300-char `[DIAG] /synth body` prefix as proof of absence (procedure step 7) — add a temporary parse-site fprintf instead |
 | "Generation stalled — no progress for Ns" | 2-min no-progress watchdog (generate.ts:107,:128); engine wedged |
 | "Generation timed out (N min limit)" | Wall-clock watchdog, `generationTimeoutMinutes` clamped [5,120], default 45 (generate.ts:139) |
-| "Generation failed on ace-server" | Engine job status 2 — read `logs\<session>\generations\gen_<uuid>_*.log`, then `ace_engine.log` for `[Server] Adapter not found` / synth load failure |
+| "Generation failed on ace-server" | Engine job status 2 — read `<data root>/logs\<session>\generations\gen_<uuid>_*.log`, then `ace_engine.log` for `[Server] Adapter not found` / synth load failure |
 | All solvers/schedulers behave like euler after an upstream sync | Lost `hot-step-sampler.h` hook in `pipeline-synth-ops.cpp` — SILENT; run `engine\verify-hooks.ps1` |
 | Trigger word absent from final caption | CoT caption replaced it and re-injection gate unmet — grep gen log for `[Trigger]` WARNING |
 | Stale LM output despite changed DiT/adapter params | Correct behavior (LM cache keys only LM params); set `cacheLmCodes: false` to force a fresh LM run |

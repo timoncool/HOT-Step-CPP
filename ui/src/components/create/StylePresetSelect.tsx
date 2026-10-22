@@ -12,7 +12,6 @@
 
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 
 interface StylePreset {
@@ -50,23 +49,20 @@ export const StylePresetSelect: React.FC<Props> = ({ caption, onCaptionChange })
   const { t } = useTranslation();
   const selected = STYLE_PRESETS.find(p => p.value === caption)?.value ?? '';
 
+  // A small "Presets" button in the Style Description header; the list opens
+  // as wide as it needs, right-aligned to the button.
   return (
-    <div className="flex items-center gap-2">
-      <ParamLabel
-        label={t('contentSection.stylePreset', 'Style preset')}
-        info={t('contentSection.stylePresetInfo', 'A ready-made band and mood written into the Style Description. Picking one replaces whatever is in the box; edit the box afterwards and the selection clears. Useful with a lead sheet, where the melody and chords are already fixed and only the arrangement is left to say.')}
-        className="text-[10px] text-zinc-500"
-      />
-      <StyledSelect
-        accent="pink"
-        size="sm"
-        className="flex-1"
-        aria-label={t('contentSection.stylePresetAria', 'Style preset')}
-        placeholder={t('contentSection.stylePresetPlaceholder', 'Pick an ensemble style')}
-        value={selected}
-        onChange={value => onCaptionChange(value)}
-        options={STYLE_PRESETS.map(p => ({ value: p.value, label: p.label, hint: p.value }))}
-      />
-    </div>
+    <StyledSelect
+      accent="pink"
+      size="sm"
+      className="!py-0.5 !px-2 !text-[10px] !rounded-md"
+      triggerLabel={t('contentSection.stylePresets', 'Presets')}
+      panelWidth={320}
+      title={t('contentSection.stylePresetInfo', 'A ready-made band and mood written into the Style Description. Picking one replaces whatever is in the box; edit the box afterwards and the selection clears. Useful with a lead sheet, where the melody and chords are already fixed and only the arrangement is left to say.')}
+      aria-label={t('contentSection.stylePresetAria', 'Style preset')}
+      value={selected}
+      onChange={value => onCaptionChange(value)}
+      options={STYLE_PRESETS.map(p => ({ value: p.value, label: p.label, hint: p.value }))}
+    />
   );
 };

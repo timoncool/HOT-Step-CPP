@@ -13,16 +13,19 @@
 // per-dataset invariant §5.2 was protecting still holds; what changed is that
 // the bulk runner is now also a legitimate owner of a job worth watching.
 
-import React, { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Clock, Loader2, Pause, PauseCircle, Play, XCircle } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useTrainingStore } from '../../stores/trainingStore';
+import { pollWhile } from '../../queries/contract';
+import { trainingQueries } from '../../queries/training-data/queries';
+import { queryManager } from '../../queries/invalidation';
 import { PIPELINE_STAGES, type PipelineItem, type PipelineStage, type PipelineSummary } from '../../services/trainingApi';
+import { useTrainingStore } from '../../stores/trainingStore';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { PipelineStageProgress } from './PipelineStageProgress';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
-const POLL_MS = 2000;
 
 const STAGE_LABEL_KEYS: Record<PipelineStage, string> = {
   label: 'trainingStudio.batch.stageLabel',
@@ -244,15 +247,14 @@ const PipelineCard: React.FC<{ pipeline: PipelineSummary; active: boolean }> = (
 
 export const MonitorPanel: React.FC = () => {
   const { t } = useTranslation();
-  const pipelines = useTrainingStore(s => s.pipelines);
-  const pipelinesLoading = useTrainingStore(s => s.pipelinesLoading);
-  const loadPipelines = useTrainingStore(s => s.loadPipelines);
+  const client = useQueryClient();
+  const worker = useTrainingStore(s => s.trainingWorker);
+  const pipelineQuery = useQuery({ ...trainingQueries.pipelines(worker),
+    refetchInterval: pollWhile<PipelineSummary[]>(data => !data || data.some(p => p.status === 'running' || p.status === 'paused'), 2000) });
+  const pipelines = pipelineQuery.data ?? [];
+  const pipelinesLoading = pipelineQuery.isPending;
   const loadDatasets = useTrainingStore(s => s.loadDatasets);
   const [recentOpen, setRecentOpen] = useState(false);
-
-  useEffect(() => {
-    void loadPipelines();
-  }, [loadPipelines]);
 
   const activePipeline = pipelines.find(p => p.status === 'running' || p.status === 'paused') ?? null;
   const recent = pipelines.filter(p => p.id !== activePipeline?.id);
@@ -262,13 +264,13 @@ export const MonitorPanel: React.FC = () => {
   const wasRunningRef = useRef(false);
   useEffect(() => {
     if (!activePipeline) {
-      if (wasRunningRef.current) { wasRunningRef.current = false; void loadDatasets(); }
+      if (wasRunningRef.current) { wasRunningRef.current = false; void queryManager.keys(client, trainingQueries.datasets(worker).queryKey).then(() => loadDatasets()); }
       return;
     }
     wasRunningRef.current = true;
-    const handle = window.setInterval(() => { void loadPipelines(); }, POLL_MS);
-    return () => window.clearInterval(handle);
-  }, [activePipeline, loadPipelines, loadDatasets]);
+  }, [activePipeline, client, worker, loadDatasets]);
+
+  if (pipelineQuery.error && pipelines.length === 0) return <p role="alert" className="text-sm text-red-500">{pipelineQuery.error.message}</p>;
 
   if (pipelinesLoading && pipelines.length === 0) {
     return (

@@ -369,10 +369,12 @@ static void yue2_job_finish(const std::shared_ptr<Job> & job, const Yue2Request 
             yyjson_mut_val * o = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_int(doc, o, "song", tr.song);
             yyjson_mut_obj_add_int(doc, o, "variation", tr.variation);
-            yyjson_mut_obj_add_uint(doc, o, "seed", tr.seed);
-            yyjson_mut_obj_add_uint(doc, o, "noise_seed", tr.noise_seed);
+            // Decimal strings: a uint64 past 2^53 does not survive the Node side's JSON.parse.
+            yyjson_mut_obj_add_strcpy(doc, o, "seed", std::to_string(tr.seed).c_str());
+            yyjson_mut_obj_add_strcpy(doc, o, "noise_seed", std::to_string(tr.noise_seed).c_str());
             yyjson_mut_obj_add_strcpy(doc, o, "end_reason", tr.end_reason.c_str());
             yyjson_mut_obj_add_int(doc, o, "frames", (int) tr.total_frames);
+            yyjson_mut_obj_add_int(doc, o, "audio_from", (int) tr.audio_from);
             const std::string sr = stage_reasons_json(tr);
             yyjson_doc * srd = yyjson_read(sr.data(), sr.size(), 0);
             if (srd) {
@@ -380,6 +382,12 @@ static void yue2_job_finish(const std::shared_ptr<Job> & job, const Yue2Request 
                 yyjson_doc_free(srd);
             }
             if (!tr.score_abc.empty()) yyjson_mut_obj_add_strn(doc, o, "abc", tr.score_abc.c_str(), tr.score_abc.size());
+            // The composer's codec stream, so a later request can resume it
+            // with codec_ids + continue_codec_ids (section-by-section takes).
+            if (!tr.semantic_ids.empty()) {
+                yyjson_mut_obj_add_val(doc, o, "semantic_ids",
+                                       yyjson_mut_arr_with_sint32(doc, tr.semantic_ids.data(), tr.semantic_ids.size()));
+            }
             yyjson_mut_arr_add_val(arr, o);
         }
         char * json = yyjson_mut_write(doc, 0, NULL);
