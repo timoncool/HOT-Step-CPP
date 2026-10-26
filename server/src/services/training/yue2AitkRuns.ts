@@ -547,15 +547,18 @@ export function isCheckpointLadder(options: { method?: unknown } | undefined): b
 }
 
 /** A checkpoint-ladder run's complete checkpoints are each flagged as a rung
- *  for the Review page, the best-rung pick and the ladder cards. Other runs
- *  keep meters.json's flag. */
-function rungsOf(run: Yue2AitkRunRecord, checkpoints: Yue2AitkCheckpointRecord[]): Yue2AitkCheckpointRecord[] {
+ *  for the Review page, the best-rung pick and the ladder cards. Any other run
+ *  keeps meters.json's flag; one with no flagged checkpoint at all (a plain
+ *  tuned run) is treated as a ladder too, so its previews are not orphaned. */
+export function rungsOf(run: Yue2AitkRunRecord, checkpoints: Yue2AitkCheckpointRecord[]): Yue2AitkCheckpointRecord[] {
   const o = run.options as Record<string, unknown> | undefined;
+  const flagAll = (rows: Yue2AitkCheckpointRecord[]) => rows.map(c => c.arPath && c.narPath ? { ...c, rung: true } : c);
+  if (isCheckpointLadder(o)) return flagAll(checkpoints);
   // Legacy saving every KL step: past the freeze the decoder-phase saves are
   // the rungs (they get the previews), since the KL no longer moves.
-  if (Number(o?.klCheckpointEvery) > 0 && o?.refinePlanner !== true) return checkpoints.map(c => c.frozen ? { ...c, rung: true } : c);
-  if (!isCheckpointLadder(o)) return checkpoints;
-  return checkpoints.map(c => c.arPath && c.narPath ? { ...c, rung: true } : c);
+  const rows = Number(o?.klCheckpointEvery) > 0 && o?.refinePlanner !== true
+    ? checkpoints.map(c => c.frozen ? { ...c, rung: true } : c) : checkpoints;
+  return rows.some(c => c.rung) ? rows : flagAll(rows);
 }
 
 /** Every indexed joint run, newest first, with checkpoint files re-scanned.

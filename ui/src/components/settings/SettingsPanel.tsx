@@ -8,7 +8,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Zap, Download, Tag, AlertTriangle, Loader2, Settings2,
   ChevronRight, Save, Scissors,
-  Key, Database, Globe, Gauge, Image as ImageIcon
+  Key, Database, Globe, Gauge, Bug, Image as ImageIcon
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { FALLBACK_LANGUAGE, SUPPORTED_LANGUAGES } from '../../i18n';
@@ -18,6 +18,9 @@ import { songApi, settingsApi } from '../../services/api';
 import { envOptions, gpusOptions, healthOptions, stemStatsOptions } from '../../queries/shell-queue/settings';
 import { queryManager } from '../../queries/invalidation';
 import { DataFolderPanel } from './DataFolderPanel';
+import { SettingsBackupPanel } from './SettingsBackupPanel';
+import { UpdatesPanel } from './UpdatesPanel';
+import { ReportIssuePanel } from './ReportIssuePanel';
 import { AdapterReferencesAction } from './AdapterReferencesAction';
 import { lireekApi } from '../../services/lireekApi';
 import { FileBrowserModal } from '../shared/FileBrowserModal';
@@ -308,7 +311,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     setBrowseKey(null);
   };
 
-  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance';
+  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance' | 'report';
   const [activeTab, setActiveTab] = useState<TabId>('general');
 
   const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
@@ -317,6 +320,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     { id: 'ai',          label: t('settings.tabs.ai'),     icon: <Key size={15} className="settings-tab-icon" /> },
     { id: 'storage',     label: t('settings.tabs.storage'),  icon: <Database size={15} className="settings-tab-icon" /> },
     { id: 'performance', label: 'Performance', icon: <Gauge size={15} className="settings-tab-icon" /> },
+    { id: 'report',      label: t('settings.tabs.report', 'Report an issue'), icon: <Bug size={15} className="settings-tab-icon" /> },
   ];
 
   return (
@@ -577,7 +581,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         <EnvTextRow envKey="OPENAI_MODEL" label={t('settings.ai.openaiModel')} description={t('settings.ai.openaiModelDesc')}
           value={envValues.OPENAI_MODEL || ''} onChange={handleEnvChange} placeholder="gpt-4o-mini" />
         <EnvTextRow envKey="ANTHROPIC_MODEL" label={t('settings.ai.anthropicModel')} description={t('settings.ai.anthropicModelDesc')}
-          value={envValues.ANTHROPIC_MODEL || ''} onChange={handleEnvChange} placeholder="claude-3-5-haiku-20241022" />
+          value={envValues.ANTHROPIC_MODEL || ''} onChange={handleEnvChange} placeholder="claude-haiku-4-5-20251001" />
         <EnvTextRow envKey="OLLAMA_MODEL" label={t('settings.ai.ollamaModel')} description={t('settings.ai.ollamaModelDesc')}
           value={envValues.OLLAMA_MODEL || ''} onChange={handleEnvChange} placeholder="llama3" />
         <EnvTextRow envKey="LMSTUDIO_MODEL" label={t('settings.ai.lmstudioModel')} description={t('settings.ai.lmstudioModelDesc')}
@@ -780,6 +784,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {/* ═══════════════ GENERAL TAB ═══════════════ */}
       {activeTab === 'general' && (
       <>
+      <UpdatesPanel />
       {/* Language Section */}
       <div className="settings-section">
         <div className="settings-section-header">
@@ -965,10 +970,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       </>
       )}
 
+      {activeTab === 'report' && <ReportIssuePanel />}
+
       {/* ═══════════════ STORAGE & DATA TAB ═══════════════ */}
       {activeTab === 'storage' && (
       <>
       <DataFolderPanel />
+      <SettingsBackupPanel settings={settings} onSettingsChange={onSettingsChange} />
       {/* Stem Storage Section */}
       <div className="settings-section">
         <div className="settings-section-header">

@@ -71,7 +71,7 @@ enum ModelKind {
     MODEL_VAE_DEC,    // VAEGGML        from vae.gguf (decoder.*)
     MODEL_FSQ_TOK,    // TokGGML        from acestep-v15-*.gguf (tokenizer.*)
     MODEL_FSQ_DETOK,  // DetokGGML      from acestep-v15-*.gguf (detokenizer.*)
-    MODEL_SA3_GGML,    // Sa3GgmlRefine from models root, 4 sa3-*.gguf (GGML backend)
+    MODEL_SA3_GGML,    // Sa3GgmlRefine: generation DiT + 3 sa3-*.gguf beside it (GGML backend)
 };
 
 struct ModelKey {
@@ -129,7 +129,7 @@ CondGGML *   store_require_cond_enc(ModelStore * s, const ModelKey & k);
 DiTGGML *    store_require_dit(ModelStore * s, const ModelKey & k);
 VAEEncoder * store_require_vae_enc(ModelStore * s, const ModelKey & k);
 VAEGGML *    store_require_vae_dec(ModelStore * s, const ModelKey & k);
-Sa3GgmlRefine * store_require_sa3_ggml(ModelStore * s, const ModelKey & k);  // k.path = models root DIRECTORY (4 sa3-*.gguf)
+Sa3GgmlRefine * store_require_sa3_ggml(ModelStore * s, const ModelKey & k);  // k.path = DiT GGUF path; the other 3 sa3-*.gguf sit in its directory
 TokGGML *    store_require_fsq_tok(ModelStore * s, const ModelKey & k);
 DetokGGML *  store_require_fsq_detok(ModelStore * s, const ModelKey & k);
 

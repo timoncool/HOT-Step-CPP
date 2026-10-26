@@ -353,7 +353,7 @@ export const StemStudio: React.FC = () => {
           {mode === 'extract' && !modelsLoading && baseModels.length === 0 && (
             <div style={styles.noModelsWarning}>
               <AlertTriangle size={14} />
-              <span>No base/SFT models found. Extract requires a non-turbo DiT model. Use <strong>Get More Models</strong> in the sidebar to download one.</span>
+              <span>No base models found. Extract needs a plain Base DiT checkpoint (acestep-v15-base-* or acestep-v15-xl-base-*); SFT, merge and turbo models are not accepted. Use <strong>Get More Models</strong> in the top bar's Models menu to download one.</span>
             </div>
           )}
           {mode === 'extract' && baseModels.length > 0 && (

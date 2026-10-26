@@ -88,6 +88,10 @@ export interface ResolvedYue2JointTrainOptions {
   preview?: import('./types.js').Yue2JointPreviewOptions;
   alignment?: import('./types.js').Yue2AlignmentOptions;
   pauseAt?: number;
+  /** Live interval edits the trainer re-reads between steps (GH #307), and
+   *  the edit revision these arguments already carry. */
+  paramsFile?: string;
+  paramsRev?: number;
   preparation?: import('./yue2AitkPrepareRunner.js').ResolvedYue2AitkPrepareOptions;
   /** Optimizer: native CUDA AdamW8bit (default) or the shared LmOptim path
    *  ('adamw-lm' is AdamW on that path: fp32 moments, warmup+cosine). */
@@ -444,6 +448,7 @@ export function buildYue2JointTrainArgs(o: ResolvedYue2JointTrainOptions): strin
   if (Number.isInteger(o.pauseAt) && (o.pauseAt as number) > 0) {
     args.push('--pause-at', String(o.pauseAt));
   }
+  if (o.paramsFile) args.push('--params-file', o.paramsFile, '--params-rev', String(o.paramsRev ?? 0));
   return args;
 }
 
@@ -708,6 +713,49 @@ export function parseYue2JointEvent(line: string, totalSteps: number): {
   } catch { return null; }
 }
 
+/** The checkpoint a finished segment must have left: the engine's own pause
+ *  or early stop, else the step cap. Never the requested pause: a live edit
+ *  can move it after the trainer's last read of the params file. */
+export function yue2JointExpectedStep(state: Pick<RelayState, 'pausedAt' | 'targetStopped' | 'lastStep'>, start: number, steps: number): number {
+  return state.pausedAt && state.pausedAt < steps ? state.pausedAt
+    : state.targetStopped && state.lastStep > start ? state.lastStep : steps;
+}
+
+/** Pacing of the joint runs training here, for live interval edits (GH #307):
+ *  the segment's first step and pause, and the preview options in use. */
+export interface LivePace { preview?: import('./types.js').Yue2JointPreviewOptions; start: number; pauseAt: number; previewPaced: boolean; rev: number }
+export const yue2JointLivePace = new Map<string, LivePace>();
+
+/** Change the checkpoint and preview interval of a running joint job. The
+ *  options change for the segments still to come, and `.params.json` in the
+ *  run folder carries them to the trainer running now, which re-reads it
+ *  between steps. A shorter preview interval that is already behind the
+ *  current step pauses at the next one. */
+export function updateYue2JointParams(job: TrainingJob, body: { saveEvery?: unknown; previewEvery?: unknown }):
+  { saveEvery: number; previewEvery?: number } | { error: string; status: number } {
+  const o = job.opts as ResolvedYue2JointTrainOptions | undefined;
+  const pace = yue2JointLivePace.get(job.id);
+  if (!o || !pace || job.status !== 'running') return { error: 'That run is not training on this machine', status: 409 };
+  const whole = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= o.steps;
+  if (body.saveEvery === undefined && body.previewEvery === undefined) return { error: 'Nothing to change: send saveEvery or previewEvery', status: 400 };
+  if (body.saveEvery !== undefined && !whole(body.saveEvery)) return { error: `saveEvery must be a whole number from 1 to ${o.steps}`, status: 400 };
+  if (body.previewEvery !== undefined) {
+    if (!(pace.preview && pace.preview.everySteps > 0)) return { error: 'This run does not pause for previews every N steps', status: 400 };
+    if (!whole(body.previewEvery)) return { error: `previewEvery must be a whole number from 1 to ${o.steps}`, status: 400 };
+  }
+  if (!fs.existsSync(o.outDir)) return { error: 'The trainer has not started yet; try again in a moment', status: 409 };
+  if (body.saveEvery !== undefined) o.saveEvery = body.saveEvery as number;
+  if (body.previewEvery !== undefined) {
+    pace.preview!.everySteps = body.previewEvery as number;
+    if (o.preview) o.preview.everySteps = body.previewEvery as number;
+    if (pace.previewPaced) pace.pauseAt = Math.min(o.steps, pace.start + (body.previewEvery as number));
+  }
+  pace.rev++;
+  fs.writeFileSync(path.join(o.outDir, '.params.json'), JSON.stringify({ rev: pace.rev, save_every: o.saveEvery, ...(pace.previewPaced ? { pause_at: pace.pauseAt } : {}) }));
+  log(job, 'info', `Intervals changed: checkpoint every ${o.saveEvery}${pace.preview && pace.preview.everySteps > 0 ? `, preview every ${pace.preview.everySteps}` : ''}`);
+  return { saveEvery: o.saveEvery, ...(pace.preview && pace.preview.everySteps > 0 ? { previewEvery: pace.preview.everySteps } : {}) };
+}
+
 export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
   const opts = job.opts as ResolvedYue2JointTrainOptions | undefined;
   if (isCancelled(job)) return;
@@ -792,6 +840,8 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
     let step = resumeStep;
     let segmentNo = 1;
     let previewChain: Promise<void> = Promise.resolve();
+    const pace: LivePace = { preview, start: step, pauseAt: 0, previewPaced: false, rev: 0 };
+    yue2JointLivePace.set(job.id, pace);
     // The first segment carries the caller's freeze (a resume from a chosen
     // checkpoint); later segments freeze only when a plan check says so.
     let freezeNext = !!(o.resume && o.freezePlannerNow);
@@ -804,7 +854,9 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
       const segmentOut = preview ? path.join(o.outDir, 'segments', `segment-${String(segmentNo).padStart(6, '0')}`) : o.outDir;
       const cadence = planCheck && !plannerFrozen ? planCheck.every : preview ? preview.everySteps : 0;
       const pauseAt = cadence > 0 ? Math.min(o.steps, step + cadence) : 0;
-      const segment = { ...o, outDir: segmentOut, resume: resume || undefined, pauseAt: pauseAt < o.steps ? pauseAt : undefined, freezePlannerNow: freezeNext };
+      Object.assign(pace, { start: step, pauseAt, previewPaced: !!preview && cadence > 0 && !(planCheck && !plannerFrozen) });
+      const segment = { ...o, outDir: segmentOut, resume: resume || undefined, pauseAt: pauseAt < o.steps ? pauseAt : undefined, freezePlannerNow: freezeNext,
+        paramsFile: path.join(o.outDir, '.params.json'), paramsRev: pace.rev };
       freezeNext = false;
       const state: RelayState = { fatalMessage: '', doneSeen: false, lastStep: step, targetStopped: false, totalSteps: o.steps };
       if (preview?.parallel) {
@@ -823,9 +875,7 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
       // A target-loss stop ends the run early: the engine checkpoints the
       // last completed step, so the validator must accept that step, not o.steps.
       // An engine-initiated pause (a KL rung) checkpoints wherever it lands.
-      const wanted = () => state.pausedAt && state.pausedAt < o.steps ? state.pausedAt
-        : state.targetStopped && state.lastStep > step
-          ? state.lastStep : (pauseAt > 0 && pauseAt < o.steps ? pauseAt : o.steps);
+      const wanted = () => yue2JointExpectedStep(state, step, o.steps);
       nativeAttempted = true;
       // The engine refuses an output folder that already exists, so a run
       // trained straight into outDir saves its norms only once it has made it.
@@ -928,6 +978,7 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
   } catch (err: unknown) {
     if (!isCancelled(job)) finishJob(job, 'failed', err instanceof Error ? err.message : String(err));
   } finally {
+    yue2JointLivePace.delete(job.id);
     // The output directory is created by ace-train. Record only after that
     // boundary, including failed/cancelled partial runs, and never before it.
     let outputExists = false;

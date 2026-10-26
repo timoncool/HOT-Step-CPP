@@ -93,6 +93,7 @@ static volatile int * _hotstep_guard_ = &hotstep_sampler_linked_;
 // therefore included mid-file, next to minimax/mm3-job.h). Included here so
 // yue2_weights_present is visible by name to hot-step-families.h's family
 // table immediately below — MUST come before that include.
+#include "sa3-preview-resolver.h"  // HOT-Step /sa3-synth checkpoint snapshots
 #include "yue2/yue2-model.h"
 
 // ── HOT-Step hook: in-process model family registry ────────────────────
@@ -102,6 +103,7 @@ static volatile int * _hotstep_guard_ = &hotstep_sampler_linked_;
 #include "hot-step-families.h"
 
 #include <algorithm>   // std::sort (HOT-Step /sa3/props adapter list)
+#include <cctype>      // std::tolower (HOT-Step /sa3-synth synth_model guard)
 #include <atomic>
 #include <condition_variable>
 #include <cmath>
@@ -4135,7 +4137,7 @@ int main(int argc, char ** argv) {
         {
             ModelKey k{};
             k.kind = MODEL_SA3_GGML;
-            k.path = models_dir;  // 4 sa3-*.gguf in the models root
+            k.path = std::string(models_dir) + "/sa3-dit-BF16.gguf";  // refine is BF16-only
             k.adapter_stack = adapter_sig;  // "" = stock; else distinct cached model
             Sa3GgmlRefine * sa3 = store_require_sa3_ggml(g_store, k);
             if (!sa3) {
@@ -4408,7 +4410,7 @@ int main(int argc, char ** argv) {
         yyjson_mut_doc_free(doc);
     });
 
-    svr.Post("/sa3-synth", on_worker([models_dir](const httplib::Request & req, httplib::Response & res) {
+    svr.Post("/sa3-synth", on_worker([models_dir, adapters_dir](const httplib::Request & req, httplib::Response & res) {
         auto file_exists = [](const std::string & p) {
             FILE * f = fopen(p.c_str(), "rb");
             if (f) { fclose(f); return true; }
@@ -4420,6 +4422,37 @@ int main(int argc, char ** argv) {
         if (req.has_param("backend") && req.get_param_value("backend") == "onnx") {
             json_error(res, 400, "StableStep ONNX backend is no longer available; omit backend or use gguf");
             return;
+        }
+
+        // Generation DiT: `synth_model` = bare filename in the models root, the
+        // same field name and meaning as ACE's request. Empty, not sa3-dit-*.gguf
+        // or not on disk falls back to BF16; the training base is refused.
+        std::string dit_file = "sa3-dit-BF16.gguf";
+        if (req.has_param("synth_model") && !req.get_param_value("synth_model").empty()) {
+            const std::string want = req.get_param_value("synth_model");
+            if (want.find('/') != std::string::npos || want.find('\\') != std::string::npos ||
+                want.find("..") != std::string::npos) {
+                json_error(res, 400, "Invalid synth_model (bare filename expected)");
+                return;
+            }
+            // Refusal is case-insensitive: the models dir may be on a case-insensitive
+            // filesystem, so "sa3-dit-BASE-..." would open the training base.
+            // Acceptance stays case-sensitive so one file can't cache under two keys.
+            std::string lower = want;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return (char) std::tolower(c); });
+            if (lower.rfind("sa3-dit-base-", 0) == 0) {
+                json_error(res, 400, "sa3-dit-base-* is the training base, not a generation DiT");
+                return;
+            }
+            const bool is_sa3_dit = want.rfind("sa3-dit-", 0) == 0 && want.size() > 13 &&
+                                    want.compare(want.size() - 5, 5, ".gguf") == 0;
+            if (is_sa3_dit && file_exists(std::string(models_dir) + "/" + want)) {
+                dit_file = want;
+            } else {
+                fprintf(stderr, "[Server] SA3 synth: synth_model %s %s, falling back to %s\n", want.c_str(),
+                        is_sa3_dit ? "not installed" : "is not an sa3-dit-*.gguf", dit_file.c_str());
+            }
         }
 
         // Duration — the one param synth has that refine does not. Refine gets
@@ -4476,6 +4509,30 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "[Server] SA3 synth: %zu adapter(s) requested\n",
                         adapter_specs.size());
             }
+        }
+
+        // Checkpoint preview: snapshot_run=<dataset>/<adapter>/<stamp>,
+        // snapshot_step=N, snapshot_scale (default 1). Internal, bounded to the
+        // training runs (sa3-preview-resolver.h); stacks after named adapters.
+        if (req.has_param("snapshot_run") || req.has_param("snapshot_step")) {
+            float snap_scale = 1.0f;
+            if (req.has_param("snapshot_scale") &&
+                !sa3_parse_snapshot_scale(req.get_param_value("snapshot_scale"), snap_scale)) {
+                json_error(res, 400, "Invalid snapshot_scale (finite number expected)");
+                return;
+            }
+            std::string snap_path, snap_sig;
+            const std::string snap_err = sa3_resolve_snapshot(
+                adapters_dir, req.get_param_value("snapshot_run"), req.get_param_value("snapshot_step"),
+                std::string(models_dir) + "/" + dit_file, snap_scale, snap_path, snap_sig);
+            if (!snap_err.empty()) {
+                json_error(res, 400, snap_err.c_str());
+                return;
+            }
+            adapter_specs.push_back({ snap_path, snap_scale });
+            if (!adapter_sig.empty()) adapter_sig += ";";
+            adapter_sig += snap_sig;
+            fprintf(stderr, "[Server] SA3 synth: snapshot %s\n", snap_path.c_str());
         }
 
         if (!have_gguf) {
@@ -4611,9 +4668,9 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        fprintf(stderr, "[Server] SA3 synth: %.2fs, steps=%d, sampler=%s, seed=%llu, backend=gguf\n",
+        fprintf(stderr, "[Server] SA3 synth: %.2fs, steps=%d, sampler=%s, seed=%llu, backend=gguf, dit=%s\n",
                 duration_sec, steps, pingpong ? "pingpong" : "euler",
-                (unsigned long long) seed);
+                (unsigned long long) seed, dit_file.c_str());
 
         // Acquire model + run. Same ModelKey / store / ModelHandle as refine.
         std::vector<float> out44;
@@ -4622,7 +4679,7 @@ int main(int argc, char ** argv) {
         {
             ModelKey k{};
             k.kind = MODEL_SA3_GGML;
-            k.path = models_dir;
+            k.path = std::string(models_dir) + "/" + dit_file;
             k.adapter_stack = adapter_sig;
             Sa3GgmlRefine * sa3 = store_require_sa3_ggml(g_store, k);
             if (!sa3) { json_error(res, 500, "SA3 GGML model load failed"); return; }
@@ -4658,6 +4715,7 @@ int main(int argc, char ** argv) {
         }
         std::string wav = audio_encode_wav(out_native, T_out, sr_out, sa3_out_fmt);
         free(out_native);
+        res.set_header("X-SA3-DiT", dit_file);
         res.set_content(wav, "audio/wav");
     }));
 

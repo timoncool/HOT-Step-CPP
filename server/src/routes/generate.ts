@@ -463,6 +463,11 @@ export async function submitGeneration(raw: any, userId: string | null): Promise
   return { ok: true, jobId: job.id, status: job.status };
 }
 
+/** True while a queued or running job will render build session `id` (Save song reads its files when it runs). */
+export function buildSessionHasActiveJob(id: string): boolean {
+  return [...jobs.values()].some(j => isActiveJob(j) && (j.params?.yue2Build as { session?: unknown } | undefined)?.session === id);
+}
+
 /** The in-memory job, while it is still held (terminal jobs go after an hour). */
 export function getGenerationJob(id: string): GenerationJob | undefined {
   return jobs.get(id);

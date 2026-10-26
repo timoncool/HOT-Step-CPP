@@ -346,9 +346,11 @@ static std::vector<ProbeSlot> g_probe_slots;
 static bool g_probe_armed = false;
 
 // Forward T tokens at cache position n_past; writes K/V into the cache and
-// reads back the LAST position's logits. n_past=0 with T>1 is the prefill;
-// T=1 with n_past>0 is a decode step. Caller advances n_past by T afterwards.
-static void forward_tokens(MidiModel * m, const float * input, int T, int n_past, float * logits_last) {
+// reads back the logits of the last n_out positions ([n_out][card]). n_past=0
+// with T>1 is the prefill; T=1 with n_past>0 is a decode step; T>1 with
+// n_past>0 is a speculative verify block. Caller advances n_past afterwards.
+static void forward_tokens(MidiModel * m, const float * input, int T, int n_past, float * logits_last,
+                           int n_out = 1) {
     const MidiConfig & c = m->cfg;
     const int H = c.num_heads, D = c.head_dim();
     const int n_kv = n_past + T;
@@ -359,6 +361,16 @@ static void forward_tokens(MidiModel * m, const float * input, int T, int n_past
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.dim, T);
     ggml_set_name(inp, "inp");
     ggml_set_input(inp);
+
+    // A verify block needs a causal mask over a non-empty cache, which
+    // diag_mask_inf gets wrong on CUDA (below). Pass it explicitly instead,
+    // the soft_max_ext path llama.cpp runs every batch through.
+    ggml_tensor * kq_mask = nullptr;
+    if (T > 1 && n_past > 0) {
+        kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, T);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_set_input(kq_mask);
+    }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
 
@@ -415,8 +427,12 @@ static void forward_tokens(MidiModel * m, const float * input, int T, int n_past
         // attends the whole cache, so the mask is a mathematical no-op —
         // skip it: the legacy diag_mask_inf CUDA kernel miscomputes with
         // n_past > 0, which silently corrupted every decode step on GPU.
-        if (T > 1) kq = ggml_diag_mask_inf(ctx, kq, n_past);
-        kq = ggml_soft_max(ctx, kq);
+        if (kq_mask) {
+            kq = ggml_soft_max_ext(ctx, kq, kq_mask, 1.0f, 0.0f);
+        } else {
+            if (T > 1) kq = ggml_diag_mask_inf(ctx, kq, n_past);
+            kq = ggml_soft_max(ctx, kq);
+        }
 
         ggml_tensor * kqv = ggml_mul_mat(ctx, V, kq);                     // [D, T, H]
         ggml_tensor * att = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));  // [D, H, T]
@@ -454,11 +470,19 @@ static void forward_tokens(MidiModel * m, const float * input, int T, int n_past
         exit(1);
     }
     ggml_backend_tensor_set(inp, input, 0, (size_t) c.dim * T * 4);
+    if (kq_mask) {
+        // query row t sees cache rows 0..n_past+t
+        std::vector<float> mask((size_t) n_kv * T, 0.0f);
+        for (int t = 0; t < T; t++) {
+            for (int j = n_past + t + 1; j < n_kv; j++) mask[(size_t) t * n_kv + j] = -INFINITY;
+        }
+        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * 4);
+    }
     if (ggml_backend_sched_graph_compute(m->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[ace-midi] FATAL: graph compute failed\n");
         exit(1);
     }
-    ggml_backend_tensor_get(logits, logits_last, (size_t) (T - 1) * logits->nb[1], (size_t) c.card * 4);
+    ggml_backend_tensor_get(logits, logits_last, (size_t) (T - n_out) * logits->nb[1], (size_t) n_out * c.card * 4);
 
     if (probe) {
         const char * prefix_env = getenv("ACE_MIDI_PROBE");
@@ -602,14 +626,23 @@ static void greedy_argmax_range(const float * logits, int n_valid, int * out) {
     *out = best;
 }
 
-template <typename TokenCb>
-static void decode_chunk(MidiModel * m, const std::vector<float> & prefix,
-                         const std::vector<int> & prompt, int max_gen, TokenCb cb) {
-    const MidiConfig & c = m->cfg;
-    const int n_valid = c.card < 1393 ? c.card : 1393;  // logits[1393:] masked upstream
-    const int T_prefix = (int) (prefix.size() / c.dim);
+static int n_valid_tokens(const MidiConfig & c) { return c.card < 1393 ? c.card : 1393; }  // logits[1393:] masked upstream
 
-    // prefill input: prefix + BOS + prompt tokens, sinusoidal positions from 0
+// Token embeddings with sinusoidal positions pos0.. into out[n][dim]
+static void embed_tokens(MidiModel * m, const int * toks, int n, int pos0, float * out) {
+    const int dim = m->cfg.dim;
+    for (int i = 0; i < n; i++) {
+        memcpy(out + (size_t) i * dim, m->emb_host.data() + (size_t) toks[i] * dim, (size_t) dim * 4);
+    }
+    add_sin_pos(out, n, dim, pos0);
+}
+
+// Prefill [prefix | BOS | prompt] (sinusoidal positions from 0); returns the
+// first greedy token and sets *n_past to the prefill length.
+static int prefill_chunk(MidiModel * m, const std::vector<float> & prefix, const std::vector<int> & prompt,
+                         int * n_past) {
+    const MidiConfig & c = m->cfg;
+    const int T_prefix = (int) (prefix.size() / c.dim);
     int T0 = T_prefix + 1 + (int) prompt.size();
     std::vector<float> input((size_t) T0 * c.dim);
     memcpy(input.data(), prefix.data(), prefix.size() * 4);
@@ -617,17 +650,27 @@ static void decode_chunk(MidiModel * m, const std::vector<float> & prefix,
     for (size_t i = 0; i < prompt.size(); i++) {
         memcpy(input.data() + prefix.size() + (i + 1) * c.dim,
                m->emb_host.data() + (size_t) prompt[i] * c.dim, (size_t) c.dim * 4);
-        cb(prompt[i]);  // teacher-forced tokens flow through the stream
     }
     add_sin_pos(input.data(), T0, c.dim, 0);
 
     std::vector<float> logits(c.card);
     forward_tokens(m, input.data(), T0, 0, logits.data());
-    int n_past = T0;
-
+    *n_past = T0;
     int tok;
-    greedy_argmax_range(logits.data(), n_valid, &tok);
+    greedy_argmax_range(logits.data(), n_valid_tokens(c), &tok);
+    return tok;
+}
 
+template <typename TokenCb>
+static void decode_chunk(MidiModel * m, const std::vector<float> & prefix,
+                         const std::vector<int> & prompt, int max_gen, TokenCb cb) {
+    const MidiConfig & c = m->cfg;
+    const int n_valid = n_valid_tokens(c);
+    for (int t : prompt) cb(t);  // teacher-forced tokens flow through the stream
+
+    int n_past;
+    int tok = prefill_chunk(m, prefix, prompt, &n_past);
+    std::vector<float> logits(c.card);
     std::vector<float> step(c.dim);
     for (int i = (int) prompt.size(); i < max_gen; i++) {
         if (tok == MIDI_EOS_ID) return;
@@ -641,6 +684,90 @@ static void decode_chunk(MidiModel * m, const std::vector<float> & prefix,
         forward_tokens(m, step.data(), 1, n_past, logits.data());
         n_past++;
         greedy_argmax_range(logits.data(), n_valid, &tok);
+    }
+}
+
+// Greedy speculative decoding (upstream MuScriptor PR #95): the draft model
+// proposes up to k tokens one at a time, the target checks them all in one
+// block and keeps them up to the first disagreement plus its own token there.
+// Every emitted token is the target's argmax, so the stream matches
+// decode_chunk up to block-vs-scalar float rounding. Rejected K/V rows need
+// no undo: n_past moves back and the next write overwrites them.
+#define MIDI_MAX_DRAFT_K 4  // upstream: K=8 flipped a target argmax on MPS fp16
+
+struct SpecStats { long proposed = 0, accepted = 0, blocks = 0; };
+
+template <typename TokenCb>
+static void decode_chunk_spec(MidiModel * m, const std::vector<float> & prefix, MidiModel * d,
+                              const std::vector<float> & d_prefix, int k_max, const std::vector<int> & prompt,
+                              int max_gen, SpecStats * st, TokenCb cb) {
+    const MidiConfig & c = m->cfg;
+    const int n_valid = n_valid_tokens(c);
+    for (int t : prompt) cb(t);
+
+    int n_past = 0, d_past = 0;
+    int cur = prefill_chunk(m, prefix, prompt, &n_past);
+    prefill_chunk(d, d_prefix, prompt, &d_past);
+
+    const int limit = max_gen - (int) prompt.size();  // tokens decode_chunk would emit at most
+    int emitted = 0;
+    std::vector<float> d_logits(d->cfg.card), step(d->cfg.dim);
+    std::vector<int>   block;
+    std::vector<float> blk_in, blk_logits;
+
+    while (true) {
+        if (cur == MIDI_EOS_ID) return;
+        cb(cur);
+        if (++emitted >= limit) return;
+
+        int k = k_max;
+        if (k > limit - emitted) k = limit - emitted;
+        if (k > m->max_seq - n_past - 1) k = m->max_seq - n_past - 1;
+        if (k > d->max_seq - d_past - 1) k = d->max_seq - d_past - 1;
+        if (k < 1) {
+            fprintf(stderr, "[ace-midi] WARNING: KV cache full at %d tokens\n", n_past);
+            return;
+        }
+
+        // draft: feed cur, then each proposal, k steps
+        block.assign(1, cur);
+        for (int i = 0; i < k; i++) {
+            embed_tokens(d, &block[i], 1, d_past + i, step.data());
+            forward_tokens(d, step.data(), 1, d_past + i, d_logits.data());
+            int p;
+            greedy_argmax_range(d_logits.data(), n_valid, &p);
+            block.push_back(p);
+        }
+
+        // target: [cur, p1..pk] in one block -> its tokens t0..tk
+        blk_in.resize((size_t) (k + 1) * c.dim);
+        blk_logits.resize((size_t) (k + 1) * c.card);
+        embed_tokens(m, block.data(), k + 1, n_past, blk_in.data());
+        forward_tokens(m, blk_in.data(), k + 1, n_past, blk_logits.data(), k + 1);
+        int a = 0, t_next = 0;
+        for (int i = 0; i <= k; i++) {
+            greedy_argmax_range(blk_logits.data() + (size_t) i * c.card, n_valid, &t_next);
+            if (i == k || t_next != block[i + 1]) break;
+            a++;
+        }
+        st->blocks++;
+        st->proposed += k;
+        st->accepted += a;
+
+        // keep cur + a accepted proposals in both caches
+        n_past += a + 1;
+        if (a == k) {  // draft never saw pk
+            embed_tokens(d, &block[k], 1, d_past + k, step.data());
+            forward_tokens(d, step.data(), 1, d_past + k, d_logits.data());
+        }
+        d_past += a + 1;
+
+        for (int i = 1; i <= a; i++) {
+            if (block[i] == MIDI_EOS_ID) return;
+            cb(block[i]);
+            if (++emitted >= limit) return;
+        }
+        cur = t_next;
     }
 }
 
@@ -1287,7 +1414,9 @@ static std::string instrument_name(int program) {
 }
 
 // jsonl: stream events + progress to stdout as they decode (demo-site UX)
-static TranscribeResult transcribe_wav(MidiModel * m, const float * wav, int n_samples, bool jsonl) {
+// draft (optional): speculative decoding with draft_k proposals per block
+static TranscribeResult transcribe_wav(MidiModel * m, const float * wav, int n_samples, bool jsonl,
+                                       MidiModel * draft = nullptr, int draft_k = 0) {
     TranscribeResult res;
     OpenNoteTracker  tracker;
 
@@ -1354,16 +1483,26 @@ static TranscribeResult transcribe_wav(MidiModel * m, const float * wav, int n_s
         std::vector<int> prompt;
         if (ci > 0) prompt = tie_section_tokens(tracker.open_keys());
 
-        std::vector<float> prefix = compute_prefix(m, wav + (size_t) ci * MIDI_CHUNK_SAMPLES, c_samples);
+        const float * cwav = wav + (size_t) ci * MIDI_CHUNK_SAMPLES;
+        std::vector<float> prefix = compute_prefix(m, cwav, c_samples);
 
         int64_t t0 = ggml_time_ms();
         int     n_tok = 0;
-        decode_chunk(m, prefix, prompt, MIDI_MAX_GEN, [&](int tok) {
+        auto    on_tok = [&](int tok) {
             n_tok++;
             handle_actions(tracker.feed(tok));
-        });
-        fprintf(stderr, "[ace-midi] chunk %d/%d: %d tokens, %lld ms\n",
-                ci + 1, n_chunks, n_tok, (long long) (ggml_time_ms() - t0));
+        };
+        if (draft) {
+            SpecStats st;
+            decode_chunk_spec(m, prefix, draft, compute_prefix(draft, cwav, c_samples), draft_k, prompt,
+                              MIDI_MAX_GEN, &st, on_tok);
+            fprintf(stderr, "[ace-midi] chunk %d/%d: %d tokens, %lld ms (draft accepted %ld/%ld in %ld blocks)\n",
+                    ci + 1, n_chunks, n_tok, (long long) (ggml_time_ms() - t0), st.accepted, st.proposed, st.blocks);
+        } else {
+            decode_chunk(m, prefix, prompt, MIDI_MAX_GEN, on_tok);
+            fprintf(stderr, "[ace-midi] chunk %d/%d: %d tokens, %lld ms\n",
+                    ci + 1, n_chunks, n_tok, (long long) (ggml_time_ms() - t0));
+        }
 
         if (jsonl) {
             printf("{\"type\":\"progress\",\"completed\":%d,\"total\":%d}\n", ci + 1, n_chunks);
@@ -1700,7 +1839,7 @@ static std::vector<uint8_t> grid_midi(const std::vector<MidiNote> & notes, const
 // With a beat model the MIDI gets tempo, meter and bar lines.
 static int run_transcribe(MidiModel * m, const std::string & audio_path, const std::string & out_path, bool jsonl,
                           bool is_raw, const std::string & beat_model, const GridExport & opts,
-                          const std::string & beats_out, const AbcOpts & ao) {
+                          const std::string & beats_out, const AbcOpts & ao, MidiModel * draft, int draft_k) {
     std::vector<float> wav;
     BeatTrack          tr;
     if (is_raw) {
@@ -1712,7 +1851,7 @@ static int run_transcribe(MidiModel * m, const std::string & audio_path, const s
         if (!beat_model.empty() && !run_beats(beat_model, mono, sr, &tr)) return 1;
         wav = resample_16k(std::move(mono), sr);
     }
-    TranscribeResult     res = transcribe_wav(m, wav.data(), (int) wav.size(), jsonl);
+    TranscribeResult     res = transcribe_wav(m, wav.data(), (int) wav.size(), jsonl, draft, draft_k);
     std::vector<uint8_t> mid = beat_model.empty()
         ? write_midi(res.notes)
         : grid_midi(res.notes, tr, (double) wav.size() / MIDI_SAMPLE_RATE, opts, beats_out, ao);
@@ -1851,7 +1990,8 @@ int main(int argc, char ** argv) {
     std::string audio_path, out_path = "out.mid";
     std::string dump_dir;
     std::string device = "auto";
-    std::string beat_model, beats_out, export_events, beats_in, track_path;
+    std::string beat_model, beats_out, export_events, beats_in, track_path, draft_dir;
+    int         draft_k = 2;  // upstream default
     GridExport  opts;
     AbcOpts     abc;
     bool   jsonl  = false;
@@ -1879,6 +2019,8 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--fill-gaps") && i + 1 < argc) opts.fill_gaps = atof(argv[++i]);
         else if (!strcmp(argv[i], "--trim-leading-bars")) opts.trim_leading = true;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) model_dir = argv[++i];
+        else if (!strcmp(argv[i], "--draft-model") && i + 1 < argc) draft_dir = argv[++i];
+        else if (!strcmp(argv[i], "--speculative-k") && i + 1 < argc) draft_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--validate") && i + 1 < argc) validate_dir = argv[++i];
         else if (!strcmp(argv[i], "--validate-decode") && i + 1 < argc) validate_decode_dir = argv[++i];
         else if (!strcmp(argv[i], "--validate-midi") && i + 1 < argc) validate_midi_dir = argv[++i];
@@ -1924,6 +2066,9 @@ int main(int argc, char ** argv) {
                 "  modes:\n"
                 "    --transcribe <audio.wav|mp3> [--out out.mid] [--jsonl]  audio -> MIDI\n"
                 "    --transcribe-raw <f32.bin>   same, raw mono 16 kHz f32 input\n"
+                "    --draft-model <dir> [--speculative-k <1-4>]   speculative decoding: a\n"
+                "                              smaller checkpoint proposes k tokens (default 2)\n"
+                "                              that the main model checks in one pass\n"
                 "    --validate <dir>          logit parity vs oracle [--tol <x>]\n"
                 "    --validate-decode <dir>   mel + greedy token parity vs oracle\n"
                 "    --validate-midi <dir>     multi-chunk events + MIDI bytes vs oracle\n"
@@ -1961,9 +2106,28 @@ int main(int argc, char ** argv) {
 #endif
     }
 
+    if (!draft_dir.empty() && (draft_k < 1 || draft_k > MIDI_MAX_DRAFT_K)) {
+        fprintf(stderr, "[ace-midi] --speculative-k must be 1-%d, not %d\n", MIDI_MAX_DRAFT_K, draft_k);
+        return 2;
+    }
+
     ggml_time_init();
     MidiModel m;
     if (!load_model(&m, model_dir)) return 1;
+    MidiModel draft;
+    if (!draft_dir.empty()) {
+        if (!load_model(&draft, draft_dir)) { free_model(&m); return 1; }
+        // cards differ (small 1393, large 1395); only the emittable range must match
+        if (n_valid_tokens(draft.cfg) != n_valid_tokens(m.cfg)) {
+            fprintf(stderr, "[ace-midi] draft vocabulary (%d) differs from the model's (%d)\n",
+                    n_valid_tokens(draft.cfg), n_valid_tokens(m.cfg));
+            free_model(&draft);
+            free_model(&m);
+            return 2;
+        }
+        fprintf(stderr, "[ace-midi] speculative decoding: draft %s, k=%d\n", draft_dir.c_str(), draft_k);
+    }
+    MidiModel * draft_p = draft_dir.empty() ? nullptr : &draft;
 
     // Every mode used to `return run_*(...)` straight out of main, leaving the
     // scheduler, backends and buffers alive. On Metal the device lives in a
@@ -1978,9 +2142,11 @@ int main(int argc, char ** argv) {
     else if (!validate_decode_dir.empty()) rc = run_validate_decode(&m, validate_decode_dir);
     else if (!validate_midi_dir.empty())   rc = run_validate_midi(&m, validate_midi_dir);
     else if (!dump_dir.empty())            rc = run_dump_logits(&m, dump_dir, out_path);
-    else if (!audio_path.empty())          rc = run_transcribe(&m, audio_path, out_path, jsonl, is_raw, beat_model, opts, beats_out, abc);
+    else if (!audio_path.empty())          rc = run_transcribe(&m, audio_path, out_path, jsonl, is_raw, beat_model, opts, beats_out, abc,
+                                                          draft_p, draft_k);
     else fprintf(stderr, "[ace-midi] no mode given\n");
 
+    if (draft_p) free_model(draft_p);
     free_model(&m);
     return rc;
 }

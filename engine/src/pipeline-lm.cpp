@@ -10,6 +10,7 @@
 #include "metadata-fsm.h"
 #include "model-store.h"
 #include "artist-token-runtime.h"
+#include "lm-cfg-extras.h"      // LmCfgExtras, lm_cfg_blend_extras
 #include "lm-adapter.h"         // LMLora complete: the prefix half of a unified adapter
 #include "lm-prefix-runtime.h"  // qw3lm_seed_prefix
 #include "prompt.h"
@@ -433,6 +434,29 @@ struct CodeRepPenalty {
     int   dry_min_len = 6;
 };
 
+// Opt-in code-phase sampling extras: min-p after top-p, and the CFG
+// refinements in lm-cfg-extras.h. All off = the existing behaviour.
+struct LmCodeSampling {
+    float       min_p = 0.0f;
+    LmCfgExtras cfg;
+};
+
+// CFG over the compact [EOS, code 0..N) view with the extras, written straight
+// into `compact`. The plain path blends in place on the full rows instead.
+static void lm_cfg_compact_extras(const float * lc, const float * lu, int eos_idx, int code_offset, float cfg_scale,
+                                  const LmCfgExtras & x, float * compact) {
+    static thread_local std::vector<float> c, u;
+    c.resize(AUDIO_CODE_COUNT + 1);
+    u.resize(AUDIO_CODE_COUNT + 1);
+    c[0] = lc[eos_idx];
+    u[0] = lu[eos_idx];
+    for (int k = 0; k < AUDIO_CODE_COUNT; k++) {
+        c[k + 1] = lc[code_offset + k];
+        u[k + 1] = lu[code_offset + k];
+    }
+    lm_cfg_blend_extras(c.data(), u.data(), c.size(), cfg_scale, x, compact);
+}
+
 static int lm_rep_mode_from_name(const std::string & name) {
     if (name == "frequency") {
         return LM_REP_FREQUENCY;
@@ -543,7 +567,8 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
                                                  bool                           use_batch_cfg,
                                                  bool (*cancel)(void *),
                                                  void * cancel_data,
-                                                 const CodeRepPenalty & rep = CodeRepPenalty()) {
+                                                 const CodeRepPenalty & rep = CodeRepPenalty(),
+                                                 const LmCodeSampling & cs  = LmCodeSampling()) {
     int  V             = lm_vocab_size(m);
     bool use_cfg       = cfg_scale > 1.0f;
     bool shared_prompt = ((int) aces.size() == 1);
@@ -638,7 +663,15 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
         seqs[i].done = false;
 
         std::vector<float> lg(prefill_logits_vec[i]);  // copy
-        if (use_cfg) {
+        if (use_cfg && cs.cfg.any()) {
+            // Mask to EOS + codes first, so the extras see the same candidate
+            // set the decode steps do.
+            std::vector<float> lu(prefill_logits_uncond_vec[i]);
+            for (int v = 0; v < AUDIO_CODE_BASE; v++) {
+                if (v != TOKEN_IM_END) lg[v] = lu[v] = -INFINITY;
+            }
+            lm_cfg_blend_extras(lg.data(), lu.data(), (size_t) V, cfg_scale, cs.cfg, lg.data());
+        } else if (use_cfg) {
             float * lu = prefill_logits_uncond_vec[i].data();
             for (int v = 0; v < V; v++) {
                 lg[v] = lu[v] + cfg_scale * (lg[v] - lu[v]);
@@ -651,7 +684,7 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
             }
         }
 
-        int tok            = sample_top_k_p(lg.data(), V, temperature, top_p, top_k, seqs[i].rng);
+        int tok            = sample_top_k_p(lg.data(), V, temperature, top_p, top_k, seqs[i].rng, cs.min_p);
         seqs[i].last_token = tok;
 
         if (tok == TOKEN_IM_END) {
@@ -752,22 +785,27 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
             // Pointer to the conditional logits for THIS active sequence
             float * lc = batch_logits.data() + (size_t) a * out_V;
 
-            if (do_cfg_this_step) {
-                // Pointer to the unconditional logits (offset by n_active)
-                float * lu = batch_logits.data() + (size_t) (n_active + a) * out_V;
+            if (do_cfg_this_step && cs.cfg.any()) {
+                const float * lu = batch_logits.data() + (size_t) (n_active + a) * out_V;
+                lm_cfg_compact_extras(lc, lu, eos_idx, code_offset, cfg_scale, cs.cfg, compact_logits.data());
+            } else {
+                if (do_cfg_this_step) {
+                    // Pointer to the unconditional logits (offset by n_active)
+                    float * lu = batch_logits.data() + (size_t) (n_active + a) * out_V;
 
-                // Targeted CFG Math: Only apply it to EOS + Audio Codes. Skip the 150,000 text tokens!
-                lc[eos_idx] = lu[eos_idx] + cfg_scale * (lc[eos_idx] - lu[eos_idx]);  // EOS token
-                for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
-                    int idx = code_offset + c;
-                    lc[idx] = lu[idx] + cfg_scale * (lc[idx] - lu[idx]);
+                    // Targeted CFG Math: Only apply it to EOS + Audio Codes. Skip the 150,000 text tokens!
+                    lc[eos_idx] = lu[eos_idx] + cfg_scale * (lc[eos_idx] - lu[eos_idx]);  // EOS token
+                    for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
+                        int idx = code_offset + c;
+                        lc[idx] = lu[idx] + cfg_scale * (lc[idx] - lu[idx]);
+                    }
                 }
-            }
 
-            // Extract ONLY the valid target tokens into the tiny compact array
-            compact_logits[0] = lc[eos_idx];
-            for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
-                compact_logits[c + 1] = lc[code_offset + c];
+                // Extract ONLY the valid target tokens into the tiny compact array
+                compact_logits[0] = lc[eos_idx];
+                for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
+                    compact_logits[c + 1] = lc[code_offset + c];
+                }
             }
 
             // Anti-loop: windowed repetition penalty over this sequence's recent codes
@@ -775,7 +813,7 @@ static std::vector<std::string> run_phase2_batch(Qwen3LM *                      
 
             // CPU samples instantly because it only has to sort ~2049 items instead of 150,000+
             int compact_tok =
-                sample_top_k_p(compact_logits.data(), compact_V, temperature, top_p, top_k, seqs[orig_i].rng);
+                sample_top_k_p(compact_logits.data(), compact_V, temperature, top_p, top_k, seqs[orig_i].rng, cs.min_p);
 
             // Map the sampled index back to global vocabulary ID
             int tok = (compact_tok == 0) ? TOKEN_IM_END : (AUDIO_CODE_BASE + compact_tok - 1);
@@ -844,7 +882,8 @@ static std::vector<std::string> run_phase2_trtllm(
     const char*            negative_prompt,
     bool (*cancel)(void*),
     void* cancel_data,
-    const CodeRepPenalty & rep = CodeRepPenalty()
+    const CodeRepPenalty & rep = CodeRepPenalty(),
+    const LmCodeSampling & cs  = LmCodeSampling()
 ) {
     int  V             = LM_TRTLLM_VOCAB;
     bool use_cfg       = cfg_scale > 1.0f;
@@ -907,10 +946,18 @@ static std::vector<std::string> run_phase2_trtllm(
             // Targeted CFG: only combine EOS + audio code logits
             float* lc = logits_cond.data();
             float* lu = logits_uncond.data();
-            lc[TOKEN_IM_END] = lu[TOKEN_IM_END] + cfg_scale * (lc[TOKEN_IM_END] - lu[TOKEN_IM_END]);
-            for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
-                int idx = AUDIO_CODE_BASE + c;
-                lc[idx] = lu[idx] + cfg_scale * (lc[idx] - lu[idx]);
+            if (cs.cfg.any()) {
+                // Blend over the compact view, then write it back so the
+                // extraction below picks it up unchanged.
+                lm_cfg_compact_extras(lc, lu, TOKEN_IM_END, AUDIO_CODE_BASE, cfg_scale, cs.cfg, compact.data());
+                lc[TOKEN_IM_END] = compact[0];
+                for (int c = 0; c < AUDIO_CODE_COUNT; c++) lc[AUDIO_CODE_BASE + c] = compact[c + 1];
+            } else {
+                lc[TOKEN_IM_END] = lu[TOKEN_IM_END] + cfg_scale * (lc[TOKEN_IM_END] - lu[TOKEN_IM_END]);
+                for (int c = 0; c < AUDIO_CODE_COUNT; c++) {
+                    int idx = AUDIO_CODE_BASE + c;
+                    lc[idx] = lu[idx] + cfg_scale * (lc[idx] - lu[idx]);
+                }
             }
         } else {
             // No CFG: just forward cond
@@ -936,7 +983,7 @@ static std::vector<std::string> run_phase2_trtllm(
         // Anti-loop: windowed repetition penalty over recent codes
         apply_code_rep_penalty(compact.data(), audio_codes, rep);
 
-        int compact_tok = sample_top_k_p(compact.data(), compact_V, temperature, top_p, top_k, rng);
+        int compact_tok = sample_top_k_p(compact.data(), compact_V, temperature, top_p, top_k, rng, cs.min_p);
         int tok = (compact_tok == 0) ? TOKEN_IM_END : (AUDIO_CODE_BASE + compact_tok - 1);
 
         if (tok == TOKEN_IM_END) {
@@ -1769,6 +1816,15 @@ int ace_lm_generate(AceLm *            ctx,
         fprintf(stderr, "[LM-Generate] %s mode, no audio code generation\n",
                 mode == LM_MODE_INSPIRE ? "Inspire" : "Format");
     } else if (!user_has_codes) {
+        LmCodeSampling cs;
+        cs.min_p       = req->lm_min_p;
+        cs.cfg.min_p   = req->lm_cfg_min_p;
+        cs.cfg.logprob = req->lm_cfg_logprob;
+        cs.cfg.rescale = req->lm_cfg_rescale;
+        if (cs.min_p > 0.0f || cs.cfg.any()) {
+            fprintf(stderr, "[LM-Sample] min_p=%.3f cfg_min_p=%.3f cfg_logprob=%d cfg_rescale=%.2f\n", cs.min_p,
+                    cs.cfg.min_p, (int) cs.cfg.logprob, cs.cfg.rescale);
+        }
         CodeRepPenalty rep;
         rep.penalty     = req->lm_rep_penalty;
         rep.window      = req->lm_rep_window;
@@ -1792,7 +1848,7 @@ int ace_lm_generate(AceLm *            ctx,
             const char * neg = (neg_prompt && neg_prompt[0]) ? neg_prompt : nullptr;
             batch_codes = run_phase2_trtllm(&ctx->lm_trtllm, *bpe, aces[0],
                                              temperature, top_p, top_k, seed, cfg_scale,
-                                             req->lm_cfg_cutoff_ratio, neg, cancel, cancel_data, rep);
+                                             req->lm_cfg_cutoff_ratio, neg, cancel, cancel_data, rep, cs);
         } else
 #endif
         // Speculative decode: draft model available + batch_size=1
@@ -1802,6 +1858,12 @@ int ace_lm_generate(AceLm *            ctx,
             // draft and target sample from different distributions, and
             // penalising only one side breaks the acceptance test. Say so
             // rather than letting the knob silently do nothing.
+            if (cs.min_p > 0.0f || cs.cfg.any()) {
+                fprintf(stderr,
+                        "[LM-Sample] WARNING speculative decode is active and does not support lm_min_p or the CFG "
+                        "extras (lm_cfg_min_p / lm_cfg_logprob / lm_cfg_rescale) for the same reason; they are "
+                        "IGNORED for this generation.\n");
+            }
             if (rep.penalty > 1.0f) {
                 fprintf(stderr,
                         "[LM-Rep] WARNING speculative decode is active (draft model loaded, batch=1) and does not "
@@ -1814,7 +1876,7 @@ int ace_lm_generate(AceLm *            ctx,
         } else {
             batch_codes = run_phase2_batch(model, *bpe, aces, temperature, top_p, top_k, seed, lm_batch_size, cfg_scale,
                                            req->lm_cfg_cutoff_ratio,
-                                           neg_prompt, ctx->params.use_batch_cfg, cancel, cancel_data, rep);
+                                           neg_prompt, ctx->params.use_batch_cfg, cancel, cancel_data, rep, cs);
         }
         if (batch_codes.empty()) {
             return -1;

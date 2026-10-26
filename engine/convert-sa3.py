@@ -20,7 +20,14 @@
 # Runs in the StableAudio3 uv venv:
 #   cd d:/Ace-Step-Latest/StableAudio3
 #   uv run --with gguf python d:/Ace-Step-Latest/hot-step-cpp/engine/convert-sa3.py
+#
+# Training base (ace-train sa3-train --base-dit), DiT only, never over the
+# installed inference files:
+#   uv run --with gguf python .../convert-sa3.py --dit-only --dit-name sa3-dit-base-BF16.gguf #     --ckpt <medium-base model.safetensors> --config <medium-base model_config.json> --out-dir <dir>
+# Existing outputs are refused unless --force. Every file records the sha256 of
+# its source checkpoint and config ("sa3.source_sha256", "sa3.source_config_sha256").
 
+import hashlib
 import json
 import os
 import sys
@@ -38,6 +45,14 @@ REPO = "stabilityai/stable-audio-3-medium"
 
 def log(msg):
     print(f"[convert-sa3] {msg}", file=sys.stderr, flush=True)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def to_np(t):
@@ -102,14 +117,22 @@ def main():
     ap.add_argument("--config", default=None, help="Local model_config.json (default: HF download)")
     ap.add_argument("--out-dir", default=OUTPUT_DIR)
     ap.add_argument("--dit-only", action="store_true")
+    ap.add_argument("--dit-name", default="sa3-dit-BF16.gguf", help="DiT output file name")
+    ap.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     args = ap.parse_args()
     out_dir = args.out_dir
+    names = [args.dit_name] + ([] if args.dit_only else
+             ["sa3-same-enc-F16.gguf", "sa3-same-dec-F16.gguf", "sa3-text-enc-BF16.gguf"])
+    existing = [n for n in names if os.path.exists(os.path.join(out_dir, n))]
+    if existing and not args.force:
+        sys.exit(f"[convert-sa3] refusing to overwrite {existing} in {out_dir} (pass --force)")
 
     os.makedirs(out_dir, exist_ok=True)
     cfg_path = args.config or hf_hub_download(REPO, "model_config.json")
     ckpt_path = args.ckpt or hf_hub_download(REPO, "model.safetensors")
     with open(cfg_path) as f:
         config_json = f.read()
+    source_meta = {"sa3.source_sha256": sha256(ckpt_path), "sa3.source_config_sha256": sha256(cfg_path)}
 
     # ── Split the combined checkpoint by prefix ─────────────────────────
     dit_tensors, enc_tensors, dec_tensors = [], [], []
@@ -135,15 +158,15 @@ def main():
             elif key.startswith("conditioner."):
                 dit_tensors.append((key, to_np(f.get_tensor(key))))
 
-    write_sa3_gguf(os.path.join(out_dir, "sa3-dit-BF16.gguf"),
-                  "sa3-dit", dit_tensors, config_json)
+    write_sa3_gguf(os.path.join(out_dir, args.dit_name),
+                  "sa3-dit", dit_tensors, config_json, extra_meta=source_meta)
     if args.dit_only:
         log("Done (dit-only).")
         return
     write_sa3_gguf(os.path.join(out_dir, "sa3-same-enc-F16.gguf"),
-                  "sa3-same-enc", enc_tensors, config_json, half="f16")
+                  "sa3-same-enc", enc_tensors, config_json, extra_meta=source_meta, half="f16")
     write_sa3_gguf(os.path.join(out_dir, "sa3-same-dec-F16.gguf"),
-                  "sa3-same-dec", dec_tensors, config_json, half="f16")
+                  "sa3-same-dec", dec_tensors, config_json, extra_meta=source_meta, half="f16")
 
     # ── T5Gemma encoder (separate HF model in the repo subfolder) ───────
     t5_cfg = hf_hub_download(REPO, "config.json", subfolder="t5gemma-b-b-ul2")
@@ -166,7 +189,7 @@ def main():
         t5_tensors.append((key, to_np(f.get_tensor(key))))
     write_sa3_gguf(os.path.join(out_dir, "sa3-text-enc-BF16.gguf"),
                   "sa3-t5gemma", t5_tensors, t5_config_json,
-                  extra_meta={"sa3.parent_config_json": config_json})
+                  extra_meta={"sa3.parent_config_json": config_json, **source_meta})
 
     log("Done.")
 

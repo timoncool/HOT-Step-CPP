@@ -22,11 +22,12 @@ The new launcher reuses the saved location and downloaded weights.
 With no pointer, an older install launched in place migrates to the sibling folder.
 A fresh extraction elsewhere can import the old app folder through Settings.
 
-Settings > Environment > Data folder provides Move current data, Use existing
-folder, Create empty data folder and Import previous install. Preview the paths
-and space required, finish active work, then confirm and restart. External
-folder overrides stay external. Import needs an empty library and keeps the
-older install. Repoint copies and deletes nothing.
+Settings > Storage & Data provides Move current data, Use existing folder,
+Create empty data folder and Import previous install. Preview the paths and
+space required, finish active work, then confirm and restart. External folder
+overrides stay external. Import needs an empty library and moves the older
+install's library, models, adapters, logs and Whisper into the data folder; the
+older app folder stays in place without them. Repoint copies and deletes nothing.
 
 If a drive is missing or a transfer stops, keep the pointer and data intact.
 Read the explanation page, fix the reported problem and restart to resume.

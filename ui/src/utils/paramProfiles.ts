@@ -87,7 +87,8 @@ export const PARAM_GROUPS: { title: string; fields: string[]; ace?: true }[] = [
     ace: true,
     fields: [
       'lmSeed', 'lmSeedFollowsDit', 'skipLm', 'skipLrc', 'useCotCaption',
-      'lmTemperature', 'lmCfgScale', 'lmTopK', 'lmTopP', 'lmNegativePrompt', 'lmCodesStrength',
+      'lmTemperature', 'lmCfgScale', 'lmTopK', 'lmTopP', 'lmMinP', 'lmCfgMinP', 'lmCfgLogprob', 'lmCfgRescale',
+      'lmNegativePrompt', 'lmCodesStrength',
       'lmCodesMode', 'lmCodesSteps',
     ],
   },

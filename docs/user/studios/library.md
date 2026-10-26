@@ -31,19 +31,19 @@ disk.
 | Control | What it does |
 |---|---|
 | View toggle (grid / list / table) | Switches how the song list renders. Remembered per browser. |
-| Source filter tabs | All, Custom-Gen, Auto-Gen, Lyric Studio, Cover Studio, Repaint, Stem Build, Song Builder, Imported. Each tab shows a count and filters client-side; only shown on the Library page, not on the Recent Songs list elsewhere in the app. |
-| Select | Enters multi-select mode: check tracks, then Download, Zip (one zip of all selected audio, up to 256 MB in total), Add to playlist or Delete the selection. Select all / deselect all toggles from the checkbox at the left of the bulk action bar; Select all visible and Clear sit beside it. Shift+click selects the range from the last clicked track, Ctrl/Cmd+click toggles one. On touch, long-press a track to start selecting, tap to toggle, and long-press a second track to select the range between them. |
-| Per page | 20, 40, 60, 80, 100, or All. Remembered per browser. |
-| Columns (table view only) | Choose which columns show. Title and Actions are always on; everything else, including generation details like seed, CFG, solver, and adapter, is opt-in and off by default. Column widths are drag-resizable and persist. |
+| Source filter tabs | All, Custom-Gen, Auto-Gen, Lyric Studio, Cover Studio, Repaint, Stem Build, Song Builder, Imported. Each tab shows a count and filters client-side; only shown on the Library page, not on the Generations lists beside Custom-Gen and Auto-Gen. |
+| Select | Enters multi-select mode: check tracks, then Compare (two or more tracks, opens a new [Compare](compare-studio.md) session with them picked), Add to playlist, Zip (one zip of the selected tracks' original audio, up to 500 tracks and 256 MB), Download or Delete the selection. Select all / deselect all toggles from the checkbox at the left of the bulk action bar; Select all visible and Clear sit beside it. Shift+click selects the range from the last clicked track, Ctrl/Cmd+click toggles one. On touch, long-press a track to start selecting, tap to toggle, and long-press a second track to select the range between them. |
+| Per page | 20, 40 (the default), 60, 80, 100, or All. Remembered per browser. |
+| Columns (table view only) | Choose which columns show. The cover thumbnail, Title and Actions are always on. Style, BPM, Key, Model, Quality, Time and Date (and Source on the All tab) show by default; the generation details, such as seed, LM seed, steps, CFG, shift, solver, scheduler, guidance, LoRA, LM and VAE, are off until you tick them. Column widths are drag-resizable and persist. |
 | Rename (pencil icon) | Inline title edit, on the card, row, or table cell. |
-| Track menu (⋯) | Run Post-Processing, Edit (loads the track's parameters back into Create), Add to Playlist, Download, Send to Cover Studio, Edit Metadata, Export Params, Retranscribe Lyrics, Generate/Regenerate Cover Art, Set as Track A / Track B, Delete. Same menu on every song list in the app: grid card, list row, table row, playlist, and the right sidebar. On phones (1023px wide or less) it opens as a bottom sheet instead of a dropdown: drag the handle down, tap the backdrop or press Esc to close it. |
+| Track menu (⋯) | Run Post-Processing (shown greyed out, with the reason on hover, when it cannot run), Remove Post-Processed Version (when one exists), Download ABC Lead Sheet (YuE2 renders), Edit (loads the track's parameters back into Custom-Gen), Add to Playlist, Download, Send to Cover Studio, Edit Metadata, Export Params, Retranscribe Lyrics, Generate/Regenerate Cover Art, Set as Track A / Track B, Delete. The same menu sits on grid cards, list rows, table rows, the playlist and the right sidebar, with the items that surface supports. On phones (1023px wide or less) it opens as a bottom sheet instead of a dropdown: drag the handle down, tap the backdrop or press Esc to close it. |
 | Set as Track A / Track B | Pins two tracks for the A/B comparison bar above the list, with a Play A/B button and a Compare button that opens a parameter diff modal. |
 | Upload into Library | Opens the import dialog (see below). Only on the Library page. |
 
 A track still being rendered by MiniMax-Music3's streaming mode appears in
 the list before its file exists, with a live percentage badge and progress
-bar instead of the normal controls. It is already playable, just not
-downloadable yet.
+bar; the grid card hides its menu until then. It is already playable, just
+not downloadable yet.
 
 ## Comparing generation settings
 
@@ -52,7 +52,10 @@ the saved AR adapter scale and VAE variant. ACE-Step shows CFG, solver and
 model quantization when the model filename identifies it. MiniMax-Music3 shows
 flow CFG, adapter scale and model quantization when recorded. Stable Audio 3
 shows its saved guidance and sampler. Missing values stay hidden; settings
-from another backend's panel do not appear.
+from another backend's panel do not appear. A track scored by the Quality
+Evaluator (see [Generation](../generation.md)) also shows its score as a
+percentage, Raw and PP when both versions were scored; hover it for the
+metallic, word-cut and noise scores.
 
 Cover Studio's **Covering band** label appears as a Tag line under the title
 in grid cards and table titles, and beneath the description in list rows.
@@ -61,7 +64,7 @@ tag. Open **How it was made** for the saved source identity and cover choices.
 Older tracks can only show the information saved at generation time.
 
 **Export Params** includes stored cover provenance and the YuE2 score, when
-present. **Edit** opens Create; it does not restore the Cover Studio workflow
+present. **Edit** opens Custom-Gen; it does not restore the Cover Studio workflow
 or reload its source. Keep a Cover Studio draft to resume that workflow.
 
 ## Player
@@ -78,6 +81,7 @@ across every view, not just Library.
 | Lock screen / media keys | The current track (title, artist or backend, cover art) shows in the OS media overlay and phone lock screen. Play, pause, previous, next and seeking work from there and from headset or keyboard media keys. |
 | 48k / 44.1k | Previews how the 48 kHz render sounds clocked out at 44.1 kHz, pitched down about 1.47 semitones with tempo unchanged. A quick way to A/B a resample artifact without actually resampling. |
 | Variant switch (No Adapter / Unmastered / Mastered) | Only shown when a track has that variant. Each segment plays it and carries its own small download button for that exact render. |
+| A / B (after Play A/B) | Takes the variant switch's place: shows which pinned track is playing and flips to the other; the x beside it leaves A/B mode. |
 | Trim/crop | Toggles trim mode; the waveform below becomes clickable to set in/out points. |
 | Volume | Slider plus mute toggle. |
 | Edit / Download / Delete | Quick actions on the currently loaded track. |
@@ -106,7 +110,7 @@ On desktop these work anywhere in the app. Press `?` to see them in a small chea
 |---|---|
 | Space or K | Play / pause |
 | J / L | Seek back / forward 10 s |
-| Up / Down | Move the focused row in the Library list (outlined in pink) |
+| Up / Down | Move the focused row in the visible song list, Library or a Generations list (outlined in pink) |
 | Enter | Play the focused row |
 | Delete | Delete the selection, or the focused row if nothing is selected. |
 | Esc | Clear the selection, then the focused row |
@@ -119,7 +123,7 @@ which has its own keys (B, Tab).
 ### Command palette
 
 On desktop, Ctrl+K (Cmd+K on Mac) opens a search box that jumps anywhere. Type a few
-letters of a studio name ("trn" finds Training Studio) or a song title;
+letters of a studio name ("trn" finds Training) or a song title;
 the list ranks studios first, then songs from your library. Use Up and
 Down to move, Enter to open, Esc to close. Picking a song opens Library and
 plays it.
@@ -151,23 +155,25 @@ the pending edit against the latest saved revision.
 Click a track (outside of selection mode) to open the right sidebar.
 
 - Cover art, inline-editable title, a backend chip (ACE-Step 1.5,
-  MiniMax-Music3, or YuE2), the artist name if set, and the subject or
-  description text.
+  MiniMax-Music3, YuE2 or Stable Audio 3), the artist name if set, and the
+  subject or description text.
 - Play/pause, Edit, and the same track action menu as everywhere else.
 - Chips for length, tempo, key, and time signature, shown only when the
   backend that made the track actually measures them. ACE-Step reports all
-  three; MiniMax-Music3 and YuE2 do not use fixed tempo/key inputs, so those
+  three; the other backends store no tempo, key or time signature, so those
   chips are omitted rather than showing a meaningless value.
 - Collapsible sections: Prompt (the style/caption text), How it was made
   (the parameters that render's own backend used, grouped as Models,
   Sampling, Planner, Adapters, Reproduction for ACE-Step; Render, Adapter,
   Reproduction for MiniMax-Music3; Plan, Render, Outcome, Adapters,
-  Reproduction for YuE2), and Lyrics.
+  Reproduction for YuE2; Models, Sampling, Reproduction for Stable Audio 3;
+  a Cover Studio group comes first on a cover), and Lyrics.
 
 For new YuE2 renders, Score says "Supplied (ABC)" only when the submitted
 score was used. Scores generated by the app's planner, including auto-replans
-and instrumental planning, say "Planned by LM". Older saved tracks retain
-their recorded status.
+and instrumental planning, say "Planned by LM", and the Outcome group's Plan
+stage reads "Planned by the app" rather than "Not run". Older saved tracks
+retain their recorded status.
 
 For a rendered YuE2 cover, **Measure drift** in the details panel aligns its
 saved audio to the lyrics used by that job, then matches sung lyric tags to
@@ -202,11 +208,13 @@ for the track.
 
 A track's Download action uses the format, bitrate, and preferred version
 (original / mastered / both) set on the Settings page. There is no
-per-download format prompt. The player's variant switch has its own
+per-download format prompt. When Settings has a Download folder, every
+download is saved there instead, with a toast saying where; the zip export
+still arrives as a browser download. The player's variant switch has its own
 inline download buttons that bypass that preference and grab an exact
 version instead. Selecting tracks and choosing Download in the bulk action
 bar downloads them one at a time, staggered so the browser doesn't block
-them, not as a single archive.
+them; Zip is the single-archive option.
 
 The server chooses the available versions for a bulk download. If the
 preferred mastered version is missing, it uses the original. With Both
@@ -279,7 +287,8 @@ follow it. A failed write keeps the previous saved result visible.
 ## Related
 
 - [Auto-Gen](insta-gen.md)
-- [Create](create.md)
+- [Custom-Gen](create.md)
+- [Compare](compare-studio.md)
 - [Cover Studio](cover-studio.md)
 - [Repaint Studio](repaint-studio.md)
 - [Stem Studio](stem-studio.md)

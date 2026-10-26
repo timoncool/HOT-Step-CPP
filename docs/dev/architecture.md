@@ -26,15 +26,17 @@ Node server   server/src/index.ts   Express on 0.0.0.0:3001
   |-- /api/*         route files in server/src/routes/
   |-- /audio         <data dir>/audio         (generated songs)
   |-- /references    <data dir>/references    (mastering reference tracks)
+  |-- /listening     ear-test score sheets under _experiments/_LISTENING/ (loopback only)
   |-- /*             ui/dist, when it exists, with an SPA fallback to index.html
   |-- SQLite         <data dir>/hotstep.db
   |-- runs as needed: ace-train, ace-caption, ace-midi, mastering, mp3-codec,
-  |                   vst-host, whisper-cli, Essentia, sd-cli
+  |                   vst-host, whisper-cli, Essentia, sd-cli, ffmpeg
   v  HTTP, server/src/services/aceClient.ts
 ace-server    engine/tools/hot-step-server.cpp   127.0.0.1:8085
   |-- ACE-Step 1.5      /lm /synth /understand /vae /warm /job ...
   |-- MiniMax-Music3    /mm3/*
   |-- YuE2              /yue2/*
+  |-- Stable Audio 3    /sa3/props /sa3-synth
   `-- SuperSep, Spectral Lifter, PP-VAE re-encode, SA3 refine
 ```
 
@@ -44,7 +46,8 @@ ace-server    engine/tools/hot-step-server.cpp   127.0.0.1:8085
 | Vite dev server | 3000 | hard-coded in `ui/vite.config.ts` and `dev.bat` — the address agents use |
 | ace-server | 8085 | `ACESTEPCPP_PORT` |
 
-The `<data dir>` is `<data root>/library/` in a git checkout. [config.md](config.md) has every
+The `<data dir>` is `<data root>/library/` when there is a data folder, and the `DATA_DIR`
+default `server/data/` in a checkout that has none. [config.md](config.md) has every
 variable, including how `DATA_DIR` resolves.
 
 ## UI server state
@@ -73,8 +76,9 @@ to 30 seconds. Resource overrides and runtime steps live in each area's README:
 | Area | Snapshot ownership and retained client work |
 |---|---|
 | [Global models](../../ui/src/queries/global-models/README.md) | Plugins, capabilities, VRAM, catalogues, model downloads, profiles, seeds, references and VST snapshots; parameter forms and selection intent stay local |
-| Training data | `queries/training-data/queries.ts` owns datasets, detail, jobs, preparation status, capabilities, workers, pipelines and batches; the training store projects only the selected worker/dataset and retains pending edits. Its missing README and remaining direct reads are requests below |
+| [Training data](../../ui/src/queries/training-data/README.md) | `queries/training-data/queries.ts` owns datasets, detail, jobs, preparation status, capabilities, workers, pipelines and batches; the training store projects only the selected worker/dataset and retains pending edits |
 | [Training runs](../../ui/src/queries/training-runs/README.md) | Worker status/jobs, local run/review/score/preparation records; charts/logs retain SSE reducers, form fields and playback stay local |
+| [SA3 previews](../../ui/src/queries/sa3-previews/README.md) | One run's SA3 checkpoint preview list, keyed under training-runs by worker, dataset and run; it polls while a cell is queued or rendering, and the render command never retries |
 | [Studios](../../ui/src/queries/studios/README.md) | MIDI jobs/notes, extraction/separation, projects, workflow snapshots and shared songs/plugins/models; composition, audio scheduling and explicit execution stay local |
 | [Cover and lyrics](../../ui/src/queries/cover-lyrics/README.md) | Catalogues, sources, profiles, presets, drafts, playlists and workflow snapshots; lyric edits and serial execution stay local |
 | [Shell and queue](../../ui/src/queries/shell-queue/README.md) | Library, recent songs, settings, preferences, browse results, generation status and queue projections; routing, playback, migration and completion effects stay client-owned |
@@ -83,7 +87,16 @@ Commands capture their target before awaiting, then update or invalidate related
 list/detail keys after success. A failed command leaves the old snapshot visible.
 Deletion cancels old reads before the command and again after success, removes
 the accepted rows and invalidates. Canceling observation aborts an HTTP read;
-canceling a server job requires its explicit command.
+canceling a server job requires its explicit command. The shared write helpers are in
+`queries/writes.ts` (`writeAndInvalidate`, `useUpload`), and `queries/invalidation.ts`
+holds the invalidation manager they call.
+
+JSON reads and commands go through one axios instance (`services/axiosClient.ts`). Its
+request interceptor adds the bearer token, and its response interceptor turns every
+failure into an `ApiError` and decides the toast: failed GETs stay silent, other failures
+toast unless the request opts out with `X-Skip-Global-Error`. Uploads stay on XHR for
+progress events and SSE streams stay on fetch. Uploads and streams that use
+`sseFailure()` in `services/httpClient.ts` report failures through the same handler.
 
 SSE remains the push channel. Shared log/download/training connections and
 workflow streams keep their existing reducers. Scoped bridges reconcile snapshots
@@ -123,7 +136,7 @@ with HOTSTEP-106; these closures do not claim live request-count reductions.
 | R3 | Engineer, shell-queue; Maker 2, cover-lyrics | Closed in `8909d3b3` and `a7a4536e`. `SONG_VIEWS` includes Cover's feed and both recent-song feeds; Cover writes/deletes and workflow events call the shared invalidator. HOTSTEP-108 passed Builder review |
 | R4 | Engineer, foundation; Maker and Maker 2, area adoption | Closed in `8909d3b3`, `a7a4536e` and `0b000e03`. Shared GPU, adapter-scan and workflow keys use the documented canonical reads and wire shapes. Workflow jobs retain auth and `after` filters; events invalidate all offsets for the captured job. Training commands/events also invalidate shared preparation snapshots |
 | R5 | Engineer, shell-queue; Maker, studios | Closed in `8909d3b3` and `0b000e03`. Peaks and player sidecars enter shared Query entries; Repaint uses the same LRC key and `fetchLrc` read. Track variants share the sidecar URL, missing files remain null, and crop/retranscription invalidates sidecars. Audio blobs and decoding remain media transports |
-| R6 | Engineer, foundation | Closed in `8909d3b3`. The foundation manifest records current dispositions and additional consumers, publishes the shared contracts and corrects the song-detail auth note. The key retains an epoch for sign-out cleanup although its read sends no bearer token |
+| R6 | Engineer, foundation | Closed in `8909d3b3`. The foundation manifest records current dispositions and additional consumers, publishes the shared contracts and corrects the song-detail auth note. The key retains an epoch for sign-out cleanup. At the time its read sent no bearer token; since the axios transport (`18897e6c`) it does |
 
 Files in R2 are under `ui/src/components/training-studio/`; other paths above
 are under `ui/src/`. The preparation context read at submission, recipe/preset
@@ -133,9 +146,18 @@ preparation detail/job polling or a displayed server snapshot.
 
 ### Surviving fetches, streams and timers
 
-All remaining direct fetch sites fall into the groups below. A service transport
-does not independently own a snapshot: its caller's Query options supply that
+At the audit, all remaining direct fetch sites fell into the groups below. A service
+transport does not independently own a snapshot: its caller's Query options supply that
 ownership. R1, R2 and R5 now follow this rule through the shared reads.
+
+Later changes are not re-audited here. The axios transport (`18897e6c`) moved every
+service file's JSON calls and uploads onto `httpClient.ts`, so the raw fetches left under
+`services/` are the transport itself and three stream readers (assistant chat, the
+lireek SSE helper and workflow events). `components/compare-studio/useAbEngine.ts`,
+`stores/compareStore.ts` and `components/storm/DriftPanel.tsx` were added after the audit
+and fetch directly; they have no disposition yet. Rows below that name raw fetches in
+service files, upload components, MetadataEditorModal or `queries/studios/lyrics.ts`
+describe the audit, not the current code.
 
 | Paths under `ui/src/` | Disposition and reason |
 |---|---|
@@ -200,18 +222,24 @@ remain explicit acceptance gaps.
 
 `server/src/services/aceEngineProcess.ts` owns the `ace-server` child process. On startup
 `index.ts` calls `startAceServer()`, which passes `--models`, `--host` and `--port`, plus
-`--adapters`, `--keep-loaded`, `--noise-profile`, `--draft-lm`, `--vae-chunk`,
-`--vae-overlap` when their settings apply. The full list is in
+`--adapters`, `--user-plugins`, `--keep-loaded`, `--noise-profile`, `--draft-lm`,
+`--vae-chunk`, `--vae-overlap` when their settings apply. The full list is in
 [config.md](config.md#flags-passed-to-ace-server).
 
 - An abnormal exit respawns the engine after 3 seconds. Three crashes inside 30 seconds
   stop the respawns and mark the engine not ready. The usual cause is a missing DLL next to
-  the binary.
+  the binary. After giving up, the engine starts again by itself when a Model Manager
+  download queue drains (`retryIfGaveUp`).
+- An empty models folder is not a crash. `ace-server` prints `ERROR: no models found` and
+  exits 1; the server spends none of the crash budget, reports `engine.noModels` on
+  `/api/health`, and starts the engine when a download queue drains or a finished `.gguf`
+  appears in the models folder (checked every 5 seconds).
 - Training jobs stop the engine on purpose to free the GPU (`stopAceServer`) and start it
   again afterwards (`restartAceServer`). A deliberate stop never triggers a respawn.
 - MiniMax-Music3 and YuE2 keep their model selection inside the engine process, so a
   restart loses it. `index.ts` registers restore hooks through `onEngineRestarted` that put
-  the saved selection back after every respawn.
+  the saved selection back after every respawn. Stable Audio 3 needs none: its DiT choice
+  is saved in SQLite and sent with each request.
 - In a portable Windows CUDA build, the first launch downloads the cuBLAS and cudart DLLs
   from Hugging Face before it starts the engine. If that fails, the engine starts on CPU.
 
@@ -223,10 +251,19 @@ to shut down first. See [building.md](building.md#engine-rebuild-rules).
 
 1. The UI builds a camelCase parameter object from the Create panel and the global bar
    (`ui/src/stores/globalParamsStore.ts`, `ui/src/types.ts`) and posts it to
-   `POST /api/generate` through `ui/src/services/api.ts`.
+   `POST /api/generate` through `ui/src/services/api.ts`. For Create and written-song
+   requests the client queue (`ui/src/stores/audioGenQueueStore.ts`) first posts the
+   intent to `POST /api/resolve/preview` (`server/src/routes/resolve.ts`), which returns
+   the exact `/api/generate` body with `expectedBackend` set, unless
+   `GENERATION_INTENT_PATH=old`. When the server owns the queue, that body is enqueued on
+   `/api/audio-queue` instead of posted directly. [api-contracts.md](api-contracts.md)
+   has the shapes.
 2. `server/src/routes/generate.ts` checks that the engine is ready, builds a job envelope
    that names the backend (`services/generation/envelope.ts`), and queues the job. Jobs run
-   one at a time on a shared GPU lane (`services/generation/gpuLane.ts`).
+   one at a time on a shared GPU lane (`services/generation/gpuLane.ts`). An optional
+   `backendOverride` runs one job on a named backend without switching the active one, and
+   an `expectedBackend` that no longer matches the backend the job would run on is refused
+   with 409.
 3. The route hands the job to the backend's `generate()`. For ACE-Step that is
    `services/backends/ace/generate.ts`:
    - `translateParams()` turns the UI params into a snake_case `AceRequest`
@@ -247,8 +284,11 @@ to shut down first. See [building.md](building.md#engine-rebuild-rules).
    or 9000 frames for an uncapped song. During NAR and the completed semantic
    handoff, the silence allowance is 400 ms per frame plus 2 minutes, with a
    15-minute floor and a 9000-frame ceiling. Actual phase/step changes reset
-   the timer; repeated running responses do not. Other phases retain their
-   existing limits, and the user-configured wall-clock timeout still applies.
+   the timer; repeated running responses do not. YuE2 decode and output phases
+   (`vae_decode`, legacy `vae`, and `encoding_output`) can be silent for a whole
+   batch, so they use the user-configured wall-clock timeout alone. Downstream
+   post-processing starts after this polling loop returns. Other phases retain
+   their existing inactivity limits.
 5. The UI polls `GET /api/generate/status/:id` until the job finishes.
 
 `ace-server` answers HTTP on one thread. While it runs DiT, VAE or adapter work it cannot
@@ -257,15 +297,16 @@ timeouts in `aceClient.ts` are long for that reason.
 
 ## Backends
 
-The server can drive three model families through one interface. The registry is
+The server can drive four model families through one interface. The registry is
 `server/src/services/backends/registry.ts`, and the interface (`EngineBackend`) is in
-`services/backends/types.ts`.
+`services/backends/types.ts`. Registration order is the backend toggle's order.
 
 | Id | Display name | Server code | Engine code |
 |---|---|---|---|
 | `ace` (default) | ACE-Step 1.5 | `services/backends/ace/` | `engine/src/` core pipeline |
 | `minimax-m3` | MiniMax-Music3 | `services/backends/minimax/` | `engine/src/minimax/`, `/mm3/*` |
 | `yue2` | YuE2 | `services/backends/yue2/` | `engine/src/yue2/`, `/yue2/*` |
+| `sa3` | Stable Audio 3 | `services/backends/sa3/` | `engine/src/sa3-*.h`, `/sa3/props`, `/sa3-synth` |
 
 Each backend reports a capability manifest (duration limits, whether it has an LM, plugins,
 adapters and so on). The UI reads it from `GET /api/capabilities` and hides controls a
@@ -285,11 +326,18 @@ changing sessions.
   `arrangement` (source sections `s0..`, the planned output occurrences `o0..`). A file
   without a version is upgraded once on first open by `migrateLegacySession`.
 - **Revision.** It counts changes to what the next take would be sent: the plan, the
-  lyrics, later the settings. Every take records the revision and the parent (the
-  spine it resumed). Every mutation (generate, keep, undo, delete, lyrics) names the
-  revision the page saw, and a mismatch is refused with 409. Keep also needs the
-  take's revision and parent to match. Keep and undo never change the revision, so a
-  take made from an earlier spine is keepable again after undoing back to it.
+  lyrics and the settings. Every take records the revision and the parent (the
+  spine it resumed). Every mutation (generate, keep, undo, crop, trim, delete a take,
+  lyrics, occurrence lyrics, settings, plan) names the revision the page saw, and a
+  mismatch is refused with 409. Keep also needs the take's revision and parent to match.
+  Keep and undo never change the revision, so a take made from an earlier spine is
+  keepable again after undoing back to it.
+- **Settings.** `POST /api/yue2-cover/build/:id/settings` changes the cover's voices,
+  tempo, key, key shift, CFG scale and AR strength. It works only before the first keep
+  and while no takes are pending, and bumps the revision.
+- **Delete.** `DELETE /api/yue2-cover/build/:id` removes the session folder. It is
+  refused with 409 while takes or a build-so-far render are running, or while a Save song
+  render for the build is queued or running.
 - **Build lyrics.** The Build page owns its lyrics. `POST /api/yue2-cover/build` takes
   an optional `lyrics` that replaces `params.lyrics`, and
   `POST /api/yue2-cover/build/:id/lyrics` replaces them later: it rewrites
@@ -300,9 +348,13 @@ changing sessions.
   written. Until a session exists the text is a draft in the Cover Studio state,
   checked by `POST /api/yue2-cover/build/lyrics-check`.
 - **Arrangement.** `POST /api/yue2-cover/build/:id/plan` replaces the occurrences not
-  yet built: `upcoming` lists source section ids (a new occurrence) or upcoming
-  occurrence ids (kept identity), and `finished` says the plan ends the song. Kept
-  occurrences never move. While the plan is open, a take's prompt adds the source
+  yet built: `upcoming` lists source section ids (a new occurrence), upcoming
+  occurrence ids (kept identity) or `improv:<bars>` (2, 4, 8 or 16 bars), and `finished`
+  says the plan ends the song. Kept occurrences never move. An improv occurrence adds
+  that many bars of rests labelled Improv to the score, and its take composes them
+  without the score. A plan edit moves takes whose own occurrences it leaves alone to the
+  new revision, so they stay keepable; a take that composed an ending stays keepable only
+  while the plan still ends after it. While the plan is open, a take's prompt adds the source
   section after the last planned one (`lookaheadSection`) and stops a few seconds into
   it, so the seam is composed without the user choosing what follows. An occurrence
   can carry its own sung lines (`POST /api/yue2-cover/build/:id/occurrence-lyrics`,
@@ -324,41 +376,56 @@ Every API mount is registered in `server/src/index.ts`. Route files are in
 
 | Feature | API mount | Route file | Main services | UI | Engine side |
 |---|---|---|---|---|---|
-| Create (main generation) | `/api/generate` | `generate.ts` | `backends/*`, `generation/*`, `aceClient.ts`, `autoTrim.ts` | `create/`, `global-bar/` | `/lm`, `/synth`, `/mm3/synth`, `/yue2/synth` |
-| Backend toggle and capabilities | `/api` (`/backends`, `/capabilities`) | `backends.ts` | `backends/registry.ts` | `global-bar/BackendToggle.tsx`, `stores/backendStore.ts` | `/mm3/props`, `/yue2/props` |
-| Insta-Gen | `/api/inspire` | `inspire.ts` | `aceClient.ts`, `lireek/llm/registry.ts` | `insta-gen/` | `/lm` in inspire mode |
-| Lyric Studio | `/api/lireek` | `lireek.ts`, `lireek/*` | `lireek/` (prompts, slop detector, LLM providers) | `lyric-studio/` | none, uses external LLMs |
-| Library | `/api/songs` | `songs.ts` | `audioCrop.ts`, `disco-analyzer.ts`, `library/importTrack.ts`, `generation/rePostProcess.ts` | `library/`, `details/`, `player/` | none |
+| Create (main generation) | `/api/generate` | `generate.ts` | `backends/*`, `generation/*`, `aceClient.ts`, `autoTrim.ts` | `create/`, `global-bar/` | `/lm`, `/synth`, `/mm3/synth`, `/yue2/synth`, `/sa3-synth` |
+| Intent resolution | `/api/resolve` | `resolve.ts` | `generation/resolve/` | `services/api.ts` (`generateApi`), `stores/audioGenQueueStore.ts` | none |
+| Durable audio queue | `/api/audio-queue` | `audioQueue.ts` | `audioQueue/intentQueue.ts`, which submits through the same path as `/api/generate` | `services/audioQueueApi.ts`, `stores/audioGenQueueStore.ts` | none of its own |
+| Workflow jobs and documents | `/api/workflows` | `workflows.ts` | `workflows/` (`workflowJobs.ts`, `revisions.ts` and each studio's job kinds) | `services/workflowApi.ts`, `queries/studios/workflows.ts` | none of its own |
+| Backend toggle and capabilities | `/api` (`/backends`, `/capabilities`) | `backends.ts` | `backends/registry.ts` | `global-bar/BackendToggle.tsx`, `stores/backendStore.ts` | `/mm3/props`, `/yue2/props`, `/sa3/props` |
+| Auto-Gen | `/api/inspire`, `/api/workflows` (`insta-*` kinds) | `inspire.ts` | `aceClient.ts`, `lireek/llm/registry.ts`, `workflows/instaGenWorkflow.ts` | `insta-gen/` | `/lm` in inspire mode |
+| Lyric Studio | `/api/lireek` | `lireek.ts`, `lireek/*` | `lireek/` (prompts, slop detector, LLM providers, the `lyric-batch` workflow kind) | `lyric-studio/` | none, uses external LLMs |
+| Library | `/api/songs` | `songs.ts` | `audioCrop.ts`, `disco-analyzer.ts`, `library/importTrack.ts`, `library/exportZip.ts`, `generation/rePostProcess.ts` | `library/`, `details/`, `player/`, `playlist/` | none |
+| Library export and import | `/api/export-import` | `exportImport.ts` | `exportImport/`, `library/importTrack.ts` | `services/exportImportApi.ts`, `library/` | none |
+| Studio drafts and playlist snapshots | `/api/studio-drafts` | `studioDrafts.ts` | `studioDrafts/` | `services/studioDraftsApi.ts`, `services/studioDraftMirror.ts`, `shared/StudioDraftPicker.tsx` | none |
+| Named presets | `/api/preferences` | `preferences.ts` | `preferences/` | `services/preferencesApi.ts`, `services/presetCollection.ts` | none |
 | Player waveform peaks | `/api/audio` | `audio.ts` | `audio/peaks.ts` | `ui/src/audio/peaksClient.ts` | none |
 | Models dropdown | `/api/models` | `models.ts` | `aceClient.ts` (`GET /props`) | `global-bar/ModelsDropdown.tsx` | `model-registry.h`, `model-store.cpp` |
 | Model Manager (downloads) | `/api/model-manager` | `modelManager.ts` | `modelDownloadService.ts`, `server/src/data/model-registry.json` | `model-manager/` | none |
 | DiT adapters (LoRA, LoKr) | `/api/adapters` | `adapters.ts` | `adapters/stMetadata.ts`, `generation/adapterSections.ts` | `create/AdaptersAccordion.tsx`, `global-bar/AdaptersDropdown.tsx` | `adapter-merge.h`, `adapter-runtime.h` |
 | Stem Studio | `/api/stem-studio` | `stemStudio.ts` | `aceClient.ts`, `audioConvert.ts` | `stem-studio/` | `/synth` (extract), `/supersep/*` |
-| SuperSep proxy | `/api/supersep` | `supersep.ts` | `audioConvert.ts` | `shared/StemMixer.tsx`, `services/supersepApi.ts` | `supersep.cpp` |
-| Stem Builder | uses the generate and stem APIs | none | none | `stem-builder/` | none of its own |
-| Repaint Studio | `/api/generate` (task type) | `generate.ts` | `generation/sourceAudio.ts` | `repaint-studio/` | `sampler-repaint.h` |
-| Cover Studio | `/api/generate`, `/api/analyze` | `generate.ts`, `analyze.ts` | `generation/sourceAudio.ts`, Essentia | `cover-studio/` | cover task types in `request.h` |
-| Song Builder | `/api/builder` | `songBuilder.ts` | `db/database.ts` | `song-builder/` | seed-latent path of `/synth` |
-| STORM (continuous stream) | `/api/generate/storm/*` | `generate.ts` | `aceClient.ts` | `storm/` | `/synth` |
+| SuperSep proxy | `/api/supersep` | `supersep.ts` | `audioConvert.ts` | `stem-studio/`, Cover Studio's stem split (`cover-studio/SourcePanel.tsx`, `stores/coverStemsStore.ts`), `services/supersepApi.ts`, `shared/StemMixer.tsx` | `supersep.cpp` |
+| Stem Builder | `/api/workflows` (`layer-render` kind), plus `/api/upload` and `/api/songs` | `workflows.ts` | `workflows/repaintLayerWorkflow.ts` | `stem-builder/`, `services/repaintLayerWorkflowApi.ts` | the `lego` task on `/synth` |
+| Repaint Studio | `/api/workflows` (`repaint-render` kind) | `workflows.ts` | `workflows/repaintLayerWorkflow.ts`, `generation/sourceAudio.ts` | `repaint-studio/`, `services/repaintLayerWorkflowApi.ts` | `sampler-repaint.h` |
+| Cover Studio | `/api/generate`, `/api/analyze`, `/api/yue2-cover`, `/api/workflows` (`cover-*` kinds) | `generate.ts`, `analyze.ts`, `yue2Cover.ts` | `generation/sourceAudio.ts`, Essentia, `workflows/coverWorkflow.ts`, `yue2Cover.ts`, `yue2Takes.ts`, `backends/yue2/cover*.ts` | `cover-studio/` | cover task types in `request.h`; `/yue2/synth` and `ace-train yue2-sheet` for YuE2 covers |
+| Song Builder | `/api/builder` | `songBuilder.ts` | `songBuilder/sectionOps.ts` (section renders run as a workflow kind), `db/database.ts` | `song-builder/` | seed-latent path of `/synth` |
+| STORM (continuous stream) | `/api/generate/storm/*` | `generate.ts` | `storm/slot.ts`, `storm/drift.ts`, `streamSessions/`, `aceClient.ts` | `storm/` | `/synth`, `/yue2/synth`, `/sa3-synth` for ACE, YuE2 and SA3 slots |
+| Stream sessions and recordings | `/api/stream-sessions` | `streamSessions.ts` | `streamSessions/` | `services/streamSessionsApi.ts`, `stores/mm3StreamStore.ts`, `hooks/useStreamAudio.ts` | none of its own |
+| Compare Studio | `/api/compare` | `compare.ts` | `compare/` (`store.ts`, `analyzer.ts`) | `compare-studio/`, `services/compareApi.ts` | none |
 | MIDI Studio | `/api/midi-studio` | `midiStudio.ts` | `muscriptor.ts`, `midiParser.ts` | `midi-studio/` | `ace-midi` binary |
 | Training Studio | `/api/training` | `training.ts` | `training/*` | `training-studio/` | `ace-train`, `ace-caption`, `/understand` |
+| Training workers (training on another PC) | `/api/workers` (controller), `/api/training/worker` (worker) | `workers.ts` | `training/trainingWorkers.ts`, `training/workerUpdate.ts`, `training/yue2Mirror.ts` | `training-studio/WorkersPanel.tsx`, `training-studio/TrainingWorkerBar.tsx` | none |
 | Cover art images | `/api/cover-art` | `coverArt.ts` | `coverArt/*` | `library/CoverArtPromptModal.tsx`, `global-bar/CoverArtDropdown.tsx` | `sd-cli` (stable-diffusion.cpp), not the music engine |
 | Mastering | `/api/mastering` | `mastering.ts` | `generation/postProcessing.ts` | `create/MasteringSection.tsx`, `global-bar/MasteringDropdown.tsx` | `mastering`, `mp3-codec` binaries |
 | VST3 chain | `/api/vst` | `vst.ts` | none, runs `vst-host` | `global-bar/VstChainDropdown.tsx`, `stores/vstChainStore.ts` | `tools/vst-host.cpp` |
 | Lua plugins | `/api/plugins` | `plugins.ts` | `aceClient.ts` (`GET /plugins`) | `global-bar/PluginControls.tsx`, `hooks/usePluginRegistry.ts` | `lua-plugin.h`, `lua-plugin-registry.h`, `hot-step-sampler.h` |
 | Assistant | `/api/assistant` | `assistant.ts` | `lireek/llm/registry.ts`, `server/src/data/assistant-knowledge.md` | `assistant/`, `services/assistantApi.ts` | none |
-| Settings (.env editor) | `/api/settings` | `settings.ts` | `config.ts` (`reloadEnvConfig`), `gpuDevices.ts` | `settings/` | none |
+| Settings (.env editor, data folder) | `/api/settings` | `settings.ts`, `settingsDataFolder.ts` | `config.ts` (`reloadEnvConfig`), `gpuDevices.ts`, `downloadSave.ts`, `server/src/dataroot/pointer.ts` | `settings/` | none |
+| Update notices | `/api/updates` | `updates.ts` | `updates/` (`checker.ts`, `install.ts`) | `settings/UpdatesPanel.tsx`, `services/updatesApi.ts` | none |
 | Parameter profiles | `/api/profiles` | `profiles.ts` | none | `global-bar/ProfilesModal.tsx` | none |
 | Seeds | `/api/seeds` | `seeds.ts` | none | `global-bar/SeedManagerDrawer.tsx` | none |
 | Uploads (audio, latents) | `/api/upload` | `upload.ts` | `latentFormat.ts` | `shared/LatentImport.tsx`, studio upload fields | none |
-| Downloads and export | `/api/download` | `download.ts` | `audioMetadata.ts` | `player/`, `library/` | `mp3-codec` |
+| Downloads and export | `/api/download` | `download.ts` | `audioMetadata.ts`, `downloadSave.ts` (`DOWNLOAD_DIR`) | `player/`, `library/` | `mp3-codec` |
 | Logs, VRAM, terminal | `/api/logs` | `logs.ts` | `logger.ts` | `terminal/`, `shared/VramIndicator.tsx` | `/vram`, `/models/loaded`, `/models/unload` |
-| Health, shutdown, restart | `/api/health`, `/api/shutdown` | `health.ts`, `shutdown.ts` | `server/src/engineState.ts`, `aceEngineProcess.ts` | none | `/health` |
+| Health, shutdown, restart | `/api/health`, `/api/shutdown` | `health.ts`, `shutdown.ts` | `server/src/engineState.ts`, `aceEngineProcess.ts` | `App.tsx` (liveness), `shared/NoModelsBanner.tsx` | `/health` |
 | Auth (local single user) | `/api/auth` | `auth.ts` | `db/database.ts` | none | none |
 | BPM and key analysis | `/api/analyze` | `analyze.ts` | Essentia binary (`ESSENTIA_BIN`) | `cover-studio/` | none |
+| DAW facade (versioned API for DAW clients) | `/api/v1/daw` | `dawV1.ts` | `daw/` (`dawFacade.ts` calls `/api/generate` over loopback) | none | none of its own |
+| Ear-test score sheets | `/listening` (not under `/api`, loopback only) | `listening.ts` | none | none, the pages live in `_experiments/_LISTENING/` | none |
 
-`POST /api/shutdown/restart` writes a `.restart-requested` marker at the repo root. The loop
-in `LAUNCH.bat` and `server/restart-loop.cmd` sees it and starts the server again.
+`POST /api/shutdown/restart` writes the restart marker (`RESTART_MARKER_PATH` in
+`config.ts`): `.restart-requested` at the repo root in a checkout, `restart-requested` in
+the profile folder in a release. The loops in `LAUNCH.bat`, `server/restart-loop.cmd`,
+`dev.sh`, `launch.sh` and the release launchers see it and start the server again. While a
+data-folder change is pending, a restart is refused with 409 if work is still running.
 
 ## Engine source layout
 
@@ -372,23 +439,24 @@ map of top-level pieces.
 | `engine/src/pipeline-synth*.cpp`, `dit.h`, `dit-graph.h` | DiT synthesis |
 | `engine/src/hot-step-sampler.h` | HOT-Step's sampling loop. Solver, scheduler and guidance dispatch go through here, not upstream's `dit-sampler.h` |
 | `engine/src/hot-step-params.h` | The sideband struct (`g_hotstep_params`) that carries HOT-Step-only request fields into the sampler |
-| `engine/src/lua-plugin.h`, `lua-plugin-registry.h` | Lua plugin host. Scans `engine/plugins/` and the repo-root `plugins/` overlay for solvers, schedulers, guidance and postprocess plugins |
+| `engine/src/lua-plugin.h`, `lua-plugin-registry.h` | Lua plugin host. Scans `engine/plugins/`, the repo-root `plugins/` overlay, then the `--user-plugins` folder when one is passed, for solvers, schedulers, guidance and postprocess plugins |
 | `engine/src/adapter-merge.h`, `adapter-runtime.h`, `adapter-cancel.h`, `lokr-*.h` | DiT adapter loading, merge and runtime modes |
 | `engine/src/model-store.h`, `model-store.cpp`, `model-registry.h` | Model discovery and VRAM residency |
 | `engine/src/vae*.h` | VAE encode and decode on GGML |
 | `engine/src/dit-trt.h`, `lm-trt.h`, `hot-step-sampler-trt.h` | TensorRT paths |
-| `engine/src/supersep.cpp`, `spectral-lifter.h`, `sa3-*.h` | Stem separation, the Spectral Lifter, and the Stable Audio 3 refiner |
+| `engine/src/supersep.cpp`, `spectral-lifter.h`, `sa3-*.h` | Stem separation, the Spectral Lifter, and Stable Audio 3: the refiner (`/sa3-refine`) and, from pure noise, the `sa3` backend's `/sa3-synth` |
 | `engine/src/hot-step-families.h` | Registry of the extra model families hosted by `ace-server` |
 | `engine/src/minimax/` | MiniMax-Music3 port and its `/mm3/*` routes (`mm3-server.h`, `mm3-job.h`) |
 | `engine/src/yue2/` | YuE2 port and its `/yue2/*` routes (`yue2-server.h`), plus the SheetSage lead-sheet model |
 | `engine/src/moss/` | MOSS-Music audio encoder used by `ace-caption` |
-| `engine/src/train/` | Training code behind `ace-train` (ACE-Step DiT and LM, MM3, YuE2) |
-| `engine/tools/ace-train.cpp` | Training CLI. Subcommands include `preprocess`, `train-dit`, `train-lm`, `mm3-lm-train`, `mm3-train-dit`, `yue2-joint-train` and others |
+| `engine/src/train/` | Training code behind `ace-train` (ACE-Step DiT and LM, MM3, YuE2, SA3) |
+| `engine/tools/ace-train.cpp` | Training CLI. Subcommands include `preprocess`, `train-dit`, `train-lm`, `mm3-lm-train`, `mm3-train-dit`, `yue2-joint-train`, `yue2-sheet`, `sa3-train` and others |
 | `engine/plugins/` | Built-in Lua solvers, schedulers and guidance modes. See [plugins-authoring.md](plugins-authoring.md) |
 | `engine/ggml` | Submodule pinned to the HOT-ggml fork. See [ggml-fork.md](ggml-fork.md) |
 
-Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-ops.cpp`,
-`model-store.h`, `dit.h`). `engine/verify-hooks.ps1` checks them along with the HOT-ggml changes.
+Four upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-ops.cpp`,
+`model-store.h`, `dit.h`, `fsq-detok.h`). `engine/verify-hooks.ps1` checks them along with the
+`hot-step-server.cpp` hooks and the HOT-ggml changes.
 
 ## Server source layout
 
@@ -398,22 +466,26 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
 | `server/src/config.ts` | Every environment variable and its default. See [config.md](config.md) |
 | `server/src/routes/` | One Express router per feature |
 | `server/src/services/` | Feature logic. `aceClient.ts` wraps the engine HTTP API; `aceEngineProcess.ts` owns the child process |
-| `server/src/services/backends/` | Backend registry and the three backend implementations |
-| `server/src/services/generation/` | Queue, envelopes, param translation, LM cache, post-processing |
+| `server/src/services/backends/` | Backend registry and the four backend implementations |
+| `server/src/services/generation/` | Queue, envelopes, param translation, intent resolution (`resolve/`), LM cache, post-processing |
+| `server/src/services/workflows/` | Durable workflow jobs, revisioned documents and the per-studio job kinds |
 | `server/src/services/training/` | Dataset Studio and Training Studio runners |
 | `server/src/services/lireek/` | Lyric Studio and the LLM provider registry |
 | `server/src/db/` | SQLite schema and access (`database.ts`, `lireekDb.ts`) |
+| `server/src/contracts/` | Request and response types shared with the UI, many with zod schemas. The UI imports some of them at runtime, which is why the Docker UI stage copies this folder |
+| `server/src/dataroot/` | Data folder choice, pointer, transfers and the read-only `locateData()` inspector. See [config.md](config.md#release-data-folder) |
 | `server/src/data/` | Runtime data shipped with the app, such as `model-registry.json` and `assistant-knowledge.md`. The release workflow copies this folder whole |
-| `server/src/engineState.ts` | Engine ready flag and boot status message |
+| `server/src/engineState.ts` | Engine ready flag, boot status message, the no-models flag and the engine's compute device |
 
 ## UI source layout
 
 | Path | What it is |
 |---|---|
-| `ui/src/App.tsx` | View routing. Views: create (default), `insta-gen`, `lyric-studio`, `cover-studio`, `stem-studio`, `stem-builder`, `song-builder`, `storm`, `midi-studio`, `training-studio`, `repaint`, `library`, `settings` |
+| `ui/src/App.tsx` | View routing. Views: create (default), `insta-gen`, `lyric-studio`, `cover-studio`, `stem-studio`, `stem-builder`, `song-builder`, `storm`, `midi-studio`, `training-studio`, `compare-studio` (URL `/compare`), `repaint`, `library`, `settings` |
 | `ui/src/components/<studio>/` | One folder per studio or panel. `global-bar/` is the parameter bar shared by all generation views; `shared/` holds reusable pieces |
 | `ui/src/stores/` | Zustand stores. `globalParamsStore.ts` holds generation params; others cover playback, backends, streaming, training, VST chain, post-processing |
-| `ui/src/services/` | Fetch wrappers. `httpClient.ts` is the shared transport (JSON/multipart/auth/cancellation/typed `ApiError`); `api.ts` is the main caller (base `/api`). Studios with large surfaces still have their own client file (`lireekApi.ts`, `trainingApi.ts`, `stemStudioApi.ts` and so on), moving onto `httpClient.ts` incrementally rather than in one pass |
+| `ui/src/services/` | HTTP clients. `httpClient.ts` is the shared client: JSON goes through the axios instance in `axiosClient.ts`, multipart uploads through XHR, SSE through `streamEvents()`, and every failure becomes the `ApiError` in `apiError.ts`. `api.ts` is the main caller (base `/api`). Studios with large surfaces keep their own client file (`lireekApi.ts`, `trainingApi.ts`, `stemStudioApi.ts` and so on), built on `httpClient.ts` |
+| `ui/src/queries/` | TanStack Query client (`client.ts`), key factory, retry and polling policy (`contract.ts`), SSE bridge, write helpers and one folder per area. See [UI server state](#ui-server-state) |
 | `ui/src/hooks/` | Shared hooks such as `useCapabilities.ts` and `usePluginRegistry.ts` |
 | `ui/src/i18n/locales/` | UI strings. `en.json` is the source for control labels |
 
@@ -421,8 +493,13 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
 
 - SQLite database: `<data dir>/hotstep.db`. Lyric Studio tables live in the same file.
   Tables include `songs`, `playlists`, `artists`, `lyrics_sets`, `profiles`, `generations`,
-  `settings`, `album_presets`, `builder_projects`, `training_datasets` and others; the schema
-  is in `server/src/db/database.ts`.
+  `settings`, `album_presets`, `builder_projects`, `training_datasets`, the `compare_*`
+  tables and others; the core schema is in `server/src/db/database.ts`. Some services
+  create their own tables: `generation_jobs` (`generation/jobLedger.ts`), `audio_intents`
+  (`audioQueue/intentQueue.ts`), `workflow_jobs` and `workflow_events`
+  (`workflows/workflowJobs.ts`), `workflow_documents` (`workflows/revisions.ts`),
+  `audio_assets` (`assets/audioAssets.ts`) and `lyric_workflow_items`
+  (`lireek/lyricWorkflow.ts`).
 - `workflow_documents` holds typed, schema-versioned, optimistically-revisioned client state:
   named VST/scale/AI-continue/YuE2-joint presets, STORM tuning, ordered playlist snapshots and
   Create/Cover/Repaint/STORM/Stem drafts (`server/src/services/workflows/revisions.ts`,
@@ -439,8 +516,9 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
   never overwrites the other writer's content. `StudioDraftPicker` loads a draft after a
   confirm if the editor has unsaved edits. Create's request content comes from
   `ui/src/components/create/createContent.ts`, shared by Generate and draft resume.
-- Files under the data dir: `audio/` (outputs), `references/`, `vst/` (`chain.json`,
-  `states/`), `lyrics/` (exports), `training/`.
+- Files under the data dir: `audio/` (outputs, with YuE2 build sessions in `audio/takes/`),
+  `references/`, `vst/` (`chain.json`, `states/`), `lyrics/` (exports), `training/`,
+  `daw_tmp/` (DAW facade uploads and exports).
 - A git checkout may also have a repo-root `data/` folder. It is not the live data dir.
 - Logs: `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` per session, holding `ace_engine.log`,
   `node_console.log`, `generations/gen_<uuid>_<task>.log` and `training/<kind>_<jobId>.log`
@@ -459,7 +537,7 @@ Three upstream files carry `#include` hooks into HOT-Step code (`pipeline-synth-
 
 ## Release storage boundary
 
-`server/src/dataroot/bootstrap.ts` resolves the release data folder before consumers open the database, logs or children. `HOT_STEP_ROOT` selects release mode; without it the checkout keeps its existing paths. The profile pointer and pending-transfer journal are outside both app and data folders. The release launcher and shutdown route share a profile `restart-requested` marker; dev retains its checkout marker.
+`server/src/dataroot/bootstrap.ts` resolves the release data folder before consumers open the database, logs or children. `HOT_STEP_ROOT` selects release mode; without it the checkout keeps its existing paths until Settings gives it a data folder ([Dev checkouts](config.md#dev-checkouts)). The profile pointer and pending-transfer journal are outside both app and data folders. The release launcher and shutdown route share a profile `restart-requested` marker; dev retains its checkout marker.
 
 App-owned `server/data/` contains bundled catalogues and assistant knowledge. Managed library, models, adapters, settings, logs and downloaded tools live under the effective data root. External overrides remain external. See [Configuration](config.md#release-data-folder).
 

@@ -10,12 +10,13 @@ import { getDb } from '../db/database.js';
 import { yue2Align } from '../services/backends/yue2/client.js';
 import type { Yue2AlignWord } from '../services/backends/yue2/align.js';
 import { COVER_DRIFT_METRIC_VERSION, measureCoverDrift } from '../services/backends/yue2/coverDrift.js';
-import { remeterTwoFourToFourFour } from '../services/backends/yue2/coverScoreTransform.js';
+import { remeterTwoFourToFourFour, shiftBarLines } from '../services/backends/yue2/coverScoreTransform.js';
 import { coverScoreDetails, registerCoverWorkflows } from '../services/workflows/coverWorkflow.js';
 import { workflowDocuments } from './workflows.js';
 import { resolveAudioAsset } from '../services/assets/audioAssets.js';
 import { WorkflowError } from '../services/workflows/workflowJobs.js';
-import { TakesError, applyBuildLyrics, applyBuildSettings,cancelBuildTakes, createBuildSession, cropBuildTake, deleteBuildTake, editBuildPlan, generateBuildTakes, getBuildSession, keepBuildTake, lyricsProblem, renderBuildPreview, setBuildTrim, setOccurrenceLyrics, undoBuildKeep } from '../services/yue2Takes.js';
+import { TakesError, applyBuildLyrics, applyBuildSettings,cancelBuildTakes, createBuildSession, cropBuildTake, deleteBuild, deleteBuildTake, editBuildPlan, generateBuildTakes, getBuildSession, keepBuildTake, lyricsProblem, renderBuildPreview, setBuildTrim, setOccurrenceLyrics, undoBuildKeep } from '../services/yue2Takes.js';
+import { buildSessionHasActiveJob } from './generate.js';
 import { buildEnvelope } from '../services/generation/envelope.js';
 import { yue2RequestForJob } from '../services/backends/yue2/generate.js';
 import type { GenerationJob } from '../services/generation/jobTypes.js';
@@ -119,6 +120,20 @@ export function createYue2CoverRouter(service: CoverService = yue2CoverService, 
       }
       let result;
       try { result = remeterTwoFourToFourFour(abc, pickup); }
+      catch (err) { throw new CoverRequestError((err as Error).message, 422); }
+      res.json(result);
+    } catch (err) { fail(res, err); }
+  });
+
+  // A preview too: every bar line moved by whole beats, for a score whose downbeats landed off.
+  router.post('/score/shift-bars', (req: Request, res: Response) => {
+    try {
+      const { abc, beats } = req.body || {};
+      if (typeof abc !== 'string' || !abc.trim() || !Number.isInteger(beats)) {
+        throw new CoverRequestError('abc and a whole number of beats are required.');
+      }
+      let result;
+      try { result = shiftBarLines(abc, beats); }
       catch (err) { throw new CoverRequestError((err as Error).message, 422); }
       res.json(result);
     } catch (err) { fail(res, err); }
@@ -267,6 +282,8 @@ export function createYue2CoverRouter(service: CoverService = yue2CoverService, 
   // section ids (s0...) or upcoming occurrence ids (o3...); `finished` ends the song.
   router.post('/build/:id/plan', (req: Request, res: Response) =>
     takes(res, () => editBuildPlan(String(req.params.id), authenticate(req)!, req.body?.revision, req.body?.upcoming, req.body?.finished)));
+  router.delete('/build/:id', (req: Request, res: Response) =>
+    takes(res, () => { deleteBuild(String(req.params.id), authenticate(req)!, buildSessionHasActiveJob); return { ok: true }; }));
   router.delete('/build/:id/takes/:take', (req: Request, res: Response) =>
     takes(res, () => deleteBuildTake(String(req.params.id), authenticate(req)!, String(req.params.take), Number(req.query.revision))));
 

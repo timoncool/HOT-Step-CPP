@@ -21,8 +21,15 @@ import {
 } from '../../contracts/workflow.js';
 import { WorkflowError } from './workflowJobs.js';
 
-/** Tables bumpRevision may touch: names are interpolated into SQL. */
-const REVISIONED_TABLES = new Set(['workflow_documents', 'builder_projects']);
+/** Tables bumpRevision may touch (names are interpolated into SQL), with the
+ *  words a user sees when a row is missing. */
+const REVISIONED_TABLES = new Map([['workflow_documents', 'saved item'], ['builder_projects', 'Song Builder project']]);
+
+/** The 404 a user sees for a saved thing that is gone: what it was, why that
+ *  happens, and the id last so support can still trace it. */
+export function missingDocument(what: string, id: string): WorkflowError {
+  return new WorkflowError(404, `This ${what} no longer exists. It was probably deleted, or saved by another HOT-Step install. (id ${id})`);
+}
 
 export function revisionConflict(currentRevision: number): WorkflowError {
   return new WorkflowError(409, `Stale revision: this was changed elsewhere and is now at revision ${currentRevision}. Reload it and apply your change again.`, { currentRevision });
@@ -37,7 +44,7 @@ export function bumpRevision(db: Database.Database, table: string, id: string, e
   const done = db.prepare(`UPDATE ${table} SET revision = revision + 1 WHERE id = ? AND revision = ?${owner}`).run(id, expected, ...ownerArgs);
   if (done.changes === 1) return expected + 1;
   const current = db.prepare(`SELECT revision FROM ${table} WHERE id = ?${owner}`).get(id, ...ownerArgs) as { revision: number } | undefined;
-  if (!current) throw new WorkflowError(404, `${table} row ${id} not found`);
+  if (!current) throw missingDocument(REVISIONED_TABLES.get(table)!, id);
   throw revisionConflict(current.revision);
 }
 
@@ -89,7 +96,7 @@ export class WorkflowDocuments {
 
   get(id: string, userId: string): WorkflowDocument {
     const r = this.db.prepare('SELECT * FROM workflow_documents WHERE id = ? AND user_id = ?').get(id, userId) as Row | undefined;
-    if (!r) throw new WorkflowError(404, `Document ${id} not found`);
+    if (!r) throw missingDocument('saved item', id);
     return toDoc(r);
   }
 
@@ -234,8 +241,13 @@ export class TypedDocuments<T extends Record<string, unknown>> {
 
   /** The document, owned by this user (or the installation) and of this kind. */
   private mine(id: string, userId: string): WorkflowDocument {
-    const doc = this.docs.get(id, this.owner(userId));
-    if (doc.kind !== this.def.kind) throw new WorkflowError(404, `Document ${id} not found`);
+    // 'studio.draft' -> 'saved studio draft', 'preferences.vst-chain-preset' -> 'saved vst chain preset'.
+    const missing = () => missingDocument(`saved ${this.def.kind.replace(/^preferences\./, '').replace(/[.-]/g, ' ')}`, id);
+    let doc: WorkflowDocument;
+    try { doc = this.docs.get(id, this.owner(userId)); } catch (err) {
+      throw err instanceof WorkflowError && err.status === 404 ? missing() : err;
+    }
+    if (doc.kind !== this.def.kind) throw missing();
     return doc;
   }
 

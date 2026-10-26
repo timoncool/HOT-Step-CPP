@@ -329,6 +329,27 @@ export interface Yue2SynthRequest {
   semantic_penalty_window?: number;
   semantic_min_tokens?: number;
   semantic_max_tokens?: number;
+  /** Not a checkpoint field: drop tokens under this fraction of the top
+   *  token's probability after top-p. 0/absent = off. */
+  semantic_min_p?: number;
+  /** Opt-in refinements of the semantic stage's logit CFG
+   *  (engine/src/lm-cfg-extras.h). Absent/0/false = the reference blend. */
+  cfg_min_p?: number;
+  cfg_logprob?: boolean;
+  cfg_rescale?: number;
+  /** Source guide for covers (sourceGuide.ts, engine yue2-guide.h). */
+  guide_path?: string;
+  guide_scale?: number;
+  guide_k?: number;
+  guide_outside?: number;
+  guide_offset_sec?: number;
+  guide_allow_end?: boolean;
+  guide_schedule?: 'flat' | 'up' | 'down' | 'sin' | 'inv_sin';
+  guide_schedule_power?: number;
+  guide_lfo?: 'off' | 'sine' | 'triangle' | 'saw' | 'square';
+  guide_lfo_period_sec?: number;
+  guide_lfo_depth?: number;
+  guide_lfo_phase?: number;
   /** Ending controls (semantic stage): stop once P(END) reaches end_threshold;
    *  add end_bias to END's logit from end_bias_from_sec, ramping over
    *  end_bias_ramp_sec. 0 = off. */
@@ -338,7 +359,9 @@ export interface Yue2SynthRequest {
   end_bias_ramp_sec?: number;
   /** C6 lyric schedule (lyricSchedule.ts): hide each timed section's lyrics,
    *  and optionally its score lines, from the composer until its first Vocal
-   *  note. Absent = off. Needs abc, one prompt for the batch and cfg_scale 1. */
+   *  note, plus any blind windows (improv bars). Absent = off. Needs abc and
+   *  one prompt for the batch; under guidance the negative prompt hides the
+   *  same score lines. */
   lyric_schedule?: Yue2LyricScheduleWire;
   /** HOT-Step: name of a registered Lua postprocess plugin to route the VAE
    *  decode through (yue2-pipeline.h's yue2_run_vae_stage hook). Absent/empty =

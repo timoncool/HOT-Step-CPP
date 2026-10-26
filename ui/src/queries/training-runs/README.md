@@ -4,7 +4,9 @@
 capture the selected worker in their canonical key and pass that worker and
 Query's abort signal to the transport. Local run indexes, review records,
 previews and worker administration retain their local routes. They omit the
-worker scope even when Train on points to a remote machine.
+worker scope even when Train on points to a remote machine. SA3 checkpoint
+previews live in their own folder, `../sa3-previews/`, but key into this area
+as `training-runs/sa3-previews` with the worker captured.
 
 GPU reads use `sharedKeys.gpus()`. Preparation detail and current job use
 `sharedKeys.preparation(id)` and `sharedKeys.preparationJob(id)`, sharing the
@@ -36,7 +38,10 @@ use the canonical training-data job cache rather than a separate transport.
 | Consumers | Snapshot owner |
 |---|---|
 | `useMm3Status`, `useYue2Status`, `useYue2ArStatus` | Worker-scoped Query status, invalidated by job events |
-| `TrainPanel` | Canonical training-data LM/DiT status queries; cached recipes seed untouched form fields |
+| `TrainPanel` | Phase host with no reads of its own: hands the section to the target's plug-in (`trainingPlugins.tsx`) and, for non-ACE targets, keeps the job stream and run-event bridge |
+| `plugins/ace.tsx` | Canonical training-data LM/DiT status queries; cached recipes seed untouched form fields; owns the ACE job stream and run events |
+| `Sa3TrainCard` | Worker-scoped `training-data/sa3-status` (built in the component, see tanstack-query.md F4#17) and `training-runs/sa3-previews` (`../sa3-previews/`); local `global-models/sa3-adapters`; audition renders follow `shell-queue/generation-status`; start, cancel, render and audition are `useMutation`s |
+| `TrainingPreviewPanel` | Shared checkpoint-preview view for the MM3, YuE2 and SA3 cards and the YuE2 ladder review; renders rows its caller has already read |
 | `MonitorPanel`, `Yue2BatchPanel` | Canonical training-data pipeline/batch/job queries; scoped store actions submit commands |
 | `Mm3RunsPanel`, `Yue2RunsList`, `Yue2ArRunsList` | Local Query run indexes, refreshed after job transitions |
 | `Yue2AitkTrainCard` | Query jobs, preparation defaults, local runs/previews, pipeline/job snapshots, GPU and worker lists |
@@ -61,6 +66,8 @@ Other routes explicitly remain local.
 | Worker `pipelines` | 2 s while running/paused; stop when terminal |
 | Worker `yue2-batch` | 3 s while running/paused; stop when terminal |
 | Worker `datasets/:id/yue2-sheet` and source detail | List every 5 s while open and live; detail on selection |
+| Worker `datasets/:id/sa3-train` | Always fresh (`staleTime` 0); 1.5 s while its job is queued or running |
+| Worker `datasets/:id/sa3-previews?run=...` | 1.5 s while a cell is queued or rendering, or the training job is active; a render or retry invalidates that dataset's previews |
 | Local `datasets/:id/mm3-runs`, `yue2-runs`, `yue2-ar-runs` | 30 s freshness; job transitions invalidate |
 | Local `datasets/:id/yue2-joint-runs` | 5 s while a local run is live or the displayed job is active |
 | Local `datasets/:id/yue2-joint-previews?run=...` | 5 s while live; joint training retains the existing 30-minute drain window for parallel previews |

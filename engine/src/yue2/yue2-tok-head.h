@@ -213,6 +213,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -871,6 +872,58 @@ static bool yue2_tok_head_predict(Yue2TokHead * h, const float * x, int64_t T, s
         const int64_t hi = s0 + n - ((s0 + n >= T) ? 0 : TRIM);
         for (int64_t i = lo; i < hi; i++) {
             (*codes)[(size_t) i] = pred[(size_t) (i - s0)];  // ascending order: later windows win
+        }
+    }
+    return true;
+}
+
+// yue2_tok_head_predict, keeping the K best codes per frame instead of the
+// argmax: same windows, same trims, same later-window-wins order. `ids` and
+// `lp` are resized to T*K, best first per frame; `lp` is the log-softmax over
+// the whole vocab, so it is comparable across frames and with the LM's own
+// log-probs. Feeds the semantic-stage source guide (yue2-guide.h). ids[f*K]
+// equals what yue2_tok_head_predict writes for frame f, ties aside.
+static bool yue2_tok_head_predict_topk(Yue2TokHead * h, const float * x, int64_t T, int64_t K,
+                                       std::vector<int32_t> * ids, std::vector<float> * lp, std::string * err) {
+    if (!h->loaded || T <= 0 || K <= 0 || K > (int64_t) h->cfg.vocab) {
+        if (err) *err = "predict_topk: head not loaded, no frames, or K outside 1..vocab";
+        return false;
+    }
+    const int64_t WIN = (int64_t) h->cfg.win, STRIDE = (int64_t) h->cfg.stride, TRIM = (int64_t) h->cfg.trim;
+    const int64_t DIN = (int64_t) h->cfg.din, V = (int64_t) h->cfg.vocab;
+    ids->assign((size_t) (T * K), 0);
+    lp->assign((size_t) (T * K), 0.0f);
+
+    std::vector<int64_t> starts;
+    yue2_tok_head_window_starts(WIN, STRIDE, T, &starts);
+    std::vector<float>   win((size_t) (DIN * WIN));
+    std::vector<float>   logits;
+    std::vector<int32_t> order((size_t) V);
+    for (int64_t s0 : starts) {
+        const int64_t n = std::min<int64_t>(WIN, T - s0);
+        std::memcpy(win.data(), x + s0 * DIN, (size_t) (n * DIN) * sizeof(float));
+        if (n < WIN) {
+            std::memset(win.data() + n * DIN, 0, (size_t) ((WIN - n) * DIN) * sizeof(float));
+        }
+        if (!yue2_tok_head_forward(h, win.data(), WIN, &logits, /*codes*/ nullptr, err)) {
+            return false;
+        }
+        const int64_t lo = s0 + (s0 == 0 ? 0 : TRIM);
+        const int64_t hi = s0 + n - ((s0 + n >= T) ? 0 : TRIM);
+        for (int64_t i = lo; i < hi; i++) {
+            const float * row = logits.data() + (size_t) ((i - s0) * V);  // ne (vocab, T): frame-major
+            float         mx  = -INFINITY;
+            for (int64_t v = 0; v < V; v++) mx = std::max(mx, row[v]);
+            double z = 0.0;
+            for (int64_t v = 0; v < V; v++) z += std::exp((double) (row[v] - mx));
+            const float lse = mx + (float) std::log(z);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + K, order.end(),
+                              [&](int32_t a, int32_t b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+            for (int64_t j = 0; j < K; j++) {
+                (*ids)[(size_t) (i * K + j)] = order[(size_t) j];
+                (*lp)[(size_t) (i * K + j)]  = row[order[(size_t) j]] - lse;
+            }
         }
     }
     return true;

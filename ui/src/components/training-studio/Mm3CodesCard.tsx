@@ -18,8 +18,8 @@ import { useTrainingStore } from '../../stores/trainingStore';
 import { Toggle } from '../shared/Toggle';
 import { JobProgress } from './JobProgress';
 import { useMm3Status } from './useMm3Status';
+import { Yue2StageCard } from './Yue2StageCard';
 
-const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
 
 export const Mm3CodesCard: React.FC<{ datasetId: string }> = ({ datasetId }) => {
   const { t } = useTranslation();
@@ -66,26 +66,11 @@ export const Mm3CodesCard: React.FC<{ datasetId: string }> = ({ datasetId }) => 
         </div>
       )}
 
-      <div className={CARD}>
-        <div className="flex items-center gap-2 mb-2">
-          <FileCode2 size={15} className="text-amber-500" />
-          <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">
-            {t('trainingStudio.mm3.codesTitle', 'RVQ codes')}
-          </h3>
-        </div>
-        <p className="text-[11px] text-zinc-500 leading-relaxed mb-3">
-          {t('trainingStudio.mm3.codesBlurb',
-            'MiniMax-Music3 ships no audio-to-code encoder, so the tokens the LM learns from are produced '
-            + 'here, natively, by the adopted community encoder. Run this once per dataset; re-running '
-            + 'overwrites with whichever encoder is installed now.')}
-        </p>
-        <p className="text-[11px] text-zinc-500 leading-relaxed mb-3">
-          {t('trainingStudio.mm3.notTensors',
-            'This replaces the ACE-Step tensor cache: the two pipelines share nothing, and an ACE variant '
-            + 'can never be used by a MiniMax-Music3 run.')}
-        </p>
-
-        {blocked ? (
+      <Yue2StageCard
+        icon={<FileCode2 size={15} className="text-amber-500" />}
+        title={t('trainingStudio.mm3.codesTitle', 'RVQ codes')}
+        done={launder ? hasLaundered : hasCodes}
+        action={blocked ? (
           <div className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400">
             <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
             <span>
@@ -94,19 +79,6 @@ export const Mm3CodesCard: React.FC<{ datasetId: string }> = ({ datasetId }) => 
           </div>
         ) : (
           <>
-            <Toggle
-              accent="amber"
-              checked={launder}
-              onChange={setLaunder}
-              className="mb-3"
-              label={t('trainingStudio.mm3.launderLabel', 'Cover-launder the codes (dense mixes)')}
-              info={t('trainingStudio.mm3.launderInfo',
-                'Renders each track back through the model (rec7 states through the flow DiT) before encoding, '
-                + 'so vocals buried in a dense mix still reach the code targets. On: slower (about 3 minutes per '
-                + 'track, capped at 6 minutes of audio) and writes a separate cache alongside the plain one; the '
-                + 'training form then picks which cache a run uses. Off: the plain export, unchanged from before '
-                + 'this option existed.')}
-            />
             <div className="flex items-center gap-3 flex-wrap">
               <button
                 onClick={() => void run()}
@@ -138,13 +110,36 @@ export const Mm3CodesCard: React.FC<{ datasetId: string }> = ({ datasetId }) => 
             </p>
           </>
         )}
-      </div>
+        footer={mine && activeJob ? <div className="mt-3"><JobProgress /></div> : undefined}
+      >
+        <p className="text-[11px] text-zinc-500 leading-relaxed mb-3">
+          {t('trainingStudio.mm3.codesBlurb',
+            'MiniMax-Music3 ships no audio-to-code encoder, so the tokens the LM learns from are produced '
+            + 'here, natively, by the adopted community encoder. Run this once per dataset; re-running '
+            + 'overwrites with whichever encoder is installed now.')}
+        </p>
+        <p className="text-[11px] text-zinc-500 leading-relaxed mb-3">
+          {t('trainingStudio.mm3.notTensors',
+            'This replaces the ACE-Step tensor cache: the two pipelines share nothing, and an ACE variant '
+            + 'can never be used by a MiniMax-Music3 run.')}
+        </p>
 
-      {mine && activeJob && (
-        <div className={CARD}>
-          <JobProgress />
-        </div>
-      )}
+        {!blocked && (
+          <Toggle
+              accent="amber"
+              checked={launder}
+              onChange={setLaunder}
+              className="mb-3"
+              label={t('trainingStudio.mm3.launderLabel', 'Cover-launder the codes (dense mixes)')}
+              info={t('trainingStudio.mm3.launderInfo',
+                'Renders each track back through the model (rec7 states through the flow DiT) before encoding, '
+                + 'so vocals buried in a dense mix still reach the code targets. On: slower (about 3 minutes per '
+                + 'track, capped at 6 minutes of audio) and writes a separate cache alongside the plain one; the '
+                + 'training form then picks which cache a run uses. Off: the plain export, unchanged from before '
+                + 'this option existed.')}
+          />
+        )}
+      </Yue2StageCard>
     </div>
   );
 };

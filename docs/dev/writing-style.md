@@ -18,8 +18,9 @@ describing UI copy that ships with one.
 
 ## No AI tells
 
-The full checklist lives in the `unslop` skill at `~/.claude/skills/unslop/`.
-The ones that matter most here:
+The full checklist lives in the `unslop` skill at `~/.claude/skills/unslop/`, a
+personal skill on the maintainer's machine that is not part of this repo. The
+ones that matter most here:
 
 No em dashes. Use a comma or end the sentence. Reaching for parentheses or an
 en dash instead just swaps one tell for another.

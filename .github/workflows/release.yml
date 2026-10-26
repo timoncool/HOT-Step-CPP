@@ -661,6 +661,12 @@ jobs:
             Set-Content -Path "$dist/engine/.cuda-version" -Value $cudaMajor -NoNewline
           }
 
+          # Exact package identity for the updater (docs/dev/releasing.md)
+          node release/build-info.mjs $dist --os windows --arch x64 --variant $variant --tag "v$version"
+          if ($LASTEXITCODE) { throw "build-info.mjs failed" }
+          node release/check-layout.mjs --package $dist --os windows --variant $variant
+          if ($LASTEXITCODE) { throw "build-info.json check failed" }
+
           # Config and docs
           Copy-Item "release/.env.example" "$dist/.env.example"
           Copy-Item "release/profile-path.mjs" "$dist/profile-path.mjs"
@@ -1379,6 +1385,10 @@ jobs:
           cp release/HOT-Step.sh "$DIST/HOT-Step.sh"
           chmod +x "$DIST/HOT-Step.sh"
 
+          # Exact package identity for the updater (docs/dev/releasing.md)
+          node release/build-info.mjs "$DIST" --os macos --arch arm64 --variant metal --tag "$GITHUB_REF_NAME"
+          node release/check-layout.mjs --package "$DIST" --os macos --variant metal
+
       - name: Smoke test packaged engine
         run: |
           # Boot the packaged engine against stub models and hit the endpoints
@@ -1892,6 +1902,10 @@ jobs:
             CUDA_MAJOR=$(echo '${{ matrix.cuda_version }}' | cut -d. -f1)
             echo -n "$CUDA_MAJOR" > "$DIST/engine/.cuda-version"
           fi
+
+          # Exact package identity for the updater (docs/dev/releasing.md)
+          node release/build-info.mjs "$DIST" --os linux --arch x64 --variant "$VARIANT" --tag "$GITHUB_REF_NAME"
+          node release/check-layout.mjs --package "$DIST" --os linux --variant "$VARIANT"
 
           # Config and docs
           cp release/.env.example "$DIST/.env.example"

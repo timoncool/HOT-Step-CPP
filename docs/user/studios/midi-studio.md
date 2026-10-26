@@ -1,7 +1,7 @@
 # MIDI Studio
 
 Turns a track into multi-instrument MIDI. Pick a song from your library, or
-upload a WAV or MP3, and the native transcription engine writes a `.mid` with
+upload a WAV, MP3 or FLAC, and the native transcription engine writes a `.mid` with
 separate parts for drums, bass, guitar, keys, and the rest of the mix. Reach
 for it when you want the notes behind a track, not just the audio, for
 example to see what a bassline is doing or to pull a MIDI file into a DAW.
@@ -34,7 +34,9 @@ Before the first transcription:
 
 1. If you have not already, open the Model Access card, follow the link to
    request access on the model's Hugging Face page, create a read token
-   there, and paste it in.
+   there, and paste it in. Save token refuses anything that is not a plain
+   `hf_` token. Once saved, the card shrinks to a "Token saved" row with
+   **Change token**.
 2. Under Transcription model, pick a size (small, medium, large) and click
    "Download weights" if it is not already marked Ready.
 3. Pick a source track: "Choose from Library" and search, or "Upload from
@@ -59,19 +61,20 @@ labels such as `[Chorus]` are skipped. The piano-roll preview shows notes only.
 | Control | What it does |
 |---|---|
 | Choose from Library | Search your [library](library.md) and pick a track with audio as the transcription source. |
-| Upload from PC | Upload a local `.wav` or `.mp3` as the source (same as dragging a file onto the panel). |
+| Upload from PC | Upload a local `.wav`, `.mp3` or `.flac` as the source (same as dragging a file onto the panel). FLAC is converted to WAV before transcription. |
 | Transcription model | `small` (103M, fastest, runs on CPU), `medium` (307M, balanced, GPU recommended), or `large` (1.4B, best quality, GPU required). |
 | Download weights | Downloads the selected model's gated weights from Hugging Face using your saved token. Shows live progress; needs a saved token first. |
 | Transcribe to MIDI | Queues a transcription job for the selected source and model. Disabled until a source is picked and that model's weights are downloaded. |
 | Transcriptions list | Every job, newest first: queued/transcribing status with chunk progress, or a done/failed result. Jobs persist to disk and survive an app restart. |
-| Preview (piano roll icon) | Expands the finished job into the piano-roll player. |
+| Preview piano roll (chevron) | Expands the finished job into the piano-roll player. A failed job that kept a partial `.mid` has it too. |
 | Download .mid | Downloads the transcribed MIDI file. |
 | Cancel / delete | Stops a running job, or removes a finished one and its files. |
 | Play / pause (in preview) | Plays the original audio and the MIDI transcription together, in sync. |
 | Original ↔ MIDI slider | Crossfades between the two audio sources so you can hear either or a blend. |
 | Instrument legend, mute (M) / solo (S) | One entry per instrument family found in the track. Mute or solo affects only the MIDI side of playback, not the original audio. |
+| Speculative decoding | Shown when `large` is selected; on by default. The small model guesses a few tokens ahead and the large model checks them in one pass, keeping only what it would have written itself, so the MIDI is unchanged. A 4-minute song took 79 s instead of 122 s on an RTX 5090. Needs the small model's weights (about 0.5 GB more GPU memory); without them the large model runs alone. |
 | Tempo & bars (model row) | Downloads Beat This!, the beat tracker that gives new transcriptions a tempo, time signature and bar lines. |
-| Tempo & bars (job panel) | Shows the detected tempo and meter, and whether the MIDI follows the performance with a tempo map. BPM and beats per bar override them (blank keeps the detected value). Tempo picks automatic, follow the performance, or one tempo. Beat halves or doubles a tempo detected at the wrong level. Quantize snaps notes to a grid (detected, 8ths, 16ths, triplets) at a chosen strength. Fill short rests holds notes over gaps of half a beat or less. Trim leading bars drops empty bars before the first note. "Rewrite MIDI" applies them; "As detected" goes back. |
+| Tempo & bars (job panel) | Shows the detected tempo and meter, and whether the MIDI follows the performance with a tempo map. BPM and beats per bar override them (blank keeps the detected value). Tempo picks automatic, follow the performance, or one tempo. Beat halves or doubles a tempo detected at the wrong level. Quantize snaps notes to a grid (detected, 8ths, 16ths, 32nds, or 8th or 16th triplets) at 25 to 100% strength. Fill short rests holds notes over gaps of half a beat or less. Trim leading bars drops empty bars before the first note. "Rewrite MIDI" applies them; "As detected" goes back. |
 | YuE2 lead sheet | Writes the transcription as the two-voice ABC score that YuE2 covers use, on the job's current bars: the sung notes as the Vocal line, the top notes of one instrument as the Ins line (Ins line picks which; Automatic takes the busiest one that is not voice, bass or drums), an estimated key, and, with Chords on, a chord symbol every half bar estimated from the accompaniment. "Copy ABC" puts it on the clipboard for Cover Studio's ABC box; "Save .abc" downloads it. |
 | Piano roll | Click anywhere on the roll to seek. Notes are colored by instrument family; with tempo and bars, the background shows the MIDI's beats and numbered bar lines instead of 10-second marks; an unfinished region is shaded while a live job is still transcribing. |
 

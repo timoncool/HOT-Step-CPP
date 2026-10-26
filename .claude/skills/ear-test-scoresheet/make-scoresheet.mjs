@@ -4,7 +4,7 @@
 //   node .claude/skills/ear-test-scoresheet/make-scoresheet.mjs <study.json>
 //
 // study.json sits in the study's folder; index.html is written next to it.
-// Track `file` paths are relative to that folder (e.g. "round1/rbf/03-nar400.wav").
+// Track `file` paths are relative to that folder (e.g. "round1/album_a/03-nar400.wav").
 // Re-run after adding tracks or rounds: scores live in the browser and in
 // scores.json, keyed by track id, so they survive a regenerated page.
 import fs from 'node:fs';

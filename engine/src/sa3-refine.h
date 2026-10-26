@@ -1137,21 +1137,23 @@ struct Sa3GgmlRefine final : Sa3Backend {
 };
 
 // Load all four GGUFs from `dir` (the models root, same place the pp-vae
-// GGUFs live). The seconds embedder reads its two tiny tensors from the DiT
+// GGUFs live). `dit_file` = the generation DiT filename in `dir` (BF16 or a
+// quant). The seconds embedder reads its two tiny tensors from that DiT
 // GGUF (conditioner.* extras). `adapters` (optional) = StableStep DoRA
 // adapter GGUFs merged into the DiT weights at load (see sa3-dit-ggml.h).
-static inline bool sa3_ggml_load(Sa3GgmlRefine * m, const char * dir,
+static inline bool sa3_ggml_load(Sa3GgmlRefine * m, const char * dir, const char * dit_file,
                                  const std::vector<Sa3AdapterSpec> * adapters = nullptr) {
-    if (!m || !dir) return false;
+    if (!m || !dir || !dit_file) return false;
     m->dir = dir;
-    std::string d = dir;
+    std::string d   = dir;
+    std::string dit = d + "/" + dit_file;
     bool ok = sa3_t5gemma_load(&m->text_enc_m, (d + "/sa3-text-enc-BF16.gguf").c_str())
-           && sa3_seconds_embedder_load(&m->seconds_m, (d + "/sa3-dit-BF16.gguf").c_str())
+           && sa3_seconds_embedder_load(&m->seconds_m, dit.c_str())
            && sa3_same_load(&m->same_enc_m, (d + "/sa3-same-enc-F16.gguf").c_str(), true)
            && sa3_same_load(&m->same_dec_m, (d + "/sa3-same-dec-F16.gguf").c_str(), false)
-           && sa3_dit_load(&m->dit_m, (d + "/sa3-dit-BF16.gguf").c_str(), adapters);
+           && sa3_dit_load(&m->dit_m, dit.c_str(), adapters);
     m->loaded = ok;
-    fprintf(stderr, "[SA3] GGML backend loaded from %s (%zu adapters): %s\n", dir,
+    fprintf(stderr, "[SA3] GGML backend loaded from %s, DiT %s (%zu adapters): %s\n", dir, dit_file,
             adapters ? adapters->size() : 0, ok ? "OK" : "FAILED");
     return ok;
 }

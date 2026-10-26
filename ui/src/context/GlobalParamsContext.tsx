@@ -119,6 +119,10 @@ export interface GlobalParams {
   lmTopP: number; setLmTopP: (v: number) => void;
   // Anti-loop repetition penalty on code sampling (local HOT-Step feature)
   lmRepPenalty: number; setLmRepPenalty: (v: number) => void;
+  lmMinP: number; setLmMinP: (v: number) => void;
+  lmCfgMinP: number; setLmCfgMinP: (v: number) => void;
+  lmCfgLogprob: boolean; setLmCfgLogprob: (v: boolean) => void;
+  lmCfgRescale: number; setLmCfgRescale: (v: number) => void;
   lmRepWindow: number; setLmRepWindow: (v: number) => void;
   lmRepMode: LmRepMode; setLmRepMode: (v: LmRepMode) => void;
   lmDryBase: number; setLmDryBase: (v: number) => void;

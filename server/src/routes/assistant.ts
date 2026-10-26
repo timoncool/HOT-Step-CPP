@@ -194,7 +194,7 @@ router.post('/chat', async (req: Request, res: Response) => {
     // The provider's abort fires exactly when a render holds the GPU and a
     // local model is being starved (#136): say so, and name the setting.
     if (/abort|timeout/i.test(`${err?.name} ${err?.message}`) && gpuLaneBusy()) {
-      err.message = `The assistant timed out while the engine was busy with a generation or stem job. Wait for it to finish, or raise LLM_TIMEOUT_MS (currently ${config.lireek.llmTimeoutMs} ms) in Settings > Environment.`;
+      err.message = `The assistant timed out while the engine was busy with a generation or stem job. Wait for it to finish, or raise LLM_TIMEOUT_MS (currently ${config.lireek.llmTimeoutMs} ms) in Settings > AI Services.`;
     }
     console.error('[Assistant] Chat error:', err.message);
     // If headers already sent (SSE started), send error event

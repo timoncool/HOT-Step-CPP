@@ -5,6 +5,10 @@ The Node server reads its configuration from environment variables, almost all o
 what it changes. None of them are required: with no `.env` the app finds the engine, the
 models and its data folder on its own.
 
+## Settings backups
+
+Settings can export application settings and Lyric Studio records as versioned JSON. Import replaces those records in one database transaction after confirmation. It does not change `.env` or machine-specific environment settings. See [Settings and Lyric Studio backup](../user/settings-backup.md).
+
 ## How configuration is loaded
 
 1. `config.ts` sets the project root. If `HOT_STEP_ROOT` is set (the portable launchers set
@@ -14,8 +18,9 @@ models and its data folder on its own.
    [Release data folder](#release-data-folder).
 2. If the `.env` does not exist and `<root>/.env.example` does, the example is copied to
    `.env` on first launch, so the Settings page has a file to write to. The `.env` is
-   `<root>/.env` in a checkout and `<data folder>/settings/.env` in a release (the release
-   copy drops the example's `DATA_DIR` line).
+   `<root>/.env` in a checkout and `<data folder>/settings/.env` whenever there is a data
+   folder: a release, or a checkout that Settings gave one. That copy comments out the
+   example's `DATA_DIR` line.
 3. `dotenv` loads that `.env` into `process.env`. Variables already set in the shell win,
    because `dotenv` does not override them.
 4. An empty `CUDA_VISIBLE_DEVICES` is deleted from `process.env`. An empty value hides every
@@ -28,9 +33,13 @@ app runs; see [Settings page and hot reload](#settings-page-and-hot-reload).
 
 | Store | What goes there | Edited from |
 |---|---|---|
-| `<root>/.env` (release: `<data folder>/settings/.env`) | Paths, ports, engine flags, GPU choice, LLM keys and endpoints, labelling throughput | Settings, Environment and AI Services tabs, or a text editor |
-| SQLite `settings` table in `hotstep.db` | Active backend (`active_backend_id`), MiniMax-Music3 and YuE2 model and adapter selections, custom Lyric Studio prompts (`prompt_<name>`), the Insta-Gen system prompt (`instagen_system_prompt`), training defaults (`training_defaults_v1`), active training models (`active_models_v1`) | The matching UI controls |
+| `<root>/.env` (with a data folder: `<data folder>/settings/.env`) | Paths, ports, engine flags, GPU choice, LLM keys and endpoints, labelling throughput | Settings, Environment and AI Services tabs, or a text editor |
+| SQLite `settings` table in `hotstep.db` | Active backend (`active_backend_id`), MiniMax-Music3 and YuE2 model and adapter selections, the Stable Audio 3 DiT (`sa3_dit_model`), custom Lyric Studio prompts (`prompt_<name>`), the Insta-Gen system prompt (`instagen_system_prompt`), training defaults (`training_defaults_v1`), active training models (`active_models_v1`) | The matching UI controls |
 | Browser `localStorage` | Generation parameters in `ui/src/stores/globalParamsStore.ts` (keys prefixed `hs-`) and other per-browser UI state | The generation controls |
+
+### Update notices
+
+Settings > General > Updates reads `GET /api/updates/status` (cached, never calls GitHub) and refreshes with `POST /api/updates/check`, optionally `{ channel }` to switch the feed (`release` or `master`). The wire shapes are in `server/src/contracts/updates.ts`; the UI copy is `ui/src/services/updatesApi.ts`, and the panel is `ui/src/components/settings/UpdatesPanel.tsx`. Notices only: no download, prepare or apply endpoint exists. The installed identity comes from `build-info.json` beside `VERSION` (a git checkout reports its own HEAD); a missing file means unknown identity and the UI never guesses a variant.
 
 ## Settings page and hot reload
 
@@ -43,13 +52,18 @@ are preserved. It does not run at startup or change browser generation parameter
 An unavailable adapter root or filesystem access error aborts the command; writes
 are transactional.
 
-`server/src/routes/settings.ts` exposes a whitelist of `.env` keys to the UI:
+`server/src/routes/settings.ts` exposes a whitelist of `.env` keys to the UI, along with
+the GPU list and the data-folder controls (handlers in `routes/settingsDataFolder.ts`):
 
 | Endpoint | Does |
 |---|---|
 | `GET /api/settings/env` | Returns the value of every exposed key. A key missing from `.env` is filled with the value the server is actually using, so the UI shows real paths. Also returns the list of restart-required keys |
 | `POST /api/settings/env` | Body `{ "values": { KEY: "value" } }`. Keys outside the whitelist are dropped. Existing lines are rewritten in place, new keys are appended, comments and line endings are kept. Then calls `reloadEnvConfig()` and returns `{ updated, restartRequired }` |
 | `GET /api/settings/gpus` | Lists NVIDIA GPUs from `nvidia-smi` (index, UUID, name, memory). Empty when `nvidia-smi` is not available |
+| `GET /api/settings/data-folder` | Mode, app root, effective data root, any `HOT_STEP_DATA_ROOT` override, the pending operation, absolute path settings that point outside the data folder, and the running work that would block a change |
+| `POST /api/settings/data-folder/preview` | Body `{ "kind", "target" }`: `kind` is `move`, `repoint`, `create` or `import`, `target` an absolute folder. Plans the operation and returns its errors without changing anything |
+| `POST /api/settings/data-folder/schedule` | Same body. Records the operation in the pointer, then requests a restart, which carries it out before the DB opens. 409 while work is running |
+| `POST /api/settings/data-folder/cancel` | Drops a pending operation that has not started |
 
 The whitelist is `EXPOSED_ENV_KEYS` in `config.ts`. A key that is not on it can only be
 set by editing `.env` or the shell environment. Keys in `RESTART_REQUIRED_KEYS` are written
@@ -74,7 +88,7 @@ In the tables below, the Settings column says where a key appears:
 | `DATA_DIR` | `./data` | Environment, Restart | Data folder: `hotstep.db`, `audio/`, `references/`, `vst/`, `lyrics/`, `training/`. See [How DATA_DIR resolves](#how-data_dir-resolves) |
 | `LYRICS_EXPORT_DIR` | `<data dir>/lyrics` | Environment | Where Lyric Studio exports lyrics. Hot-reloaded |
 | `DOWNLOAD_DIR` | empty | Environment | Absolute folder that `POST /api/download/:id/save` writes into. Empty keeps browser downloads. Checked (creatable, writable) when saved. Hot-reloaded |
-| `MUSCRIPTOR_MODELS_DIR` | `<data dir>/models/muscriptor` | Environment, Restart | Where MIDI Studio keeps its MuScriptor weights. Read in `services/muscriptor.ts` when the module loads |
+| `MUSCRIPTOR_MODELS_DIR` | `<data dir>/models/muscriptor` | Environment, Restart | Where MIDI Studio keeps its MuScriptor weights. Read in `services/muscriptor.ts` when the module loads, and used as given: a relative value does not resolve against the data folder |
 | `TRAINING_DIR` | `<data dir>/training` | env only | Training Studio working folder |
 | `WHISPER_EXE` | `<root>/tools/whisper/whisper-cli[.exe]` | env only | Whisper binary for lyric transcription. On macOS and Linux, the app also checks for `whisper-cli` on PATH and does not auto-download it. Install with [`brew install whisper.cpp`](https://formulae.brew.sh/formula/whisper.cpp) or set this to an existing executable path. |
 | `WHISPER_MODELS_DIR` | `<models>/whisper` | env only | Whisper model folder |
@@ -88,14 +102,14 @@ samples stay in the app.
 
 ### How DATA_DIR resolves
 
-In a git checkout, `DATA_DIR` is resolved against `server/`, the folder one level above
-`server/src/`. The default `./data` means `server/data/`. The repo's `.env.example` sets
+In a git checkout without a data folder, `DATA_DIR` is resolved against `server/`, the
+folder one level above `server/src/`. The default `./data` means `server/data/`. The repo's `.env.example` sets
 `DATA_DIR=./server/data`, which is wrong for a checkout: it resolves to
 `server/server/data/` and the app starts with an empty library. In a checkout, use
 `DATA_DIR=./data` or an absolute path.
 
-In a release, an unset `DATA_DIR` means `<data folder>/library`, and a relative one
-resolves against the data folder.
+With a data folder (a release, or a checkout that Settings gave one), an unset `DATA_DIR`
+means `<data folder>/library`, and a relative one resolves against the data folder.
 
 Releases before the data folder resolved it against the package root, so the shipped
 `DATA_DIR=./server/data` put the library in `<package>/server/data/`, beside the bundled
@@ -117,7 +131,7 @@ pointer, `bootstrap.ts` start-up choice, `transfer.ts` moves and path rewrites,
 | `models/`, `adapters/` | Engine models (with cover art, Whisper models, TRT caches) and adapters |
 | `settings/.env` | Settings and API keys |
 | `logs/` | Session logs |
-| `tools/whisper/`, `tools/runtime/` | Whisper binary; Model Manager runtime DLLs, put on the engine's PATH through `TENSORRT_LIBS` |
+| `tools/whisper/`, `tools/runtime/` | Whisper binary; Model Manager runtime DLLs, put first on the library search path of every child process (`PATH` on Windows, `LD_LIBRARY_PATH` elsewhere) and used as the default `TENSORRT_LIBS` |
 | `plugins/` | User plugin overlay |
 | `hot-step-data.json` | Marks the folder as a HOT-Step data folder |
 
@@ -195,7 +209,6 @@ checkout back at its own folders; data that already moved stays in the data fold
 |---|---|---|---|
 | `SERVER_PORT` | `3001` | Environment, Restart | Port the Node server listens on. The Vite proxy in `ui/vite.config.ts` is hard-coded to `3001`, so dev mode breaks if you change it |
 | `SERVER_HOST` | `0.0.0.0` | env only | Interface the Node server binds to |
-| `GENERATION_INTENT_PATH` | `resolved` | Environment, Restart | `old` is the only rollback, keeping the legacy client builder; unset or any other value sends Create and written-song requests through Node intent resolution |
 | `ACESTEPCPP_PORT` | `8085` | Environment, Restart | Engine port. Passed as `--port`; the server connects to `http://<host>:<port>` |
 | `ACESTEPCPP_HOST` | `127.0.0.1` | Environment, Restart | Engine bind address, passed as `--host`, and the host the server connects to |
 
@@ -212,8 +225,8 @@ Vite with `--port 3000 --host`, and `ui/vite.config.ts` sets port 3000 and host 
 | `YUE2_NO_OVERLAP` | unset | Engine process | Any value keeps every YuE2 render on the work thread instead of the NAR lane (engine/docs/ARCHITECTURE.md) |
 | `YUE2_OVERLAP_MIN_FREE_GB` | `4` | Engine process | Free VRAM the NAR lane needs at the handoff; below it the render runs inline |
 | `ACESTEPCPP_DRAFT_LM` | empty | env only | Passed as `--draft-lm` when the file exists. Speculative decoding is off on purpose: per-call GGML overhead cancels the gain |
-| `CUDA_VISIBLE_DEVICES` | empty (all GPUs) | Environment, Restart | GPU for the engine and for `ace-train`. The Settings picker writes a GPU UUID. A value that is not a UUID is passed through as given, and the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` so indices match `nvidia-smi`. The child environment is rebuilt from the live `config` value on every spawn, so a training job started after saving uses the new GPU |
-| `TENSORRT_LIBS` | `engine/deps/tensorrt_libs` if it contains `nvinfer_10.dll` or `libnvinfer.so.10`, else empty | env only | Prepended to the engine's `PATH` so TensorRT can load. If a `trtllm-libs` folder exists two levels above the engine binary, it is prepended too |
+| `CUDA_VISIBLE_DEVICES` | empty (Auto) | Environment, Restart | GPU for the engine and for `ace-train` (`services/gpuDevices.ts`). Auto leaves the choice to the engine when `nvidia-smi` lists fewer than two GPUs; with two or more it passes the UUID of the one with the most VRAM, ties going to the lower index. The Settings picker writes a GPU UUID, passed as given. An index-only value is translated to UUIDs through `nvidia-smi`; any other value is passed through as given, and the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless you set it yourself) so indices match `nvidia-smi`. The child environment is rebuilt from the live `config` value on every spawn, so a training job started after saving uses the new GPU. A YuE2 joint training job can name its own GPU UUID, which overrides this for that job |
+| `TENSORRT_LIBS` | In a release, `<data folder>/tools/runtime`. Otherwise `engine/deps/tensorrt_libs` if it contains `nvinfer_10.dll` or `libnvinfer.so.10`, else empty | env only | Prepended to the engine's `PATH` so TensorRT can load. If a `trtllm-libs` folder exists two levels above the engine binary, it is prepended too |
 
 ### Warm-up on startup
 
@@ -242,6 +255,7 @@ All of these are env only.
 | `--host <addr>` | `ACESTEPCPP_HOST` | Always |
 | `--port <n>` | `ACESTEPCPP_PORT` | Always |
 | `--adapters <dir>` | `ACESTEPCPP_ADAPTERS` | Folder exists |
+| `--user-plugins <dir>` | The data folder's `plugins/` | There is a data folder (a release, or a checkout that Settings gave one). The engine scans it after the shipped plugins |
 | `--keep-loaded` | `ACESTEPCPP_KEEP_LOADED` | Not `0` |
 | `--noise-profile <wav>` | `ACESTEPCPP_NOISE_PROFILE` | File exists |
 | `--draft-lm <gguf>` | `ACESTEPCPP_DRAFT_LM` | File exists |
@@ -275,7 +289,7 @@ them are hot-reloaded when saved from Settings.
 | `UNSLOTH_BASE_URL` | `http://127.0.0.1:8888` | AI Services | Unsloth server |
 | `UNSLOTH_USERNAME` | empty | AI Services | Unsloth login |
 | `UNSLOTH_PASSWORD` | empty | AI Services | Unsloth password |
-| `UNSLOTH_KEYLESS` | empty | AI Services | Set to `1` when a local Studio runs with its "keyless API access" setting on — no username/password needed. The provider stays hidden until this or both credentials are set |
+| `UNSLOTH_KEYLESS` | empty | AI Services | Set to `1` when a local Studio runs with its "keyless API access" setting on, so no username or password is needed. Any other value is off. The provider stays hidden until this or both credentials are set; credentials win when both are present |
 | `UNSLOTH_MODEL` | empty | AI Services | Unsloth model |
 | `LLAMACPP_BASE_URL` | `http://127.0.0.1:8080/v1` | AI Services | llama.cpp server |
 | `LLAMACPP_MODEL` | empty | AI Services | llama.cpp model |
@@ -312,7 +326,7 @@ Not exposed in Settings on purpose. Edit `.env`.
 
 ## Training workers
 
-Exposed in Settings → Server and hot-reloaded. Code: `server/src/services/training/trainingWorkers.ts`, routes in `server/src/routes/workers.ts`.
+Exposed in Settings > Environment > Server and hot-reloaded. Code: `server/src/services/training/trainingWorkers.ts`, routes in `server/src/routes/workers.ts`.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -331,10 +345,12 @@ The Workers panel calls `GET /api/workers`, which requests each worker's token-g
 | `HOT_STEP_ROOT` | unset | `config.ts` | Project root. Setting it turns on portable mode, which among other things downloads the CUDA runtime DLLs on a Windows CUDA build's first launch. Set by the portable launchers `release/HOT-Step.bat` and `release/HOT-Step.sh` |
 | `HOT_STEP_DATA_ROOT` | unset | `dataroot/bootstrap.ts` | Release only. Use this data folder for this process, ignoring `data-location.json`. A scheduled move does not run while it is set |
 | `HOT_STEP_PROFILE_DIR` | unset | `dataroot/paths.ts` | Replaces the profile folder that holds `data-location.json` and the dev pointers. Meant for test fixtures |
-| `HOT_STEP_DEV` | unset | `routes/shutdown.ts` | Set by `dev.bat`. Lets `POST /api/shutdown` kill the Vite process on port 3000 after checking it is Node running Vite. Windows only |
+| `HOT_STEP_DEV` | unset | `routes/shutdown.ts` | Set to `1` by `dev.bat` and `dev.sh`. On Windows it lets `POST /api/shutdown` kill the Vite process on port 3000 after checking it is Node running Vite. It also gates `HOTSTEP_GENERATE_CAPTURE` and `HOTSTEP_YUE2_COVER_FORCE_FALLBACK` |
 | `HOTSTEP_GENERATE_CAPTURE` | unset | `services/generation/requestCapture.ts` | Dev only, honoured only when `HOT_STEP_DEV` is set. `record` saves every `POST /api/generate` body as a fixture under `<data dir>/dev-captures/generate/`, then generates as normal; `capture-only` saves it and queues nothing. See [Generation API contracts](api-contracts.md#fixture-capture-dev-only) |
+| `HOTSTEP_YUE2_COVER_FORCE_FALLBACK` | unset | `services/training/yue2ArTrainRunner.ts` | Dev only: `1`, with `HOT_STEP_DEV=1`, sends every Cover Studio YuE2 lead-sheet transcription down its fallback path, which waits for the GPU lane and frees the engine for the transcriber. Tests that path on a card where both fit |
+| `GENERATION_INTENT_PATH` | `resolved` | `routes/resolve.ts` | `old` is the only rollback, keeping the legacy client builder; unset or any other value sends Create and written-song requests through Node intent resolution. The UI reads it from `GET /api/resolve/path`. Read from the process environment, so a `.env` change needs a restart |
 | `PP_STEM_CACHE_GB` | `4` | `services/generation/stemCache.ts` | Disk budget for cached vocal and instrumental stems that the post-processing chain reuses when it runs again on the same audio. `0` disables the cache |
-| `HOTSTEP_DAW_KEY` | unset | `services/daw/dawFacade.ts` | Shared secret for the `/api/v1/daw` facade. Set = every caller, loopback and Vite-proxied included, must send it as `X-DAW-Key`. Unset = only demonstrably local callers pass: the socket and every `X-Forwarded-For`, `X-Real-IP` and `Forwarded` hop must be loopback Uploads and float32 take exports live in `<DATA_DIR>/daw_tmp/<id>/`, swept every 15 min (6 h TTL, 10 min for failed or cancelled jobs) |
+| `HOTSTEP_DAW_KEY` | unset | `services/daw/dawFacade.ts` | Shared secret for the `/api/v1/daw` facade. Set = every caller, loopback and Vite-proxied included, must send it as `X-DAW-Key`. Unset = only demonstrably local callers pass: the socket and every `X-Forwarded-For`, `X-Real-IP` and `Forwarded` hop must be loopback. Uploads and float32 take exports live in `<DATA_DIR>/daw_tmp/<id>/`, swept every 15 min (6 h TTL, 10 min for failed or cancelled jobs) |
 | `DOCKER_PATH_MAP` | unset | `services/pathMapper.ts` | JSON object mapping Windows path prefixes to container mount points, so presets saved on Windows work in Docker. Set in `.env.docker` |
 
 ## Other env files

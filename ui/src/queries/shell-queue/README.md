@@ -59,16 +59,19 @@ disco stem extraction it starts) twice.
 |---|---|---|
 | Post-processing run | `shell-queue/post-process` | Query observer, 1.5 s while running, stops at a terminal status; one completion event |
 | Cover art job | `shell-queue/cover-art-job` | Observer, 2 s, stops at a terminal status, five-minute safety stop |
+| Report log tails | `shell-queue/report-logs` | Fresh each visit; the Report an issue tab redacts and trims them |
+| Last failed job | `shell-queue/report-failed-job` | Auth; fresh each visit; newest failed audio queue item |
 | Server version | `shell-queue/health` | Settings footer |
 | `.env` values | `shell-queue/env` | Fresh each load; seeds the editable form |
 | GPUs, stem storage | shared `gpus`, `shell-queue/stem-stats` | Clearing stems updates then invalidates |
 | Data folder | `shell-queue/data-folder` | Fresh each visit; refetched after a cancel or a failed command |
+| Update notice | `shell-queue/updates` | Fresh each visit; polled every 2 s while a check started elsewhere (startup, another tab) is still running; Check now writes its result into the entry |
 | File browser listing | shared `browse` | Fresh each navigation; only the newest navigation lands |
 | Adapter folder scan | shared `adapter-scan` | Fresh per click |
 | YuE2 caption source | `shell-queue/yue2-captions` | Fresh; failures caught by the caller, never cached as empty |
 | Workflow job (queue) | shared `workflow-job`, `after` 0 | Fresh per read, no retry |
 | Waveform peaks | shared `peaks` | `audio/peaksClient.ts`; never stale, `forgetPeaks` removes a rewritten file's entry, failures uncached |
-| Lyric sidecars | shared `lrc`, `lyrics-json` (`lyrics.ts`) | One entry per base render; missing caches null; crop and retranscribe call `invalidateSidecars` |
+| Lyric sidecars | shared `lrc`, `lyrics-json` (`lyrics.ts`) | One entry per base render; missing caches null; crop (`TrimControls.tsx`) and retranscribe (`SongActionsMenu.tsx`) refresh them through `queryManager.sidecars.all` |
 | YuE2 lead sheet | shared `score-abc` (`lyrics.ts`) | One entry per base render, read when a song actions menu opens; missing or the SPA shell caches null |
 | Presets and settings documents | `shell-queue/presets`, `shell-queue/setting` | Default adapters for `PresetCollection` and `SettingDocument`; fresh reads, dropped when unread (gcTime 0), writes invalidate |
 
@@ -90,14 +93,16 @@ global-models' `referencesOptions`, and upload or delete invalidates that key.
 | `components/create/MasteringSection.tsx` | query (global-models references); upload and delete are mutations |
 | `components/create/Mm3ComposeButton.tsx` | mutation (compose) |
 | `components/create/trainingCreateDraft.ts` | transport: one-shot handoff read applied to the form once |
-| `components/details/MetadataEditorModal.tsx` | mutation; App invalidates |
+| `components/details/MetadataEditorModal.tsx` | mutation: the save runs through `writeAndInvalidate` with the `song:written` event, the cover upload through `useUpload` |
 | `components/details/Yue2CoverDrift.tsx` | mutation (measure) |
 | `components/library/CoverArtPromptModal.tsx` | query (job); prompt preview is a one-shot pre-fill of an editable field; generate is a mutation |
 | `components/library/ImportTracksModal.tsx` | mutation; `song-created` invalidates |
 | `components/player/LyricsBar.tsx`, `SectionMarkers.tsx` | query (shared `lrc`, `lyrics-json`) |
 | `components/player/TrimControls.tsx` | mutation; invalidates song views and sidecars |
+| `components/settings/AdapterReferencesAction.tsx` | mutation (album preset adapter-reference cleanup); `lireekApi` invalidates the lireek snapshots after it |
 | `components/settings/DataFolderPanel.tsx` | query; preview, schedule, cancel and restart are commands |
 | `components/settings/SettingsPanel.tsx` | query (health, env, GPUs, stem stats); saves, purges and restart are mutations |
+| `components/settings/UpdatesPanel.tsx` | query (`shell-queue/updates`); Check now is a `useMutation` that writes its result into the entry |
 | `components/shared/FileBrowserModal.tsx` | query |
 | `components/shared/LatentImport.tsx` | mutation (upload) |
 | `components/shared/PresetSyncNotices.tsx` | query through `PresetCollection` |
@@ -105,7 +110,7 @@ global-models' `referencesOptions`, and upload or delete invalidates that key.
 | `components/shared/StudioDraftPicker.tsx` | consumer of cover-lyrics' draft service; its Query adoption is that owner's |
 | `components/shared/UnifiedRecentSongs.tsx` | query |
 | `hooks/usePolling.ts` | deleted; it had no callers |
-| `services/audioQueueApi.ts`, `dataFolderApi.ts`, `preferencesApi.ts`, `workflowApi.ts` | transport; reads take `ReadOptions` |
+| `services/audioQueueApi.ts`, `dataFolderApi.ts`, `preferencesApi.ts`, `updatesApi.ts`, `workflowApi.ts` | transport; reads take `ReadOptions` |
 | `services/exportImportApi.ts` | mutation (imports, export resolve, profile validation) |
 | `services/presetCollection.ts`, `settingDocument.ts` | query (default adapters) |
 | `stores/audioGenQueueStore.ts` | query (all server reads); commands direct; `lireekApi` preset reads and health probes stay transport (cover-lyrics' client; liveness) |
@@ -132,7 +137,7 @@ launch the app or claim network counts.
 | Browser-owned queue | Status reads per running job at the existing 1.5 s and 2.5 s loops; no projection poll |
 | Post-processing re-run | `GET /api/songs/:id/postprocess?jobId=` every 1.5 s, one at a time, stops at done or failed |
 | Cover art (library menu) | `GET /api/cover-art/generate/:jobId` every 2 s, stops at done or failed |
-| Settings | `/api/health`, `/api/settings/env`, `/api/settings/gpus`, `/api/stem-studio/stats`, `/api/settings/data-folder` on open |
+| Settings | `/api/health`, `/api/settings/env`, `/api/settings/gpus`, `/api/stem-studio/stats`, `/api/settings/data-folder`, `/api/updates/status` on open |
 | Presets (Storm AI-continue) | `/api/preferences/presets/:family`, `/api/preferences/settings/:family` on load and after writes |
 
 1. Open Library, Create and the Recent Songs column together. Count one

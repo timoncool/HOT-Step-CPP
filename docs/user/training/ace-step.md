@@ -1,6 +1,6 @@
 # ACE-Step training
 
-This guide covers training your own ACE-Step 1.5 adapters in the [Training Studio](../studios/training-studio.md): what each adapter type changes, how to prepare a dataset, which settings to start from and how to tell whether the result is any good. It assumes ACE-Step is the active backend, because the Training Studio trains for whichever backend is selected in the top bar. For how the trainers work inside, see [training internals](../../dev/training-internals.md).
+This guide covers training your own ACE-Step 1.5 adapters in the [Training Studio](../studios/training-studio.md): what each adapter type changes, how to prepare a dataset, which settings to start from and how to tell whether the result is any good. It assumes ACE-Step is the training target: make ACE-Step the active generation backend with the engine picker at the top of the sidebar, and leave the **Training target** picker above the phase tabs on **Active generation backend**. For how the trainers work inside, see [training internals](../../dev/training-internals.md).
 
 ## What you can train
 
@@ -25,7 +25,7 @@ How many tracks: the app warns below 10 files, and 10 or more gives much better 
 
 Labels live in a `<stem>.txt` sidecar beside each audio file (caption, genre, lyrics, BPM, key and so on). Side-Step reads the same format, so a folder labelled there imports with its labels kept.
 
-Which captioner to use: MOSS (local, needs its model installed) and Gemini both listen to the track, so their captions describe what is actually there. Other LLM providers write from the title, artist and lyrics only. A MOSS or Gemini caption pass also writes the MiniMax-Music3 and YuE2 caption files beside the audio, so one labelling pass serves all three backends.
+Which captioner to use: MOSS (local, needs its model installed) and Gemini both listen to the track, so their captions describe what is actually there. Other LLM providers write from the title, artist and lyrics only. A MOSS or Gemini caption pass also writes the MiniMax-Music3 and YuE2 caption files beside the audio, so one labelling pass serves ACE-Step, MiniMax-Music3 and YuE2. MOSS cannot write the YuE2 sentence itself: with MOSS, the default LLM provider (Gemini unless you changed it) writes it, so that provider needs to be set up.
 
 Two Build options matter for ACE-Step. The trigger position puts the trigger before the caption, after it, or instead of it; "Instead of the caption" trains an adapter that only ever saw the bare trigger, so the descriptive caption and the genre-only share are discarded. "Genre-only captions" sets the share of samples that train on the genre tags alone instead of the full caption.
 
@@ -33,7 +33,7 @@ Changing the trigger word or its position after preprocessing makes Preprocess r
 
 ## Preprocessing
 
-Preprocess encodes the dataset into training tensors against one DiT base. Pick a BF16 base: the app warns on quantized bases, and results from them may be degraded. The sound adapter can only be trained against the base you preprocessed with, so choose the base you intend to generate with.
+Preprocess encodes the dataset into training tensors against one DiT base. It is a collapsible stage card with the run button outside the fold, like YuE2's stages, and the **Tensors** chip on the dataset card turns on when tensors exist. The Train page uses the same cards for the planner (LM) and sound (DiT) adapters. Pick a BF16 base: the app warns on quantized bases, and results from them may be degraded. The sound adapter can only be trained against the base you preprocessed with, so choose the base you intend to generate with.
 
 Defaults: max duration 600 s per track, peak normalisation to -1 dB, max caption tokens 512, max lyric tokens 2048. The engine stops for the duration of the job and restarts afterwards. Measured on an RTX 5090, preprocessing uses about 6 GB of VRAM and takes about 3 seconds per song.
 
@@ -54,7 +54,7 @@ Defaults the form ships:
 | Prefix columns | 8 | Trained with the LoRA and shipped in the same file. |
 | Caption dropout | 0.3 | Trains some steps on the trigger word alone. Needs a trigger word; the server drops it with a warning if the dataset has none. |
 | Prior preservation | Off | |
-| Flash attention | On | |
+| Flash attention | On | A KV prefix needs exact attention, so while the artist token is on and Prefix columns is above 0, as shipped, the run trains with exact attention. |
 | Continue from this adapter's newest run | On | A name with no previous run trains from scratch. |
 | Calibrate after training | Off | |
 
@@ -64,7 +64,7 @@ When to move off the defaults:
 
 - For a LoRA-only run (untick the artist token and set prefix columns to 0), a lower target is reasonable. Everything a planner adapter measurably did in testing was in place by a loss of about 2.0, and pushing much further mostly bought looping plans.
 - For LoRA-only runs, prior preservation every 3rd step together with caption dropout 0.3 measured best in the one experiment behind it. Prior preservation needs at least one other artist preprocessed at the 600 s cap to act as the reference.
-- Pick a smaller base size if 4B does not fit your card. The form shows its VRAM estimate and the longest sequence it can fit; songs longer than that are skipped and reported.
+- Pick a smaller base size if 4B does not fit your card. Once a run has started, the form shows the trainer's VRAM estimate and the longest sequence it can fit; songs longer than that are skipped and reported.
 
 How long it takes: in the measurements behind the trainer, a 4B run that stopped at target 4.0 took about 12 minutes on an RTX 5090. That was an earlier recipe without the soft prompt.
 <!-- TODO(verify): wall-clock time for the current 4B default recipe (artist token + prefix on). -->
@@ -79,7 +79,7 @@ Defaults the form ships:
 | Quality | Balanced | Fast, Balanced and Thorough set max epochs to 150, 500 and 900. |
 | Target loss | 0.3 (0.2 on Thorough) | Measured on the 5-epoch average. Max epochs is only a backstop. |
 | Optimizer | Prodigy (automatic step size) | AdamW and Muon are selectable. |
-| Learning rate | 0.002 for LoKR, 5e-4 for LoRA | |
+| Learning rate | 0.002 for LoKR, 5e-4 for LoRA | Ignored under Prodigy, which sets its own step size. AdamW and Muon use it. |
 | Gradient accumulation | 4 | |
 | Also train the MLP projections | On | Most of a record's timbre lives there. It costs VRAM, so the audio window gets shorter to pay for it. |
 | Flash attention (full-song crops) | On | |
@@ -94,7 +94,7 @@ When to move off the defaults:
 - Keep the mirror on "BF16 store, F32 maths". The faster "BF16" option rounds the arithmetic as well as the storage, and adapters trained with it were judged coarse by ear.
 - Batch sizes above 1 were measured about 2.5 times slower at full depth on a 32 GB card. They only help shallow, partial-depth runs.
 - DoRA, HiRA, LoHa and HRA are LoRA variants. In a blind listening test none of them beat plain LoRA, so treat them as experiments.
-- If you change the learning rate, change gradient accumulation with it. For LoKR the two were tuned together, and one without the other is untested.
+- On AdamW or Muon, if you change the learning rate, change gradient accumulation with it. For LoKR the two were tuned together, and one without the other is untested.
 
 VRAM: the trainer refuses to start only when its cheapest configuration does not fit your free VRAM, and the refusal names what it tried. On the tested XL base, a card with 12 GB free trained all 32 layers at a short window with a rank-16 LoRA, and the frozen base alone sets a floor of about 8.3 GB. The larger LoKR default with MLP projections needs more, and bigger cards get longer windows. On a 32 GB card, flash attention let the auto-fit choose full-song windows.
 <!-- TODO(verify): the Sound LoRA panel still says "Needs a 16 GB GPU (24 GB for full depth)"; the trainer no longer refuses on that rule. -->

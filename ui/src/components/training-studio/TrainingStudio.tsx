@@ -11,7 +11,8 @@ import { AlertTriangle, GraduationCap, Layers } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useBackendStore } from '../../stores/backendStore';
 import { useTrainingStore, type TrainingPhase } from '../../stores/trainingStore';
-import { YUE2_BACKEND_ID } from '../../utils/yue2CaptionSource';
+import { ParamLabel } from '../shared/ParamLabel';
+import { StyledSelect } from '../shared/StyledSelect';
 import { CapabilityBanner } from './CapabilityBanner';
 import { DatasetDetail } from './DatasetDetail';
 import { DatasetList } from './DatasetList';
@@ -23,6 +24,9 @@ import { PreprocessPanel } from './PreprocessPanel';
 import { TrainPanel } from './TrainPanel';
 import { TrainingWorkerBar } from './TrainingWorkerBar';
 import { Yue2BatchPanel } from './Yue2BatchPanel';
+import { getTrainingPlugin } from './trainingPlugins';
+import { resolvePhase, type TrainingTargetOverride } from './trainingTargets';
+import { useTrainingTarget } from './useTrainingTarget';
 
 // ── URL helpers ──────────────────────────────────────────────────────────────
 //
@@ -76,6 +80,10 @@ export const TrainingStudio: React.FC = () => {
   const activeBackendId = useBackendStore(s => s.activeBackendId);
   const fetchBackends = useBackendStore(s => s.fetchBackends);
   const activeBackend = backends.find(b => b.id === activeBackendId);
+  // The ONE effective target (persisted override or active backend; a running
+  // job pins it). Everything below follows it: chips, preparation, train, previews.
+  const { target, override, setOverride, locked } = useTrainingTarget();
+  const plugin = getTrainingPlugin(target);
   const multiBackend = backends.length > 1;
 
   const setPhase = useTrainingStore(s => s.setPhase);
@@ -147,13 +155,14 @@ export const TrainingStudio: React.FC = () => {
   }, [openDataset, closeDataset, setPhase]);
 
   // The Monitor phase's batch pipeline only runs the preprocess-based
-  // backends, and Optimise is YuE2's alone. PhaseStepper drops those chips, but
-  // a user standing on one when the backend changed would otherwise be left
-  // looking at content this backend can never use, so move them on.
+  // backends, Optimise is YuE2's alone and SA3 has no Preprocess. PhaseStepper
+  // drops those chips, but a user standing on one when the target changed would
+  // otherwise be left looking at content this target can never use, so move
+  // them on.
   useEffect(() => {
-    if (activeBackendId === YUE2_BACKEND_ID && phase === 'monitor') setPhase('train');
-    if (activeBackendId !== YUE2_BACKEND_ID && phase === 'optimise') setPhase('train');
-  }, [activeBackendId, phase, setPhase]);
+    const next = resolvePhase(target, phase);
+    if (next !== phase) setPhase(next);
+  }, [target, phase, setPhase]);
 
   const fatalError = error && !detail;
 
@@ -169,7 +178,7 @@ export const TrainingStudio: React.FC = () => {
               {multiBackend && activeBackend && (
                 <span
                   title={t('trainingStudio.backendHint',
-                    'Training follows the active generation backend. Switch it with the backend pill in the bar at the top of the window.') as string}
+                    'Training follows the active generation backend. Switch it with the engine picker at the top of the sidebar.') as string}
                   className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
                 >
                   <Layers size={11} />
@@ -197,7 +206,24 @@ export const TrainingStudio: React.FC = () => {
 
         <TrainingWorkerBar />
         <CapabilityBanner />
-        <PhaseStepper />
+        {/* The picker moved out of the Train page: the target now drives the
+            chips and the stepper too, so it sits above them. Read-only while a
+            submitted job pins the target. SA3 as the active backend needs no
+            choice. */}
+        {activeBackendId !== 'sa3' && (
+          <div className="rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4 flex flex-col gap-1">
+            <ParamLabel label={t('trainingStudio.sa3.target')} info={t('trainingStudio.sa3.targetInfo')} />
+            <StyledSelect value={locked ? target : override} disabled={locked} accent="amber"
+              onChange={(v: string) => setOverride(v as TrainingTargetOverride)} options={[
+                { value: 'active', label: t('trainingStudio.sa3.activeTarget') },
+                { value: 'sa3', label: t('trainingStudio.sa3.title') },
+                // While a job pins the target, show it: ACE/MM3/YuE2 ids match neither option above.
+                ...(locked && target !== 'sa3'
+                  ? [{ value: target, label: backends.find(b => b.id === target)?.displayName ?? target }] : []),
+              ]} />
+          </div>
+        )}
+        <PhaseStepper target={target} />
 
         {/* Above the phase content, not inside it: the batch runs datasets
             that are never opened and must stay visible wherever the user
@@ -222,11 +248,11 @@ export const TrainingStudio: React.FC = () => {
           selectedDatasetId ? <DatasetDetail /> : <DatasetList />
         ) : phase === 'preprocess' ? (
           // YuE2's phase 2 is Prepare: its own stages, not the ACE/MM3 panel.
-          activeBackendId === YUE2_BACKEND_ID ? <TrainPanel section="prepare" /> : <PreprocessPanel />
+          plugin.renderPrepare ? <TrainPanel target={target} section="prepare" /> : <PreprocessPanel />
         ) : phase === 'optimise' ? (
-          <TrainPanel section="optimise" />
+          <TrainPanel target={target} section="optimise" />
         ) : phase === 'train' ? (
-          <TrainPanel />
+          <TrainPanel target={target} />
         ) : phase === 'refine' ? (
           <RefinePanel />
         ) : phase === 'review' ? (

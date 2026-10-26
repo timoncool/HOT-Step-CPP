@@ -4,7 +4,7 @@ Everything a new client needs to drive HOT-Step over HTTP, without reading `ui/s
 execution service. It links the shared contracts and worked call sequences; it does not
 repeat them. [`server/scripts/frontend-reference/`](../../server/scripts/frontend-reference/README.md)
 is a headless reference client built from exactly these contracts, exercising the real Node
-routes end to end against a fake engine and fake workers, never `ui/src`.
+routes end to end against a fake engine and fake trainer runners, never `ui/src`.
 
 This page proves the contracts are enough to build and orchestrate a client under fake
 dependencies. It does not qualify trainer/engine correctness, audio quality, or human
@@ -36,7 +36,7 @@ rebuilt from the actual `router.<verb>()` calls and `index.ts` mounts — never 
 the code that defines it. It names the file but not the request/response shape; those are in
 the domain pages this one links below.
 
-`GET /api/capabilities?backend=<id>` reports what the active backend actually supports
+`GET /api/capabilities?backend=<id>` reports what a backend (the active one by default) actually supports
 (`core`, `features`, `extensions`), so a client can branch on capability flags instead of a
 hardcoded backend id. See [Engine capability manifest](api-contracts.md#engine-capability-manifest).
 
@@ -45,9 +45,11 @@ hardcoded backend id. See [Engine capability manifest](api-contracts.md#engine-c
 Every error is JSON with an `error` string, occasionally extra fields (`expectedBackend`,
 `currentRevision`, `issues` from zod). See [Errors](api-contracts.md#errors) for the generate
 route's table; the same shape (plain `error`, sometimes `currentRevision` on a `409`) recurs
-across the revisioned document routes (playlist, drafts, presets).
+across the revisioned document routes (playlist, drafts, presets). The DAW facade under
+`/api/v1/daw` is the exception: its errors are `{ api, error: { code, message } }`.
 
-There is no HTTP contract version number. New response fields are additive; a client must
+There is no HTTP contract version number outside that facade, whose responses carry `api: 1`.
+New response fields are additive; a client must
 ignore ones it does not recognise. A document or job has its own `revision`/`schemaVersion`,
 which is a conflict and upgrade mechanism for that one row, not an API version
 ([Versioning](api-contracts.md#versioning)).
@@ -59,32 +61,37 @@ common mistake a new client makes:
 
 | Mechanism | Routes | Survives a restart? | Resume |
 |---|---|---|---|
-| Legacy generation job | `/api/generate/status/:id`, `/cancel/:id` | No — lost from memory. `404` means "gone", not "never existed" | None; resubmit |
+| Legacy generation job | `/api/generate/status/:id`, `/cancel/:id` | The job does not; its outcome does. `/status` answers from a ledger kept for a week, and a job that was queued or running reports `failed` with `interrupted: true`. `/cancel` answers `404`, and `404` on `/status` means "gone", not "never existed" | None; resubmit |
 | Durable audio queue | `/api/audio-queue/*` | Yes — items persist in the database | Items left `submitting`/`submitted` become `interrupted`; only an explicit `POST /items/:id/retry` runs them again |
 | Workflow jobs/documents | `/api/workflows/*` | Yes | `GET /jobs/:id/events?after=N` resumes an SSE stream with `Last-Event-ID`; an interrupted job needs `POST /jobs/:id/retry` |
 
 None of these replay or continue an interrupted run by itself. A client must poll or
 reconnect, see the terminal or interrupted state, and explicitly retry; nothing reruns
 automatically. See [Jobs](api-contracts.md#jobs), [Durable audio queue](api-contracts.md#durable-audio-queue)
-and [Workflow jobs and revisions](api-contracts.md#workflow-jobs-and-revisions).
+and [Workflow jobs and revisions](api-contracts.md#workflow-jobs-and-revisions). Training jobs,
+preparation pipelines and batches have their own routes and restart rules
+([Restarts](frontend-training.md#restarts)).
 
 ## Create's queue ownership
 
 A fresh Create submission goes through one of two paths, and a new client must pick the
-right one rather than assume either. The browser decides with one `localStorage` key,
+right one rather than assume either. The bundled UI decides with one `localStorage` key,
 `lireek-audio-queue-owner-v1` (`ui/src/stores/audioGenQueueStore.ts`):
 
 | Value | Meaning | Submission path |
 |---|---|---|
-| Missing or any value other than `server`/`migrating` | Browser queue (the default) | The browser holds the queue client-side and submits each item directly to legacy `POST /api/generate`, polling `GET /api/generate/status/:id` and cancelling with `POST /api/generate/cancel/:id` |
-| `server` | Durable Node ownership | The browser submits through [`/api/audio-queue`](api-contracts.md#durable-audio-queue) instead; Node holds the queue and survives a browser close or server restart |
-| `migrating` | Handoff in progress | Submissions are refused (`Audio queue migration is in progress`) until the migration guard resolves it to `server` (success) or back to `browser` (failure) |
+| `server` | Durable Node ownership; a fresh install ends up here | The browser submits through [`/api/audio-queue`](api-contracts.md#durable-audio-queue) instead; Node holds the queue and survives a browser close or server restart |
+| `browser`, missing, or any other value | Browser queue | The browser holds the queue client-side and submits each item directly to legacy `POST /api/generate`, polling `GET /api/generate/status/:id` and cancelling with `POST /api/generate/cancel/:id` |
+| `migrating` | Handoff in progress | Submissions are refused (`Audio queue migration is in progress`) and the browser queue does not run. It becomes `server` when the import succeeds, or `browser` when an explicit rollback finishes; a failed attempt stays `migrating` |
 
-A client that has never run the migration, or that reads an unset/unrecognised key, is on
-the browser path — it is never silently treated as server-owned. The key, its default and
-its three values are an existing browser decision this documentation does not change; a new
-client does not migrate another client's queue, and nothing here is a contract to add a
-fourth value or move the default.
+A missing or unrecognised value does not stay that way. On load, the bundled UI settles it
+once (`ensureQueueOwnerDecided`, with the rule in `decideQueueOwnerAction`,
+`ui/src/stores/audioQueueOwnerDecision.ts`): with nothing unfinished in the browser queue it
+writes `server`, and otherwise it migrates the queue to Node with the `resume` choice. A
+stored `migrating` is retried by replaying the saved import, unless a rollback was asked for.
+Only a finished rollback writes `browser`, and that value stays. The key and its values are
+the bundled UI's own state, not a server contract: a new client does not read or migrate
+another client's queue, and Node accepts both submission paths.
 
 Both submission paths are exercised with fake execution in `client.test.ts`: the legacy
 direct-submit path and the resolved durable-queue path (`client.test.ts:58`, resolve ->
@@ -95,7 +102,8 @@ HTTP-only client can demonstrate for itself.
 ## Import and export
 
 Covered in full in [Media for frontend clients](frontend-media.md): upload an asset, import
-it into the library, resolve what to export, download each resolved URL. Per-item requests
+it into the library, resolve what to export, download each resolved URL or have the server
+save it into its download folder. Per-item requests
 (import, export) report success or error per item, in order; one bad item never stops the
 rest.
 
@@ -106,7 +114,7 @@ Every audited workflow group, its contract page and its reference-client coverag
 | Group | Contracts | Reference coverage |
 |---|---|---|
 | Create | [Create's control dictionary](frontend-create-controls.md), [Generate request](api-contracts.md#generate-request) | `client.test.ts` |
-| Insta-Gen | [Studio workflows](frontend-studios.md#insta-gen-insta-preview-insta-direct-insta-approve) | `client.test.ts` |
+| Auto-Gen | [Studio workflows](frontend-studios.md#auto-gen-insta-preview-insta-direct-insta-approve) | `client.test.ts` |
 | Lyric Studio | [Studio workflows](frontend-studios.md#lyric-studio-batch-lyric-batch) | `client.lyric.test.ts`, `client.lyric.chain.test.ts` (full chain, fixture orchestration — live LLM/Genius unverified, see "What this page cannot prove") |
 | Cover | [Studio workflows](frontend-studios.md#cover-cover-open-cover-caption-cover-transcribe-cover-render) | `client.test.ts` (open only), `client.cover.test.ts` (full chain) |
 | Repaint | [Studio workflows](frontend-studios.md#repaint-and-lego-layer-repaint-render-layer-render) | `client.test.ts` |
@@ -116,6 +124,7 @@ Every audited workflow group, its contract page and its reference-client coverag
 | ACE training | [Training for frontend clients](frontend-training.md) | `client.training.test.ts`, `client.trainingRuns.test.ts` |
 | MM3 training | [Training for frontend clients](frontend-training.md) | `client.training.test.ts`, `client.trainingRuns.test.ts` |
 | YuE2 training | [Training for frontend clients](frontend-training.md) | `client.training.test.ts`, `client.trainingRuns.test.ts` |
+| SA3 training | [Training for frontend clients](frontend-training.md#starting-sa3-training) | none |
 | Library | [Library, playlist, drafts and Song Builder](frontend-library.md#songs) | `client.library.test.ts` |
 | Playlists | [Library, playlist, drafts and Song Builder](frontend-library.md#playlist) | `client.library.test.ts` |
 | Studio drafts | [Library, playlist, drafts and Song Builder](frontend-library.md#studio-drafts) | `client.library.test.ts` |
@@ -125,7 +134,7 @@ Every audited workflow group, its contract page and its reference-client coverag
 | Settings/backends | [Engine capability manifest](api-contracts.md#engine-capability-manifest) | `client.library.test.ts` |
 
 Restart interruption, where it applies, is exercised separately in `client.restart.test.ts`
-against the real training-job and workflow-job persistence, not simulated.
+against the real training-job, workflow-job and preparation-pipeline persistence, not simulated.
 
 ## What this page cannot prove
 

@@ -115,8 +115,17 @@ test('score to lyrics: blocks open their own sections where the score has too fe
     [['first', 6.2], ['hook line', 12.1], ['third', 18.2], ['hook again', 24.1]]));
   assert.deepEqual(plan.sections.map(s => `${s.label}@${s.bar}`),
     ['intro@1', 'verse@3', 'chorus@5', 'verse@7', 'chorus@9', 'outro@11']);
+  assert.deepEqual(plan.sections.map(s => s.tag), [null, 'Verse 1', 'Chorus', 'Verse 2', 'Chorus', null]);
   assert.equal(plan.lyrics, '[intro]\n\n[verse]\nfirst line\n\n[chorus]\nhook line\n\n[verse]\nthird line\n\n[chorus]\nhook again\n\n[outro]');
   assert.deepEqual(plan.unsure, []);
+});
+
+test('score to lyrics: an instrumental outro stays when the last word is stretched over it', () => {
+  const lyrics = '[Verse]\nfirst line\n\n[Chorus]\nhook line';
+  const timed = words(lyrics, [['first', 6.2], ['hook line', 12.1]]);
+  timed[1].end = 35;  // the aligner drags the last word past the outro's start (30 s)
+  const plan = planScoreFromLyrics(score, lyrics, timed);
+  assert.deepEqual(plan.sections.map(s => `${s.label}@${s.bar}`).at(-1), 'outro@11');
 });
 
 test('score to lyrics: a block with no timing joins the section before it', () => {

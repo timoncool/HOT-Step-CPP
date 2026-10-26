@@ -15,7 +15,10 @@ ownership rules, see [Building a replacement frontend](build-a-frontend.md).
 The consumer HTTP contract has no version number yet. The internal generation envelope's
 `version: 1` (`GENERATION_ENVELOPE_VERSION`, `server/src/services/backends/types.ts`) versions the
 server's own job snapshot, not this API. New fields are additive; a client must ignore
-response fields it does not know.
+response fields it does not know. The one versioned surface is the DAW facade under
+`/api/v1/daw`: every response there carries `api: 1`, and its errors are
+`{ api, error: { code, message } }` rather than a plain `error` string
+([DAW facade notes](api.md#daw-facade-notes-apiv1daw)).
 
 ## Local auth
 
@@ -24,12 +27,21 @@ response fields it does not know.
 | Get a token | `GET /api/auth/auto` returns `{ user, token }`. It creates the single local user on first use. No credentials are asked for (`server/src/routes/auth.ts:36-41`). |
 | Use it | `Authorization: Bearer <token>` on routes that call `getUserId` (`auth.ts:98-102`), including `POST /api/generate`. |
 | Lifetime | Tokens live in server memory only. Every server restart invalidates them; the next call answers `401 { "error": "Unauthorized" }` and the client fetches a new token from `/api/auth/auto`. |
-| Unauthenticated routes | Job status (`GET /api/generate/status/:id`), cancel, queue and the media mounts below do not check the token. |
+| Unauthenticated routes | Job status (`GET /api/generate/status/:id`), cancel, cancel-all, queue, reset-queue, the STORM and MM3 stream routes, `/api/download/:id` and the media mounts below do not check the token. |
 
 Exposure today: the Node server binds `SERVER_HOST`, default `0.0.0.0` (`server/src/config.ts:221-224`),
 CORS is open (`server/src/index.ts:80`), and the Vite dev server binds `0.0.0.0:3000`
-(`ui/vite.config.ts`). Only the training-worker token gate checks the caller's address
-(`server/src/services/training/trainingWorkers.ts:92-96`), and only when a worker token is set.
+(`ui/vite.config.ts`). A few gates look at where a call comes from:
+
+- The training-worker token gate (`workerTokenGate`, `server/src/services/training/trainingWorkers.ts`)
+  covers every `/api` route, but only when a worker token is set. A call passes when its
+  socket and every `X-Forwarded-For` hop are loopback, or when it carries the token.
+- The `/listening` score-sheet pages answer only loopback callers (`server/src/routes/listening.ts`).
+- The DAW facade at `/api/v1/daw` needs `X-DAW-Key` when `HOTSTEP_DAW_KEY` is set, and
+  otherwise answers only local callers (see [`HOTSTEP_DAW_KEY`](config.md)).
+- `POST /api/updates/check` refuses a cross-origin request with `403`
+  (`server/src/services/updates/origin.ts`).
+
 So the local auth contract identifies the installation's single user; it does not restrict
 who can reach the server. Changing that belongs to the separately approved auth and route
 policy work, not to this baseline.
@@ -46,9 +58,10 @@ missing control defaults, computes the adapter stack and conditional fields,
 and then overlays `input` as the existing Create caller does. Optional `settings`
 carries `triggerUseFilename` and `triggerPlacement` for filename trigger fallback. Backend-specific
 controls belong in `params.backendParams`; Node reads their keys, defaults and
-value constraints from the active backend's capability manifest. An unknown
+value constraints from the capability manifest of the backend the job runs on. An unknown
 or invalid extension value returns `400`. The active backend still selects the
-engine, and a flat legacy body keeps its existing handling. The original body
+engine unless a top-level `backendOverride` names another (see below), and a flat legacy
+body keeps its existing handling. The original body
 is captured before intent resolution when dev capture is enabled.
 
 - The body is the UI's `GenerationParams` shape (`ui/src/types.ts:108-371`), camelCase, plus
@@ -64,7 +77,8 @@ is captured before intent resolution when dev capture is enabled.
 - The server, not the body, chooses the backend: the active backend from `/api/backends`
   (`buildEnvelope` in `server/src/services/generation/envelope.ts`). `backend` in the body is
   log-only; a mismatch is recorded on the job as `submittedBackendMismatch`.
-- `backendOverride` (optional, top level of a flat body or an intent, never sent by the UI) runs
+- `backendOverride` (optional, top level of a flat body or an intent; the bundled UI sends it
+  only for Training Studio's SA3 auditions) runs
   this one job on the named registered backend without changing the active one. It must be a
   non-empty string naming a registered backend, or the request fails with `400`. A copy inside an
   intent's `params` or `input` is ignored. The override must support the requested operation
@@ -72,12 +86,20 @@ is captured before intent resolution when dev capture is enabled.
   render. Before any job (or YuE2 score preview) loads weights, the GPU lane frees every other
   backend's VRAM and waits for the engine to confirm. A release that cannot be confirmed fails
   the job rather than loading next to the other backend.
-- `expectedBackend` (optional, sent by the MCP server, never by the UI) makes the request fail
+- `expectedBackend` (optional) makes the request fail
   with `409` when it differs from the backend the job will run on: the `backendOverride` when one
   is given, otherwise the active backend (`submitGeneration` in `server/src/routes/generate.ts`).
+  The MCP server sends it, every request a resolve preview returns carries it, and so do the
+  requests the studio workflows build. On an intent body it is read from `input`.
 - Unknown fields are kept. The whole body is frozen into the job's envelope as `submission`, and
   each backend's `resolveRequest` reads what it understands. Backend-specific knobs travel as
   prefixed keys (`yue2*`, `mm3*`) or in `backendParams`.
+- A body that carries a YuE2 Prepare document (`yue2Prepare`) must pass the same check YuE2
+  Build uses (`preparedParams`, `server/src/contracts/yue2Prepare.ts`): confirmed structure and
+  lyrics, `yue2Abc` matching the confirmed score, Instrumental mode agreeing with the
+  confirmed lyrics and, unless every section is instrumental, `lyrics` equal to the lyrics the
+  document exports. A failure is a `409`; on success the document is dropped before the job is
+  queued.
 - Seeds: `seed` with `randomSeed`. When `randomSeed` is true the backend picks a seed. A
   retried attempt can be reseeded (`envelope.policy.retry.reseedOnRetry`), and the seed it
   actually used is reported per attempt in `attempts[].effective.seed`. MM3 seeds are decimal
@@ -98,11 +120,17 @@ Every error is JSON with an `error` string, and sometimes extra fields:
 
 | Status | When | Extra fields |
 |---|---|---|
-| `400` | Body is not an object, `backend` is not a string, `backendOverride` is malformed or unknown, the job's backend does not support the requested operation, a missing timbre reference | none |
+| `400` | Body is not an object, `backend` is not a string, `backendOverride` is malformed or unknown, the job's backend does not support the requested operation, a missing timbre reference, an intent that fails its schema or carries an unknown or invalid `backendParams` value, a body the backend's own resolver rejects | none |
 | `401` | Missing or stale token | none |
 | `409` | `expectedBackend` differs from the active backend, or from `backendOverride` when one is given | `expectedBackend`, `activeBackend`, and `backendOverride` on the override case |
-| `500` | Request capture failed (dev only), or the active backend is not registered | none |
+| `409` | The active backend changed while an intent was being resolved | `activeBackend` |
+| `409` | A `yue2Prepare` document fails the Prepare check | none |
+| `500` | Request capture failed (dev only), the active backend is not registered, or an intent could not be resolved for another reason | none |
 | `503` | Engine still booting, or paused for training preprocessing | `detail` on the boot case |
+
+The engine checks run before the token check, so while the engine is booting or paused an
+unauthenticated request also gets `503`. With dev capture on, the capture's own token check
+comes first (see [Fixture capture](#fixture-capture-dev-only)).
 
 Failures after queuing are not HTTP errors. They show up in the job status.
 
@@ -110,26 +138,57 @@ Failures after queuing are not HTTP errors. They show up in the job status.
 
 | Route | Contract |
 |---|---|
-| `GET /api/generate/status/:id` | `{ jobId, status, stage, progress, result, error, attempts, ace_job_id, ace_phase, ace_phase_progress, batch, mm3_streaming, mm3_interleaved, mm3_duration, mm3_takes, mm3_take_seeds, mm3_ending }` (`generate.ts`, status route). `404` when the id is unknown. |
-| `POST /api/generate/cancel/:id` | `{ success: true, jobId }`. Marks the job cancelled and cancels the engine job. |
+| `GET /api/generate/status/:id` | `{ jobId, status, stage, progress, result, error, attempts, ace_job_id, ace_phase, ace_phase_progress, batch, mm3_streaming, mm3_interleaved, mm3_duration, mm3_takes, mm3_take_seeds, mm3_ending }` (`generate.ts`, status route). `mm3_take_seeds` are decimal strings. A job no longer held in memory answers from the job ledger (below), with `interrupted` added. `404` when neither knows the id. |
+| `POST /api/generate/cancel/:id` | `{ success: true, jobId }`. Marks the job cancelled and cancels the engine job. One song of a running YuE2 batch is dropped from the batch and the rest carry on. `404` for an id not held in memory. |
 | `POST /api/generate/cancel-all` | `{ success: true, cancelled }` |
 | `GET /api/generate/queue` | `{ depth, running, owner, draining, current, pending }` |
-| `POST /api/generate/reset-queue` | `{ success: true, cancelled, drained }` |
+| `POST /api/generate/reset-queue` | `{ success: true, cancelled, drained }`. Active jobs end `failed` with error `Queue reset by user`, and the lane's waiting tasks are drained. |
 
 `status` is one of `pending`, `running`, `lm_running`, `synth_running`, `saving` (active) or
 `succeeded`, `failed`, `cancelled` (terminal) (`server/src/services/generation/jobTypes.ts`).
 
-- Jobs live in server memory. A terminal job is pruned an hour after creation.
-- A server restart loses every job, queued or running. Status then answers `404`, so a
-  client must treat `404` on a job it submitted as "lost", not "never existed".
+- Live job state is in server memory. A terminal job is pruned from memory an hour after
+  creation.
+- Each job also has a row in the job ledger (the `generation_jobs` table,
+  `server/src/services/generation/jobLedger.ts`), written when it is queued and again when it
+  ends, and kept for a week. `/status` reads it once the job has left memory:
+  - A job that finished keeps its outcome: `status`, `error`, and `result` on success. The
+    live-only fields come back empty (`attempts: []`, `ace_*` and `batch` null, MM3 fields at
+    their defaults).
+  - A job that was queued or running when the server stopped reports `status: 'failed'`,
+    `stage: 'Interrupted'`, `interrupted: true` and an error saying the server restarted.
+    Nothing is resubmitted.
+- `/cancel` and the MM3 stream route read memory only, so they answer `404` for a job the
+  ledger reports. Ledger writes are best effort, so a client should still treat `404` on a
+  job it submitted as "lost", not "never existed".
 - Jobs run one at a time on the shared GPU lane. YuE2 can render several queued jobs in one
   engine batch; `batch` names the lead and its members.
 
 On success `result` carries:
 - `audioUrls`, with `songIds` index-aligned (one per take)
 - optional `bpm`, `duration`, `keyScale`, `timeSignature`
-- per-take `durations`, `masteredAudioUrls` and `noAdapterAudioUrls`
+- per-take `durations`, `masteredAudioUrls` and `noAdapterAudioUrls`, and, when present, the
+  scalars `masteredAudioUrl` and `noAdapterAudioUrl` (the first non-empty take's)
 - `timing` and `totalMs`
+
+## YuE2 score preview
+
+`POST /api/generate/yue2/plan` plans a YuE2 lead sheet without rendering audio, so a client can
+show the score before committing to a render. The body is the same flat body a YuE2 render
+takes, and the route needs the bearer token. It refuses with `503` while the engine is booting
+or paused for training preprocessing, `401` without a token, and `400` when the active backend
+is not YuE2. It runs on the GPU lane like a render, freeing the other backends' VRAM first,
+and answers once the plan is done:
+
+- `{ abc, seed, end_reason, stage_end_reasons, health, notes }`, where `health` is the
+  server's check of the score (`Yue2ScoreHealth` in
+  `server/src/services/backends/yue2/scoreHealth.ts`: a `verdict` of `healthy`, `long`,
+  `runaway` or `unknown`, bar counts and the section markers)
+- plus `semantic_ids` when the body sets `semantic: true`, which also runs the semantic stage
+
+Any failure, including an empty caption or `cot` off, is `500 { error }`. Closing the connection
+cancels the preview. To render the approved score, send it as `yue2Abc` on an ordinary
+`POST /api/generate` with the returned `seed` pinned.
 
 ## Media
 
@@ -150,10 +209,10 @@ names its session in the `X-Stream-Session` header. Types are in
 
 | Method | Path | Does |
 |---|---|---|
-| `GET` | `/api/stream-sessions` | Sessions, newest first |
-| `GET` | `/api/stream-sessions/:id` | Status, per-chunk analysis, recording state |
-| `POST` | `/api/stream-sessions/:id/recording` | `{ action: 'start' \| 'stop' \| 'discard' }` |
-| `GET` | `/api/stream-sessions/:id/recording/export?format=wav\|flac\|mp3\|opus&bitrate=` | The stopped recording as a download |
+| `GET` | `/api/stream-sessions` | `{ sessions }`, newest first |
+| `GET` | `/api/stream-sessions/:id` | `{ session }`: status, per-chunk analysis, recording state |
+| `POST` | `/api/stream-sessions/:id/recording` | `{ action: 'start' \| 'stop' \| 'discard' }`, answered with `{ session }`; any other action is `400` |
+| `GET` | `/api/stream-sessions/:id/recording/export?format=wav\|flac\|mp3\|opus&bitrate=` | The stopped recording as a download (`format` defaults to `wav`; `bitrate` 32 to 512, else `400`) |
 
 Analysis: each chunk (STORM slot, MM3 window) gets BPM, key and first onset from
 `server/src/services/streamSessions/analysis.ts`, the same code the STORM player imports for
@@ -183,7 +242,9 @@ Lifetime and caps (`LIMITS` in `services/streamSessions/index.ts`):
 Stop, cancel and reconnect: the session ends when its stream ends, whether it finished or was
 stopped or aborted. Start fails with 409 after that, but stopping, exporting and discarding
 still work until the session expires. A reconnect opens a new stream and so a new session;
-recordings do not carry across.
+recordings do not carry across. Start also answers 409 while an earlier recording still holds
+data (export or discard it first), and export answers 409 while still recording, when nothing
+was recorded, or after the recording failed. An unknown or expired session id is 404.
 
 Access follows the stream routes: installation-scoped, no per-user check.
 
@@ -244,21 +305,24 @@ construction, so old and new can be diffed fixture against fixture.
 
 `GET /api/capabilities?backend=<id>` (default: the active backend) returns the backend's
 manifest, cached for 10 seconds. If the probe fails it returns an all-false manifest with
-`up: false` rather than an error (`server/src/routes/backends.ts:153-188`). The shape is
+`up: false` rather than an error (`server/src/routes/backends.ts:153-189`). An id that names
+no registered backend is `404 { error }`. The shape is
 `BackendCapabilities` (`server/src/services/backends/types.ts:160-177`):
 
 | Field | Meaning |
 |---|---|
-| `backend` | Backend id: `ace`, `minimax-m3` or `yue2` |
+| `backend` | Backend id: `ace`, `minimax-m3`, `yue2` or `sa3` (Stable Audio 3) |
 | `up` | Whether the backend answered its probe |
-| `core.captionSource` | `none`, `mm3-tracks` or `yue2-dataset`; gates the existing Create and Lyric Studio caption source controls |
+| `core.captionSource` | `none`, `mm3-tracks` or `yue2-dataset`; gates the existing Create and Lyric Studio caption source controls. SA3 does not declare it |
 | `core` | Model-agnostic parameters it honours: `duration { max, auto, editable? }`, `bpm`, `keyscale`, `negativePrompt`, `batch { max }`, `seed`, plus backend-declared extras |
 | `features` | One boolean per feature or studio, such as `cover`, `repaint`, `stems`, `streaming`, `adapters`, `lmAdapters`, `lmAdapterSelectable`, `whisper`, `forcedAlignment` |
 | `extensions` | Backend-declared knobs, rendered by the shared plugin-parameter renderer and grouped by `group` (`generation` or `lm`) and optional `section` |
 | `license` | Optional licence text, shown verbatim |
 
-`GET /api/backends` lists `{ id, displayName, resourcePool, active }` and `activeId`.
-`POST /api/backends/active { id }` switches backends.
+`GET /api/backends` returns `{ backends: [{ id, displayName, resourcePool, active }], activeId }`.
+`POST /api/backends/active { id }` switches backends and answers `{ activeId }` at once: a
+missing `id` is `400`, an unknown one `404`. The outgoing backend frees its VRAM in the
+background, and the next render waits for that release before it loads weights.
 
 Shared code should branch on these flags, not on a backend id. The UI does not yet do this
 everywhere; changes to the manifest are proposed separately before they land here.
@@ -268,11 +332,13 @@ everywhere; changes to the manifest are proposed separately before they land her
 `GET /api/resolve/path` returns `{ "path": "old" | "resolved" }` to an authenticated
 client. The server setting `GENERATION_INTENT_PATH` defaults to `resolved`; only the exact
 value `old` rolls back to the legacy client builder, and any other value (including unset)
-selects resolved. Create and the Lyric Studio written-song queue read this before each
-submission. A missing path endpoint on an older server selects the old path.
+selects resolved. Create, and the Lyric Studio written-song queue while the browser owns it,
+read this before each submission. When Node owns the queue, a written song is always resolved
+before it is queued. A missing path endpoint on an older server selects the old path.
 Changing the setting does not replay existing jobs or rewrite browser drafts. A selected
 resolved path previews a typed intent and submits its returned request; preview errors stop
-that submission. The queue remains browser-owned in this slice.
+that submission. Where Node owns the queue, that request is what the
+[durable audio queue](#durable-audio-queue) stores.
 
 `POST /api/resolve/preview` builds the body Create or the Lyric Studio queue would send to
 `/api/generate`, without queuing anything. Node resolves the caption, wildcards, compose
@@ -300,6 +366,7 @@ The browser state those paths read from local storage arrives as explicit fields
 - "Use LM adapter" (`settings.useLmAdapter`, default false)
 - filename trigger settings (`settings.triggerUseFilename`, `settings.triggerPlacement`)
 - randomized timbre (`settings.randomizeTimbreRef`)
+- "Master to album track" (`settings.masterToAlbumTrack`)
 - the stored time signature and language
 - the app flags (`settings.app`)
 
@@ -322,7 +389,8 @@ Resolution rules, unchanged from the browser:
     choice is Custom.
   - Then wildcards are expanded, when `autoExpand` is set.
   - Then the trigger is prepended, unless the caption already starts with it as a whole word,
-    and the beat intro request is appended.
+    and the beat intro request is appended. On YuE2 the trigger is never prepended: YuE2 puts
+    its adapter's trigger in the style template, so `compose.loraTrigger` is ignored there.
 - **Wildcards** use the DiT seed when the seed is fixed, zero included, and a fresh random
   seed when it is random. The seed used is in `provenance.wildcards`.
 - **Duration.**
@@ -338,6 +406,12 @@ Resolution rules, unchanged from the browser:
   - On MiniMax-Music3 the preset adapter, or none, replaces the global one.
   - A preset reference track becomes the mastering reference, and also the timbre reference
     unless the snapshot names a dedicated one.
+- **Master to album track** applies to written songs only. With `settings.masterToAlbumTrack`
+  the request turns on `postProcessingEnabled` and `masteringEnabled` and names the album in
+  `masterToAlbumLyricsSet`. Post-processing then skips the VST chain and draws a random track
+  of the album's training dataset as the mastering reference at render time, so each render
+  gets its own and a queued request does not change. With no dataset audio the mastering
+  reference stays as set.
 
 The response is `{ request, provenance, warnings, uiEffects, version }`:
 - `provenance` says where the caption, duration and trigger came from, and which preset paths
@@ -367,16 +441,16 @@ bearer token.
 
 | Route | Does |
 |---|---|
-| `POST /items` | Queue `{ idempotencyKey, request, meta? }`. `201 { item, created: true }` for a new item. The same key with the same request answers `200 { item, created: false }`. The same key with a different request answers `409` |
-| `GET /items[?status=]` | All items, oldest first |
-| `GET /items/:id` | One item, or `404` |
-| `POST /items/:id/cancel` | Cancel; `409` for a finished item |
-| `POST /items/:id/retry` | Queue a failed, cancelled or interrupted item again as a new attempt; `409` otherwise |
+| `POST /items` | Queue `{ idempotencyKey, request, meta? }`. `201 { item, created: true }` for a new item. The same key with the same request answers `200 { item, created: false }`. The same key with a different request answers `409`. A malformed body is `400 { error, issues }`, and an `expectedBackend` that names no registered engine is `400` |
+| `GET /items[?status=]` | `{ items }`, oldest first; an unknown `status` is `400` |
+| `GET /items/:id` | `{ item }`, or `404` |
+| `POST /items/:id/cancel` | Cancel; `{ item }`, or `409` for a finished item |
+| `POST /items/:id/retry` | Queue a failed, cancelled or interrupted item again as a new attempt; `{ item }`. `409` otherwise, or for an imported item with no resolved request |
 | `GET /state`, `POST /pause`, `POST /resume` | `{ paused, maxInFlight, counts }` |
-| `POST /migration/import` | Import a verified browser backup by `backupId` with `choice: hold`, `resume`, or `discard`; returns a persistent receipt with each legacy and server item id. A repeated backup id returns the same receipt. Invalid items return `400` with field paths or item ids; conflicting items return `409` |
-| `POST /migration/resume-held` | Explicitly release imported held ids and resume the executor |
-| `POST /migration/rollback-export` | Pause submissions and export all items, job ids, and state. Returns `409` while a submission is in flight; retry after it settles |
-| `DELETE /items/:id` | Dismiss a terminal item; `409` while active |
+| `POST /migration/import` | Import a verified browser backup by `backupId` with `choice: hold`, `resume`, or `discard`; returns a persistent receipt `{ backupId, imported, existing, items: [{ legacyId, itemId, status }] }`. A repeated backup id returns the same receipt. Invalid items return `400` with field paths or item ids; conflicting items return `409` |
+| `POST /migration/resume-held` | `{ ids }`: explicitly release imported held items and resume the executor; `{ items }`. `409` for an id that is not held |
+| `POST /migration/rollback-export` | Pause submissions and export everything as `{ version: 1, exportedAt, state, items }`. Returns `409` while a submission is in flight; retry after it settles |
+| `DELETE /items/:id` | Dismiss a terminal item; `{ removed: true }`, or `409` while active |
 
 `request` is the exact body for `/api/generate`, normally a resolve preview's `request`. It is
 captured once and never re-resolved. Its engine is its `expectedBackend`. A request without one
@@ -398,6 +472,11 @@ Item `status`:
 | `succeeded`, `failed`, `cancelled` | The job's outcome. `result` holds the job result; `error` holds the reason |
 | `interrupted` | The server stopped while the item was submitting or submitted, or its job disappeared from the generation queue. Whether it rendered is unknown |
 
+Each item also carries `elapsedSeconds`, its generation time in seconds, computed on the
+server. It is null until the job starts running (queue wait does not count), counts up while
+it runs, and is frozen once the item reaches a final status, from the job's own start and end
+times when the job is still known.
+
 How each transition happens:
 - **Submit.** A claim (pending to submitting) is one guarded update, so a cancel racing a
   submit, or two executors, cannot both act on an item.
@@ -406,7 +485,7 @@ How each transition happens:
     the reason in `waiting`.
   - Any other refusal marks it failed.
 - **Cancel.**
-  - A pending item is cancelled at once.
+  - A pending or held item is cancelled at once.
   - A submitting item is cancelled as soon as its submit returns, including its new job.
   - A submitted item cancels its job.
 - **Restart.** On startup, items left submitting or submitted become `interrupted`. Their
@@ -415,15 +494,20 @@ How each transition happens:
   earlier job ids in `previousJobIds` and counts the attempt in `attempt`.
 
 Items live in the `audio_intents` table, created on first use; the paused flag is in
-`audio_queue_state`.
+`audio_queue_state` and import receipts in `audio_queue_imports`.
 
 The browser migration saves a versioned export of both the legacy localStorage queue and the
 IndexedDB queue, including item and job ids. It reads the saved copy back before importing,
-downloads it, and retains the original browser records after the server receipt is stored.
+downloads it when the user moves the queue by hand, and retains the original browser records
+after the server receipt is stored. The bundled UI also moves on its own: on load, a browser
+that has never settled who owns its queue becomes server-owned at once when nothing is
+pending, and otherwise migrates its pending items with `choice: resume` and no download
+([Create's queue ownership](build-a-frontend.md#creates-queue-ownership)).
 New queue items then go to `/api/audio-queue`; the browser reads its status, takes and job
 results. Reloads and other tabs read the same server list. To roll back, the browser pauses
 the server, exports and verifies its current items, reconciles submitted and terminal job ids
-into the saved browser queue, and holds pending work for an explicit resume. Moving the queue
+into the saved browser queue, cancels the server items still pending or held, and holds that
+pending work for an explicit resume. Moving the queue
 back to the server clears that pause whatever the import choice: `hold` and `discard` apply to
 the imported items' own status, and new work runs as soon as it is queued. A submitting
 item cannot be exported until its submission settles. Submitted or interrupted jobs are
@@ -447,13 +531,16 @@ in `server/src/contracts/workflow.ts`, and the UI client is `ui/src/services/wor
 | `POST /jobs` | Submit `{ kind, idempotencyKey, input }`. `201 { job, created: true }` for a new job. The same key and input within (user, kind) answers `200 { job, created: false }`. The same key with another input is a `409`. An unknown kind, or input the kind's schema rejects, is a `400` with field paths |
 | `GET /jobs[?kind=&status=]` | The user's jobs, newest first, at most 200 |
 | `GET /jobs/:id[?after=N]` | `{ job, events, gap }`: the events after sequence `N` |
-| `GET /jobs/:id/events[?after=N]` | Server-sent events: a snapshot frame `{ type: 'snapshot', job, gap }`, then `{ type: 'event', event }` frames with `id:` set to the event's sequence, so `Last-Event-ID` resumes. The stream ends at the job's current final status; a retried job's stream carries on past the earlier attempt's |
+| `GET /jobs/:id/events[?after=N]` | Server-sent events: a snapshot frame `{ type: 'snapshot', job, gap }`, then `{ type: 'event', event }` frames with `id:` set to the event's sequence, so `Last-Event-ID` resumes. A `: ping` comment line every 25 s keeps the connection open. The stream ends at the job's current final status; a retried job's stream carries on past the earlier attempt's |
 | `POST /jobs/:id/cancel` | Acknowledge a cancel. `409` for a finished job |
 | `POST /jobs/:id/retry` | Run a failed, cancelled or interrupted job again as a new attempt; `409` otherwise |
-| `POST /documents` | Create `{ kind, data }` at revision 1 |
-| `GET /documents?kind=`, `GET /documents/:id` | Read documents |
+| `POST /documents` | Create `{ kind, data }` at revision 1; `201 { document }` |
+| `GET /documents?kind=`, `GET /documents/:id` | Read documents. `kind` is required; the list holds the 200 most recently updated |
 | `PUT /documents/:id` | `{ expectedRevision, data }`. Lands only if the stored revision still matches; otherwise `409 { error, currentRevision }` |
-| `DELETE /documents/:id?expectedRevision=N` | Delete, with the same check |
+| `DELETE /documents/:id?expectedRevision=N` | Delete, with the same check; `{ removed: true }` |
+
+A kind registered as a typed document (presets, preferences, studio drafts) is served only by
+its own domain's routes; these generic document routes refuse it with `400`.
 
 Job `status`:
 
@@ -507,39 +594,57 @@ Jobs and events live in `workflow_jobs` and `workflow_events`, documents in
 
 ## UI transport client
 
-`ui/src/services/httpClient.ts` is the one configurable client for every route above: a base
-URL (default `/api`) and a separate `mediaRoot` (default `''`, same origin) for `mediaUrl()`,
-bearer auth, `AbortSignal` cancellation, JSON `get/post/patch/put/delete`, and a multipart
-`upload()` (XHR, so it can report progress fetch cannot). It is the transport underneath
-`api.ts`; studios with their own client file (`lireekApi.ts`, `trainingApi.ts`,
-`stemStudioApi.ts`, and the other per-studio clients) keep their current fetch wrappers and move
-onto it incrementally in later slices, not in one pass.
+`ui/src/services/httpClient.ts` (`ApiClient`, default instance `apiClient`) is the bundled UI's
+client for every route above. It has a base URL (default `/api`) and a separate `mediaRoot`
+(default `''`, same origin) for `mediaUrl()`. It offers JSON `get/post/patch/put/delete` plus a
+generic `request()`, a multipart `upload()`, and two SSE helpers. `api.ts`'s own
+`get/post/patch/del` delegate to it, and so do the per-studio clients (`lireekApi.ts`,
+`trainingApi.ts`, `stemStudioApi.ts` and the rest). For the query layer on top, see
+[UI server state](ui-server-state.md) and [TanStack Query](tanstack-query.md).
 
-Two ways to read an SSE route, picked by whether the route checks the bearer token:
+JSON calls run on one shared axios instance (`ui/src/services/axiosClient.ts`, with an adapter
+on `globalThis.fetch`):
+- Its request interceptor adds `Authorization: Bearer <token>` from a module-level accessor
+  (`setAuthToken`) that `AuthProvider` sets, so callers never pass the token.
+- The default timeout is 60 s (`DEFAULT_TIMEOUT_MS`). Routes that block for minutes, such as
+  adapter scans, folder browsing, Whisper retranscribe and mastering runs, pass
+  `SLOW_ROUTE_TIMEOUT_MS` (300 s).
+- Per-call options are `signal`, `timeout`, `baseURL`, `responseType: 'blob'` for binary
+  routes, and `silent`, which sends `X-Skip-Global-Error: 1`.
+
+Its response interceptor is the one place a failure is handled (`handleFailure`). Every
+non-OK response or network failure becomes `ApiError(status, message, body, currentRevision?,
+reason?)` (`ui/src/services/apiError.ts`):
+- `message` is the server's `error` string. Without one it is `Server unreachable` for a
+  network failure (status 0), a short text for 401, 403 and 404, and `Server error (HTTP
+  <status>)` otherwise.
+- Aborts are rethrown as cancellations, never logged or toasted.
+- A failed GET never toasts; reads show their own error state and retry. Any other failed
+  call is logged and toasted unless it was `silent` or went to `/api/health`.
+- A 401, whatever the method, shows a warning and runs the re-auth callback
+  (`setOnUnauthorized`), at most once per 30 s.
+
+`ApiError` also carries the stale-revision (`currentRevision`) and unsupported-version
+(`reason`) detail of a `409`, and it absorbed `workflowApi.ts`'s old `WorkflowRequestError`.
+Song Builder section commands (`builderOp`) throw it too, and a post-processing refusal for an
+already processed song attaches `alreadyProcessed` and `masteredAudioUrl` to it
+(`runSongPostProcessing` in `api.ts`). `generateApi.selectedPath` keeps its
+404-means-older-server fallback.
+
+`upload()` stays on XHR, because only XHR reports upload progress, and its failures go through
+the same `handleFailure`. SSE stays on `fetch`, since axios does not stream response bodies.
+There are two ways to read an SSE route, picked by whether the route checks the bearer token:
 - `eventSourceUrl(path)` + `sharedEventSource.ts` for routes that don't (model-manager download
-  progress, logs) — `EventSource` cannot set a header, so this is honest about carrying no auth
-  rather than smuggling a token into the query string, which `getUserId` (`routes/auth.ts`)
-  would not read anyway.
-- `streamEvents(path, onData, opts)` for routes that do — a `fetch` with `Authorization`,
-  reading the response body and splitting `data:` frames the same way `workflowApi.ts`'s
-  `followJob` already does for `/api/workflows`. `onData` gets each frame's raw payload; this
-  method does no protocol-specific parsing of its own. Cancellable via `opts.signal`, unlike
-  `sharedEventSource`'s auto-reconnecting streams.
+  progress, logs). `EventSource` cannot set a header, and `getUserId` (`routes/auth.ts`) reads
+  only `Authorization`, so a token in the query string would not help.
+- `streamEvents(path, onData, opts)` for routes that do: a `fetch` with `Authorization` that
+  splits `data:` frames the same way `workflowApi.ts`'s `followJob` does for `/api/workflows`.
+  `onData` gets each frame's raw payload. A non-OK response throws the same `ApiError`
+  (`sseFailure`). It is cancellable via `opts.signal`, unlike `sharedEventSource`'s
+  auto-reconnecting streams.
 
-Every non-OK response throws `ApiError(status, message, body, currentRevision?, reason?)` — a
-superset of `workflowApi.ts`'s `WorkflowRequestError`, so a revisioned caller (document/job
-writes, song-builder sections) can switch to this client later without losing the stale-revision
-or unsupported-version detail. `message` is the server's `error` field, or `API error: <status>`
-when the body is not JSON. A caller that already does `catch (e) { ... e.message }` needs no
-change, since `ApiError extends Error`.
-
-Compatibility: this client changes no request body, header or route — it is a drop-in
-replacement for the fetch calls it wraps. `api.ts`'s own `get/post/patch/del` now delegate to it;
-`generateApi.selectedPath` keeps its 404-means-legacy-server fallback. Call sites with their own
-error shape (`builderOp`'s `WorkflowRequestError`, the post-processing endpoints' `alreadyProcessed`
-flag, `vstApi.updateChain`'s no-throw `.then(r => r.json())`) are left untouched rather than
-folded in and risking a silent behavior change; they are candidates for a later slice once each
-one's special case has an equivalent on `ApiError` or its own typed subclass.
+The other `fetch` calls left in `ui/src/services` are SSE readers too: `followJob`,
+`assistantApi.ts`'s chat stream and `lireekApi.ts`'s `consumeSSE`.
 
 ### Shared contracts for legacy routes
 
@@ -548,8 +653,8 @@ from. Two routes that predate that pattern had drifted into two independently ha
 copies of the same shape — exactly the bug class shared contracts exist to prevent:
 
 - **Auth** (`server/src/routes/auth.ts`, `server/src/contracts/auth.ts`). `GET /api/auth/auto`
-  returns `AutoLoginResponse` (`{ user, token }`); `GET /me` returns `MeResponse` (`{ user }`,
-  `401`/`404` on a missing/unknown token); `POST /setup` and `PATCH /username` both return
+  returns `AutoLoginResponse` (`{ user, token }`); `GET /me` returns `MeResponse` (`{ user }`;
+  `401` for a missing or unknown token, `404` when the token's user row is gone); `POST /setup` and `PATCH /username` both return
   `UsernameUpdateResponse` (`{ user, token }` — username changes mint a fresh token). `AuthUser`
   is the `users` table row (`id`, `username`, `bio`, `avatar_url`, `banner_url`, `created_at`).
   `ui/src/types.ts`'s `User`/`AuthState` now re-export `AuthUser` instead of keeping their own
@@ -559,7 +664,8 @@ copies of the same shape — exactly the bug class shared contracts exist to pre
   (`{ packs, files, modelsDir, variant, cudaMajor }`); `files` are `RegistryFile` — a catalogue
   `RegistryFileEntry` (`id`, `role`, `displayName`, `scale`, `variant`, `quant`, `sizeBytes`,
   `sha256?`, `companions?`, `sm?`, `family?`, ...) plus this install's `installed`/`outdated`.
-  `POST /download` and `POST /download/:id/resume` both return `DownloadStartResponse`
+  `POST /download` (`{ fileId, hfToken? }`, the token only for gated Hugging Face repos) and
+  `POST /download/:id/resume` both return `DownloadStartResponse`
   (`{ jobId }`); `GET /downloads` streams `{ jobs: DownloadJob[] }` frames (unauthenticated, via
   `eventSourceUrl`/`sharedEventSource`); `POST /download/:id/cancel` and
   `DELETE /files/:filename` are untyped `{ ok: boolean }` acks, unchanged. `ui/src/types.ts`
@@ -571,35 +677,50 @@ copies of the same shape — exactly the bug class shared contracts exist to pre
 The remaining legacy domains predated the contracts pattern entirely — one ad-hoc inline type in
 `api.ts`, no server-side counterpart. Each now has a `server/src/contracts/<domain>.ts`; the
 route returns against it (`satisfies`, type-only, no logic or validation change) and `api.ts`
-imports the same type instead of its own copy. Errors across all of them are the ordinary
-`{ error: string }` shape `ApiError` already unwraps — only the success payloads are listed here.
+imports the same type instead of its own copy. Errors across all of them carry the ordinary
+`error` string that `ApiError` already unwraps, now and then with extra fields (`hint` on a
+missing `vst-host.exe`, `blockers` on a refused restart, `current` and `entries` on an adapter
+browse error).
 
 - **Health** (`contracts/health.ts`). `GET /health` returns `HealthResponse`: `status`,
-  `version`, `commit`, `dirty`, `engineBuiltAt` (ace-server.exe's mtime, or `null`), nested
-  `aceServer`/`server`/`engine` status, and `clients` (open SSE-holding tabs). `api.ts`'s
+  `version`, `commit`, `dirty`, `build` (`tag`, `sha`, `variant`, `channel` from the package's
+  `build-info.json`; without one, `sha` falls back to the checkout's HEAD and the rest is
+  `null`), `engineBuiltAt` (ace-server.exe's mtime, or `null`), nested
+  `aceServer`/`server`/`engine` status, and `clients` (open SSE-holding tabs). `engine` holds
+  `ready`, `bootStatus`, `noModels` (true while the engine is down only because no model is
+  installed), and `backend` and `device`, the compute backend and ggml device the engine
+  reported loading on (both `null` until its first model load). `api.ts`'s
   previous inline type was missing `version`, `commit`, `dirty`, `engineBuiltAt` and `clients`,
   and marked `engine` optional when the route always sends it. `GET /presence` is a raw SSE
   keepalive with no JSON frames and has no response type.
 - **Shutdown** (`contracts/shutdown.ts`, mounted at `/api/shutdown`). No request body. `POST
   /api/shutdown` always returns `200 { success: true, message }` (`ShutdownResponse`) before
   tearing the process down 300ms later. `POST /api/shutdown/restart` returns `200
-  { success: true, message }` (`RestartResponse`) after writing the `.restart-requested`
-  marker for the loop wrapper to pick up; a write failure is `500 { error }`.
+  { success: true, message }` (`RestartResponse`) after writing the restart marker for the
+  loop wrapper to pick up; a write failure is `500 { error }`. While a data-folder move is
+  scheduled and work is still running, it refuses with `409 { error, blockers }`.
 - **Settings** (`contracts/settings.ts`). `GET /settings/env` takes no input and returns
   `EnvResponse` (`{ values, restartKeys }`, unset keys backfilled with their resolved default).
   `POST /settings/env` takes `{ values: Record<string, string> }`; keys outside
   `EXPOSED_ENV_KEYS` or non-string values are silently dropped rather than rejected; a
   missing/non-object `values` is `400 { error }`, but an empty `values: {}` (or one with no
-  exposed keys) is a no-op `200 { updated: [], restartRequired: false }`, not an error. On a
+  exposed keys) is a no-op `200 { updated: [], restartRequired: false }`, not an error. A
+  non-empty `DOWNLOAD_DIR` that is not absolute, or that cannot be created and written to, is
+  `400 { error }`. On a
   non-empty update it returns
-  `EnvUpdateResponse` (`{ updated, restartRequired }`, `restartRequired` true if any updated key
-  is in `RESTART_REQUIRED_KEYS`), or `500 { error }` if writing `.env` fails. `GET
+  `EnvUpdateResponse` (`{ updated, restartRequired }`, `restartRequired` true when a key whose
+  resolved value changed is in `RESTART_REQUIRED_KEYS`), or `500 { error }` if writing `.env`
+  fails. `GET /settings/env` is `500 { error }` if `.env` cannot be read. `GET
   /settings/gpus` takes no input and returns `GpusResponse` (`{ gpus: GpuInfo[] }`, empty array
   when `nvidia-smi` is unavailable), where `GpuInfo` re-exports `services/gpuDevices.ts`'s
   existing `NvidiaGpu` rather than a third copy of the same shape.
 - **Profiles** (`contracts/profiles.ts`). A profile is `ProfileFile` (`{ name, saved_at, data }`
   — the same shape as an exported preset JSON, so one can be dropped into the profiles folder by
-  hand). `GET /profiles` takes no input, returns `ListProfilesResponse`. `GET /profiles/:name`
+  hand). Profiles are per engine: every route takes `?backend=<id>`, and `POST` a `backend`
+  body field. Omitted, or not a valid id, means `ace`. ACE profiles live in the profiles folder
+  itself and each other engine's in a subfolder named after its id; every `ProfileFile` the
+  routes return carries `backend`. `GET /profiles` returns `ListProfilesResponse`
+  (`{ profiles, count }`, `500 { error }` on a read failure). `GET /profiles/:name`
   returns a bare `ProfileFile`, `404 { error }` if missing. `POST /profiles` takes
   `{ name: string, data: object }`; a missing/blank `name` or a `data` that isn't a plain
   object is `400 { error }`; on success it overwrites any existing profile of that name and
@@ -650,7 +771,10 @@ imports the same type instead of its own copy. Errors across all of them are the
   }`; a non-array `plugins` is `400 { error }`, else it saves and echoes back `ChainConfig`
   (`UpdateChainResponse`). `POST /vst/gui` takes `{ pluginPath: string, uid?: string }`; a
   missing `pluginPath` is `400 { error }`, a missing `vst-host.exe` is `503 { error }`, else
-  `GuiResponse` (`{ ok, pid }`). `POST /vst/process` takes `{ inputPath: string, outputPath:
+  `GuiResponse` (`{ ok, pid }`). One editor runs per chain entry: while the editor for that
+  `uid` is still open, a second call starts no process and answers `{ ok, pid, alreadyOpen: true }`.
+  `GET /vst/gui/open` takes no input and returns `{ uids }`, the entries whose editor is still
+  running. `POST /vst/process` takes `{ inputPath: string, outputPath:
   string }`; missing either is `400 { error }`, a missing `vst-host.exe` is `503 { error }`, a
   missing `inputPath` file is `404 { error }`, a processing failure is `500 { error }`, else
   `ProcessResponse` (`{ ok, skipped: true }` when no plugin is enabled — input copied through
@@ -694,8 +818,9 @@ imports the same type instead of its own copy. Errors across all of them are the
   is `400 { error }`, else `DownloadStartResponse` (`{ jobId }`) — same contract as the initial
   `POST /download`.
 
-Compatibility for all of the above: every change here is a type annotation (`satisfies` on an
+Compatibility: sharing these types was a type annotation (`satisfies` on an
 existing `res.json(...)` call, or a `: Type` on an existing variable) and an import swap on the
-client side. No route logic, validation, status code or response field changed; the point was
+client side. That change altered no route logic, validation, status code or response field; the point was
 closing the gap between what each route actually sends and what the client's type claimed it
-sends, not altering either.
+sends, not altering either. The bullets above describe the routes as they are now, including
+later changes such as per-engine profiles.

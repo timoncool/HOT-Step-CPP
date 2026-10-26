@@ -10,7 +10,7 @@ result:
 3. Step count and solver.
 4. Post-processing.
 
-The defaults in each Create panel are a reasonable starting point, not a
+The defaults in the generation bar are a reasonable starting point, not a
 floor. Everything below is optional and mostly off by default, because most
 of it costs render time.
 
@@ -27,9 +27,12 @@ precision needs more VRAM and runs slower per step.
 | Planner LM | 1.7B Q8_0 | 4B Q8_0 | 4B BF16 |
 | VAE decoder | Standard VAE BF16 | ScragVAE BF16 | Standard or ScragVAE at F32 |
 
-The XL Turbo DiT needs about 12 GB of VRAM. ScragVAE is a fine-tuned decoder
+The XL Turbo DiT needs about 12 GB of VRAM. On an RTX 50-series card, the
+Blackwell Optimized pack's MXFP4 XL Turbo DiT uses the card's FP4 tensor cores
+and runs about 22% faster than Q4. ScragVAE is a fine-tuned decoder
 with more high-frequency energy and dynamic range than the standard decoder;
-select it from the Models dropdown, no retraining involved. The base (non-turbo)
+select it from the Models dropdown, no retraining involved. The F32 decoders
+are SafeTensors files. The base (non-turbo)
 DiT variants exist too, but they need 60 to 100 steps to reach a comparable
 result, so they are a poor trade for anyone chasing quality per minute.
 
@@ -42,10 +45,13 @@ result, so they are a poor trade for anyone chasing quality per minute.
 | Balanced | LM Q8_0, DiT Q4_K_M | ~12 GB | Quality lives in the LM, VRAM lives in the DiT |
 | Q8_0 | Q8_0 throughout | ~13 GB | Recommended: near-lossless, about half the F16 size |
 | F16 | Full precision | ~24 GB | Reference quality bar |
+| NVFP4 | LM and DiT NVFP4, depth Q8_0 | ~8 GB | Fastest on RTX 50-series cards; quality not yet judged by ear |
 
-The Q8_0 and below quants use an importance matrix measured from the
+The LM quants below Q8_0 use an importance matrix measured from the
 full-precision model, so error is spent on the weights that carry signal
-rather than spread evenly.
+rather than spread evenly. The Model Manager notes that these K-quant LMs run
+the autoregressive stage five to six times slower than Q8_0 or NVFP4 on CUDA, so
+the Q6_K and Q4_K_M packs save VRAM, not time.
 
 ### YuE2
 
@@ -62,15 +68,29 @@ have measured that the ConvRot checkpoint is faster on your card. ConvRot
 generation does not yet apply the joint companion decoder that GGUF
 generation does, so treat it as a training-time checkpoint first.
 
+### Stable Audio 3
+
+Generation uses the BF16 DiT (about 2.9 GB) by default, and it is the only one
+whose sound has been checked. The quantized DiTs in the Model Manager, from Q8_0
+down to IQ1_S plus MXFP4 and NVFP4, are experimental and not yet judged by ear;
+only the Q8_0 and Q6_K files match BF16 on a single-forward parity check. Pick
+one from Models with Stable Audio 3 active.
+
 ## The prompt and lyrics
 
 A vague caption produces vague music no matter what the sampler does. Three
 things move the result more than any dial:
 
-- Section tags. Only `[Intro]`, `[Verse]`, `[Verse 1]`, `[Verse 2]`,
-  `[Pre-Chorus]`, `[Chorus]`, `[Post-Chorus]`, `[Bridge]`, `[Interlude]`,
-  `[Outro]`, `[Hook]` and `[Refrain]` are recognised. Each must be alone on
-  its own line.
+- Section tags. Put each tag alone on its own line. The labels the ACE-Step
+  base model documents are `[Intro]`, `[Verse]` or `[Verse 1]`, `[Pre-Chorus]`,
+  `[Chorus]`, `[Bridge]`, `[Outro]`, `[Build]`, `[Drop]`, `[Breakdown]`,
+  `[Instrumental]`, `[Guitar Solo]`, `[Piano Interlude]`, `[Fade Out]` and
+  `[Silence]`; `[Post-Chorus]` and `[Interlude]` also work. `[Hook]` and
+  `[Refrain]` are not among them. One short descriptor can follow a dash, as in
+  `[Chorus - High Energy]`; use a dash, not a colon. An `[Intro]` or `[Outro]`
+  with no lyric lines under it should say what plays there, such as
+  `[Intro - Instrumental]`, or the model may fill it with an instrumental of any
+  length.
 - Concrete genre and instrumentation. "Nylon guitar, brushed percussion,
   velvet crooning vocals, golden-age Latin romance" gives the model more to
   work with than "romantic ballad". Name the instruments, the playing style
@@ -83,14 +103,14 @@ things move the result more than any dial:
 ## Steps and solver
 
 More steps help up to a point, then the extra render time buys nothing. Past
-roughly 40 steps on ACE-Step, further steps mostly add noise rather than
-detail.
+roughly 40 steps on ACE-Step, further steps stop improving the result.
 
 ### ACE-Step 1.5
 
 Default is 12 steps. The in-app assistant has a one-click "Maximum quality"
 preset: the JKASS Quality solver, 35 steps, the `sgm_uniform` scheduler, APG
-guidance at scale 6.0, and a VAE re-encode pass at 0.15 blend. JKASS Quality
+guidance at scale 6.0, the Denoiser at 0.1, and a PP-VAE re-encode pass at 0.15
+blend. JKASS Quality
 is a 2-NFE solver, so each step costs two network evaluations; 35 steps there
 is roughly what 70 would cost on a 1-NFE solver like Euler or DPM++2M.
 
@@ -111,10 +131,18 @@ refinement in the same way extra ACE-Step steps do.
 ### YuE2
 
 The ODE Steps slider (`yue2OdeSteps`) defaults to 32 and ranges from 8 to 64.
-Each step is a midpoint solver step, meaning two network evaluations. Lower
+With the default Midpoint NAR Solver each step is two network evaluations. The
+experimental NAR Solver choices take one, except Timestep Lie with its Per
+section curve, which can take more. Lower
 is faster and less refined; there is no published ceiling analogous to
 ACE-Step's diminishing-returns point, so this one is worth an A/B rather than
 assuming higher is always better.
+
+### Stable Audio 3
+
+Steps defaults to 8 and ranges from 1 to 64. With the default MD Pingpong Blend
+sampler, 8 steps beat 12 and 24 in an ear test, and more steps tend to sound
+worse, so raising Steps is not a quality lever here.
 
 ## Post-processing
 
@@ -129,8 +157,9 @@ stage below defaults to off. None of it happens unless you turn it on.
 - Mastering (`masteringEnabled`) runs matchering-based mastering against a
   reference track.
 - PP-VAE re-encodes the finished mix through the post-processing VAE to
-  smooth spectral artifacts. If you turn it on, F32 gives the best result of
-  the available precisions.
+  smooth spectral artifacts. F32 gives the best result of the available
+  precisions, and the engine uses it whenever it is installed, ahead of BF16
+  and F16. The Quick Start, XL Quality and Blackwell Optimized packs include it.
 - ScragVAE, described above, is a decoder swap rather than a post-process
   stage, and applies during the main render.
 
@@ -148,8 +177,8 @@ from zero-crossing rate (20 percent). You can evaluate the raw render, the
 mastered render, or both, and the score is stored per track and shown as a
 colour-coded badge in the Library.
 
-To isolate one variable, set `randomSeed` to false and pin a specific seed,
-then change only the setting you are testing between two generations. The
+To isolate one variable, turn Random off beside Generation Seed (`randomSeed`)
+and pin a specific seed, then change only the setting you are testing between two generations. The
 Library's A/B compare view lists every parameter that differs between two
 pinned tracks side by side, so you can confirm the seed and everything else
 actually matched before comparing the quality scores or listening yourself.
@@ -168,3 +197,5 @@ What to change first, per backend, when you want slower but better:
   the caption.
 - YuE2: the Q8_0 or full-precision LM pack, ODE Steps raised from 32 toward
   64, generate from the GGUF rather than the ConvRot checkpoint.
+- Stable Audio 3: the BF16 DiT, with Steps left at 8 on MD Pingpong Blend.
+  StableStep is not offered for Stable Audio 3 output.

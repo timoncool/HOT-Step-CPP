@@ -176,6 +176,14 @@ Prints per-step sigma values, step sizes (gaps), and the min/max gap ratio to th
 - Ratio 5:1 = moderate (noticeable clustering)
 - Ratio 10:1+ = aggressive (sparse gaps likely, may cause artifacts)
 
+#### Auto-Shift Ref (v5.1 only)
+**MD HT Scheduler (HAP+TPT) v5.1**, the built-in copy, has every control above plus this one. It works out Shift Warp for you from the step count: `shift = (ref - 1) / (steps - 1)`, clamped to 0.5-8.0. Set it to the step count the model was tuned at (30 for MiniMax-Music3) and a short run keeps the reference run's time at high sigma, which brings back bass and stereo correlation at low step counts.
+
+- 0 = off (default), the manual Shift Warp is used
+- 1-60 = auto, the manual Shift Warp is ignored
+
+Muddy or smeared means the shift came out too high, so lower Auto-Shift Ref; thin or wide means it is too low.
+
 ---
 
 ## Pairing Guide
@@ -187,7 +195,7 @@ Trajectory Anchor's stabilization stack needs reasonably uniform step sizes to w
 |---|---|---|
 | Density Floor | 0.1-0.2 | Prevents sparse gaps |
 | Uniformity Blend | 0.1-0.3 | Tames clustering |
-| Smooth Window | 3 | Gradual transitions |
+| Schedule Smoothing | 3 | Gradual transitions |
 | Poly Slope | 0.8 (at 12 steps) | More structure steps for turbo |
 | Phase Intensity | 0.5-1.0 | Don't over-cluster |
 
@@ -225,7 +233,7 @@ Omni Relational is step-based like Trajectory Anchor but lighter (no memory buff
 Increase Density Floor (0.2-0.3). Add Uniformity Blend (0.2). The schedule has sparse gaps causing oversized solver steps.
 
 **Output sounds over-smoothed or lacks punch**
-Reduce Uniformity Blend and Smooth Window. Increase Phase Intensity. You're flattening the schedule too much — let it cluster.
+Reduce Uniformity Blend and Schedule Smoothing. Increase Phase Intensity. You're flattening the schedule too much — let it cluster.
 
 **Trajectory Anchor fighting the schedule**
 See the Trajectory Anchor pairing guide above. Floor + blend + smoothing, all gentle.

@@ -116,6 +116,12 @@ export interface AceRequest {
   lm_dry_base?: number;
   /** 'dry' only: matched codes required before any penalty applies */
   lm_dry_min_len?: number;
+  /** Code phase: drop codes under this fraction of the top code's probability (0 = off). */
+  lm_min_p?: number;
+  /** Opt-in CFG refinements for the code phase (engine lm-cfg-extras.h). */
+  lm_cfg_min_p?: number;
+  lm_cfg_logprob?: boolean;
+  lm_cfg_rescale?: number;
   lm_top_k?: number;
   lm_negative_prompt?: string;
   negative_prompt?: string;
@@ -859,6 +865,9 @@ export const aceClient = {
    *  outSr) of exactly `durationSec` seconds. */
   async submitSa3Synth(
     opts: {
+      synthModel?: string;
+      /** Actual filename returned by engines that support DiT selection. */
+      onModelResolved?: (filename: string) => void;
       tokens: number[];       // exactly 256 padded T5Gemma token ids
       nTokens: number;        // real (non-pad) token count
       durationSec: number;    // requested length, 1..600 s
@@ -894,6 +903,7 @@ export const aceClient = {
     params.set('tokens', opts.tokens.join(','));
     params.set('n_tokens', String(opts.nTokens));
     params.set('duration', String(opts.durationSec));
+    if (opts.synthModel) params.set('synth_model', opts.synthModel);
     if (opts.dumpLatent) params.set('dump_latent', opts.dumpLatent);
     if (opts.backend && opts.backend !== 'auto') params.set('backend', opts.backend);
     if (opts.adapters && opts.adapters.length > 0) {
@@ -927,6 +937,8 @@ export const aceClient = {
       const errBody = await res.text().catch(() => 'Unknown error');
       throw new Error(`ace-server POST /sa3-synth failed (${res.status}): ${errBody}`);
     }
+    const actualModel = res.headers.get('X-SA3-DiT');
+    if (actualModel) opts.onModelResolved?.(actualModel);
     const arrayBuf = await res.arrayBuffer();
     return Buffer.from(arrayBuf);
   },

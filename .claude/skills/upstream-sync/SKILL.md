@@ -15,19 +15,20 @@ can place individual children elsewhere.
 - Checking whether a sync is pending, or repairing a botched one.
 - Diagnosing: linker error `unresolved external symbol hotstep_sampler_linked_`, or a build that compiles clean but all solvers/schedulers/guidance modes stopped working.
 
-**Background you need (no prior context assumed):** The C++ engine in `engine/` is a fork of acestep.cpp, a GGML port of the ACE-Step music model. The generation pipeline is LM → DiT → VAE, where **DiT** = Diffusion Transformer, the denoising model. HOT-Step replaces upstream's DiT sampling loop (`dit-sampler.h`) with its own (`hot-step-sampler.h`) that adds 17 solvers, 9 schedulers, guidance modes, and Lua plugins. The fork is **not** a git merge — it is file-copy based, using three zones:
+**Background you need (no prior context assumed):** The C++ engine in `engine/` is a fork of acestep.cpp, a GGML port of the ACE-Step music model. The generation pipeline is LM → DiT → VAE, where **DiT** = Diffusion Transformer, the denoising model. HOT-Step replaces upstream's DiT sampling loop (`dit-sampler.h`) with its own (`hot-step-sampler.h`) that adds its own solvers, schedulers and guidance modes (native ones in `engine/src/solvers/`, `schedulers/`, `guidance/`, plus hot-loaded Lua plugins). The fork is **not** a git merge — it is file-copy based, using three zones:
 
 | Zone | What | Sync strategy |
 |---|---|---|
-| **Upstream Zone** | Most of `engine/src/*.h` / `*.cpp` — kept byte-identical to upstream | Direct `Copy-Item` from a vanilla clone |
-| **HOT-Step Zone** | `engine/src/hot-step-*`, `engine/src/solvers/`, `engine/src/schedulers/`, `engine/src/guidance/`, `engine/src/mastering.h`, `engine/src/adapter-runtime.h`, `engine/src/adapter-merge.h`, `engine/src/model-registry.h`, `engine/tools/hot-step-server.cpp` — never exists upstream | Never conflicts; never copy |
-| **Modified Upstream Zone** | Exactly 3 files: `pipeline-synth-ops.cpp`, `model-store.h`, `dit.h` — upstream files carrying HOT-Step `#include` hooks | **Manual merge only, NEVER direct-copy** |
+| **Upstream Zone** | The `engine/src/*.h` / `*.cpp` files still byte-identical to upstream (a shrinking set, see the drift note) | Direct `Copy-Item` from a vanilla clone |
+| **HOT-Step Zone** | Files with no upstream counterpart: `engine/src/hot-step-*`, `engine/src/schedulers/`, `engine/src/guidance/`, `engine/src/minimax/`, `engine/src/yue2/`, `engine/src/train/`, `engine/src/mastering.h`, `engine/src/adapter-runtime.h`, `engine/src/adapter-trt.h`, `engine/src/adapter-cancel.h`, `engine/tools/hot-step-server.cpp`, and every other file upstream does not have. `engine/src/solvers/` was HOT-Step-only until upstream added its own (drift note) | Never conflicts; never copy |
+| **Modified Upstream Zone** | Upstream files the fork changed. Four carry HOT-Step `#include` hooks: `pipeline-synth-ops.cpp`, `model-store.h`, `dit.h`, and `fsq-detok.h` (which `fsq-tok.h` depends on, Hook 5). `adapter-merge.h` and `model-registry.h` exist upstream too but are fork rewrites | **Manual merge only, NEVER direct-copy** |
 
-> **⚠ Zone model drift (verified 2026-07-14):** two of this table's assumptions no longer hold.
+> **Zone model drift (verified 2026-07-14, updated 2026-10-23):** three assumptions of the original zone table no longer hold; the table above already reflects them.
 > 1. **`src/solvers/` now EXISTS upstream** (added 2026-05-06, commit `8974778` — modular Euler/SDE/DPM++3M/STORK4 dispatch). Its 7 filenames collide with the fork's own `engine/src/solvers/` (created independently 2026-04-18, commit `889c250`, different interface). The Phase 2 copy loop MUST also exclude everything under `src/solvers/` — a direct copy clobbers HOT-Step's native solvers with incompatible upstream versions.
-> 2. **The Upstream Zone has eroded.** As of 2026-07-14, 11 of the 13 upstream-touched files since `31cc9ea` are fork-modified (e.g. `qwen3-lm.h` carries safetensors loading via fork-only `weight-source.h`/`config-json.h`; `backend.h`, `dit-graph.h`, `vae.h`, `request.*`, `wav.h`, `qwen3-enc.h`, `pipeline-synth.*` also differ). Do NOT assume direct-copy safety from this table — before copying any file, verify pristineness: diff the fork's copy against `git show <lastSynced>:src/<file>` from the upstream clone (with `--strip-trailing-cr`). Pristine → copy; modified → manual merge.
+> 2. **The Upstream Zone has eroded.** As of 2026-07-14, 11 of the 13 upstream-touched files since `31cc9ea` were fork-modified (e.g. `qwen3-lm.h` carries safetensors loading via fork-only `weight-source.h`/`config-json.h`; `backend.h`, `dit-graph.h`, `vae.h`, `request.*`, `wav.h`, `qwen3-enc.h`, `pipeline-synth.*` also differ). Checked again 2026-10-23: 28 of the 43 files in upstream `src/` at `9d38f00` (outside `solvers/`) differ from the fork's copies. Only 15 are still byte-identical: `audio-io.h`, `audio-resample.h`, `debug.h`, `dit-sampler.h`, `dwt-haar.h`, `gguf-weights.h`, `graph-arena.h`, `metadata-fsm.h`, `philox.h`, `pipeline-understand.cpp`, `pipeline-understand.h`, `static-graph.h`, `task-types.h`, `timer.h`, `weight-ctx.h`. Do NOT assume direct-copy safety from this table — before copying any file, verify pristineness: diff the fork's copy against `git show <lastSynced>:src/<file>` from the upstream clone (with `--strip-trailing-cr`). Pristine → copy; modified → manual merge.
+> 3. **`adapter-merge.h` and `model-registry.h` exist upstream** (added there 2026-04-17 and 2026-03-29) even though older versions of this table filed them under the HOT-Step Zone. The fork's copies are rewrites (`adapter-merge.h` is 2011 lines against upstream's 1013), so a direct copy would wipe HOT-Step's adapter and registry features. Merge them by hand like the hook files.
 
-`engine/tools/ace-server.cpp` is upstream's server kept as a direct-copy **reference only — not compiled**. The shipped `ace-server` binary is built from `engine/tools/hot-step-server.cpp` (see `engine/CMakeLists.txt:416-418`).
+`engine/tools/ace-server.cpp` is upstream's server kept as a **reference only — not compiled**. It carries two small fork edits on top of upstream's copy (the cover/repaint exemption from the caption check, and a per-batch `seed_b` offset), so it is not a pristine copy either. The shipped `ace-server` binary is built from `engine/tools/hot-step-server.cpp` (see `engine/CMakeLists.txt:483-484`). The other upstream sources in `tools/` (`ace-lm.cpp`, `ace-synth.cpp`, `ace-understand.cpp`, `mp3-codec.cpp`, `neural-codec.cpp`, `quantize.cpp`, `synth-batch-runner.h`) ARE compiled, and every one of them differs from upstream at `9d38f00` (e.g. `ace-synth --check`), so they are manual-merge files too.
 
 The full workflow doc lives at `docs/plans/upstream-sync-workflow.md`, which is **gitignored (local-only)** — other machines will not have it. This skill is the portable distillation, with two known errors in that doc corrected (see [reference.md](reference.md)).
 
@@ -38,11 +39,13 @@ acestep.cpp pins its own ggml (ServeurpersoCom/ggml). HOT-Step does not follow t
 HOT-Step's ggml changes as commits ([docs/dev/ggml-fork.md](../../../docs/dev/ggml-fork.md)).
 Copying acestep.cpp files never touches `engine/ggml`. If a synced file needs a newer ggml
 op or fix, land it on HOT-ggml first (cherry-pick from ServeurpersoCom/ggml or ggml-org),
-then move the gitlink, then rerun `engine/verify-hooks.ps1` (hooks 7-17 cover the fork).
+then move the gitlink, then rerun `engine/verify-hooks.ps1` (hooks 7 to 18 cover the fork).
+Upstream's own `ggml: fork update` commits (most of its history since `9d38f00`) only move
+that pin, so they bring nothing to copy.
 
 ## Golden rules (hard constraints)
 
-1. **NEVER direct-copy the 3 Modified Upstream Zone files** (`pipeline-synth-ops.cpp`, `model-store.h`, `dit.h`). WHY: copying `pipeline-synth-ops.cpp` wholesale is the *silent* failure — it compiles clean but kills every HOT-Step sampler feature (see hook table below). This actually happened once; the whole defense system exists because of it.
+1. **NEVER direct-copy a Modified Upstream Zone file**, above all the 4 hook files (`pipeline-synth-ops.cpp`, `model-store.h`, `dit.h`, `fsq-detok.h`) and `fsq-tok.h`. WHY: copying `pipeline-synth-ops.cpp` wholesale is the *silent* failure — it compiles clean but kills every HOT-Step sampler feature (see hook table below). This actually happened once; the whole defense system exists because of it.
 2. **ALWAYS run `engine/verify-hooks.ps1` after copying files and BEFORE building.** WHY: it catches hook loss in seconds; a build wastes minutes and a silent regression wastes hours.
 3. **Commit the fork locally before starting.** WHY: file-copy sync has no git-merge undo; the commit is your only rollback point.
 4. **NEVER push the `v1.5-upstream-sync-*` tag** (or anything without explicit user approval). WHY: any pushed `v*` tag triggers the full multi-platform CI release build. The tag is fine locally.
@@ -51,17 +54,18 @@ then move the gitlink, then rerun `engine/verify-hooks.ps1` (hooks 7-17 cover th
 7. **Never add HOT-Step code to Upstream Zone files** (new behavior goes in a `hot-step-*` file), and **never add `hot-step-*` files to the upstream clone.** WHY: keeps future syncs a trivial copy.
 8. Git hygiene: all work on `master`, stage explicit paths only, never `git add -A`.
 
-## The three hook files (verified line numbers)
+## The four hook files (verified line numbers)
 
 | File | Hook | If clobbered by direct copy |
 |---|---|---|
-| `engine/src/pipeline-synth-ops.cpp` | `#include "hot-step-sampler.h"` at line 9 (replaces upstream's `dit-sampler.h`). Lines 10–12 are also fork-only: `hot-step-sampler-trt.h`, `adapter-trt.h`, `stream-pipeline.h` | **SILENT at compile time** — all solvers/schedulers/guidance/custom timesteps/DCW/APG go dead. Caught only by the linker sentinel |
-| `engine/src/model-store.h` | `#include "hot-step-params.h"` at line 53 (provides `AdapterGroupScales`) | Compile error (self-catching) |
-| `engine/src/dit.h` | `#include "adapter-merge.h"` (line 11) + `#include "adapter-runtime.h"` (line 13); line 12 `hot-step-build-flags.h` is also fork-only | Compile error (self-catching) |
+| `engine/src/pipeline-synth-ops.cpp` | `#include "hot-step-sampler.h"` at line 9 (replaces upstream's `dit-sampler.h`). Also fork-only: lines 10–11 `hot-step-sampler-trt.h`, `adapter-trt.h`, and line 16 `trt-runtime-probe.h` | **SILENT at compile time** — all solvers/schedulers/guidance/custom timesteps/DCW/APG go dead. Caught only by the linker sentinel |
+| `engine/src/model-store.h` | `#include "hot-step-params.h"` at line 52 (provides `AdapterGroupScales`); line 56 `sa3-refine.h` is also fork-only | Compile error (self-catching) |
+| `engine/src/dit.h` | `#include "adapter-runtime.h"` (line 14), next to `#include "adapter-merge.h"` (line 11), which upstream's `dit.h` has too. Also fork-only: lines 12–13 `convrot.h`, `hot-step-build-flags.h`, and lines 16, 17, 22 `concept-steer.h`, `config-json.h`, `weight-source.h` | Compile error (self-catching) |
+| `engine/src/fsq-detok.h` (with `fsq-tok.h`) | `#include "fsq-quant.h"` at line 20, the one reference-conformant FSQ quantizer (its only includer); `fsq-tok.h` gets it through `fsq-detok.h` and no longer defines `fsq_encode_index` | Copying one of the two is a redefinition or missing-symbol compile error (the loud failure `fsq-quant.h` intends). Copying both can bring back upstream's non-conformant FSQ (about 40% index match, per `verify-hooks.ps1`) without a build error; Hook 5 catches it |
 
-**Why the sampler hook failure is silent:** the hook is a *substitution*, not an addition. Upstream `dit-sampler.h` and fork `hot-step-sampler.h` both provide a function named `dit_ggml_generate`. A whole-file copy of upstream `pipeline-synth-ops.cpp` replaces both the include AND the call site (`pipeline-synth-ops.cpp:1503`) with mutually-consistent upstream versions — everything compiles, HOT-Step's sampler simply stops being called.
+**Why the sampler hook failure is silent:** the hook is a *substitution*, not an addition. Upstream `dit-sampler.h` and fork `hot-step-sampler.h` both provide a function named `dit_ggml_generate`. A whole-file copy of upstream `pipeline-synth-ops.cpp` replaces both the include AND the call site (`pipeline-synth-ops.cpp:1465`) with mutually-consistent upstream versions — everything compiles, HOT-Step's sampler simply stops being called.
 
-**The defense — linker sentinel:** `engine/src/hot-step-sampler.h:1312` defines external-linkage symbol `hotstep_sampler_linked_`; `engine/tools/hot-step-server.cpp:51-52` references it. If the include reverts to `dit-sampler.h`, the symbol vanishes and the link fails with `unresolved external symbol hotstep_sampler_linked_`. That exact error means: re-hook `hot-step-sampler.h` in `pipeline-synth-ops.cpp`. Mechanism detail: [reference.md](reference.md).
+**The defense — linker sentinel:** `engine/src/hot-step-sampler.h:1549` (block at 1540–1552) defines external-linkage symbol `hotstep_sampler_linked_`; `engine/tools/hot-step-server.cpp:52-53` references it. If the include reverts to `dit-sampler.h`, the symbol vanishes and the link fails with `unresolved external symbol hotstep_sampler_linked_`. That exact error means: re-hook `hot-step-sampler.h` in `pipeline-synth-ops.cpp`. Mechanism detail: [reference.md](reference.md).
 
 ## verify-hooks.ps1
 
@@ -69,7 +73,15 @@ then move the gitlink, then rerun `engine/verify-hooks.ps1` (hooks 7-17 cover th
 powershell -File "D:\Ace-Step-Latest\hot-step-cpp\engine\verify-hooks.ps1"
 ```
 
-Exit 0 = intact, exit 1 = broken. It runs **5 checks** (not 3 — the script is authoritative over the docs): the three hook files above, plus `hot-step-server.cpp` → `hot-step-params.h` include, plus the sentinel string in `hot-step-sampler.h` (`engine/verify-hooks.ps1:15-68`).
+Exit 0 = intact, exit 1 = broken. It checks far more than the hook files (the script is authoritative over the docs; details in [reference.md](reference.md)):
+
+- Hooks 1–3: `pipeline-synth-ops.cpp`, `model-store.h`, `dit.h`.
+- Hook 4 and its 4-family and 4-gate rows: `hot-step-server.cpp` includes `hot-step-params.h`, includes and calls the MM3 (`mm3-server.h`, `mm3-job.h`) and YuE2 (`yue2-server.h`) route registrations, and asks `hot_step_any_family_weights_present()` at both boot gates.
+- Hook 5: `fsq-detok.h` includes `fsq-quant.h`, and neither FSQ header carries upstream's own FSQ quantizer back.
+- Hook 6: the sentinel string in `hot-step-sampler.h`.
+- Hooks 7–18: `engine/ggml` is the HOT-ggml fork with each HOT-Step ggml change present (7–16, 18) and is clean at the pinned commit (17).
+
+`engine/build.cmd` runs it before every compile and aborts the build when it fails; `build-mac.sh` runs it through `pwsh`.
 
 ## The sync procedure
 
@@ -85,30 +97,42 @@ Read the last-synced commit from the marker. The marker uses `KEY=VALUE` lines �
 
 ```powershell
 $lastSynced = ((Get-Content "D:\Ace-Step-Latest\hot-step-cpp\engine\UPSTREAM_SYNC" | Where-Object { $_ -match '^UPSTREAM_COMMIT=' }) -replace '^UPSTREAM_COMMIT=','').Trim()
-git -C D:\Ace-Step-Latest\acestepcpp\acestep.cpp log --oneline "$lastSynced..HEAD" -- src/ tools/ace-server.cpp
-git -C D:\Ace-Step-Latest\acestepcpp\acestep.cpp diff --stat "$lastSynced..HEAD" -- src/ tools/ace-server.cpp
+git -C D:\Ace-Step-Latest\acestepcpp\acestep.cpp log --oneline "$lastSynced..HEAD" -- src/ tools/
+git -C D:\Ace-Step-Latest\acestepcpp\acestep.cpp diff --stat "$lastSynced..HEAD" -- src/ tools/
 ```
 
-Zero commits → already up to date, stop.
+Zero commits → already up to date, stop. Commits that only touch `ggml` (upstream's own ggml pin) need no port. Changes under `tools/` other than `ace-server.cpp` land in compiled, fork-modified CLI sources: hand-merge them like Phase 3.
 
 ### Phase 2 — Direct-copy Upstream Zone files (with hard exclusions)
 
+The loop copies only files the fork has not changed since the last sync, and sends every other changed file to a manual merge:
+
 ```powershell
 cd D:\Ace-Step-Latest\acestepcpp\acestep.cpp
-$excludeFiles = @("pipeline-synth-ops.cpp", "model-store.h", "dit.h")   # NEVER direct-copy
+$excludeFiles = @("pipeline-synth-ops.cpp", "model-store.h", "dit.h", "fsq-detok.h", "fsq-tok.h")   # NEVER direct-copy
 $changedFiles = git diff --name-only "$lastSynced..HEAD" -- src/
 foreach ($f in $changedFiles) {
-    $basename = Split-Path $f -Leaf
-    if ($excludeFiles -contains $basename) {
-        Write-Host "SKIP (modified upstream): $f — manual merge in Phase 3" -ForegroundColor Yellow
+    $fork = "D:\Ace-Step-Latest\hot-step-cpp\engine\$f"
+    if (($excludeFiles -contains (Split-Path $f -Leaf)) -or $f -like 'src/solvers/*') {
+        Write-Host "SKIP (hook file or upstream solvers/): $f" -ForegroundColor Yellow
         continue
     }
-    Copy-Item "D:\Ace-Step-Latest\acestepcpp\acestep.cpp\$f" "D:\Ace-Step-Latest\hot-step-cpp\engine\$f" -Force
+    if (Test-Path $fork) {
+        # Direct-copy only a file the fork never changed since the last sync.
+        $base = (git show "${lastSynced}:$f" 2>$null) -join "`n"
+        if (((Get-Content $fork) -join "`n") -cne $base) {
+            Write-Host "MANUAL MERGE (fork-modified): $f" -ForegroundColor Yellow
+            continue
+        }
+    }
+    Copy-Item "D:\Ace-Step-Latest\acestepcpp\acestep.cpp\$f" $fork -Force
     Write-Output "Copied: $f"
 }
 # New upstream files — any new .cpp needs an engine/CMakeLists.txt entry:
 git diff --diff-filter=A --name-only "$lastSynced..HEAD" -- src/
 ```
+
+A dry run of this loop (with `Copy-Item` swapped for a print) against the commits fetched on 2026-10-23 copied only `metadata-fsm.h` and flagged the other 8 changed `src/` files for a manual merge. Line-ending or encoding noise can only make a pristine file look modified, which errs toward a manual merge.
 
 Do NOT copy upstream `src/dit-sampler.h` expecting it to matter — the fork's `engine/src/dit-sampler.h` is **dead code** (nothing compiled includes it; the active sampler is `hot-step-sampler.h`). Copying it is harmless but see Phase 4.
 
@@ -116,16 +140,17 @@ Do NOT copy upstream `src/dit-sampler.h` expecting it to matter — the fork's `
 
 ```powershell
 cd D:\Ace-Step-Latest\acestepcpp\acestep.cpp
-foreach ($f in @("src/pipeline-synth-ops.cpp", "src/model-store.h", "src/dit.h")) {
+foreach ($f in @("src/pipeline-synth-ops.cpp", "src/model-store.h", "src/dit.h", "src/fsq-detok.h", "src/fsq-tok.h")) {
     if (git log --oneline "$lastSynced..HEAD" -- $f) { Write-Host "NEEDS MERGE: $f" -ForegroundColor Yellow }
 }
 ```
 
-For each flagged file: review `git diff $lastSynced..HEAD -- src/<file>` in the upstream clone, then hand-port those changes into the fork's copy **without removing the hooks**:
+For each flagged file, and each file Phase 2 marked `MANUAL MERGE`: review `git diff $lastSynced..HEAD -- src/<file>` in the upstream clone, then hand-port those changes into the fork's copy **without removing the hooks**. The 2026-07-14 sync did this with a per-file 3-way merge (`git merge-file`, base = the previous sync point):
 
-- `pipeline-synth-ops.cpp`: keep the fork-only includes (lines 9–12) and the fork's extended `dit_ggml_generate` call site (line 1503). This file has diverged well beyond the include line — treat the fork's copy as the base and port upstream's diff into it, never the reverse.
-- `dit.h`: keep the includes at lines 11–13 (`adapter-merge.h`, `hot-step-build-flags.h`, `adapter-runtime.h`).
-- `model-store.h`: keep the `hot-step-params.h` include (line 53).
+- `pipeline-synth-ops.cpp`: keep the fork-only includes (lines 9–11 and 16) and the fork's extended `dit_ggml_generate` call site (line 1465). This file has diverged well beyond the include line — treat the fork's copy as the base and port upstream's diff into it, never the reverse.
+- `dit.h`: keep the fork-only includes among lines 11–22 (`adapter-runtime.h`, `convrot.h`, `hot-step-build-flags.h`, `concept-steer.h`, `config-json.h`, `weight-source.h`).
+- `model-store.h`: keep the `hot-step-params.h` include (line 52) and `sa3-refine.h` (line 56).
+- `fsq-detok.h` / `fsq-tok.h`: keep the `fsq-quant.h` include in `fsq-detok.h` (line 20), and never bring back upstream's `FSQ_LEVELS`, `fsq_decode_index` or `fsq_encode_index` in either file; port only the rest of upstream's diff.
 
 ### Phase 4 — Port fixes from upstream dit-sampler.h
 
@@ -133,7 +158,7 @@ For each flagged file: review `git diff $lastSynced..HEAD -- src/<file>` in the 
 git -C D:\Ace-Step-Latest\acestepcpp\acestep.cpp log --oneline "$lastSynced..HEAD" -- src/dit-sampler.h
 ```
 
-If changed: review the diff and hand-port relevant **bug fixes** into `engine/src/hot-step-sampler.h`. Do NOT overwrite `hot-step-sampler.h` with upstream's file. If upstream changed the `dit_ggml_generate` signature, update both the fork's signature in `hot-step-sampler.h` (a superset with extra params) and the call site in `pipeline-synth-ops.cpp:1503` to stay compatible.
+If changed: review the diff and hand-port relevant **bug fixes** into `engine/src/hot-step-sampler.h`. Do NOT overwrite `hot-step-sampler.h` with upstream's file. If upstream changed the `dit_ggml_generate` signature, update both the fork's signature in `hot-step-sampler.h` (a superset with extra params) and the call site in `pipeline-synth-ops.cpp:1465` to stay compatible. Performance work is worth porting too: the 2026-07-14 sync was followed by a port of upstream's StaticGraph direct execution into `hot-step-sampler.h` (`73e057b6`).
 
 ### Phase 5 — Verify hooks, build, validate
 
@@ -142,6 +167,8 @@ powershell -File "D:\Ace-Step-Latest\hot-step-cpp\engine\verify-hooks.ps1"   # M
 cmd /c "D:\Ace-Step-Latest\hot-step-cpp\dev-rebuild.bat"                      # never engine\build.cmd directly
 ```
 
+From an agent tool call, `dev-rebuild.bat`'s wait loop cannot sleep; use the three manual phases in the `engine-dev-loop` skill (Procedure 1) instead, and check the build output rather than the exit code.
+
 Post-sync validation checklist:
 - [ ] Generate a text2music track
 - [ ] Generate with an adapter in merge mode (adapter = LoRA-style fine-tune applied to the DiT)
@@ -149,7 +176,8 @@ Post-sync validation checklist:
 - [ ] Switch models mid-session
 - [ ] All solvers/schedulers/guidance modes selectable in the UI — **ask the user to eyeball this; do not use a browser agent**
 - [ ] **Keep every generated validation track** — do NOT delete audio outputs on your own quality judgment; the user verifies by ear. Report output paths/song IDs so the user can A/B them against pre-sync generations (a subtle sampler/VAE regression is exactly what these exist to catch).
-- [ ] Newest `<data root>/logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log` shows a **`[DiT] Guidance:` line**. This is the definitive runtime proof the HOT-Step sampler is active — upstream's sampler never prints it. (A bare `[DiT] Solver:` line is NOT proof: upstream also prints one at the upstream clone's *own* `src/dit-sampler.h:397` — NOT the fork's stale copy at `engine/src/dit-sampler.h`, which predates that feature and contains no such line. The HOT-Step version additionally includes the scheduler name — format `Solver: <name> (<scheduler>, N NFE/step, order N)` from `hot-step-sampler.h:503`.)
+- [ ] Newest `<data root>/logs/YYYY-MM-DD_HH-MM-SS/ace_engine.log` shows a **`[DiT] Guidance:` line**. This is the definitive runtime proof the HOT-Step sampler is active — upstream's sampler never prints it. (A bare `[DiT] Solver:` line is NOT proof: upstream also prints one, from `src/dit-sampler.h:404`. The fork's `engine/src/dit-sampler.h` is a byte-identical copy of that file since the 2026-07-14 sync, and still not compiled. The HOT-Step version additionally includes the scheduler name — format `Solver: <name> (<scheduler>, N NFE/step, order N)` from `hot-step-sampler.h:712`.)
+- [ ] Run `node tools/engine-smoke.mjs` (the headless render receipt from the `engine-dev-loop` skill) and keep its `[Check Batch0]` lines and `ENGINE SMOKE:` verdict.
 
 ### Phase 6 — Record marker, commit, tag (do NOT push)
 
@@ -178,14 +206,15 @@ git tag -a "v1.5-upstream-sync-$shortHash" -m "sync: upstream acestep.cpp at $sh
 | Path | Role |
 |---|---|
 | `engine/UPSTREAM_SYNC` | Sync marker: last-synced upstream commit, `KEY=VALUE` format |
-| `engine/verify-hooks.ps1` | 5-check hook verifier; run after copy, before build |
-| `engine/src/pipeline-synth-ops.cpp` | Modified-upstream: sampler hook (line 9) + extended call site (line 1503) |
-| `engine/src/model-store.h` | Modified-upstream: `hot-step-params.h` hook (line 53) |
-| `engine/src/dit.h` | Modified-upstream: adapter hooks (lines 11–13) |
-| `engine/src/hot-step-sampler.h` | The fork's active DiT sampler; linker sentinel at lines 1311–1315 |
+| `engine/verify-hooks.ps1` | Hook and HOT-ggml verifier (hooks 1–18); run after copy, before build; `build.cmd` also runs it |
+| `engine/src/pipeline-synth-ops.cpp` | Modified-upstream: sampler hook (line 9) + extended call site (line 1465) |
+| `engine/src/model-store.h` | Modified-upstream: `hot-step-params.h` hook (line 52) |
+| `engine/src/dit.h` | Modified-upstream: adapter hooks and other fork-only includes (lines 11–22) |
+| `engine/src/fsq-detok.h`, `engine/src/fsq-tok.h` | Modified-upstream: use the shared reference-conformant quantizer in `fsq-quant.h` (verify-hooks Hook 5) |
+| `engine/src/hot-step-sampler.h` | The fork's active DiT sampler; linker sentinel at lines 1540–1552 |
 | `engine/src/dit-sampler.h` | Upstream's sampler — **dead code in the fork**, nothing includes it |
-| `engine/tools/hot-step-server.cpp` | Compiled server binary source; sentinel consumer at lines 51–52 |
-| `engine/tools/ace-server.cpp` | Upstream server, direct-copy reference only, NOT compiled |
+| `engine/tools/hot-step-server.cpp` | Compiled server binary source; sentinel consumer at lines 52–53 |
+| `engine/tools/ace-server.cpp` | Upstream server, reference only (two small fork edits), NOT compiled |
 | `engine/src/_backup_pre_sync/` | Git-tracked snapshot of `engine/src/` taken before the 2026-04-26 sync — read-only rollback reference |
 | `D:\Ace-Step-Latest\acestepcpp\acestep.cpp\` | Vanilla upstream clone (separate repo, machine-specific path) |
 | `docs/plans/upstream-sync-workflow.md` | Original workflow doc — **gitignored, local-only, has 2 stale snippets** |
@@ -194,10 +223,13 @@ git tag -a "v1.5-upstream-sync-$shortHash" -m "sync: upstream acestep.cpp at $sh
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Linker: `unresolved external symbol hotstep_sampler_linked_` | `pipeline-synth-ops.cpp` direct-copied from upstream; include reverted to `dit-sampler.h` | Restore line 9 `#include "hot-step-sampler.h"` and re-merge the fork's call site (line 1503) plus fork-only includes (lines 10–12); re-run verify-hooks |
-| Compiles clean but solver/scheduler/guidance selections dead or ignored; engine log missing `[DiT] Guidance:` | Sampler hook clobbered AND sentinel lost (e.g. `hot-step-sampler.h` itself damaged) — the fully silent regression | verify-hooks checks 1 and 5; restore from git history; rebuild |
-| Compile error: `AdapterGroupScales` undefined in `model-store.h` | `model-store.h` direct-copied; lost line-53 include | Re-add `#include "hot-step-params.h"`; re-merge upstream diff |
-| Compile errors for adapter merge/runtime symbols via `dit.h` | `dit.h` direct-copied; lost lines 11–13 includes | Re-add includes; re-merge upstream diff |
+| Linker: `unresolved external symbol hotstep_sampler_linked_` | `pipeline-synth-ops.cpp` direct-copied from upstream; include reverted to `dit-sampler.h` | Restore line 9 `#include "hot-step-sampler.h"` and re-merge the fork's call site (line 1465) plus fork-only includes (lines 10–11, 16); re-run verify-hooks |
+| Compiles clean but solver/scheduler/guidance selections dead or ignored; engine log missing `[DiT] Guidance:` | Sampler hook clobbered AND sentinel lost (e.g. `hot-step-sampler.h` itself damaged) — the fully silent regression | verify-hooks Hooks 1 and 6; restore from git history; rebuild |
+| Compile error: `AdapterGroupScales` undefined in `model-store.h` | `model-store.h` direct-copied; lost line-52 include | Re-add `#include "hot-step-params.h"`; re-merge upstream diff |
+| Compile errors for adapter runtime, ConvRot or concept-steering symbols via `dit.h` | `dit.h` direct-copied; lost the fork-only includes (lines 12–22) | Re-add includes; re-merge upstream diff |
+| verify-hooks `[FAIL]` on Hook 5 (`fsq-detok.h` / `fsq-tok.h`) | An FSQ header was direct-copied and upstream's own quantizer came back (not reference-conformant, ~40% index match per the script) | Restore the fork's copy; the conformant quantizer lives in `fsq-quant.h` |
+| `[build] ABORTED: engine hooks or the ggml fork are missing` from `build.cmd` | verify-hooks failed before the compile started | Fix the `[FAIL]` lines it printed; for Hooks 7–18 run `git submodule sync -- engine/ggml` then `git submodule update --init engine/ggml` |
+| Compile errors for adapter helpers such as `adapter_compute_delta`, `adapter_rebase_fetch` or `adapter_dora_preflight_file` | `adapter-merge.h` direct-copied: it exists upstream, but upstream's copy has none of the fork's helpers (the same goes for `model-registry.h`) | Restore the fork's copy from git; merge upstream's diff by hand |
 | Infinite ace-server respawn + file locks during rebuild | Built via `engine/build.cmd` while the app runs | Use `dev-rebuild.bat` from repo root |
 | CI release build unexpectedly kicked off | Pushed a `v1.5-upstream-sync-*` (or any `v*`) tag | Never push sync tags; delete the remote tag immediately if it happens |
 | `$lastSynced` resolves to `UPSTREAM_REPO=acestep.cpp` and git errors on the range | Used the workflow doc's stale marker-parse snippet | Parse the `UPSTREAM_COMMIT=` line (Phase 1 above) |
@@ -206,8 +238,9 @@ git tag -a "v1.5-upstream-sync-$shortHash" -m "sync: upstream acestep.cpp at $sh
 
 - **VALIDATED (it happened):** a whole-file direct copy of upstream `pipeline-synth-ops.cpp` once silently disabled every HOT-Step sampler feature with a clean build. The linker sentinel + `verify-hooks.ps1` were built in response (design doc: `docs/plans/2026-05-05-harden-upstream-sync-implementation.md`, local-only).
 - **VALIDATED:** last completed sync is upstream commit `9d38f00` on 2026-07-14 (fork commit `a178b57`, local tag `v1.5-upstream-sync-9d38f00`), done via per-file 3-way merge (`git merge-file` with base = previous sync point) rather than direct copy — required by the zone-model drift above. Previous sync: `31cc9ea` on 2026-04-26.
-- **VALIDATED (2026-07-14 assessment):** upstream HEAD `9d38f00`; ~60 commits pending. Headline items: LM perf overhaul (`qwen3-lm.h` +552 lines — persistent graph arenas, static batched decode graph replay, `set_rows` KV writes; new headers `graph-arena.h`/`static-graph.h`, no CMake entry needed), snake autofuse pass + fused Vulkan/CUDA snake, K/V→F16 cast before `flash_attn_ext` (touches hook file `dit.h`!), WAV PCM24 fixes, `GGML_CUDA_GRAPHS` default ON, SYCL/Intel Arc cmake support. LM/snake work requires bumping `engine/ggml` (fork at `e705c5fe` 2026-05-25; upstream submodule at `b677b63c` 2026-07-08). The turbo-CFG-clobber fix (`b8ba253`) is ALREADY in the fork. Upstream's `dit-sampler.h` refactor + `src/solvers/` are dead code for the fork (see zone-drift warning) — harvest math fixes only.
-- **VALIDATED:** docs saying "3 hook files" undercount the script — `verify-hooks.ps1` runs 5 checks across 4 files. The script wins.
+- **VALIDATED (2026-07-14 assessment, before that sync):** ~60 commits from `31cc9ea` to upstream HEAD `9d38f00`. Headline items: LM perf overhaul (`qwen3-lm.h` +552 lines — persistent graph arenas, static batched decode graph replay, `set_rows` KV writes; new headers `graph-arena.h`/`static-graph.h`, no CMake entry needed), snake autofuse pass + fused Vulkan/CUDA snake, K/V→F16 cast before `flash_attn_ext` (touches hook file `dit.h`!), WAV PCM24 fixes, `GGML_CUDA_GRAPHS` default ON, SYCL/Intel Arc cmake support. LM/snake work then required bumping `engine/ggml` (fork at `e705c5fe` 2026-05-25; upstream submodule at `b677b63c` 2026-07-08); `engine/ggml` has since become the HOT-ggml fork (see the ggml section). The turbo-CFG-clobber fix (`b8ba253`) was ALREADY in the fork. Upstream's `dit-sampler.h` refactor + `src/solvers/` are dead code for the fork (see zone-drift warning) — harvest math fixes only.
+- **PENDING (2026-10-23):** the clone's fetched `origin/master` is 34 commits past `9d38f00`, up to `de858d8` (2026-10-16). 21 of them only move upstream's ggml pin. The other 13 touch `src/backend.h` (`--device` GGML device selection, `6013134`), `src/pipeline-lm.cpp`/`pipeline-lm.h` (heterogeneous LM request batching, `9761469`), the hook file `src/dit.h`, `src/dit-graph.h`, `src/qwen3-*.h`, `src/request.cpp`, `src/metadata-fsm.h`, and most of the CLI sources in `tools/`. Of the 9 changed `src/` files, only `metadata-fsm.h` is still pristine in the fork.
+- **VALIDATED:** docs saying "3 hook files" undercount the script — `verify-hooks.ps1` checks hooks 1–18 across `hot-step-server.cpp`, the hook files, the FSQ headers and `engine/ggml`. The script wins.
 - **VALIDATED:** the workflow doc's Phase 1 marker-parse and Phase 6 marker-write snippets are stale versus the real `KEY=VALUE` marker format. Use this skill's corrected versions.
 - **UNVALIDATED / HYPOTHESIS:** swapping only the include line (not the whole file) back to `dit-sampler.h` would *probably* be a compile error rather than silent, because the fork's call site passes an extended argument list upstream's signature lacks. Only the whole-file copy is believed truly silent. Not empirically tested.
 - Rejected hardening ideas (explored, deliberately NOT implemented — don't "restore" them): `hot-step-hooks-verify.h` compile guard, `static_assert` in the clobbered file, making `dit-sampler.h` a 2-line shim. Details in [reference.md](reference.md).
@@ -217,5 +250,6 @@ git tag -a "v1.5-upstream-sync-$shortHash" -m "sync: upstream acestep.cpp at $sh
 - [reference.md](reference.md) (this folder) — sentinel mechanism with code, `_backup_pre_sync/` details, DONE/NOT-DONE hardening ledger, marker file contents.
 - `docs/plans/upstream-sync-workflow.md` — original workflow (**gitignored/local-only; may be absent on other machines; two snippets stale**).
 - `docs/plans/2026-05-05-harden-upstream-sync-implementation.md` — hardening design history (**gitignored/local-only**).
-- `CLAUDE.md` § "Upstream sync" — the short committed summary.
-- `engine/docs/ARCHITECTURE.md` — engine internals (committed).
+- `AGENTS.md` § "Upstream sync" — the short committed summary (`CLAUDE.md` only imports it).
+- [docs/dev/ggml-fork.md](../../../docs/dev/ggml-fork.md) — how HOT-ggml is pinned and updated.
+- `docs/dev/engine.md` — engine guide, including the hook files (committed); `engine/docs/ARCHITECTURE.md` is the request JSON and CLI reference.

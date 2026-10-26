@@ -12,22 +12,26 @@ time you open the app. A different browser, or one with its site data cleared, s
 the defaults listed below. To keep a set of settings you can return to, save a
 [profile](#profiles).
 
-The ACE-Step Adapters section has a **Runtime DoRA magnitudes** switch. It defaults
-to off for compatibility with older runtime renders and is shared with MiniMax-Music3
-requests. See [DoRA loading](adapters.md#file-formats) for its effect on runtime memory.
-
 ## The bar at a glance
 
 | Section | What it holds |
 |---|---|
 | Models | The DiT, LM, VAE decoder and text encoder in use, plus a link to the Model Manager. |
-| Backend | The active generation backend. Only shown when more than one backend is installed. See [Backends](backends.md). |
 | Adapters | LoRA and LoKr adapters for the DiT and the planner LM. See [Adapters](adapters.md). |
 | Generation | Steps, guidance, shift, solver, schedule, guidance mode, seed, batch size and the engine-side audio correction stages. |
 | LM / Thinking | The language model stage. The switch in the section header turns the LM on or off. |
 | Post-Processing | Everything that runs on the finished audio. The switch in the header is the master switch for the chain. |
-| Profiles | Save, apply, import and export named snapshots of every setting. |
-| VRAM | GPU memory in use. Hover it to see which models are loaded and unload them. |
+| Profiles | A button at the right of the bar. Save, apply, import and export named snapshots of every setting. |
+
+The engine picker is not part of the bar. It sits at the top of the left sidebar, under
+the logo, and only appears when more than one backend is installed; see
+[Backends](backends.md). GPU memory is shown in the Terminal box, described under
+[VRAM indicator](#vram-indicator).
+
+In a window narrower than 1024 pixels, or one taller than it is wide, the bar shrinks to a
+menu button, the logo and a Settings button. Settings opens the same sections as a list;
+tap a section's header to expand it. Profiles and the VST monitor strip are only
+in the full-width bar.
 
 Each section shows a one-line summary of its current state. The Generation summary, for
 example, reads like `12s · Euler · Linear · APG 9.0 · σ3.0 · Seed Rnd`: steps, solver,
@@ -38,9 +42,10 @@ open, so you can reach a file picker or another window without it collapsing. A 
 section closes when you click its header again, click outside it, or press Esc. Most
 controls have a small help card: hover the label to read what the control does.
 
-The bar changes shape with the active backend. MiniMax-Music3 and YuE2 show their own
-model pickers, planner controls and adapter panels, and a section the backend has no use
-for says so instead of showing ACE-Step controls that would do nothing. Everything below
+The bar changes shape with the active backend. MiniMax-Music3, YuE2 and Stable Audio 3
+show their own model pickers and generation controls, MiniMax-Music3 and YuE2 add their own
+planner controls and adapter panels, and a section the backend has no use for says so
+instead of showing ACE-Step controls that would do nothing. Everything below
 describes the ACE-Step 1.5 layout. For the others, see [Backends](backends.md).
 
 In Create with YuE2 selected, the Caption source picker can use tracks from a linked
@@ -54,6 +59,12 @@ source identity and AR/NAR adapter pair are
 captured with the job. See [Cover Studio](studios/cover-studio.md).
 
 ## Models
+
+With Stable Audio 3 active, Models lists the installed generation DiTs from the
+models folder, including quant names ending in `-imat`. BF16 is the default.
+Training files named `sa3-dit-base-*` are excluded. The selection is saved on the
+server and captured when a job is queued. If a selected file is removed, the
+engine falls back to BF16 and the generation log records the filename it loaded.
 
 | Control | What it does |
 |---|---|
@@ -69,7 +80,8 @@ probes disable the affected choice and show the reason beneath it. Download the 
 in Model Manager or choose an installed VAE. Generation checks the captured model
 selection before planning starts, including files removed while a job was queued.
 
-Any empty slot is filled with the first installed model of that type. On first launch, if
+Any empty slot, or one whose model is no longer installed, is filled with the first
+installed model of that type. On first launch, if
 no models are found after the engine has had a few seconds to start, the Model Manager
 opens by itself. When the active backend reports its own weights missing, a banner under
 the bar links to the Model Manager; nothing downloads until you ask.
@@ -109,9 +121,10 @@ defaults, since picking a different adapter can change what "default" means.
 These three pickers are Lua plugins, so the lists grow when a plugin is added and each
 entry carries its own description in its help card.
 
-- The solver decides how one step is taken. Solvers are grouped by how many network
-  evaluations (NFE) each step costs. A 2-NFE solver at 20 steps costs about what a 1-NFE
-  solver costs at 40.
+- The solver decides how one step is taken. Solvers are listed by how many network
+  evaluations (NFE) each step costs: one-evaluation solvers first, then multi-evaluation
+  solvers with their NFE in the name, then adaptive ones that choose their own count. A
+  2-NFE solver at 20 steps costs about what a 1-NFE solver costs at 40.
 - The schedule decides where the steps fall. Three extra entries are built into the picker
   rather than coming from plugins. Beta (Custom) has Alpha and Beta sliders (0.1 to 2.0,
   defaults 0.5 and 0.7). Power has an Exponent slider (0.25 to 4.0, default 2.0), where
@@ -215,8 +228,10 @@ The save icon beside Generation Seed opens the Seed Manager:
 - The "random" button loads a random seed from your saved list.
 - Delete takes two clicks.
 
-Saved seeds are stored by the server, so they are the same in every browser.
-<!-- TODO(verify): SeedManagerDrawer's header comment says it imports existing ComfyUI SeedSaver files; confirm where the server reads them from before documenting it. -->
+Saved seeds are stored by the server, so they are the same in every browser. Each one is
+a JSON file in the `seeds/` folder of the data folder's `library/`. The file format is the
+one the SeedSaver node from MD_Nodes uses in ComfyUI, so seed files saved there can be
+copied into that folder and appear in the list.
 
 ### Batch size
 
@@ -239,6 +254,10 @@ values: 120 BPM, 120 seconds, C major, 4/4.
 | CFG Scale | 0 to 10 | 2.2 | Guidance strength for the LM itself. |
 | Top-K | 0 to 200 | 0 | Limits sampling to the K most likely tokens. 0 turns it off. (YuE2's Composer Top-K is separate: 0 is unlimited there, and unlimited with a temperature above 1.0 is clamped to 1.0.) |
 | Top-P | 0 to 1 | 0.92 | Nucleus sampling threshold. |
+| Min-P | 0 to 0.5 | 0 | After Top-P, drops every audio code under this fraction of the most likely code's probability. Cuts the unlikely tail without narrowing close choices. 0 turns it off. |
+| CFG Plausibility | 0 to 0.5 | 0 | Applies CFG only to codes the conditioned pass gives at least this fraction of its top probability; the rest keep their unguided value. 0 turns it off. |
+| CFG Rescale | 0 to 1 | 0 | Pulls the guided distribution's spread back toward the conditioned pass's, so a high CFG Scale changes which codes win without sharpening or flattening everything. 0 turns it off. |
+| CFG in Log-Probabilities | toggle | off | Blends the two CFG passes after normalising each to log-probabilities instead of on raw logits. |
 | Repetition Penalty | 1.0 to 1.5 | 1.1 | Penalises recently used audio codes to break stuck loops. 1.0 turns it off. |
 | Rep. Mode | Presence, Frequency, DRY | Presence | Shown when the penalty is above 1.0. See below. |
 | Rep. Window (codes) | 8 to 256 | 64 | How far back the penalty looks. The LM emits 5 codes per second, so 64 codes is 12.8 seconds; the label shows the seconds. |
@@ -246,6 +265,10 @@ values: 120 BPM, 120 seconds, C major, 4/4.
 | Negative Prompt | text | `NO USER INPUT` | Negative conditioning text for the LM. |
 | LM Codes | Strength 0 to 1, or Step Count | Strength 1.0 | How many DiT steps the LM's audio codes condition. Strength is a fraction of the step budget. With Step Count on, you set an absolute number of steps (default 6) that stays fixed when you change Inference Steps. |
 | LM Seed | toggle and number | Use DiT Seed on | With Use DiT Seed on, the LM seed follows the Generation Seed: a fixed Generation Seed makes both deterministic, a random one makes both random. Turn it off to set an independent LM seed, which has its own Seed Manager. |
+
+Min-P and the three CFG refinements are ignored, with a warning in the engine log,
+when a draft model is loaded for speculative decoding at batch size 1, the same as
+the repetition penalty.
 
 The three repetition modes trade loop-breaking against keeping deliberate repetition:
 
@@ -265,15 +288,16 @@ a "Cache LM audio codes" option that reuses the previous codes. See
 
 Everything in this section runs on the audio after the engine has rendered it. The switch
 in the section header is a master switch: with it off, none of the stages below run,
-whatever their own switches say. The exceptions are Lyric Timestamps (LRC) and Whisper
-Lyrics, which work with the master switch off.
+whatever their own switches say. The exceptions are Lyric Timestamps (LRC), YuE2's Lyric
+Timestamps (Forced Alignment) and Whisper Lyrics, which work with the master switch off.
 
 Post-processing never overwrites the render. It works on a copy, and the song keeps both
 the original and the processed file; the Library lets you play either. If the master
-switch was off when a song was made, you can run the chain on it later from the track's
-menu. A song that has already been processed is refused, so a chain cannot be stacked
-twice. See [Library](studios/library.md).
-<!-- TODO(verify): exact label of the "run post-processing" entry in the Library track menu. -->
+switch was off when a song was made, Run Post-Processing in the track's menu runs the
+chain on it later, with your current settings and even with the master switch off. It
+needs the raw WAV render. A song that has already been processed is refused, so a chain
+cannot be stacked twice; Remove Post-Processed Version in the same menu deletes the
+processed copy. See [Library](studios/library.md).
 
 ### Order of the chain
 
@@ -297,13 +321,19 @@ The stages always run in this order, per track:
 A stage that fails is logged and skipped; the song is still saved. Cover art runs after
 the chain, or alongside it when Parallel Cover Art is on in Settings.
 
+Songs queued from Lyric Studio with Master to Album Track on run with Mastering on,
+mastered against a random track from that album's training dataset, and skip the VST
+chain. Your own post-processing settings are left as they are. See
+[Lyric Studio](studios/lyric-studio.md).
+
 ### Stages
 
 | Stage | Default | What it does |
 |---|---|---|
-| Lyric Timestamps (LRC) | on | Synchronised lyric timing for karaoke-style playback, taken from the DiT's lyric attention during the render. Hidden on backends that cannot provide it. |
+| Lyric Timestamps (LRC) | on | Synchronised lyric timing for karaoke-style playback, taken from the model's lyric attention during the render: the DiT on ACE-Step, the planner LM on MiniMax-Music3. Hidden on backends that cannot provide it. |
+| Lyric Timestamps (Forced Alignment) | off | YuE2 only. Aligns the finished render against your lyrics for karaoke playback and section markers. Adds a pass per track and needs the YuE2 Lyric Aligner from the Model Manager. |
 | Whisper Lyrics | off | Transcribes the sung lyrics with word-level timestamps, using your lyrics as a spelling guide. Model (Auto-detect, Large v3 Turbo, Large v3, Medium, Base), Language, Beam Size (1 to 10, default 5) and "Isolate vocals first". Needs a Whisper model from the Model Manager. |
-| Tiled Decoder | off | Replaces the built-in VAE decode with a tiled decode plugin (overlap crossfading, optional dual-pass merge, channel suppression and a small DSP chain). Only shown when a postprocess plugin is installed; its settings come from the plugin. |
+| Tiled Decoder | off | Replaces the built-in VAE decode with a tiled decode plugin (overlap crossfading, optional dual-pass merge, channel suppression and a small DSP chain). Only shown when a postprocess plugin is installed; its settings come from the plugin. With none picked yet, it picks MD Audio Tiled Decoder V2.1 when that is installed. |
 | PP-VAE Re-encode | off | Runs the decoded audio through a second, higher-fidelity autoencoder to clean up fizz and high-frequency noise. Adds roughly 1 to 2 seconds. Original Blend (0 to 1, default 0) mixes the unprocessed audio back in. It runs on GGML and is shown when the PP-VAE model is installed. |
 | StableStep | off | Re-renders the instrumental through Stable Audio 3 to replace VAE fizz with real detail. See [StableStep](#stablestep). |
 | Spectral Lifter | off | Removes AI shimmer, reduces spectral noise and can extend the high end. Denoise Strength (default 0.3), Noise Floor (0.1), HF Extension (0), Transient Boost (0), Shimmer Reduction (6 dB, applied to the 10 to 14 kHz band). |
@@ -311,13 +341,14 @@ the chain, or alongside it when Parallel Cover Art is on in Settings.
 | Pre-VST Gain Offset | 0 dB | A fixed gain (-10 to +10 dB) before the VST chain and mastering. Negative values give a VST chain headroom. When something runs after it, peaks above full scale are passed on for that stage to handle; when nothing does, it limits. |
 | VST Chain | empty | Your own VST3 plugins. See [VST chain](#vst-chain). |
 | Mastering | off | Matches the level, frequency balance and dynamics of a reference track you upload. "Also use as timbre reference" feeds the same track to the DiT as a [timbre reference](#timbre-reference); ACE-Step only, so the switch is hidden on the other backends. |
-| Final Normalizer | off | Always the last stage that changes the audio. Measures integrated loudness (ITU-R BS.1770-4) and sets the gain to hit a target: Spotify / YouTube Music (-14 LUFS, the default), Apple Music / Tidal (-16), EBU R128 (-23), Club / DJ Playback (-8) or Custom (-30 to -5). A look-ahead limiter holds peaks at the Peak Ceiling (-6 to 0 dBFS, default -1). The resulting true peak is written to the generation log. |
+| Final Normalizer | off | Always the last stage that changes the audio. Measures integrated loudness (ITU-R BS.1770-4) and sets the gain to hit a target: Spotify / YouTube Music at -14 LUFS (the default), Apple Music / Tidal at -16, EBU R128 (Broadcast) at -23, Club / DJ Playback at -8, or Custom from -30 to -5. A look-ahead limiter holds peaks at the Peak Ceiling (-6 to 0 dBFS, default -1). The resulting true peak is written to the generation log. |
 | Cover Art | off | See [Cover art](#cover-art). |
 | Quality Evaluator | off | Scores each track from spectral analysis and shows the score as a badge in the Library. Evaluate: Unmastered (default), Mastered or Both. |
 
 When the active backend is not ACE-Step, the Tiled Decoder, PP-VAE and Spectral Lifter
-panels are hidden because they depend on ACE-Step's VAE. The VST chain, Mastering,
-StableStep and the Final Normalizer work with any backend.
+panels are hidden because they depend on ACE-Step's VAE. The VST chain, Mastering and the
+Final Normalizer work with any backend. StableStep works with every backend except Stable
+Audio 3, whose output is already Stable Audio 3.
 
 ### StableStep
 
@@ -336,8 +367,8 @@ installed the panel says "not installed" and explains what is missing.
 | Re-encode vocals through PP-VAE | off | Smooths fizzy vocals at the cost of about 5 dB of air above 10 kHz. Off leaves the vocal stem untouched. |
 | Vocal level | 0 dB | -6 to +6 dB trim of the vocal against the refined instrumental. 0 keeps the original balance. |
 | Source blend | Off | Crossover keeps the original below a frequency (default 250 Hz, width 200 Hz) and the refine above it. Mix blends the two full-band (SA3 amount, default 100%). |
-| Follow generation seed | on | The refine uses the song's seed, so the same seed reproduces the same refine. Untick to set a fixed seed. |
-| Sampler (advanced) | Native | Refine steps (1 to 64, default 8) and separate solver, schedule and guidance pickers for the refine. These do not change the Generation section's picks. |
+| Follow generation seed | on | The refine uses the song's seed, so the same seed reproduces the same refine. Turn it off to set a fixed seed. |
+| Sampler (advanced) | Native | Refine steps (1 to 64, default 8) and separate solver, schedule and guidance pickers for the refine, with a guidance scale (1 to 10) once a guidance mode is picked. The SA3 Clean button sets a tested combination: Wasserstein Flow v1.2.1, Psychoacoustic, Phase Inversion and 24 steps. These do not change the Generation section's picks. |
 
 ### VST chain
 
@@ -365,7 +396,10 @@ shown, including three or more. If the monitor misbehaves, `vst_host.log` in the
 `logs/<session>` folder records each start, stop, seek and rate change.
 
 Presets save the current chain under a name so you can switch between chains. The chain
-itself is stored by the server; presets are stored in the browser.
+and its presets are both stored by the server, so they are the same in every browser.
+Presets an older version saved in this browser move to the server the first time the
+panel loads them; one whose name matches a preset already on the server waits for you to
+pick Keep both or Replace saved.
 <!-- TODO(verify): VST3 scanning and the monitor on Linux and macOS builds. The route and host binary exist, but only the Windows path has been confirmed here. -->
 
 ### Cover art
@@ -387,6 +421,10 @@ selects a planner adapter for the LM. It has a Simple mode for one adapter and a
 mode for stacking several, with per-section influence, loading mode, VRAM options and
 per-layer group scales. Everything about it is in [Adapters](adapters.md).
 
+The ACE-Step Adapters section has a **Runtime DoRA magnitudes** switch. It defaults
+to off for compatibility with older runtime renders and is shared with MiniMax-Music3
+requests. See [DoRA loading](adapters.md#file-formats) for its effect on runtime memory.
+
 ## Profiles
 
 Profiles, at the right of the bar, saves every setting in the bar under a name. Profiles
@@ -397,7 +435,8 @@ sampling and LM settings. Profiles saved before this change belong to ACE-Step.
 
 - Type a name and click Save. "Include caption and lyrics" (on by default) also stores the
   Custom-Gen content fields: caption, lyrics, negative prompt, instrumental, BPM, duration,
-  key, time signature, vocal language and trigger word.
+  key, time signature, vocal language, trigger word, and the Beat I/O switch with its bar
+  count.
 - Apply loads a profile immediately, content included, without reloading the page.
   Older profiles that name removed ONNX VAE or StableStep choices load the current defaults.
 - Click a profile's name to expand a grouped list of every value it holds.
@@ -432,13 +471,18 @@ re-runs from the Library wait in the same line.
   affects only jobs you queue next.
 - A job that fails is retried once automatically with a new random seed, unless you
   cancelled it.
-- A job that stops reporting progress is treated as stalled and failed: after two minutes
-  while sampling steps are counting, or 15 minutes in stages that report nothing until
-  they finish, such as model loads and VAE decode. A job that runs
-  longer than the Generation Timeout in Settings (default 30 minutes, counted per track from
-  when the engine picks it up, not while it waits) is also failed.
+- A job that stops reporting progress is treated as stalled and failed. Stages that report
+  nothing until they finish, such as model loads and VAE decode, get 15 minutes. While
+  sampling steps are counting, two minutes of silence makes the server ask the engine; if
+  the engine says the job is still running, it gets the 15-minute window too. A YuE2 NAR
+  chunk gets longer in proportion to its length, and YuE2's decode and output stages are
+  only held to the Generation Timeout. A job that runs longer than the Generation Timeout
+  in Settings (default 30 minutes, counted per track from when the engine picks it up, not
+  while it waits) is also failed. A render the engine has already finished is kept, even
+  when it lands at the limit.
 - While the engine is starting or paused for training, queued jobs wait for it rather than
-  failing.
+  failing. A song queued for one engine waits, and says so in its row, while another
+  engine is active; the queue never switches engines by itself.
 - YuE2 jobs waiting with matching settings render together as one engine batch when Batch
   Queued Songs is on. See [Backends](backends.md#yue2). The queue boxes those jobs together
   and shows the time the whole batch took, the audio it produced and the ratio of the two;
@@ -449,11 +493,15 @@ re-runs from the Library wait in the same line.
   limit, not a setting), and songs that have been waiting longer than that are sent at once.
 - Every finished row shows a ratio next to its length: audio seconds per second of
   generation, so 3.0 means a minute of music took twenty seconds.
-- The queue survives a page reload: running jobs reconnect. After a full restart of the app
-  the server has forgotten them, so unstarted and interrupted jobs are held and a banner
-  offers Resume or Discard. Nothing restarts on its own.
+- The queue survives a page reload and a full restart of the app, because the server keeps
+  it in its database. Songs that had not been sent to the engine yet carry on once it is
+  ready. A song that was rendering when the app stopped is marked interrupted, with a note
+  to check the Library, and only Retry renders it again. A browser-owned queue (see
+  below) reconnects running jobs after a page reload instead; after a full restart it
+  holds unstarted and interrupted songs and a banner offers Resume or Discard.
 - The Queue section has Retry for failed items, Clear Done for finished ones, and Reset,
-  which cancels everything active and pending on the server.
+  which cancels everything active and pending on the server. Send To Playlist (off by
+  default) adds each finished song to the playlist.
 - The queue itself lives either in your browser or on the server; a fresh install is
   server-owned from the start. An older browser-owned queue with pending work moves to
   the server automatically the next time you load the app, keeping each item's state
@@ -467,17 +515,17 @@ re-runs from the Library wait in the same line.
   paused until you retry the roll back or move the queue to the server again.
 
 An external agent (Claude Code, Codex) can also submit and poll generations through the
-`hotstep` MCP server, across all three backends. See [Driving HOT-Step with an
-agent](mcp.md).
+`hotstep` MCP server, on ACE-Step 1.5, MiniMax-Music3 and YuE2. Stable Audio 3 is not
+covered. See [Driving HOT-Step with an agent](mcp.md).
 
 ### Progress badge and done notifications
 
-While jobs run, the Create entry in the sidebar and the mobile header show a badge with the running count and the active job's percent, and the tab title reads like `(2) 43% · HOT-Step`. The first time you click Generate the browser asks whether HOT-Step may show notifications; if you allow it, a notification appears when a job finishes while the tab is in the background. Clicking it brings the tab forward and opens the song.
+While jobs run, the Create entry in the sidebar (the menu drawer on a narrow screen) shows a badge with the running count and the active job's percent, and the tab title reads like `(2) 43% · HOT-Step`. The first time you click Generate the browser asks whether HOT-Step may show notifications; if you allow it, a notification appears when a job finishes while the tab is in the background. Clicking it brings the tab forward and opens the song.
 
 ## Task modes
 
 The engine has one generation pipeline and several task modes. The studio picks the mode;
-the bar's settings apply to all of them.
+the bar's settings apply to all of them except extract, described below the table.
 
 | Task mode | What it does | Used by |
 |---|---|---|
@@ -496,7 +544,10 @@ the AR composer follows that score instead of planning a new one. It does not ru
 ACE-Step's `cover` or `cover-nofsq` mode. ACE-Step skips the LM stage for cover,
 cover-nofsq, repaint, lego and extract; the caption and lyrics go to the DiT as
 written. lego, extract and complete need a base or SFT DiT, not a turbo model.
-<!-- TODO(verify): whether Stem Separator's extract jobs use any Generation-bar settings. They are submitted by the Stem Separator's own route, not the shared generation queue path. -->
+Stem Separator's extract jobs run outside the shared queue, through the Stem Separator's
+own route. They use the studio's own model picker with adapters off and a random seed;
+the bar's steps, solver, schedule and guidance settings do not reach them, so the engine
+uses its defaults.
 
 Returning to a studio does not submit another generation. The queue keeps its
 existing order and ownership rules while status views share current results.

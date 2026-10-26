@@ -14,6 +14,18 @@ import { readDuration } from '../training/audioMeta.js';
 
 type LogFn = (level: 'INFO' | 'DEBUG' | 'WARNING' | 'ERROR', msg: string) => void;
 
+/** The file a source audio URL (/references/..., /audio/..., or a path) names. */
+export function resolveSourceAudioPath(sourceAudioUrl: string): string {
+  const resolvedUrl = mapPath(sourceAudioUrl) || sourceAudioUrl;
+  return resolvedUrl.startsWith('/references/')
+    ? path.join(config.data.dir, 'references', resolvedUrl.replace('/references/', ''))
+    : resolvedUrl.startsWith('/audio/')
+      ? path.join(config.data.audioDir, resolvedUrl.replace('/audio/', ''))
+      : path.isAbsolute(resolvedUrl)
+        ? resolvedUrl
+        : path.join(config.data.dir, resolvedUrl);
+}
+
 /** Load and prepare source audio for cover/repaint tasks */
 export function loadSourceAudio(
   sourceAudioUrl: string | undefined,
@@ -22,14 +34,7 @@ export function loadSourceAudio(
 ): Buffer | undefined {
   if (!sourceAudioUrl) return undefined;
 
-  const resolvedUrl = mapPath(sourceAudioUrl) || sourceAudioUrl;
-  const srcPath = resolvedUrl.startsWith('/references/')
-    ? path.join(config.data.dir, 'references', resolvedUrl.replace('/references/', ''))
-    : resolvedUrl.startsWith('/audio/')
-      ? path.join(config.data.audioDir, resolvedUrl.replace('/audio/', ''))
-      : path.isAbsolute(resolvedUrl)
-        ? resolvedUrl
-        : path.join(config.data.dir, resolvedUrl);
+  const srcPath = resolveSourceAudioPath(sourceAudioUrl);
 
   log('DEBUG', `[Synth Phase] Looking for source audio at: ${srcPath}`);
 

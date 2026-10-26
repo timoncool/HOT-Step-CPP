@@ -1,7 +1,7 @@
 # release/build-release.ps1 — Build a complete portable release of HOT-Step CPP
 #
 # Usage:
-#   .\release\build-release.ps1 [-Version "1.5.0"] [-SkipEngine] [-SkipUI] [-Variant cuda] [-BuildBackend all]
+#   .\release\build-release.ps1 [-Version "1.5.0"] [-SkipEngine] [-SkipUI] [-Variant cuda -CudaAsset cuda13.1] [-BuildBackend all]
 #
 # Produces:
 #   release/out/HOT-Step-CPP-v{version}-win-x64-{variant}.zip
@@ -20,6 +20,8 @@ param(
     [string]$Variant = "cuda",       # Packaged backend
     [ValidateSet("all", "cuda", "vulkan", "cpu")]
     [string]$BuildBackend = "all",   # Backends to compile
+    [ValidateSet("", "cuda13.1", "cuda12.8", "cuda12-volta")]
+    [string]$CudaAsset = "",         # CI asset this CUDA build stands in for (build-info.json)
     [string]$NodeVersion = "24.18.0" # Node.js LTS version to bundle
 )
 
@@ -28,6 +30,11 @@ $ErrorActionPreference = "Stop"
 if ($BuildBackend -ne "all" -and $BuildBackend -ne $Variant) {
     throw "BuildBackend '$BuildBackend' must match Variant '$Variant', or use BuildBackend 'all'."
 }
+# build-info.json names an exact asset variant, and the CUDA toolkit decides which one.
+if ($Variant -eq "cuda" -and -not $CudaAsset) {
+    throw "Variant cuda needs -CudaAsset cuda13.1, cuda12.8 or cuda12-volta to match the toolkit you build with."
+}
+$assetVariant = if ($Variant -eq "cuda") { $CudaAsset } else { $Variant }
 $buildCuda = if ($BuildBackend -in @("all", "cuda")) { "ON" } else { "OFF" }
 $buildVulkan = if ($BuildBackend -in @("all", "vulkan")) { "ON" } else { "OFF" }
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -405,6 +412,13 @@ Copy-Item (Join-Path $ReleaseDir "profile-path.mjs") (Join-Path $dist "profile-p
 Copy-Item (Join-Path $ReleaseDir "HOT-Step.bat") (Join-Path $dist "HOT-Step.bat")
 Copy-Item (Join-Path $ReleaseDir "README.txt") (Join-Path $dist "README.txt")
 Copy-Item (Join-Path $ProjectRoot "open-browser-if-needed.mjs") (Join-Path $dist "open-browser-if-needed.mjs")
+Set-Content -Path (Join-Path $dist "VERSION") -Value $Version -NoNewline
+
+# Exact package identity for the updater (docs/dev/releasing.md)
+& $NodeExe (Join-Path $ReleaseDir "build-info.mjs") $dist --os windows --arch x64 --variant $assetVariant --tag "v$Version"
+if ($LASTEXITCODE) { throw "build-info.mjs failed" }
+& $NodeExe (Join-Path $ReleaseDir "check-layout.mjs") --package $dist --os windows --variant $assetVariant
+if ($LASTEXITCODE) { throw "build-info.json check failed" }
 
 Write-Host "  Assembly complete" -ForegroundColor Green
 

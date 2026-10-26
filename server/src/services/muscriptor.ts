@@ -239,6 +239,16 @@ export interface MidiExportOptions {
   trimLeadingBars?: boolean;
 }
 
+/** ace-midi flags for speculative decoding (upstream MuScriptor PR #95): the
+ *  small model drafts four tokens at a time and the large one checks them in a
+ *  single pass, so the output is the large model's own. Only large gains:
+ *  measured on a 4 min track, CUDA, large 122 s -> 79 s; medium 61 s -> 60 s. */
+export function speculativeArgs(model: MuscriptorModel, enabled: boolean, smallReady: boolean): string[] {
+  return enabled && model === 'large' && smallReady
+    ? ['--draft-model', modelDir('small'), '--speculative-k', '4']
+    : [];
+}
+
 export function exportArgs(o: MidiExportOptions): string[] {
   const a: string[] = [];
   const num = (flag: string, v: unknown, ok: (x: number) => boolean) => {

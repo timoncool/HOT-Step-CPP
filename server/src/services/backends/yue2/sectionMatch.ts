@@ -261,6 +261,8 @@ export interface ScorePlanSection {
   bar: number;
   /** 1-based lyric block that opens it, or null for an instrumental section. */
   block: number | null;
+  /** That block's own tag as written ([Verse 2]), when it has one. */
+  tag: string | null;
 }
 
 export interface ScorePlanResult {
@@ -296,7 +298,7 @@ export function planScoreFromLyrics(abc: string, lyrics: string, words: Yue2Alig
 
   // Each block's start bar: a score marker beside it, else a phrase start
   // beside it, else the bar nearest its first word. Must move forward.
-  const opened: Array<{ block: number; bar: number; label: string; body: string[]; lastBar: number | null }> = [];
+  const opened: Array<{ block: number; bar: number; label: string; tag: string | null; body: string[]; lastBar: number | null }> = [];
   const unsure: ScorePlanResult['unsure'] = [];
   blocks.forEach((block, i) => {
     const t = firstWord(block, words);
@@ -309,19 +311,26 @@ export function planScoreFromLyrics(abc: string, lyrics: string, words: Yue2Alig
     if (bar === null || (prev && bar <= prev.bar)) {
       unsure.push({ block: i + 1, tag: block.tag });
       if (prev) { prev.body.push(block.body); prev.lastBar = lastWordBar(block) ?? prev.lastBar; }
-      else opened.push({ block: i + 1, bar: 1, label: block.tag ? sectionKind(block.tag) : 'verse', body: [block.body], lastBar: null });
+      else opened.push({ block: i + 1, bar: 1, label: block.tag ? sectionKind(block.tag) : 'verse', tag: block.tag, body: [block.body], lastBar: null });
       return;
     }
-    opened.push({ block: i + 1, bar, label: block.tag ? sectionKind(block.tag) : 'verse', body: [block.body], lastBar: lastWordBar(block) });
+    opened.push({ block: i + 1, bar, label: block.tag ? sectionKind(block.tag) : 'verse', tag: block.tag, body: [block.body], lastBar: lastWordBar(block) });
   });
 
-  // Score sections that fall in a gap between sung blocks stay, as written.
-  const kept = original.filter(section => {
+  // A section the Vocal never sings in (its first bar aside, as in scoreSpans).
+  const unsung = (k: number) => {
+    const start = original[k].startBar, end = k + 1 < original.length ? original[k + 1].startBar - 1 : bars.length;
+    return !onsets.slice(end > start ? start : start - 1, end).some(onset => onset !== null);
+  };
+  // Score sections that fall in a gap between sung blocks stay, as written,
+  // and so does one with no Vocal note: the aligner can stretch a last word
+  // over an instrumental outro.
+  const kept = original.filter((section, k) => {
     const after = opened.filter(o => o.bar <= section.startBar).at(-1);
     const next = opened.find(o => o.bar > section.startBar);
     if (after && after.bar === section.startBar) return false;
     if (next && next.bar - section.startBar < 1) return false;
-    return !after || (after.lastBar !== null && section.startBar > after.lastBar);
+    return !after || unsung(k) || (after.lastBar !== null && section.startBar > after.lastBar);
   });
   // A kept marker right before a sung block of the same label is that block's
   // own section (an intro marked at bar 1, sung from bar 5): one section.
@@ -335,8 +344,8 @@ export function planScoreFromLyrics(abc: string, lyrics: string, words: Yue2Alig
     }
   }
   const sections: Array<ScorePlanSection & { body?: string[] }> = [
-    ...kept.map(section => ({ label: section.label.trim(), bar: section.startBar, block: null })),
-    ...opened.map(o => ({ label: o.label, bar: o.bar, block: o.block, body: o.body })),
+    ...kept.map(section => ({ label: section.label.trim(), bar: section.startBar, block: null, tag: null })),
+    ...opened.map(o => ({ label: o.label, bar: o.bar, block: o.block, tag: o.tag, body: o.body })),
   ].sort((a, b) => a.bar - b.bar);
   const text = sections.map(s => `[${s.label}]${s.body ? `\n${s.body.join('\n\n')}` : ''}`).join('\n\n');
   const same = sections.length === original.length &&

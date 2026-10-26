@@ -9,21 +9,11 @@ Building the engine: [docs/dev/building.md](../../docs/dev/building.md).
 Model files and where to get them: [docs/user/models.md](../../docs/user/models.md).
 
 Everything here was checked against `engine/src/request.cpp`,
-`engine/tools/hot-step-server.cpp` and the CLI sources in `engine/tools/`. When the
+`engine/tools/hot-step-server.cpp`, `engine/src/minimax/mm3-request.h`,
+`engine/src/yue2/yue2-request.h` and the CLI sources in `engine/tools/`. When the
 code and this page disagree, the code wins; fix the page.
 
 ## Request JSON reference
-
-`adapter_runtime_dora` is an optional boolean shared by ACE-Step and MiniMax-Music3
-generation requests. It defaults to false, preserving legacy runtime DiT behavior.
-True enables DoRA magnitude rescaling, including runtime paths forced by adapter
-windows or sections. Merge and LM adapter behavior is unchanged. The Node/UI field
-is `adapterRuntimeDora`; false and absent values omit the wire key.
-
-For MM3 flow-DiT training, `ace-train mm3-train-dit --dora` sets `MM3TrainArgs.dora`.
-The trainer takes the same `--cache`, `--models` and `--out` arguments as LoRA and
-requires the outputs of both `mm3-preprocess` and `mm3-condition`. This trainer
-remains CLI-only; it is not an app training job or a DiT adapter capability.
 
 The ACE-Step request (`AceRequest`, `engine/src/request.h`) is one JSON object. It
 is read by `ace-lm`, `ace-synth` and `ace-understand`, and by ace-server's `/lm`,
@@ -48,6 +38,10 @@ straight to `/synth` or `ace-synth`.
     "lm_cfg_scale":         2.0,
     "lm_cfg_cutoff_ratio":  1.0,
     "lm_top_p":             0.9,
+    "lm_min_p":             0.0,
+    "lm_cfg_min_p":         0.0,
+    "lm_cfg_logprob":       false,
+    "lm_cfg_rescale":       0.0,
     "lm_top_k":             0,
     "lm_rep_penalty":       1.0,
     "lm_rep_window":        64,
@@ -94,7 +88,9 @@ straight to `/synth` or `ace-synth`.
 }
 ```
 
-`GET /props` returns this object with every default filled in, under `default`.
+`GET /props` returns every `AceRequest` field with its default under `default`,
+including the seed-breeding, solver and DCW fields described below that this block
+leaves out.
 
 Two more fields are parsed but not used for dispatch: `solver` (default `"euler"`)
 and `stork_substeps` (default 10). `solver` only appears in a log line. On ace-server
@@ -142,8 +138,8 @@ are used. Resolved once per input request.
 breeding: the initial DiT noise is a slerp from the `seed` noise toward the `seed_b`
 noise (each batch item treated as one vector, normalized lerp when nearly parallel).
 `0` gives `seed` exactly, `1` gives `seed_b` exactly. Synth batch items offset
-`seed_b` by the same `+i` as `seed`. Ignored by the streaming path. API field names
-on `/api/generate`: `seedB`, `seedBlend`.
+`seed_b` by the same `+i` as `seed`. API field names on `/api/generate`: `seedB`,
+`seedBlend`.
 
 **`seed_blend_end`** (float 0 to 1, default `-1` = off). Seed morph: when set with
 `seed_b`, the blend varies along the latent time axis. The noise is `[T, C]`
@@ -152,16 +148,9 @@ time-major; frame `f` is slerped on its own (per-frame vector across channels) a
 song can start as one seed and end as the other. API field: `seedBlendEnd`.
 Per-frame morph is not the same as whole-item breeding even at a constant blend (each frame is slerped on its own), so when `seed_blend_end` equals `seed_blend` the engine uses the whole-item breeding path.
 
-SA3 seed breeding: `/sa3-synth` accepts `seed_b` (int64, `-1` = off) and `seed_blend`
-(float 0 to 1, default 0) as form/query params. The whole pure-noise latent is slerped
-from the `seed` noise toward the `seed_b` noise (same std::mt19937_64 gaussian at
-`seed_b`); `0` gives `seed` exactly, `1` gives `seed_b`. No effect on `/sa3-refine`.
-
 **`lm_seed`** (int64, `-1` = unset). Seed for the LM sampler. On ace-server `/lm`, an
 unset `lm_seed` follows `seed`, and a random value is drawn if both are unset. Batch
 item `b` of `/lm` gets `lm_seed + b`.
-<!-- TODO(verify): ace-lm and ace-understand never resolve lm_seed = -1, so the LM
-     sampler seeds from (uint32_t)-1 on every run. Check whether that is intended. -->
 
 **`lm_batch_size`** (int, default 1). Number of LM variations. `ace-lm` clamps it to
 1..9; ace-server clamps it to 1..`--max-batch`.
@@ -175,6 +164,9 @@ The rules:
 2. `seed = -1` resolves to one random value per input request.
 3. `lm_batch_size = N` produces N LM outputs; `synth_batch_size = N` produces N DiT
    outputs with consecutive seeds.
+4. LM output `b` comes back as a standalone request (`lm_batch_size` 1) carrying
+   `seed + b` (from a random base when `seed` is -1), `seed_b + b` when `seed_b` is
+   set, and `lm_seed + b`.
 
 ### LM sampling (`ace-lm`, `/lm`)
 
@@ -196,6 +188,18 @@ or the CoT caption), so it only applies there when lyrics are given and
 **`lm_top_p`** (float, default 0.9). Nucleus cutoff. `1.0` disables it.
 
 **`lm_top_k`** (int, default 0). `0` disables top-k.
+
+**`lm_min_p`** (float, default 0 = off). Code phase only: after top-p, drop every code
+whose probability is under `lm_min_p` times the top code's.
+
+**`lm_cfg_min_p`**, **`lm_cfg_logprob`**, **`lm_cfg_rescale`** (defaults 0, false, 0).
+Opt-in CFG refinements for the code phase (`engine/src/lm-cfg-extras.h`).
+`lm_cfg_min_p` blends only codes the conditional pass gives at least that fraction of
+its top probability; the rest keep their conditional logit. `lm_cfg_logprob` blends
+log-softmax rows instead of raw logits. `lm_cfg_rescale` (0 to 1) pulls the blended
+row's spread back toward the conditional row's. All off keeps the plain blend. The
+speculative (draft model) path ignores `lm_min_p` and these three and logs a warning,
+as it does for the repetition penalty.
 
 **`lm_rep_penalty`** (float, default 1.0 = off). Repetition penalty over recently
 emitted audio codes, to break code loops.
@@ -235,8 +239,10 @@ and step count instead (between 1 and 6, centred on 3).
 
 **`custom_timesteps`** (string, default `""`). Comma-separated descending timesteps,
 for example `"0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0"`. Overrides
-`inference_steps` and `shift`. The last value is the endpoint, so N values give N-1
-steps.
+`inference_steps` and `shift`, and a scheduler plugin. The last value is the
+endpoint, so N values give N-1 steps. On ace-server the sideband copy of this field
+wins, and it drops the last value only when that value is `0`, so end the list with
+`0`.
 
 **`dit_sliding_window`** (int, default -1). Window override, in tokens (12.5 per
 second), for the DiT's sliding-window attention layers. `-1` keeps the model's value,
@@ -245,9 +251,6 @@ the trained window is out of distribution.
 
 **`latent_shift`**, **`latent_rescale`** (float, defaults 0.0 and 1.0). Applied to the
 DiT output before VAE decode: `latent * latent_rescale + latent_shift`.
-<!-- TODO(verify): on the GGML path through ace-server these look applied twice, once
-     in hot-step-sampler.h from the sideband copy and once in pipeline-synth-ops.cpp
-     from the request copy. Confirm before relying on non-default values. -->
 
 **`lss_strength`** (float, default 0 = off), **`lss_var_thresh`** (default 0.15),
 **`lss_dc_remove`** (default true). Latent Spectral Suppressor: before VAE decode,
@@ -292,11 +295,12 @@ normalisation, `10` clips the top 0.001 %, `999` clips the top 0.1 %.
 and `ace-synth` use the `--mp3-bitrate` flag instead.
 
 **`get_lrc`** (bool, default false). Runs an extra DiT pass for cross-attention
-alignment and produces LRC lyric timestamps. ace-server returns them in the
-`X-LRC-Text` header of the `/job` result.
+alignment and produces LRC lyric timestamps. ace-server returns the first track's
+LRC, base64-encoded, in the `X-LRC-Text` header of the `/job` result.
 
 **`postprocess_plugin`** (string, default `""`). A Lua postprocess plugin to use for
-VAE decode instead of the built-in tiled decoder.
+VAE decode instead of the built-in tiled decoder. An unknown name, or a plugin whose
+`process()` fails, falls back to the built-in decoder.
 
 **`pp_vae_reencode`** (bool, default false). Round-trips the audio through the
 post-processing VAE when a PP-VAE model is installed.
@@ -346,36 +350,35 @@ only the first object's sideband fields are read.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `vae_model` | `""` | VAE from the registry. An unavailable `.onnx` VAE is rejected |
+| `vae_model` | `""` | VAE from the registry. Empty takes the first non-ONNX VAE. A name ending in `.onnx` is a 400: ONNX decoding was removed |
 | `emb_model` | `""` | Text encoder from the registry |
 | `infer_method` | `"euler"` | Solver plugin name. Unknown names fall back to `euler` |
-| `scheduler` | `""` | Scheduler plugin name. Empty uses the shift schedule |
+| `scheduler` | `""` | Scheduler plugin name, or `composite:<a>+<b>:<crossover>:<split>` to blend two. Empty uses the shift schedule; an unknown name uses `linear` |
 | `guidance_mode` | `"apg"` | Guidance plugin name. Unknown names fall back to `apg` |
 | `plugin_params` | `{}` | Plugin parameters, `{"pluginName:key": value}`. Values may be strings, numbers or booleans |
 | `apg_momentum`, `apg_norm_threshold` | 0.75, 2.5 | APG tuning |
 | `stork_substeps`, `beat_stability`, `frequency_damping`, `temporal_smoothing` | 10, 0.25, 0.4, 0.13 | Copied into the solver state |
 | `cfg_cutoff_ratio` | 1.0 | Fraction of DiT steps that run CFG |
 | `cache_ratio` | 0.0 | Fraction of middle steps that reuse the previous velocity instead of a forward pass |
-| `custom_timesteps` | `""` | Same as the request field; `ops_build_schedule` reads this copy |
+| `custom_timesteps` | `""` | Same as the request field; `ops_build_schedule` prefers this copy |
 | `dcw_enabled`, `dcw_mode`, `dcw_scaler`, `dcw_high_scaler` | false, `"low"`, 0.1, 0.0 | Wavelet-domain sampler correction. `dcw_mode` is `low`, `high`, `double` or `pix` |
 | `latent_shift`, `latent_rescale` | 0.0, 1.0 | Same as the request fields |
 | `denoise_strength`, `denoise_smoothing`, `denoise_mix` | 0.0, 0.7, 0.25 | Post-VAE spectral denoiser. Uses the `--noise-profile` noise profile when one was loaded |
 | `adapter_mode` | `"merge"` | `merge`, `runtime` or `runtime_lowrank` |
-| `adapter_runtime_quant` | `"bf16"` | Runtime delta precision: `bf16`, `q8_0`, `q4_k` |
+| `adapter_runtime_quant` | `"bf16"` | Runtime delta precision: `bf16`, `q8_0` or `q4_0` (`q4_k` is read as `q4_0`). A tensor whose input width is not a multiple of 32 stays BF16 |
+| `adapter_runtime_dora` | false | Runtime modes: DoRA magnitude rescaling for DoRA adapters, including runtime paths forced by adapter windows or sections. Merge mode is unchanged. A non-boolean value is ignored. The Node field is `adapterRuntimeDora`, sent only when true |
 | `adapter_merge_lowvram` | false | Merge mode: requantise merged weights to the base type instead of F32 |
 | `adapter_group_scales` | all 1.0 | Object with `self_attn`, `cross_attn`, `mlp`, `cond_embed`, `time_embed`, `proj_in` |
 | `adapter_section_align_at` | 0.55 | Fraction of steps before per-section masks are rebuilt from cross-attention alignment. `<= 0` keeps the proportional map |
 | `adapter_section_isolation` | 0.0 | 0 to 1 penalty on self-attention across section boundaries |
-| `rebase_source`, `rebase_beta` | `""`, 0.0 | Nudge adapted weights toward the adapter's training base: a DiT name from the registry, and the strength. Merge mode only |
+| `rebase_source`, `rebase_beta` | `""`, 0.0 | Nudge adapted weights toward the adapter's training base: a DiT name from the registry, and the strength. Merge and runtime modes; skipped with per-section masking |
 | `concepts` | `[]` | Concept steering vectors: `{"name", "path", "target": "dit" or "lm", "alpha", "layers": [...]}` |
-| `concept_extract` | none | `{"out", "name", "positive", "negative", "target_class", "pairs", "null_ref", "top_k"}`. Turns the job into a paired harvest that writes a concept GGUF instead of audio. Needs `out`, `positive` and `negative` |
+| `concept_extract` | none | `{"out", "name", "positive", "negative", "target_class", "pairs", "null_ref", "top_k"}`. Turns the job into a paired harvest that writes a concept GGUF instead of audio. Needs `out`, `positive` and `negative` (each a string or an array of strings); `pairs` defaults to 24, `top_k` to 4 |
 | `seed_strength` | 0.0 | Repaint only: bias the region's initial noise toward the `seed_latents` multipart part |
 | `evict_lm` | false | Free the LM before loading the synth pipeline |
 | `vae_chunk` | 0 | Per-request VAE tile size (`0` keeps the loaded value) |
 | `batch_cfg` | -1 | `0` splits CFG into two forwards, `1` batches them, `-1` keeps the default |
-
-<!-- TODO(verify): /lm never parses the sideband, so a concept with target "lm" only
-     reaches the LM through whatever the last /synth left in g_hotstep_params. -->
+| `stream_mode` | false | Removed with the ONNX streaming pipeline. `true` (or `"true"`, `"1"`) is a 400 |
 
 ### MiniMax-Music3 request (`POST /mm3/synth`)
 
@@ -412,8 +415,19 @@ are reported, not ignored.
 | `lm_adapter` | `""` | Path to a PEFT LM adapter |
 | `lm_adapter_mode` | `"runtime"` | `runtime` or `merge` |
 | `lm_adapter_merge_gpu` | true | Merge mode: merge on the GPU |
-| `lm_adapter_scale`, `lm_adapter_scale_attn`, `lm_adapter_scale_mlp`, `lm_adapter_scale_early`, `lm_adapter_scale_mid`, `lm_adapter_scale_late` | | Adapter scales: overall, by module group, and by depth third |
+| `lm_adapter_scale`, `lm_adapter_scale_attn`, `lm_adapter_scale_mlp`, `lm_adapter_scale_early`, `lm_adapter_scale_mid`, `lm_adapter_scale_late` | 1.0 each | Adapter scales, -4 to 4: overall, by module group, and by depth third |
 | `lm_soft_off` | false | Run the adapter's weight delta without its artist token or KV prefix |
+| `adapter_runtime_dora` | false | The same key ACE reads, here for the LM adapter: true recomputes a DoRA adapter's column norms at the dialled scale instead of its base scale |
+
+Out-of-range planner sampling values are clamped, not refused. The ranges are
+`lm_temperature` 0.05 to 4, `lm_top_k` 0 to 16385, `lm_top_p` 0 to 1,
+`lm_rep_penalty` 1 to 2, `lm_rep_window` 0 to 4000, `lm_dry_base` 1.05 to 4 and
+`lm_dry_min_len` 1 to 200.
+The prompt is tokenized before the job is queued, so a prompt over the 5000-token
+limit is a 400 that names the count. The response carries `id` (also as `job_id`),
+the resolved `seed` (and `seed_str`, the same value as a decimal string, because a
+64-bit seed does not survive a JavaScript number), the clamped `takes`, `ar_seed`
+and the resolved sampling settings.
 
 ### YuE2 request (`POST /yue2/synth`)
 
@@ -425,24 +439,36 @@ Parsed by `yue2_parse_request` in `engine/src/yue2/yue2-request.h`.
 | `lyrics` | `""` | Lyrics |
 | `cot` | `"off"` | `off`, `melody` or `full`. `melody` and `full` run the ABC plan stage |
 | `abc` | none | ABC text to use instead of running the plan stage |
-| `plan_only` | false | Stop after the plan stage and return the ABC score. Needs `cot` other than `off` |
+| `plan_only` | false | Stop after the plan stage and return the ABC score. Needs `cot` other than `off`; cannot be combined with `abc` or `semantic_only` |
 | `semantic_only` | false | Stop after the semantic stage and return the codec ids |
-| `semantic_retries` | 0 | Redraws per song whose semantic stage runs away, up to 4 side by side; the first to end cleanly wins |
-| `plan_cutoff` | 1.5 | A stream past this x its plan's length + 20 s is a runaway (`limit_hit`); 0 = only the stage cap |
-| `seed` | random | Song seed. Song i of a batch uses `seed + i` |
-| `noise_seed` | `seed` | NAR noise seed. Variation j uses `noise_seed + j` |
+| `semantic_retries` | 0 | 0 to 20. Redraws per song whose semantic stage runs away, up to 4 side by side; the first to end cleanly wins |
+| `plan_cutoff` | 1.5 | 0 to 10. A stream past this x its plan's length + 20 s is a runaway (`limit_hit`); 0 = only the stage cap |
+| `seed` | random | Song seed, a non-negative integer or a decimal string (for values past 2^53). Song i of a batch uses `seed + i` |
+| `noise_seed` | `seed` | NAR noise seed, same encoding. Variation j uses `noise_seed + j` |
 | `lm_batch_size` | 1 | Songs per request, 1 to 4 |
-| `songs` | none | A batch of different songs: an array of 1 to 4 objects, each with its own `style` (required), `lyrics`, `abc`, `seed` and `noise_seed`. Everything else comes from the request. Sets the batch size and cannot be combined with `lm_batch_size` above 1. Song i without a `seed` uses the request seed plus i. Tracks come back song-major in array order |
+| `songs` | none | A batch of different songs: an array of 1 to 4 objects (up to 8 with `plan_only`), each with its own `style` (required), `lyrics`, `abc`, `seed` and `noise_seed`. Everything else comes from the request. Sets the batch size and cannot be combined with `lm_batch_size` above 1. Song i without a `seed` uses the request seed plus i. Tracks come back song-major in array order |
 | `synth_batch_size` | 1 | Noise variations per song, 1 to 9 |
-| `plan_<field>`, `semantic_<field>` | checkpoint | Per-stage sampler overrides. `<field>` is `temperature`, `top_p`, `top_k`, `repetition_penalty`, `penalty_window`, `min_tokens` or `max_tokens` |
-| `cfg_scale` | resolved from the checkpoint | NAR CFG |
+| `plan_<field>`, `semantic_<field>` | checkpoint | Per-stage sampler overrides. `<field>` is `temperature`, `top_p`, `top_k`, `repetition_penalty`, `penalty_window`, `min_tokens`, `max_tokens` or `min_p`. `min_p` (0 to 1, default 0 = off) is not a checkpoint field: after top-p it drops every token under that fraction of the top token's probability |
+| `cfg_min_p`, `cfg_logprob`, `cfg_rescale` | 0, false, 0 | Opt-in refinements of the semantic stage's logit CFG, as `lm_cfg_*` above. All off keeps the reference BF16 blend |
+| `cfg_scale` | 1.01 with `cot: "off"`, else 1.0 | NAR CFG |
 | `ode_steps` | checkpoint | NAR ODE steps |
-| `ode_method` | `"midpoint"` | The only method implemented |
-| `infer_method`, `scheduler`, `plugin_params` | `""`, `""`, `{}` | Lua solver and scheduler for the NAR stage. Empty keeps native midpoint and the uniform grid |
+| `ode_method` | `"midpoint"` | The only method implemented; any other value is a 400 |
+| `infer_method`, `scheduler`, `plugin_params` | `""`, `""`, `{}` | Lua solver and scheduler for the NAR stage. Empty keeps native midpoint and the uniform grid. Only an allowlist runs: solvers `md_wasserstein_yue2`, `md_ancestral_yue2`, `md_latent_eq_yue2` and `md_tlie_yue2`; schedulers `md_ht_scheduler V3`, `md_plan_aware_yue2`, `md_plan_loose_yue2` and `md_plan_overdrive_yue2`. Any other name is a 400. `plugin_params` values must be strings, numbers or booleans |
+| `postprocess_plugin` | `""` | Lua postprocess plugin for the VAE decode; empty, unknown or failing keeps the native decode |
+| `lm_adapter`, `lm_adapter_scale`, `lm_type` | absent | The job's own model pick, with the [`/yue2/select-model`](#endpoints) rules, applied when the job starts. Absent keeps the current pick |
+| `lyric_schedule` | off | Hides lyric sections from the semantic stage until their time on the score clock: `{"mode": "bias" or "mask", "bias", "abc", "lead_sec", "behind", "sections": [{"start_sec", "lyric": [c0, c1], "abc": [[c0, c1], ...]}], "blind": [{"from_sec", "to_sec", "lyric", "abc"}]}`. Spans are codepoint ranges into the request's `lyrics` and `abc`. Mode `bias` adds `bias` (-60 to below 0, required) to the hidden prompt rows' attention; mode `mask` hides them completely. `abc: true` also hides each section's score lines, `lead_sec` (0 to 30) reveals a section that long before its first note, and `behind` (-1 to 256, -1 = never) also hides sections more than that many before the current one. A blind window hides its spans while the composer writes frames from `from_sec` up to `to_sec`. Up to 256 sections, in score order, and 16 blind windows; at least one of the two |
 | `nar_cache_ratio` | 0.0 | Fraction of middle NAR steps that reuse the last velocity |
 | `nar_chunk_frames` | 0 | NAR chunk cap in frames (25 per second). 0 renders a normal song in one chunk |
 | `end_threshold` | 0.0 | 0 to 1. Stop the semantic stage when the sampler puts this much probability on the end token |
 | `end_bias`, `end_bias_from_sec`, `end_bias_ramp_sec` | 0.0 | Additive end-token bias (-50 to 50), when it starts, and its ramp |
+| `guide_path` | none | Source guide file from `ace-train yue2-guide` (absolute path). Turns on source guidance for the semantic stage: per 25 Hz frame, the real-audio tokenizer's top-K codes for a recording |
+| `guide_scale` | 0.5 | 0 to 1. Mixes the LM's distribution with the tokenizer's (renormalised over the candidates): `(1 - s) p_LM + s p_tok`. Roughly the share of frames that follow the source |
+| `guide_k` | 0 | Candidates used per frame, 0 = every one the file holds |
+| `guide_outside` | 0.0 | -1000 to 0. Additive penalty on codes outside the candidates; -100 or below makes the candidates the only legal codes |
+| `guide_offset_sec` | 0.0 | Shift the source against the output, -3600 to 3600 s |
+| `guide_allow_end` | false | Allow the end token while a guide frame is active |
+| `guide_schedule`, `guide_schedule_power` | `"flat"`, 1.0 | Scale envelope over the guide: `flat`, `up`, `down`, `sin` or `inv_sin`, raised to the power |
+| `guide_lfo`, `guide_lfo_period_sec`, `guide_lfo_depth`, `guide_lfo_phase` | `"off"`, 4.0, 0.0, 0.0 | Periodic scale modulation: `off`, `sine`, `triangle`, `saw` or `square`. Depth 1 swings the scale between 0 and its value |
 | `codec_ids` | none | Semantic codes (0 to 32767) to render instead of sampling. Without continuation, single song and single variation only |
 | `continue_codec_ids` | false | Treat `codec_ids` as a shared prefix for 1 to 4 songs and keep sampling after it, at any `cfg_scale`. No `semantic_retries` |
 | `preview_max_frames` | 0 | Bound on semantic frames, 0 to 9000 (training previews) |
@@ -480,6 +506,54 @@ reads `nar` from the handoff. The lane is skipped, and the render runs inline, w
 `YUE2_NO_OVERLAP` is set, under ConvRot, with a Lua NAR solver or scheduler, or with less
 than `YUE2_OVERLAP_MIN_FREE_GB` (default 4) of free VRAM. Warm, unload and select-model wait
 for a render in flight before touching weights.
+
+### Stable Audio 3 request (`POST /sa3-synth`)
+
+`/sa3-synth` reads its parameters from the query string (or form fields), not a JSON
+body. It runs synchronously on the GPU worker and returns a WAV. `/sa3-refine` shares
+the plugin and adapter parameters and adds its refine-only ones, which are documented
+above its handler in `hot-step-server.cpp`.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `tokens`, `n_tokens` | required | The prompt as comma-separated T5Gemma token ids (the Node server tokenizes) and the count of real tokens. A missing or zero `n_tokens` is a 400 |
+| `duration` | 30 | Seconds, at least 1; anything above 600 is cut to 600 |
+| `steps` | 8 | 1 to 64 |
+| `sampler` | `pingpong` | `pingpong` or `euler` |
+| `seed` | from the clock | Unsigned 64-bit seed |
+| `seed_b`, `seed_blend` | -1, 0 | Seed breeding, below |
+| `synth_model` | `sa3-dit-BF16.gguf` | Generation DiT, below |
+| `adapters` | none | `name:strength,name:strength`. Each needs `<models>/sa3-adapters/<name>.gguf`; a missing file or a name with a path in it is a 400 |
+| `snapshot_run`, `snapshot_step`, `snapshot_scale` | none, none, 1 | Checkpoint previews, below |
+| `solver`, `scheduler`, `guidance_mode`, `guidance_scale`, `plugin_params` | none, none, none, 1, none | Lua plugins. The solver parameter is `solver` here, where `/synth` uses `infer_method`; `plugin_params` is a JSON object string. `guidance_scale` is clamped to 1 to 20, and guidance runs only above 1. A full-loop solver needs `sampler=euler` |
+| `postprocess_plugin` | none | Lua postprocess plugin for the decode |
+| `sa3_lua_renoise` | 1 | `0` turns off the pingpong re-noise the engine wraps around a per-step Lua solver |
+| `out_sr`, `out_fmt` | 44100, `s16` | Output rate (8000 to 192000) and WAV sample format |
+| `backend` | auto | `gguf` or auto; `onnx` is a 400. Without `sa3-dit-BF16.gguf` the request is a 501 |
+| `debug_zero_noise`, `dump_latent` | off | Validation only: zero noise, and a bare file name under `<models>/sa3-latents/` for the final latent |
+
+Seed breeding: the whole pure-noise latent is slerped from the `seed` noise toward
+the `seed_b` noise (same std::mt19937_64 gaussian at `seed_b`); `seed_blend` 0 gives
+`seed` exactly, 1 gives `seed_b`. `seed_b` -1 is off. No effect on `/sa3-refine`.
+
+Generation DiT: `synth_model` is a bare filename in the models root (the same field
+name ACE uses for its DiT), for example `sa3-dit-Q8_0.gguf`. An empty or absent
+value uses `sa3-dit-BF16.gguf`; so does a value that does not match
+`sa3-dit-*.gguf` or names a file that is not installed, with the reason in the log.
+A name containing `/`, `\` or `..` is a 400, and so is the training base
+`sa3-dit-base-*` in any letter case. The `sa3-dit-*.gguf` match is case-sensitive,
+so a differently cased name falls back to BF16 instead of caching the same file
+under a second key. The response header `X-SA3-DiT` names the DiT that ran. The
+store keys the SA3 model on the DiT path, so each quant caches as its own entry.
+`/sa3-refine` takes no DiT parameter and always loads `sa3-dit-BF16.gguf`.
+
+Checkpoint previews: `snapshot_run` (`<dataset>/<adapter>/<stamp>`), `snapshot_step`
+(positive decimal) and `snapshot_scale` (finite float, default 1) load the captured
+training export `snapshots/step-N.gguf` under the SA3 training runs root as an extra
+adapter. Bad charsets, a file outside the root, a non-`dora-rows-v1` GGUF, an
+inference base that differs from the loaded DiT or an unparseable scale return 400.
+The public adapter names and `/sa3/props` are unaffected. Details:
+[engine reference](../../docs/dev/engine.md#stable-audio-3-sampling).
 
 ## Generation modes
 
@@ -592,7 +666,7 @@ Audio encoding:
   --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
 
 Memory control:
-  --vae-chunk <N>         Latent frames per tile (default: 256)
+  --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
 Debug:
@@ -612,6 +686,9 @@ above 0.02, or more than 0.1% of samples past full scale. The env var
 `HOTSTEP_CHECK_INJECT` (a comma list, one of `none`, `nan`, `subnormal`, `silence`,
 `dc`, `clip` per track) corrupts tracks before the check so the checks themselves can be tested. ace-synth exits 1 when a
 track produces no audio or its file fails to write, and 2 when a `--check` fails.
+Setting `HOTSTEP_BCAST_TEST` or `HOTSTEP_KRON_TEST` makes ace-synth run a
+model-free backend self-test (the per-section mask broadcast, or the LoKr
+Kronecker apply) and exit with its result instead.
 
 The first request picks the models: `synth_model` for the DiT (empty takes the first),
 `adapter` or `adapters` from `--adapters`, and `output_format` for the output. The
@@ -663,7 +740,7 @@ Output:
   -o <json>               Output JSON (default: stdout summary)
 
 Memory control:
-  --vae-chunk <N>         Latent frames per tile (default: 256)
+  --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
 Debug:
@@ -673,7 +750,10 @@ Debug:
   --dump <dir>            Dump tok_latents + tok_codes (skip LM)
 ```
 
-The DiT file supplies the FSQ tokenizer weights.
+The DiT file supplies the FSQ tokenizer weights. The understand defaults only apply
+when no request is given: a `--request` file, like the `request` part of
+`/understand`, starts from the normal `AceRequest` defaults (temperature 0.85,
+top_p 0.9) for any field it leaves out.
 
 ## ace-server reference
 
@@ -691,7 +771,7 @@ Plugins:
 
 Memory control:
   --keep-loaded           Keep models in VRAM between requests
-  --vae-chunk <N>         Latent frames per tile (default: 256)
+  --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
 
 Speculative decoding:
@@ -712,10 +792,16 @@ Debug:
   --no-fa                 Disable flash attention
   --no-batch-cfg          Split CFG into two separate forwards (LM + DiT)
   --clamp-fp16            Clamp hidden states to FP16 range
+  --backend-check         Load GGML backends without models, print a JSON report, exit
 ```
 
 Notes the usage text does not cover:
 
+- `--backend-check` needs no `--models`. Its report lists each registered backend
+  with its devices, the device the engine would pick, and every `ggml-*.dll` beside
+  the exe with whether it registered; on Windows a DLL that did not register is
+  named with its load error and the first import that could not be loaded. The
+  release smoke test (`release/smoke-artifact.mjs`) decides pass or fail from it.
 - `--noise-profile <wav>` is also accepted. It loads a noise profile for the
   spectral denoiser (`denoise_strength`).
 - `--draft-lm` auto-discovery is disabled in the code; only an explicit path enables
@@ -723,10 +809,13 @@ Notes the usage text does not cover:
 - `--max-batch` is clamped to 1..9.
 - `--models` is scanned at startup, and its `onnx/` subfolder too. `--adapters` is
   scanned for DiT adapters and its `lm/` subfolder for planner-LM adapters.
-- `--user-plugins <dir>` is a plugin root with the same `solvers/`, `schedulers/`,
-  `guidance/` and `postprocess/` subfolders as `engine/plugins/`. It is scanned last,
-  and a user file that declares a shipped plugin's name replaces it. The release
-  app passes `<data folder>/plugins`; dev passes nothing.
+- Lua plugins are scanned once at startup from `engine/plugins/` and then the
+  project root's `plugins/`, each with `solvers/`, `schedulers/`, `guidance/` and
+  `postprocess/` subfolders. `--user-plugins <dir>` is a third root with the same
+  subfolders, scanned last; a user file that declares a shipped plugin's name
+  replaces it, and any other duplicate keeps the first one loaded. The app passes
+  `<data folder>/plugins` whenever it runs with a data folder, which a release
+  always does; a dev checkout without a data folder passes nothing.
 - The app starts ace-server on port 8085.
 
 | Pipeline | Needs | Enables |
@@ -734,9 +823,11 @@ Notes the usage text does not cover:
 | LM | an LM GGUF | `/lm` |
 | Synth | DiT, text encoder and VAE | `/synth`, `/warm` |
 | Understand | LM, DiT and VAE | `/understand` |
+| VAE | a VAE | `/vae` |
+| Codes decode | DiT and VAE | `/codes-decode` |
 
-Endpoints whose pipeline has no models return 501. With only MM3 or YuE2 weights
-present, the server still starts and serves those routes.
+Endpoints whose pipeline has no models return 501. With only MM3, YuE2 or Stable
+Audio 3 weights present, the server still starts and serves those routes.
 
 ### Endpoints
 
@@ -767,16 +858,22 @@ POST /codes-decode               Codes to audio. Body: AceRequest JSON with
                                  audio_codes (required), synth_model, vae,
                                  output_format, peak_clip.
 POST /warm[?keep_loaded=1]       Preload. Body: {"dit", "vae", "adapter",
-                                 "adapter_scale"}.
+                                 "adapter_scale"}; adapter is a registry name.
+                                 A no-op unless models are kept loaded: the job
+                                 result is then {"warm":false,"reason"}.
 
 GET  /job?id=N                   Status: {"status", "phase", "phase_step",
-                                 "phase_total", "adapter_progress"}. status is
-                                 running, done, failed or cancelled. YuE2 jobs add
-                                 end_reason, stage_end_reasons, tracks and abc.
+                                 "phase_total", "adapter_progress",
+                                 "songs_done"}. status is running, done, failed
+                                 or cancelled. songs_done is a YuE2 batch's bit
+                                 mask of songs that finished the running stage,
+                                 0 otherwise. YuE2 jobs add end_reason,
+                                 stage_end_reasons, tracks and abc.
 GET  /job?id=N&result=1          Result. /lm and /understand: JSON array of
                                  AceRequest. /synth: one audio file, or
-                                 multipart/mixed for a batch; LRC text in the
-                                 X-LRC-Text header when get_lrc was set.
+                                 multipart/mixed for a batch; the first track's
+                                 LRC, base64-encoded, in the X-LRC-Text header
+                                 when get_lrc was set.
 GET  /job?id=N&latent=1          /synth: the first track's post-DiT latents, raw
                                  f32 [T*64].
 POST /job?id=N&cancel=1          Cancel a job.
@@ -792,7 +889,8 @@ GET  /props                      version, models (lm, embedding, dit, vae),
                                  adapters, lm_adapters, cli (max_batch,
                                  mp3_bitrate), default (full AceRequest), presets
                                  (turbo, sft).
-GET  /logs                       Server stderr as server-sent events.
+GET  /logs                       Server stderr as server-sent events, starting
+                                 with up to the last 512 lines.
 GET  /plugins                    Lua plugin registry.
 GET  /vram                       {"used_mb", "total_mb", "free_mb"} (zeros on
                                  non-CUDA builds).
@@ -804,8 +902,12 @@ POST /models/restore-policy      Undo ?keep_loaded=1. 409 when --keep-loaded was
 GET  /                           Embedded web UI (gzip).
 ```
 
-Post-processing endpoints. These run synchronously on the HTTP thread, except
-SuperSep, which has its own job table.
+Post-processing and Stable Audio 3 endpoints. `/pp-vae-reencode`, `/sa3-refine` and
+`/sa3-synth` answer synchronously, but their work runs on the GPU worker queue
+behind any job already queued. `/spectral-lifter` runs on the HTTP thread. SuperSep
+queues on the same worker and keeps its own job table, which has no eviction:
+release a job when you are done with it. The `/sa3-synth` parameters are in
+[Stable Audio 3 request](#stable-audio-3-request-post-sa3-synth).
 
 ```
 POST /pp-vae-reencode[?blend=0..1][&backend=gguf][&out_fmt=s16|s24|f32]
@@ -818,11 +920,18 @@ POST /sa3-refine?...             Body: WAV or MP3. Stable Audio 3 refine. Query
                                  steps, sampler, seed, rms_match, env_match, mix,
                                  band_blend, band_freq, band_width, out_sr,
                                  backend, adapters, solver, scheduler,
-                                 guidance_mode, guidance_scale, plugin_params).
-                                 backend is gguf or auto (both GGML);
-                                 backend=onnx returns 400.
-POST /supersep/separate?level=0..4
+                                 guidance_mode, guidance_scale, plugin_params,
+                                 postprocess_plugin, sa3_lua_renoise,
+                                 debug_zero_noise). backend is gguf or auto (both
+                                 GGML); backend=onnx returns 400.
+GET  /sa3/props                  SA3 availability (sa3-dit-BF16.gguf and the
+                                 tokenizer), sample rate, prompt token limit and
+                                 the adapters in <models>/sa3-adapters/.
+POST /sa3-synth?...              Stable Audio 3 text to audio; returns WAV and an
+                                 X-SA3-DiT header.
+POST /supersep/separate?level=0..5
                                  Body: audio. Starts stem separation, returns {"id"}.
+                                 Level 3 is retired and runs as 2.
 GET  /supersep/progress?id=      Progress.
 GET  /supersep/result?id=        Stem list.
 GET  /supersep/serve?id=&stem=N  One stem as WAV.
@@ -833,9 +942,9 @@ POST /spectral-lifter?...        Body: WAV. Query: denoise_strength, noise_floor
                                  hf_mix, transient_boost, shimmer_reduction.
 ```
 
-`/pp-vae-reencode`, `/sa3-refine`, `/supersep/serve`, `/supersep/recombine` and
-`/spectral-lifter` take `?out_fmt=s16|s24|f32` for the returned WAV; the default is
-`s16`.
+`/pp-vae-reencode`, `/sa3-refine`, `/sa3-synth`, `/supersep/serve`,
+`/supersep/recombine` and `/spectral-lifter` take `?out_fmt=s16|s24|f32` for the
+returned WAV; the default is `s16`.
 
 MiniMax-Music3 and YuE2 endpoints. Request fields for the two synth routes are in
 [MiniMax-Music3 request](#minimax-music3-request-post-mm3synth) and
@@ -845,7 +954,8 @@ MiniMax-Music3 and YuE2 endpoints. Request fields for the two synth routes are i
 GET  /mm3/props                  MM3 files, config, what is loaded.
 POST /mm3/warm, /mm3/unload      Load or free MM3 weights.
 POST /mm3/select-model           Body {"lm", "depth", "cond", "dit", "voc"} quant
-                                 tokens ("" = best available).
+                                 tokens ("" = best available). A legacy "synth"
+                                 key sets the four non-LM roles at once.
 POST /mm3/synth                  MM3 job on the shared queue.
 GET  /mm3/job?id=                MM3 progress: stage, window, seed, timings.
                                  &ar=1 returns the planner codes.
@@ -866,15 +976,19 @@ POST /yue2/select-model          Body {"vae_variant", "lm_type", "lm_adapter",
 POST /yue2/synth                 YuE2 job; poll with GET /job.
 POST /yue2/tokenize-check        Prompt assembly and token count, no GPU work.
 POST /yue2/imatrix               Activation statistics for quantize --imatrix.
-POST /yue2/align                 multipart: audio + lyrics. Forced alignment.
+POST /yue2/align                 multipart: audio + lyrics. Forced alignment, run
+                                 on the GPU worker.
 ```
 
 Errors are JSON, `{"error":"message"}`, with a 4xx or 5xx status.
 
 ### Concurrency
 
-One worker thread runs every GPU job in FIFO order: ACE-Step, MM3 and YuE2 alike.
-The job table holds 32 entries; finished jobs are evicted oldest first and running
+One worker thread runs every GPU job in FIFO order: ACE-Step, MM3 and YuE2 jobs,
+SuperSep separations, and the synchronous worker routes (`/pp-vae-reencode`,
+`/sa3-refine`, `/sa3-synth`, `/yue2/align`, `/worker-drain`). The other `/mm3/*`
+and `/yue2/*` routes, warm, unload and imatrix included, run on the HTTP thread. The
+job table holds 32 entries; finished jobs are evicted oldest first and running
 jobs never are. Each job has its own cancel flag, and a cancel during adapter
 precompute takes effect between deltas.
 
@@ -925,7 +1039,8 @@ Latent formats (decode auto-detects):
 
 NAC8 and NAC4 files start with an 8-byte header: the 4-byte magic (`NAC8` or
 `NAC4`) and a uint32 frame count. A NAC8 frame is 66 bytes (an f16 scale and 64
-int8 values).
+int8 values); a NAC4 frame is 34 bytes (an f16 scale and 32 bytes of packed 4-bit
+values). `--input` and `--output` are accepted as long forms of `-i` and `-o`.
 
 ```bash
 ./neural-codec --vae models/vae-BF16.gguf --encode --q4 -i song.wav -o song.nac4
@@ -952,16 +1067,89 @@ mp3-codec -i song.wav -o song.mp3 -b 192
 mp3-codec -i song.mp3 -o song.wav --format wav32
 ```
 
+## quantize reference
+
+GGUF requantizer for ACE-Step, MiniMax-Music3 and YuE2 files. It reads a BF16 or
+F16 GGUF and writes the quantized file one tensor at a time.
+
+```
+Usage: quantize <input.gguf> <output.gguf> <type> [--imatrix <file.gguf>]
+Types: Q2_K Q3_K_S Q3_K_M Q3_K_L Q4_K_S Q4_K_M Q5_K_S Q5_K_M Q6_K Q8_0 NVFP4 MXFP4
+       IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ3_XXS IQ4_XS
+```
+
+The type name is matched case-insensitively, and `-m` is a short form of
+`--imatrix`. Most types raise the important tensors (`v_proj`, `down_proj` and their
+equivalents) to a higher type in some or all layers; `Q3_K_S`, `Q5_K_S`, `Q6_K`,
+`Q8_0`, `NVFP4`, `MXFP4` and `IQ4_XS` do not. The embedding has its own type:
+`Q6_K` under the K-quants and `IQ4_XS`, `Q8_0` under `Q8_0`, `NVFP4` and `MXFP4`,
+and `Q2_K` to `Q5_K` under the other i-quants. MM3 files follow the converter's
+choice: F16 tensors are quantized and F32 tensors are left alone. `IQ1_S`, `IQ2_XXS` and
+`IQ2_XS` cannot be built without an importance matrix and stop before reading the
+input. Collect one with `POST /mm3/imatrix` or `POST /yue2/imatrix`; the file
+format is described in `engine/src/minimax/mm3-imatrix.h`.
+
+## ace-train reference
+
+`ace-train <subcommand> [options]` runs one training job per subcommand; the list is
+in [the engine guide](../../docs/dev/engine.md#training-subcommands), and
+`ace-train --help` prints the full option list. With `--jsonl` a trainer writes
+machine-readable events on stdout and human logs on stderr. The sections below give
+the flags of a few subcommands in detail.
+
+`ace-train mm3-train-dit --dora` trains the MM3 flow-DiT adapter as DoRA instead of
+LoRA (`MM3TrainArgs.dora`). It takes the same `--cache`, `--models` and `--out`
+arguments as LoRA and needs the outputs of both `mm3-preprocess` and
+`mm3-condition`. This trainer is CLI-only: it is not an app training job or a DiT
+adapter capability.
+
+## Stable Audio 3 training CLI
+
+```text
+ace-train sa3-train --models <models> --base-dit <medium-base.gguf> --inference-dit <medium.gguf> --manifest <train-manifest.json> --out <new-run> --steps 1000 --rank 16 --alpha 16 --lr 0.0001 --duration 12 --seed 42 --checkpoint-every 100 --export-every 0 --bwd mm --jsonl
+ace-train sa3-train-check --models <models> --base-dit <medium-base.gguf> --fixtures <reference-directory>
+```
+
+`--manifest`, `--models`, `--base-dit` and `--out` are required for `sa3-train`;
+`--fixtures`, `--base-dit` and `--models` for `sa3-train-check`. `--duration` sets
+the maximum crop in seconds; the 12-second example is a smoke configuration, while
+the trainer and server default is 380 seconds. `--cache` overrides the pre-encoding
+cache, otherwise `<out>/cache`. `--inference-dit` defaults to
+`<models>/sa3-dit-BF16.gguf`. `--resume` reads `<out>/state.gguf` and checks the
+saved run fingerprint; without `--resume`, an `--out` that already holds
+`state.gguf` is refused. Total `--steps` includes completed updates.
+`--checkpoint-every` sets the state-save interval; `--export-every 0` disables
+periodic inference snapshots. Final raw, state and inference files are separate. The server's checkpoint previews run the
+trainer in segments: an absolute `--steps` bound, then `--resume` with a larger one in the
+same `--out`, with `--export-every 0`; `<out>/state.gguf` records the completed step.
+
+`--bwd mm` is the default backward path; `--bwd outprod` selects OUT_PROD.
+`--tf32 on|off` defaults off. The standalone `--train-seconds` option also trains
+the seconds embedder, but the server deliberately excludes it from published
+adapters because that adapter site has no inference loading contract.
+Writing `<out>/STOP` requests a checkpoint stop at the next training step.
+`--jsonl` emits start, resume, data, progress, log, step, checkpoint, export,
+stopped, done and error events (the `type` field). A stopped run is resumable when
+state exists; it is not a completed publication. See [training internals](../../docs/dev/training-internals.md#stable-audio-3-medium-training).
+
 ## ace-train YuE2 preparation reference
 
 `ace-train yue2-prepare-aitk` builds native joint-training caches from a Legacy
 manifest. See [training internals](../../docs/dev/training-internals.md) for the
 full preparation command and workflow.
 
+```
+ace-train yue2-prepare-aitk --legacy-manifest FILE --checkpoint FILE
+    --tokenizer GGUF_OR_DIR --output NEW_DIR --model vae=FILE
+    --model semantic=FILE --model sheetsage=FILE [--trigger WORD]
+    [--caption-dropout-trigger TEXT] [--lyric-timing 0|1]
+```
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--trigger <text>` | empty | Inject a trigger into full captions. With a non-empty caption, the style becomes `<text>, in the style of <text>. <caption>`; with an empty caption, it is just `<text>` |
+| `--trigger <text>` | empty | Inject a trigger into full captions. With a non-empty caption, the style becomes `<text>, in the style of <text>. <caption>`; with an empty caption, it is just `<text>`. One line, at most 128 bytes |
 | `--caption-dropout-trigger <text>` | `--trigger`, or empty | Exact style text for the caption-dropout prefixes, with no wrapper. One line, at most 128 bytes; CR, LF and NUL are rejected |
+| `--lyric-timing 0\|1` | 0 | Attach the word timings the AR lyric-cursor loss trains on. With 1, every source with lyrics needs a `cursor_words` file. The server passes 1 unless the preparation turns lyric timing off, which the Fixed recipe requires |
 
 The fallback dropout style is also bare trigger text. Preparation tokenizes the
 dropout prefixes with the same lyrics and sheet conditioning as the full-caption
@@ -972,6 +1160,28 @@ HOT-Approved, the Fixed recipe preset, passes `--caption-dropout-trigger` with
 the trigger, or the dataset slug if no trigger is set. Older prepared datasets
 need re-preparing; the server invalidates the old Fixed recipe preparation cache.
 
+## ace-train YuE2 hold-out evaluation reference
+
+These flags belong to `ace-train yue2-joint-train`. See
+[training internals](../../docs/dev/training-internals.md#yue2-preparation-operations)
+for the evaluation output and sampling procedure.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--holdout-items I,J,...` | none | Exclude distinct zero-based prepared-dataset indices from training; at least one item must remain. With adapted evaluation and no separate evaluation dataset, score only these items |
+| `--eval-adapted --resume <optimizer.resume>` | off | Restore a checkpoint and compare base versus adapted planner CE and decoder MSE without updating weights. Pass the run's training flags and total `--steps` |
+| `--eval-dataset <dataset.json>` | training dataset or its hold-out split | Score every item of this separate prepared dataset; takes precedence over the in-dataset split for evaluation |
+| `--eval-nar-window N` | `--nar-crop-frames` | Adapted-evaluation window in frames; `0` means the whole song |
+| `--eval-seed N` | `--seed` | Unsigned seed for adapted-evaluation draws |
+
+Resume records bind the hold-out split as a set. Supply the same indices on
+training and evaluation resumes. The saved order must contain every non-held-out
+item exactly once and its cursor must index that order. A legacy record with no
+saved split can resume only without a hold-out; a new split requires a new run.
+The summary reports `held_out:true` when using a saved split or a separate
+evaluation dataset, and `false` when scoring the unsplit training dataset.
+These flags do not add a training early-stop rule.
+
 ## fattn-train-test reference
 
 Parity harness for `GGML_OP_FLASH_ATTN_TRAIN{,_BACK}`: compares the fused op
@@ -980,21 +1190,35 @@ against the autodiff'd reference attention chain. See
 for the full ops/patch background.
 
 ```
-Usage: fattn-train-test [--backend cpu|cuda|vulkan] [--prec f32|tf32] [--extra]
-                         [--large] [--cheap] [--quick] [--fwd-only]
-                         [--threads N] [--bench] [--bench-tr] [--bench-lm]
+Usage: fattn-train-test [--backend cpu|cuda|vulkan|metal] [--prec f32|tf32|bf16]
+                         [--extra] [--large] [--cheap] [--quick] [--fwd-only]
+                         [--threads N] [--bench] [--bench-iters N]
+                         [--bench-tr] [--bench-lm] [--bench-yue2]
+                         [--dsw-check] [--saved-check]
 
-  --backend   cpu (default), cuda or vulkan. Resolved by registry device
-              name, never "first GPU device found" — a CUDA request
-              cannot land on Vulkan or vice versa. Missing requested
-              backend: hard failure (prints loaded devices), never a
-              silent CPU fallback.
-  --prec      f32 (default) or tf32. tf32 is CUDA-only; requesting it on
-              CPU or Vulkan is an error, not an ignore.
-  --bench     Times fused vs manual attention on CUDA only (the tf32 arm
-              is a CUDA tensor-core question). Defaults to CUDA with no
-              --backend; any OTHER explicit --backend is rejected.
+  --backend   cpu (default), cuda, vulkan or metal. Resolved by registry
+              device name, never by the first GPU device found, so a CUDA
+              request cannot land on Vulkan or the reverse. A requested
+              backend that is not loaded is a hard failure (it prints the
+              loaded devices), never a silent CPU fallback.
+  --prec      f32 (default), tf32 or bf16. tf32 and bf16 need --backend
+              cuda; asking for them anywhere else is an error, not an
+              ignore.
+  --bench     Times fused vs manual attention on CUDA (the tf32 arm is a
+              CUDA tensor-core question). Defaults to CUDA with no
+              --backend; --backend metal runs the Metal checks; any other
+              explicit --backend is rejected.
 ```
+
+`--bench-lm` times the ACE-Step LM trainer's attention geometry instead of the
+DiT's (`--lm-S`, `--lm-small`, `--lm-nh`, `--lm-nkv`, `--lm-gq`, `--lm-layers`,
+`--lm-only manual|blocked|fused` shape it). `--bench-tr` (`--tr-s`, `--tr-enc`,
+`--tr-real`, `--tr-only`, `--tr-fused`), `--bench-yue2` (`--yue2-only`,
+`--yue2-scale`, `--yue2-sites`), `--dsw-check` and `--saved-check` are further
+timing and Metal checks. The comment block at the top of
+`tools/fattn-train-test.cpp` describes the parity grid, `--bench` and `--bench-lm`.
+The tool exits 0 only when every parity case passes; the bench modes exit 0 unless
+the backend is missing or a compute call fails.
 
 ```bash
 fattn-train-test --backend cuda

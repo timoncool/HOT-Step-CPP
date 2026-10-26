@@ -10,7 +10,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Redo2, Undo2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { previewRegroup, type RegroupResult } from '../../utils/abcRebar';
-import { cutSection, mergeScoreSections } from '../../utils/abcSectionMove';
+import { cutSection, mergeScoreSections, resectionScore } from '../../utils/abcSectionMove';
+import type { Yue2ScorePlan } from '../../services/yue2CoverApi';
 import { sectionColours } from '../../utils/abcSections';
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -37,11 +38,14 @@ interface Props {
   onHighlight: (bars: [number, number] | null) => void;
   /** After the structure is confirmed, to approve the score for rendering. */
   onConfirmed: () => void;
+  /** Where the recording sings each lyric block, as score sections (the
+   *  server's Match score to lyrics); absent without lyrics or a recording. */
+  planFromLyrics?: () => Promise<Yue2ScorePlan>;
   /** Extra tools the studio keeps under the strip (the 2/4 to 4/4 converter). */
   children?: React.ReactNode;
 }
 
-export const PrepareStructure: React.FC<Props> = ({ prep, sourceAudioUrl, scorePlaying, scoreStarts, onPlayScore, onHighlight, onConfirmed, children }) => {
+export const PrepareStructure: React.FC<Props> = ({ prep, sourceAudioUrl, scorePlaying, scoreStarts, onPlayScore, onHighlight, onConfirmed, planFromLyrics, children }) => {
   const { t } = useTranslation();
   const { doc } = prep;
   const editing = prep.editingStructure && prep.step === 'structure';
@@ -130,6 +134,29 @@ export const PrepareStructure: React.FC<Props> = ({ prep, sourceAudioUrl, scoreP
   };
   const rename = () => { if (single) ok(prep.applyStructuralOp({ kind: 'relabel', index: list.indexOf(single), label })); };
 
+  // ── Sections from lyrics ──
+  // Each sung lyric block opens a section where the recording sings it, named
+  // with its own tag; sections with no words stay. One replace, so one undo.
+  const [planning, setPlanning] = useState(false);
+  const [planNote, setPlanNote] = useState('');
+  const abcNow = useRef(doc.abc);
+  useEffect(() => { abcNow.current = doc.abc; });
+  const fromLyrics = async () => {
+    if (!planFromLyrics) return;
+    const abc = doc.abc;
+    setPlanning(true); setMessage(''); setPlanNote('');
+    try {
+      const plan = await planFromLyrics();
+      if (abcNow.current !== abc) { fail(t('cover.prepare.structure.fromLyricsStale')); return; }
+      const next = resectionScore(abc, plan.sections.map(s => ({ label: s.tag ?? s.label, bar: s.bar })));
+      if ('error' in next) { fail(next.error); return; }
+      if (next.abc === abc) { setPlanNote(t('cover.prepare.structure.fromLyricsSame')); return; }
+      if (ok(prep.applyStructuralOp({ kind: 'replace', abc: next.abc })))
+        setPlanNote(t('cover.prepare.structure.fromLyricsDone', { count: plan.sections.length, unsure: plan.unsure.length }));
+    } catch (e) { fail(String((e as Error)?.message ?? e)); }
+    finally { setPlanning(false); }
+  };
+
   // ── Delete (advanced) ──
   const remove = () => {
     if (!single) return;
@@ -198,6 +225,8 @@ export const PrepareStructure: React.FC<Props> = ({ prep, sourceAudioUrl, scoreP
           title={t('cover.prepare.undo')} aria-label={t('cover.prepare.undo')}><Undo2 className="h-3 w-3" /></button>
         <button type="button" className={btn} disabled={!prep.canRedo} onClick={() => prep.redo()}
           title={t('cover.prepare.redo')} aria-label={t('cover.prepare.redo')}><Redo2 className="h-3 w-3" /></button>
+        {editing && planFromLyrics && <button type="button" className={btn} disabled={planning} onClick={() => void fromLyrics()}
+          title={t('cover.prepare.structure.fromLyricsInfo')}>{planning ? t('cover.prepare.structure.fromLyricsBusy') : t('cover.prepare.structure.fromLyrics')}</button>}
         {!editing && <>
           <span className="text-emerald-600 dark:text-emerald-400">{t('cover.prepare.structure.locked')}</span>
           <button type="button" className={btn} onClick={() => { prep.beginStructureEdit(); }}>{t('cover.prepare.structure.edit')}</button>
@@ -245,6 +274,7 @@ export const PrepareStructure: React.FC<Props> = ({ prep, sourceAudioUrl, scoreP
       </p>}
 
       {err && <p role="alert" className="text-red-500">{err}</p>}
+      {planNote && !err && <p role="status" className="text-zinc-500">{planNote}</p>}
 
       {sourceAudioUrl && <audio ref={audio} src={sourceAudioUrl} preload="auto" className="hidden"
         onPlay={() => { owner.start('recording'); setHearing(true); }}

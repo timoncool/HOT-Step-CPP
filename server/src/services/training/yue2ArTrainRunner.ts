@@ -39,6 +39,8 @@ import { evictOtherFamilies } from '../generation/residency.js';
 import { saveDatasetCoverAbc } from '../coverDatasetSource.js';
 import { YUE2_LICENSE_NOTICE } from '../backends/yue2/index.js';
 import { EMPTY_COVER_SCORE_ERROR, hasSoundingVocalBar } from '../backends/yue2/scoreHealth.js';
+import { vocalCadenceAbc } from '../backends/yue2/vocalCadence.js';
+import { readWav } from '../generation/audioLevel.js';
 import { getDataset } from './datasetsRepo.js';
 import { refreshYue2PresetsForNewRun } from './lyricStudioExport.js';
 import { missingYue2TrainModels, readYue2PreprocessSummary } from './yue2Train.js';
@@ -706,7 +708,9 @@ export async function runYue2SheetJob(job: TrainingJob,
 
 /** Transcribe one cover source through the same queued job relay as dataset sheets. */
 export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, jobDir: string,
-  deps = { missingModels: missingYue2SheetModels, run: runYue2AceTrain }): Promise<string> {
+  deps: { missingModels: typeof missingYue2SheetModels; run: typeof runYue2AceTrain;
+    /** The source's vocal stem; with it, a silent Vocal line becomes the vocal's rhythm. */
+    vocalStem?: (audioPath: string) => Promise<string> } = { missingModels: missingYue2SheetModels, run: runYue2AceTrain }): Promise<string> {
   try {
     const missing = deps.missingModels();
     if (missing.length) throw new Error(`The SheetSage2 transcriber is missing: ${missing.join(', ')}`);
@@ -716,7 +720,7 @@ export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, 
     };
     const st: SheetState = { fatalMessage: '', doneSeen: false, lastStep: 0, totalSteps: 0 };
     const verify = () => {
-      try { return hasSoundingVocalBar(readYue2CoverAbc(manifest, name)) ? null : EMPTY_COVER_SCORE_ERROR; }
+      try { return hasSoundingVocalBar(readYue2CoverAbc(manifest, name)) || deps.vocalStem ? null : EMPTY_COVER_SCORE_ERROR; }
       catch (err) { return err instanceof Error ? err.message : String(err); }
     };
     let loadFailed = false;
@@ -742,7 +746,19 @@ export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, 
       }, { label: `${job.id} cover transcription fallback`, family: 'yue2' });
     }
     if (isCancelled(job)) throw new Error('Cover lead-sheet transcription was cancelled');
-    const abc = readYue2CoverAbc(manifest, name);
+    let abc = readYue2CoverAbc(manifest, name);
+    if (!hasSoundingVocalBar(abc) && deps.vocalStem) {
+      // Rap, screams: no pitched melody, but the chords, the Ins line and the
+      // vocal's rhythm are still worth a cover.
+      log(job, 'info', 'The transcriber heard no sung melody; writing the vocal rhythm from the vocal stem on one note.');
+      try { abc = vocalCadenceAbc(abc, readWav(await deps.vocalStem(audioPath))); }
+      catch (err) { throw new Error(`${EMPTY_COVER_SCORE_ERROR}, and its vocal rhythm could not be read: ${err instanceof Error ? err.message : String(err)}`); }
+      if (isCancelled(job)) throw new Error('Cover lead-sheet transcription was cancelled');
+      // The cover job's result is read back from this manifest.
+      const data = JSON.parse(fs.readFileSync(manifest, 'utf8')) as { sources: { name: string; abc?: string }[] };
+      for (const row of data.sources) if (row.name === name) row.abc = abc;
+      fs.writeFileSync(manifest, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
+    }
     if (!hasSoundingVocalBar(abc)) throw new Error(EMPTY_COVER_SCORE_ERROR);
     saveDatasetCoverAbc(audioPath, abc);
     finishJob(job, 'done');

@@ -11,9 +11,14 @@ can place individual children elsewhere.
 
 Native C++/GGML port of [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3),
 built 2026-08-13 (release day) as HOT-Step's second generation backend behind an N-backend
-abstraction. **Status: rudimentary text2music only** (caption + lyrics + duration + seed);
-no covers/repaint/stems/adapters/training. Output = raw 44.1 kHz stereo WAV (app norm is 48 k —
-post-chain steps that hardcode 48 k are skipped for MM3).
+abstraction. **Status: text2music only**: no cover, repaint, lego, extract or stems
+(`features` in `server/src/services/backends/minimax/index.ts`). Around that it has grown runtime
+LM adapters, the shared Lua sampler plugins, LRC, Whisper, StableStep and the VST/mastering
+post chain, play-while-rendering streaming, natural-ending candidates and LM LoRA training in
+the Training Studio. Flow-DiT LoRAs merge only through the `MM3_ADAPTER` env var
+(`mm3_apply_adapters`, `engine/src/minimax/mm3-model.h`), and the native DiT trainer
+(`ace-train mm3-train-dit`) is CLI-only. Output = raw 44.1 kHz stereo WAV (app norm is 48 k;
+PP-VAE and Spectral Lifter, which assume ACE's VAE, are skipped for MM3).
 
 Deep docs (local, gitignored): `docs/plans/multi-backend-architecture.md` (architecture plan,
 day-0 findings, op inventory) and `docs/plans/mm3-gguf-layout.md` (GGUF contract + loader
@@ -60,9 +65,10 @@ schema renderer in `BackendExtensionControls.tsx`. An untagged knob is a
 Generation knob, which is where every one of them lived before groups existed,
 so an older manifest still renders exactly as it did.
 
-MM3's `group: 'lm'` set is the six `mm3Lm*` sampling knobs plus the four that
+MM3's `group: 'lm'` set is the six `mm3Lm*` sampling knobs plus the seven that
 decide what happens to the planner's output: `mm3ArSeed`, `mm3ReuseAr`,
-`mm3SaveArCodes`, `mm3PlankPath`.
+`mm3SaveArCodes`, `mm3PlankPath`, and the saved-plan trio `mm3SaveHiddens`,
+`mm3HiddensName`, `mm3HiddensPath`.
 
 Two things to know before touching the LM cluster:
 
@@ -78,32 +84,41 @@ Two things to know before touching the LM cluster:
 
 | Piece | Where |
 |---|---|
-| Engine modules | `engine/src/minimax/` — `mm3-model.h` (loader/residency), `mm3-tokenizer.h`, `mm3-lm-graph.h`, `mm3-ar-loop.h`, `mm3-sample.h`, `mm3-depth-graph.h`, `mm3-cond-graph.h`, `mm3-dit-graph.h`, `mm3-vocoder-graph.h`, `mm3-pipeline.h` (e2e + chunking), `mm3-request.h` (prompt assembly/hygiene), `mm3-job.h` (job queue + VRAM arbitration), `mm3-server.h` (endpoints) |
-| Hooks | one include in `engine/tools/hot-step-server.cpp` (+ `mm3_register_routes`/`mm3_register_job_routes` call sites); checked by `engine/verify-hooks.ps1` (hooks 4/4b/4c) |
-| Server backend | `server/src/services/backends/` — `types.ts` (EngineBackend + capability manifest), `registry.ts`, `ace/`, `minimax/{client,index,generate}.ts`; routes `server/src/routes/backends.ts`; generation branch at top of `runGeneration` in `routes/generate.ts` |
-| UI | `stores/backendStore.ts`, `hooks/useCapabilities.ts`, `global-bar/BackendToggle.tsx` (hidden until ≥2 backends), `shared/BackendCapabilityGate.tsx` (studio guards), gating in `GlobalParamBar.tsx` |
+| Engine modules | `engine/src/minimax/`: `mm3-model.h` (loader/residency, `MM3_ADAPTER` DiT merge), `mm3-tokenizer.h`, `mm3-lm-graph.h`, `mm3-ar-loop.h`, `mm3-sample.h`, `mm3-depth-graph.h`, `mm3-cond-graph.h`, `mm3-dit-graph.h`, `mm3-dit-trt.h` (TensorRT DiT renderer), `mm3-vocoder-graph.h`, `mm3-pipeline.h` (e2e + chunking), `mm3-request.h` (prompt assembly/hygiene), `mm3-job.h` (job queue + VRAM arbitration), `mm3-server.h` (endpoints), `mm3-plugins.h` (Lua sampler bridge), `mm3-align.h` (LRC), `mm3-ar-cache.h` + `mm3-hiddens-file.h` (AR cache, saved plans), `mm3-lm-adapter.h` / `mm3-lm-merge.h` / `mm3-lm-dora.h` (LM LoRAs), `mm3-adapter.h` (flow-DiT LoRA merge), `mm3-imatrix.h` (LM imatrix collection); training-side `mm3-dav-encode.h`, `mm3-rvq-encode.h`, `mm3-rec7.h` |
+| Hooks | include/call pairs in `engine/tools/hot-step-server.cpp`: `minimax/mm3-server.h` + `mm3_register_routes`, and the mid-file `minimax/mm3-job.h` + `mm3_register_job_routes`; checked by `engine/verify-hooks.ps1` ("Hook 4-family" rows, plus "Hook 4-gate" for the boot gates) |
+| Server backend | `server/src/services/backends/`: `types.ts` (EngineBackend + capability manifest), `registry.ts`, `ace/`, `minimax/{client,index,generate,hiddens,lmAdapter,plank,trigger}.ts`, plus `yue2/` and `sa3/`; routes `server/src/routes/backends.ts` (backends, capabilities, models, MM3 planks/plans/LM adapters); `runGeneration` in `routes/generate.ts` dispatches to the envelope's `backend.generate()`, which for MM3 is `runMinimaxGeneration` |
+| UI | `stores/backendStore.ts`, `hooks/useCapabilities.ts`, `global-bar/BackendToggle.tsx` (the engine picker, rendered at the top of the sidebar by `sidebar/Sidebar.tsx`; null until ≥2 backends), `shared/BackendCapabilityGate.tsx` (studio guards), gating in `GlobalParamBar.tsx`, `global-bar/Backend{Generation,Lm,Models}Dropdown.tsx` + `BackendExtensionControls.tsx`, `SamplerPluginControls.tsx`, `Mm3LmAdapterDropdown.tsx`, streaming in `stores/mm3StreamStore.ts` |
 | Models | **5-way split since 2026-08-14** (ported from ServeurpersoCom/minimaxmusic.cpp): `<data root>/models/mm3/mm3-{lm,depth,cond,dit,voc}-<quant>.gguf` (archs `qwen3` / `mm3-{depth,cond,dit,voc}`), legacy `mm3-synth-*` bundles still load (fill any role; split file wins per quant token). Per-role quant mixing (LM Q8_0 + DiT Q4_K_M is the headline combo); a DiT/adapter swap reloads only cond+dit+voc — LM stays warm. cond/voc are **never quantised** (f16 only). Hosted `scragnog/MiniMax-Music3-GGUF`; registry role `mm3`, packs rebuilt on split components in `server/src/data/model-registry.json` |
 | Converter | `engine/tools/convert-mm3.py` (safetensors→GGUF bundle; folds weight-norm; refuses pruned/int8_convrot) then `engine/tools/split-mm3.py` (byte-exact bundle→5-way split; idempotent; cond/voc only from native bundles) |
-| Fixtures / parity | `D:\Ace-Step-Latest\mm3-weights\fixtures\` (manifest.json + raw f32 dumps + reference WAVs), seed-spread study in `..\seed-spread-2026-08-13\`; venvs: `.venv-convert` (numpy/gguf), `.venv-ref` (patched diffusers @ dafe3733 — `patch_venv.py --restore`; `capture_fixtures.py --replay` rebuilds dumps without rerunning the model) |
+| Fixtures / parity | `D:\Ace-Step-Latest\mm3-weights\fixtures\` (manifest.json + raw f32 dumps + reference WAVs), seed-spread study in `..\seed-spread-2026-08-13\`; venvs: `.venv-convert` (numpy/gguf), `.venv-ref` (patched diffusers @ dafe3733 — `patch_venv.py --restore`; `capture_fixtures.py --replay` rebuilds dumps without rerunning the model) <!-- TODO(verify): D:\Ace-Step-Latest\mm3-weights\ was absent on the dev machine on 2026-10-23; the engine headers still cite mm3-weights/fixtures/. Confirm where the fixtures live now. --> |
 
 ## Engine endpoints (:8085 via app, standalone tests on :8086)
 
-`GET /mm3/props` (files/config/loaded/limits — **blocks while an MM3 generation runs**; always
-call with ~2.5 s timeout and keep last-known-good), `POST /mm3/warm` / `POST /mm3/unload`
-(idempotent; unload frees weights+KV), `POST /mm3/synth` (production, rides the same FIFO GPU
+`GET /mm3/props` (files/config/loaded/limits — **blocks while an MM3 generation runs**; the Node
+client calls it with a 2.5 s timeout and keeps last-known-good, `minimax/client.ts` `mm3Props`),
+`POST /mm3/warm` / `POST /mm3/unload` (idempotent; unload frees weights+KV),
+`POST /mm3/select-model` (per-role quant selection; send every role, see performance reference),
+`POST /mm3/synth` (production, rides the same FIFO GPU
 worker as ACE `/synth`; standard `/job?id=` progress/cancel/result; request contract documented
 in `mm3-request.h`/`mm3-job.h`), `GET /mm3/job?id=` (MM3-vocabulary progress, never blocks;
-`&ar=1` returns the Plank code blob — see below),
+`&ar=1` returns the Plank code blob — see below), `GET /mm3/take?id=&take=N` (one ensemble take's
+audio, `&lrc=1` / `&ar=1` for its LRC or codes; never takes the MM3 mutex),
 `GET /mm3/stream?id=` (live audio of a running job — chunked WAVs, one reader, never takes the
-MM3 mutex; see "Streaming player" below), 
-`POST /mm3/tokenize-check` (cold-capable; 5000-token limit), plus deprecated bring-up endpoints
+MM3 mutex; see "Streaming player" below),
+`POST /mm3/tokenize-check` (cold-capable; 5000-token limit), `POST /mm3/imatrix`
+(`start`/`stop`/`status`/`reset`/`save` an LM activation-importance collection, driven by
+`/mm3/lm-plan`, for the 2-3 bit LM quants), plus deprecated bring-up endpoints
 (`/mm3/voc-decode`, `/mm3/dit-forward`, `/mm3/flow-sample`, `/mm3/depth-frame`,
 `/mm3/cond-encode`, `/mm3/lm-plan`, `/mm3/synth-e2e`) kept for parity work — they run GPU work
-on httplib threads; never build production paths on them.
+on httplib threads; never build production paths on them. Routes register in
+`mm3-server.h:2258-2270` and `mm3-job.h:1971-1974`.
 
 **Standalone launch gotcha:** ace-server exits `0xC0000135` with zero output unless
 `engine/trtllm-libs` + `engine/deps/tensorrt_libs` are prepended to PATH (aceEngineProcess.ts
 does this; `engine/server.cmd` does not).
+<!-- TODO(verify): since 70c0ce60 (2026-09-11) nvinfer_10.dll and nvonnxparser_10.dll are
+delay-loaded (engine/CMakeLists.txt:359-373) and TRT-LLM is off by default, so a current build
+may start without them on PATH. Re-test standalone launch before relying on this note. -->
 
 **Caption echo (added 2026-08-21).** `POST /mm3/synth` prints the caption to stderr at job
 creation, so it reaches the terminal, `ace_engine.log` and the in-app Terminal — the MM3
@@ -128,14 +143,23 @@ counts localises a drop to the wire rather than the UI.
 `takes: K`. The planner runs K takes in one batched pass (seed+t); any take that
 reaches max_frames without EOS is DROPPED before the flow stage; if none ended
 the plan repeats at seed + K (round r plans seed + r*K + t) up to `eos_rounds`
-times, then fails with "no candidate ended naturally". The job JSON's `takes`
-is the number RENDERED; `takes_planned`, `takes_dropped`, `eos_rounds_used`,
-`require_eos` and a per-take `round` are added, and `take_detail` is emitted
-whenever candidates were in play. Ignored on an interleaved stream (logged).
-Server: `mm3RequireEnding` (default on, Generation dropdown) sends takes 3,
-eos_rounds 4 and reads the surviving count/seeds from the completion detail.
+times. Since 242645c4 a run where nothing ever ends renders the longest capped
+plan anyway and reports `eos_fallback: true`, which the server relays as a
+warning rather than a normal success. `min_frames` adds a floor: a candidate
+that ends shorter is dropped and re-planned like one that never ended
+(`takes_short`). The job JSON's `takes` is the number RENDERED; `takes_planned`,
+`takes_dropped`, `takes_capped`, `takes_short`, `eos_rounds_used`, `require_eos`,
+`eos_fallback` and a per-take `round` are added, and `take_detail` is emitted
+whenever candidates were in play. A streamed render with `require_eos` stays
+serial: the candidates need the whole plan before anything renders (logged).
+Server (`minimax/generate.ts`): `mm3RequireEnding` (default on, Generation
+dropdown) sends at least 3 takes (`mm3Takes` raises it for variations), eos_rounds 4,
+and `stop_after_first_eos` when one song was asked for; `mm3MinLength` (default
+on) derives `min_frames` from the lyrics at 4 words/s with a 15 s floor. It reads
+the surviving count/seeds from the completion detail.
 Duration on MM3 is ALWAYS auto (a requested length was a hard cap that cut
-endings off); the Create panel hides the control in MM3 mode. Batched take 0
+endings off): the wire always carries the 300 s ceiling and the Create panel
+hides the control in MM3 mode. Batched take 0
 is a different song from the same seed by design (check-mm3-ensemble.mjs).
 Knock-ons: Save Plan To Disk is dead while the toggle is on; each ended
 candidate costs its own flow pass.
@@ -186,7 +210,7 @@ candidate costs its own flow pass.
     Objective version of the same gate: encode a **440 Hz sine** and measure what comes back
     (was 220.0 Hz, i.e. ratio 0.5000; correct is 440.0 Hz / 1.0000). A pure tone cannot be
     argued with, and it brackets which stage is at fault.
-15. **Rob's ear beat every metric, twice.** He called "slow motion, too deep" on the first
+15. **The user's ear beat every metric, twice.** They called "slow motion, too deep" on the first
     adapter and again on the third; both times it was explained away as regression-to-the-mean
     (which produces a genuinely similar description) and five runs of hyperparameter tuning
     followed on corrupt data. When the user reports a *physical* symptom — speed, pitch,
@@ -213,15 +237,17 @@ candidate costs its own flow pass.
     recipe: train ALL sites at modest delta, then zero q,k rows + proj heads in the export
     (`groupfilter.py` pattern — q,k rows are B[0:4096] of the fused qkv; ablation-proven:
     q,k = structure poison, proj_in/out = seed-dependent fuzz, MLP+V+out = timbre).
-18. **An MM3-only install must not kill the server at boot.** The startup gates in
+19. **An MM3-only install must not kill the server at boot.** The startup gates in
     `hot-step-server.cpp` (`registry_scan` empty → exit 1; partial ACE synth without LM →
     exit 1) predate MM3 and knew nothing about it: a user with only `<data root>/models/mm3/*.gguf` got a
     dead engine → empty model dropdowns for BOTH backends + the MM3 "weights missing" CTA,
     while the Model Manager (Node disk scan, checks subdirs) said everything was installed
-    (GitHub issue #118). Both gates now fall through when `mm3_weights_present()`
-    (mm3-model.h — filename-only probe of `<models>` + `<models>/mm3`) is true; ACE handlers
-    already degrade per-request with an empty registry. Any future boot-time hard-exit must
-    ask "can MM3 still serve?" first.
+    (GitHub issue #118). Both gates now ask `hot_step_any_family_weights_present()`
+    (`engine/src/hot-step-families.h`), a table whose MM3 row is `mm3_weights_present()`
+    (mm3-model.h, a filename-only probe of `<models>` + `<models>/mm3`) beside the YuE2 and SA3
+    probes; `verify-hooks.ps1` "Hook 4-gate" fails the build if an upstream sync restores the
+    single-name gate. ACE handlers already degrade per-request with an empty registry. Any
+    future boot-time hard-exit must ask "can any family still serve?" first.
 
 ## Validation bar for MM3 changes
 

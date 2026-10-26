@@ -90,9 +90,10 @@ WORKDIR /build/ui
 COPY ui/package*.json ./
 RUN npm ci
 COPY ui/ .
-# Browser runtime imports need these sibling sources. trainingRecipes imports
-# zod/v4; retain the server's locked package and its normal resolution path.
-COPY server/src/contracts/trainingRecipes.ts /build/server/src/contracts/trainingRecipes.ts
+# Browser runtime imports need these sibling sources. Copy contracts/ whole so a
+# new contract can't break the image; they import zod/v4, so retain the server's
+# locked package and its normal resolution path (their service imports are type-only).
+COPY server/src/contracts/ /build/server/src/contracts/
 COPY server/src/services/streamSessions/analysis.ts /build/server/src/services/streamSessions/analysis.ts
 COPY --from=server-deps /build/server/node_modules/zod/ /build/server/node_modules/zod/
 RUN npx vite build

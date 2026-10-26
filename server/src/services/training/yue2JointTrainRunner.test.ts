@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyFixedRecipe, buildYue2JointTrainArgs, legacyYue2DoraError, parseYue2JointEvent, parseYue2JointStopMode, reconKeepDecision } from './yue2JointTrainRunner.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { applyFixedRecipe, buildYue2JointTrainArgs, legacyYue2DoraError, parseYue2JointEvent, parseYue2JointStopMode, reconKeepDecision, updateYue2JointParams, yue2JointExpectedStep, yue2JointLivePace } from './yue2JointTrainRunner.js';
 
 test('Fixed recipe forces its recipe and retains the companion decoder', () => {
   const recipe = applyFixedRecipe({ method: 'fixed-recipe', rank: 16, alpha: 256, adapterType: 'lokr',
@@ -195,4 +198,41 @@ test('DoRA reaches the joint trainer as --adapter-type dora; legacy endpoints re
   assert.match(legacyYue2DoraError({ adapterType: 'dora' }) ?? '', /only available in joint/);
   assert.match(legacyYue2DoraError({ dora: true }) ?? '', /only available in joint/);
   assert.equal(legacyYue2DoraError({ adapterType: 'lora', dora: false }), null);
+});
+
+test('live interval edit: validates, re-paces the preview pause and writes .params.json for the trainer', () => {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-params-'));
+  try {
+    const opts = { checkpoint: 'b', dataset: 'd', outDir, steps: 1000, saveEvery: 100, seed: 1, device: 'CUDA0' };
+    const job = { id: 'live-1', kind: 'yue2-joint-train', status: 'running', opts, events: [], listeners: new Set() } as any;
+    assert.equal((updateYue2JointParams(job, { saveEvery: 50 }) as any).status, 409, 'no live pace yet');
+    const preview = { enabled: true, everySteps: 200 } as any;
+    yue2JointLivePace.set(job.id, { preview, start: 400, pauseAt: 600, previewPaced: true, rev: 0 });
+    assert.equal((updateYue2JointParams(job, { saveEvery: 0 }) as any).status, 400);
+    assert.equal((updateYue2JointParams(job, { saveEvery: 1001 }) as any).status, 400);
+    assert.equal((updateYue2JointParams(job, { previewEvery: 2.5 }) as any).status, 400);
+    assert.equal((updateYue2JointParams(job, {}) as any).status, 400);
+    assert.deepEqual(updateYue2JointParams(job, { saveEvery: 25, previewEvery: 50 }), { saveEvery: 25, previewEvery: 50 });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outDir, '.params.json'), 'utf8')), { rev: 1, save_every: 25, pause_at: 450 });
+    assert.equal(opts.saveEvery, 25);
+    assert.equal(preview.everySteps, 50);
+    // A pause past the end clamps to the last step; a run not paced by previews refuses previewEvery.
+    updateYue2JointParams(job, { previewEvery: 900 });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(outDir, '.params.json'), 'utf8')).pause_at, 1000);
+    yue2JointLivePace.set(job.id, { start: 0, pauseAt: 0, previewPaced: false, rev: 7 });
+    assert.equal((updateYue2JointParams(job, { previewEvery: 10 }) as any).status, 400);
+    updateYue2JointParams(job, { saveEvery: 75 });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outDir, '.params.json'), 'utf8')), { rev: 8, save_every: 75 });
+    assert.deepEqual(buildYue2JointTrainArgs({ ...opts, paramsFile: 'p.json', paramsRev: 8 }).slice(-4), ['--params-file', 'p.json', '--params-rev', '8']);
+  } finally {
+    yue2JointLivePace.delete('live-1');
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test('expected checkpoint follows the engine, never a pause a late edit moved', () => {
+  // A shorter preview edit landing during the final save: no paused event, so the cap.
+  assert.equal(yue2JointExpectedStep({ lastStep: 1500, targetStopped: false }, 1200, 1500), 1500);
+  assert.equal(yue2JointExpectedStep({ pausedAt: 1212, lastStep: 1212, targetStopped: false }, 1200, 1500), 1212);
+  assert.equal(yue2JointExpectedStep({ lastStep: 1340, targetStopped: true }, 1200, 1500), 1340);
 });

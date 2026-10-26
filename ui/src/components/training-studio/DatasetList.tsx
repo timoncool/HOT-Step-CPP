@@ -6,9 +6,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Database, Disc3, FolderOpen, FolderPlus, GraduationCap, ListChecks, Loader2, Plus, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useBackendStore } from '../../stores/backendStore';
 import { useTrainingStore } from '../../stores/trainingStore';
-import { YUE2_BACKEND_ID } from '../../utils/yue2CaptionSource';
+import { useTrainingTarget } from './useTrainingTarget';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
@@ -49,8 +48,9 @@ export const DatasetList: React.FC = () => {
   // caches, preparation, joint training, refinement per dataset). ACE's bulk
   // path is the pipeline behind "Import multiple…" and MM3 has none, so the
   // button appears only when YuE2 is the active backend.
-  const activeBackendId = useBackendStore(s => s.activeBackendId);
-  const isYue2 = activeBackendId === YUE2_BACKEND_ID;
+  // YuE2's batch actions and done-filter follow the effective target, so an
+  // SA3 override does not keep them.
+  const isYue2 = useTrainingTarget().target === 'yue2';
 
   const [wizardOpen, setWizardOpen] = useState(false);
   const [batchWizardOpen, setBatchWizardOpen] = useState(false);
@@ -112,7 +112,7 @@ export const DatasetList: React.FC = () => {
             <button
               onClick={() => setYue2BatchOpen(true)}
               title={t('trainingStudio.yue2.batch.ctaHint',
-                'Train several of these datasets one after another on the server: preparation, joint training and refinement each. Survives reloads and restarts.') as string}
+                'Train several of these datasets one after another on the server: preparation, then joint training for each. Survives page reloads; after a server restart the batch comes back paused until you resume it.') as string}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
             >
               <ListChecks size={14} /> {t('trainingStudio.yue2.batch.cta', 'Train multiple…')}

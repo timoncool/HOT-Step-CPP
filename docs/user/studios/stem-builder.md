@@ -12,19 +12,20 @@ generated layer at a time.
 
 ## Where to find it
 
-Sidebar entry "Stem Builder", directly below Stem Studio.
+Sidebar entry "Stem Builder", below Stem Separator and Compare.
 
 Stem Builder needs:
 
-- The active backend to support it. The studio shows a "not supported"
-  message instead of its controls on a backend without this capability;
-  today that means the ACE backend.
+- The active backend to support it. Today that means ACE-Step 1.5: the
+  sidebar lists Stem Builder only while it is the active engine, and switching
+  to another backend while the page is open moves the app to Custom-Gen.
 - At least one plain Base DiT checkpoint installed
   (`acestep-v15-base-*` or `acestep-v15-xl-base-*`). SFT, merge and turbo
   checkpoints are not accepted for this task, and the studio shows a warning
-  with a link to Get More Models when none is found.
-- A source backing track: upload a file, or send a track in from another
-  studio's output via "use as source".
+  when none is found; download one from the
+  [Model Manager](model-manager.md).
+- A source backing track: upload a file, or reuse one of your earlier Stem
+  Builder renders with "Use as source".
 
 ## Workflow
 
@@ -39,8 +40,9 @@ Stem Builder needs:
 5. Click Build. The button label follows your track choice, for example
    "Build drums".
 6. The stage text shows when the render is queued and generating; Cancel stops
-   the workflow and its audio request. A server restart marks an active
-   workflow interrupted rather than starting a second render.
+   the workflow and its audio request. Leaving the page does not stop the
+   render, and coming back picks it up again. A server restart marks an
+   active workflow interrupted rather than starting a second render.
 7. When it finishes, the new stem opens in the preview player next to the
    source and is added to the Layer Stack.
 8. To add another layer on top, use the Source button on the newest Layer
@@ -52,31 +54,36 @@ Stem Builder needs:
 | Control | What it does |
 |---|---|
 | Source Audio | Upload zone for the backing track. Once a file is loaded, shows the filename and a clear (X) button to remove it and reset the session. |
-| Model | Base DiT model to render with. Only appears once at least one pure Base checkpoint is installed; auto-selects the first one found. |
+| Model | Base DiT model to render with. Only appears once at least one pure Base checkpoint is installed; picks the one you used last if it is still installed, otherwise the first one found. |
 | Target Track | Grid of the 12 instrument tracks the engine recognises (vocals, backing vocals, drums, bass, guitar, keyboard, percussion, strings, synth, fx, brass, woodwinds). Single-select. |
 | Style Hint (optional) | Free-text description of the stem's character, passed to the engine as the generation caption. |
 | Build / Cancel | Starts or stops the render. Disabled until a source, track and model are all set. |
 | Preview player | Plays the source and the generated stem together, synced. Independent volume slider and mute per side, plus a shared seek bar. Opens automatically on a finished render. |
 | Layer Stack | Every stem built this session, most recent first. Each has a Play button; only the most recent has a Source button, which loads its output as the next source. |
-| Recent Builds | Past Stem Builder renders pulled from the song library (up to 20), each with Play, Use as source and Delete. Delete removes the song and its audio file. |
-| Queue | Count of pending or in-flight Stem Builder jobs, alongside the shared generation queue. |
+| Recent Builds | Past Stem Builder renders pulled from the song library (up to 20), each with Play, Use as source and Delete. Delete asks for confirmation, then removes the song and its audio file. |
+| Queue | The shared generation queue, with a count of its pending and running jobs. |
 
 ## Tips and limits
 
 Duration is not a control here: the rendered stem always matches the length
 of the source track.
 
-Node checks that the selected upload or Library song belongs to you and still
-exists before queueing a layer. An older saved upload without an ownership
-record needs to be uploaded again.
+Node checks that the selected upload or earlier render belongs to you and
+still exists before queueing a layer. An older saved upload without an
+ownership record needs to be uploaded again.
 
 A Stem Builder render skips mastering, the post-processing effects chain and
 any loaded adapter, so what comes out is the raw stem, not the fully
-processed output you would get from Create or Cover Studio.
+processed output you would get from Create or Cover Studio. It also ignores
+the global bar's sampler: every layer renders with the Euler solver, the
+linear scheduler and APG guidance at scale 1.0, although the global step
+count still applies. Every track except vocals is rendered as an
+instrumental.
 
 The Layer Stack only lets you carry forward the *most recent* layer as the
 next source, so a session builds one chain of layers, not a branching tree.
-Loading a new file, or clearing the source, resets the stack.
+Loading a new file or a Recent Build as the source, or clearing the source,
+resets the stack.
 
 There is no download or mixdown control inside Stem Builder itself. Every
 generated layer is saved as its own song, filed under "Stem Build" in the
@@ -86,7 +93,7 @@ Library, where it can be played or downloaded like any other track.
 
 ## Related
 
-- [Stem Studio](stem-studio.md)
+- [Stem Separator](stem-studio.md)
 - [Library](library.md)
 - [Create](create.md)
 - [Generation settings](../generation.md)

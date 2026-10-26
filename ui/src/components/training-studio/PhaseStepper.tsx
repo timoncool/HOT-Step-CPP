@@ -12,13 +12,11 @@
 import React from 'react';
 import { ArrowLeft, Database, Layers, Cpu, Activity, Lock, Sparkles, ListChecks, Gauge } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useBackendStore } from '../../stores/backendStore';
-import { useTrainingStore } from '../../stores/trainingStore';
-import { YUE2_BACKEND_ID } from '../../utils/yue2CaptionSource';
+import { useTrainingStore, type TrainingPhase } from '../../stores/trainingStore';
+import { getTrainingPlugin } from './trainingPlugins';
+import type { TrainingTargetId } from './trainingPluginTypes';
 
-type Phase = 'dataset' | 'preprocess' | 'optimise' | 'train' | 'refine' | 'review' | 'monitor';
-
-const PHASES: Array<{ id: Phase; icon: React.ReactNode; labelKey: string; enabled: boolean }> = [
+const PHASES: Array<{ id: TrainingPhase; icon: React.ReactNode; labelKey: string; enabled: boolean }> = [
   { id: 'dataset',    icon: <Database size={14} />, labelKey: 'trainingStudio.phase.dataset',    enabled: true },
   { id: 'preprocess', icon: <Layers size={14} />,   labelKey: 'trainingStudio.phase.preprocess', enabled: true },
   // YuE2 only: optional measurements of the prepared album before training.
@@ -31,27 +29,20 @@ const PHASES: Array<{ id: Phase; icon: React.ReactNode; labelKey: string; enable
   { id: 'monitor',    icon: <Activity size={14} />, labelKey: 'trainingStudio.phase.monitor',    enabled: true },
 ];
 
-export const PhaseStepper: React.FC = () => {
+/** `target` is the studio's one effective training target (useTrainingTarget). */
+export const PhaseStepper: React.FC<{ target: TrainingTargetId }> = ({ target }) => {
   const { t } = useTranslation();
   const phase = useTrainingStore(s => s.phase);
   const setPhase = useTrainingStore(s => s.setPhase);
   const selectedDatasetId = useTrainingStore(s => s.selectedDatasetId);
   const closeDataset = useTrainingStore(s => s.closeDataset);
-  // Phase 2 is a different thing per backend: ACE encodes a tensor cache,
-  // MiniMax-Music3 exports RVQ codes. Same slot in the pipeline, so the chip is
-  // relabelled rather than a fifth phase being invented.
-  const backendId = useBackendStore(s => s.activeBackendId);
-  const mm3Mode = backendId === 'minimax-m3';
-  // YuE2 owns its preprocess on the Train page, so the slot is dropped rather
-  // than relabelled. Its monitor slot is dropped too: the batch pipeline is
-  // the preprocess-based backends' unattended queue, and YuE2 has its own
-  // queue view on the same Train page.
-  // Refine is hidden since 2026-09-27: the recipe picks rungs from a run's own
-  // ladder on the Train page. The phase itself stays reachable from Review
-  // for the earlier recipe's ladders.
-  const phases = backendId === YUE2_BACKEND_ID
-    ? PHASES.filter(p => p.id !== 'monitor' && p.id !== 'refine')
-    : PHASES.filter(p => p.id !== 'refine' && p.id !== 'review' && p.id !== 'optimise');
+  // Which chips show, and what phase 2 is called, belongs to the target's
+  // plug-in: ACE encodes a tensor cache, MiniMax-Music3 exports RVQ codes
+  // ("Codes"), YuE2 prepares ("Prepare") and has no Monitor, SA3 has no
+  // Preprocess at all. Refine stays hidden for everyone; it is only reachable
+  // from Review for the earlier recipe's ladders.
+  const plugin = getTrainingPlugin(target);
+  const phases = plugin.phases.map(id => PHASES.find(p => p.id === id)!);
 
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
@@ -83,11 +74,10 @@ export const PhaseStepper: React.FC = () => {
               }`}
             >
               {p.enabled ? p.icon : <Lock size={12} />}
-              {mm3Mode && p.id === 'preprocess'
-                ? t('trainingStudio.mm3.phaseCodes', 'Codes')
-                : backendId === YUE2_BACKEND_ID && p.id === 'preprocess'
-                  ? t('trainingStudio.phase.prepare', 'Prepare')
-                  : t(p.labelKey)}
+              {(() => {
+                const override = plugin.phaseLabels[p.id];
+                return override ? t(override.key, override.fallback) : t(p.labelKey);
+              })()}
             </button>
           </React.Fragment>
         );

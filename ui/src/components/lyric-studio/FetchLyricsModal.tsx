@@ -70,7 +70,7 @@ export const FetchLyricsModal: React.FC<FetchLyricsModalProps> = ({
               type="text"
               value={artist}
               onChange={(e) => setArtist(e.target.value)}
-              placeholder="e.g. Steel Panther"
+              placeholder="Artist name"
               disabled={!!prefillArtist}
               className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-zinc-300 dark:border-white/10 text-white placeholder:text-zinc-500 focus:outline-none focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20 transition-all disabled:opacity-50"
               autoFocus={!prefillArtist}
@@ -91,7 +91,7 @@ export const FetchLyricsModal: React.FC<FetchLyricsModalProps> = ({
               type="text"
               value={album}
               onChange={(e) => setAlbum(e.target.value)}
-              placeholder="e.g. Feel the Steel (or leave empty for top songs)"
+              placeholder="Album title (or leave empty for top songs)"
               className="w-full px-4 py-2.5 rounded-xl bg-white/5 border border-zinc-300 dark:border-white/10 text-white placeholder:text-zinc-500 focus:outline-none focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20 transition-all disabled:opacity-50"
               autoFocus={!!prefillArtist}
             />

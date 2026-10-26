@@ -4,6 +4,30 @@ import {
   SA3_LOADING_STAGE, sa3RenderStage, resolveSa3Sampler, resolveSa3SeedBlend,
 } from './generate.js';
 
+test('SA3 sends the captured DiT and reports the response filename, including fallback', async () => {
+  const { aceClient } = await import('../../aceClient.js');
+  const originalFetch = globalThis.fetch;
+  const requested = 'sa3-dit-Q4_K_M-imat.gguf';
+  const seen: string[] = [];
+  let returned: string | undefined = requested;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    assert.equal(new URL(String(url)).searchParams.get('synth_model'), requested);
+    return new Response(new Uint8Array([1, 2, 3]), {
+      headers: returned ? { 'X-SA3-DiT': returned } : {},
+    });
+  }) as typeof fetch;
+  try {
+    for (returned of [requested, 'sa3-dit-BF16.gguf', undefined]) {
+      const wav = await aceClient.submitSa3Synth({
+        tokens: [1], nTokens: 1, durationSec: 1, synthModel: requested,
+        onModelResolved: filename => seen.push(filename),
+      });
+      assert.deepEqual([...wav], [1, 2, 3]);
+    }
+    assert.deepEqual(seen, [requested, 'sa3-dit-BF16.gguf']);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('SA3 selects its default Lua sampler while preserving native and plugin overrides', () => {
   assert.deepEqual(resolveSa3Sampler({}, {}), { sampler: 'pingpong', solver: 'md_pingpong_blend' });
   assert.deepEqual(resolveSa3Sampler({ sa3Sampler: 'pingpong' }, {}), { sampler: 'pingpong' });

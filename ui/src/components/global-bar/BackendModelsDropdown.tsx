@@ -141,7 +141,7 @@ export const BackendModelsDropdown: React.FC = () => {
             {meta[current]?.label && (
               <p className="text-[10px] text-zinc-500 mt-1.5 font-mono truncate">{meta[current].label}</p>
             )}
-            {bucket === 'dit' && (
+            {bucket === 'dit' && ditRuntime && (
               <Mm3RendererRow
                 ditRuntime={ditRuntime}
                 value={ditBackend}

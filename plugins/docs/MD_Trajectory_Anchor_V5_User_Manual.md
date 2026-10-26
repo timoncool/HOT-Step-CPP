@@ -6,7 +6,7 @@
 
 ## What Does Trajectory Anchor Do?
 
-Every other solver in the MD suite takes over the entire sampling loop and controls how the model steps from noise to audio. Trajectory Anchor is different. It's a **step() solver**, which means it works alongside whatever guidance module you have active (STORM Guidance, Clarity, APG, etc.) instead of replacing it. Your guider stays active.
+Many solvers in the MD suite take over the entire sampling loop and control how the model steps from noise to audio. Trajectory Anchor is different. It's a **step() solver**, which means it works alongside whatever guidance module you have active (STORM Guidance, Clarity, APG, etc.) instead of replacing it. Your guider stays active.
 
 What it actually does: at each denoising step, it applies a stack of stabilization systems to the latent — momentum, structure locking, tonal correction, energy management — that keep the trajectory from drifting, oscillating, or losing coherence during the generation.
 
@@ -163,9 +163,9 @@ The solver automatically scales alpha down when the latent has low entropy (alre
 **Why:** Some configurations (high CFG, aggressive guidance, long generations) can cause the latent energy to ramp up over the course of generation, leading to clipping or distortion.
 
 **RMS Target Min / Max:**
-- Min = ceiling at low sigma (detail phase). Start at 1.2-1.8.
-- Max = ceiling at high sigma (structure phase). Start at 2.5.
-- ACE-Step latents typically run ~2.0 RMS at x0.
+- Min = ceiling at low sigma (detail phase). Max = ceiling at high sigma (structure phase).
+- Both default to 0 = auto: Min becomes 1.2 and Max 2.5 on ACE-Step, scaled to the active model's own latent RMS on other models. ACE-Step latents typically run ~2.0 RMS at x0, Stable Audio 3 about 0.685.
+- Any value above 0 overrides auto. On ACE-Step, start Min at 1.2-1.8 and Max at 2.5.
 
 **RMS Servo Gain:**
 - 0.6 = gradual correction (default, recommended)
@@ -181,7 +181,9 @@ The solver automatically scales alpha down when the latent has low entropy (alre
 
 Like RMS Servo but smarter — monitors the entropy * RMS product (a measure of "how chaotic and how energetic") and nudges toward a target value. Correction capped at 0.05% per step, so it accumulates gently over many steps.
 
-**Default: OFF.** Experimental. If you enable it, run with verbose output first to see what your latent's actual entropy distribution looks like before setting targets.
+The target has two parts. **Pressure Target RMS** defaults to 0 = auto, which is 2.0 on ACE-Step and scales with the active model's latent RMS, like the RMS Servo targets. **Pressure Target Entropy** defaults to 7.5, an image-domain value that audio may not share.
+
+**Default: OFF.** Experimental. V5 has no verbose output that shows your latent's actual entropy, so move the targets in small steps if you change them.
 
 ### Relational Weight (Barbour Best Matching)
 
@@ -190,11 +192,15 @@ Per-block velocity equalization from the Omni Relational solver, available here 
 - 0.0 = off (default)
 - 0.3-0.5 = balanced
 
+**Relational Sigma Decay** (default 1.0 = linear) sets how fast the weight fades as sigma drops.
+
 **Important:** Do NOT use this if you're also running Confluence as your solver — the two velocity-reshaping systems fight each other.
 
 ### Eta (SDE Noise)
 
 Stochastic noise injection per step. 0 = pure deterministic ODE (default). Small values (0.05-0.15) add subtle variation without overwhelming the stabilization. Scaled by sigma so it fades during detail phase.
+
+**Seed** (default 42) drives this noise, step by step, so the same Seed gives the same noise whatever the generation seed is.
 
 ### Safety Clamp
 
@@ -282,7 +288,7 @@ Turn on Identity Anchor (blend 0.08, sigma 0.5). V5's anti-ringing makes this sa
 Tonal Anchor should already be ON by default. If it is and you're still hearing drift, increase tonal_strength to 0.20-0.30.
 
 **Energy runaway / clipping / distortion**
-Turn on RMS Servo (min 1.2, max 2.5, gain 0.6). If severe, also turn on Latent Pressure.
+Turn on RMS Servo (Min and Max at 0 = auto, which is 1.2 and 2.5 on ACE-Step; gain 0.6). If severe, also turn on Latent Pressure.
 
 **"More steps sounds worse" (shouldn't happen in V5)**
 If you're experiencing this, the step-budget auto-scaling may not be reading the step count correctly. Check that you're on the latest HOT-Step build. As a manual workaround, reduce Inertia Alpha and other strengths proportionally when increasing steps.

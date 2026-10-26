@@ -1,5 +1,7 @@
 // Native dora-rows-v1 loader acceptance against an independent FP64 reference.
 // Build target: sa3-dora-load-test (BUILD_TESTING=ON).
+// Run with no arguments for synthetic export/load acceptance. External fixtures
+// below add full-model validation after the synthetic cases pass.
 // Run: sa3-dora-load-test BASE.gguf ADAPTER1.gguf ADAPTER2.gguf
 // Or set SA3_DORA_BASE, SA3_DORA_ADAPTER1 and SA3_DORA_ADAPTER2 for CTest.
 // Uses CPU buffers only. Tests every adapted element, including upload/readback.
@@ -10,6 +12,9 @@
 
 #include <stdexcept>
 #include <set>
+
+#define SA3_EXPORT_NO_MAIN
+#include "test-sa3-adapter-export.cpp"
 
 static void require(bool ok, const std::string & message) {
     if (!ok) throw std::runtime_error(message);
@@ -92,6 +97,11 @@ static std::vector<uint16_t> load(const GGUFModel & base, Sa3AdapterSet * adapte
 }
 
 int main(int argc, char ** argv) {
+    try { sa3_export_test::run(); }
+    catch (const std::exception & e) {
+        fprintf(stderr, "SA3 EXPORT FAIL: %s\n", e.what());
+        return 1;
+    }
     const char * base_path = argc == 4 ? argv[1] : std::getenv("SA3_DORA_BASE");
     const char * ad1 = argc == 4 ? argv[2] : std::getenv("SA3_DORA_ADAPTER1");
     const char * ad2 = argc == 4 ? argv[3] : std::getenv("SA3_DORA_ADAPTER2");
@@ -100,8 +110,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (!base_path || !ad1 || !ad2) {
-        printf("SKIP: set SA3_DORA_BASE, SA3_DORA_ADAPTER1, SA3_DORA_ADAPTER2\n");
-        return 77;
+        printf("Synthetic export/load passed. Optional full-model checks need SA3_DORA_BASE, SA3_DORA_ADAPTER1, SA3_DORA_ADAPTER2\n");
+        return 0;
     }
     ggml_backend_t backend = nullptr;
     try {

@@ -30,6 +30,7 @@ import { listAllYue2AitkRuns } from '../../training/yue2AitkRuns.js';
 import { yue2AdapterTrigger, setYue2ManualTrigger } from './jointAdapterContext.js';
 import { coverScoreChoices, transformCoverScore, type CoverScoreChoices } from './coverScoreTransform.js';
 import { EMPTY_COVER_SCORE_ERROR, hasSoundingVocalBar } from './scoreHealth.js';
+import { yue2CoverGuide, type Yue2CoverGuide } from './sourceGuide.js';
 import { runYue2Generation } from './generate.js';
 import {
   yue2Props, yue2PropsCached, yue2SelectModel, yue2Unload, TIMEOUT_DRAIN,
@@ -320,6 +321,9 @@ export interface Yue2CoverSubmission extends Partial<CoverScoreChoices> {
   sourceLabel?: string;
   /** Reviewed full score, retained beside the score actually rendered. */
   fullScore?: string;
+  /** Follow source: steer the composer with the source recording itself
+   *  (sourceGuide.ts). Absent = the score alone, as before. */
+  guide?: Yue2CoverGuide;
 }
 
 /** Reads the same `yue2Cover` shape back out of envelope.options.yue2 (the
@@ -350,10 +354,13 @@ export function yue2CoverFromSubmission(submission: Readonly<Record<string, unkn
   // Validate marker fields even when this reads an older captured envelope.
   coverScoreChoices(rawChoices as Partial<CoverScoreChoices>);
   const fullScore = typeof r.fullScore === 'string' ? r.fullScore : undefined;
+  const guide = yue2CoverGuide(r.guide);
+  if (guide && sourceKind === 'musicxml') throw new Error('Follow source needs a source recording; a MusicXML cover has none.');
   return { ...(sourceId ? { sourceId } : {}), ...(sourceKind === 'musicxml' ? { sourceKind } : {}),
     ...(sourceLabel ? { sourceLabel } : {}),
     ...rawChoices as Partial<CoverScoreChoices>,
-    ...(fullScore !== undefined ? { fullScore } : {}) };
+    ...(fullScore !== undefined ? { fullScore } : {}),
+    ...(guide ? { guide } : {}) };
 }
 
 /** The persisted selection a cover job's pick is resolved against: same LM
@@ -403,7 +410,7 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
     options.yue2Cover = { ...(cover.sourceId ? { sourceId: cover.sourceId } : {}),
       ...(cover.sourceKind ? { sourceKind: cover.sourceKind } : {}),
       ...(cover.sourceLabel ? { sourceLabel: cover.sourceLabel } : {}),
-      ...choices, fullScore: score.fullScore } satisfies Yue2CoverSubmission;
+      ...choices, fullScore: score.fullScore, ...(cover.guide ? { guide: cover.guide } : {}) } satisfies Yue2CoverSubmission;
     options.yue2Abc = score.renderedAbc;
     options.yue2CfgScale = choices.cfgScale;
   }
@@ -669,6 +676,32 @@ async function capabilities(): Promise<BackendCapabilities> {
         hint: 'Cap on the song in codec frames (25 per second; 9000 = 6 min). A render that hits it '
             + `reports limit_hit. Checkpoint: ${sd('semantic', 'max_tokens', 9000)}.`,
         default: sd('semantic', 'max_tokens', 9000), min: 200, max: 9000, step: 100,
+      },
+      {
+        key: 'yue2SemMinP', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'Composer Min-P',
+        hint: 'After Top-P, drop every codec frame candidate whose probability is under this fraction of the '
+            + 'top candidate\'s. Trims the long tail that produces stray noises without flattening the '
+            + 'choice the way a lower Top-K does. 0 = off (the checkpoint has no min-p).',
+        default: 0, min: 0, max: 0.5, step: 0.01,
+      },
+      {
+        key: 'yue2CfgMinP', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'CFG Plausibility',
+        hint: 'Apply CFG only to candidates the conditioned pass itself gives at least this fraction of its '
+            + 'top probability; the rest keep their unguided value, so guidance cannot promote tokens the model '
+            + 'thinks are implausible. 0 = off. Only matters when CFG is not 1 (Chain of Thought off, or a set CFG Scale).',
+        default: 0, min: 0, max: 0.5, step: 0.01,
+      },
+      {
+        key: 'yue2CfgLogprob', group: 'lm', section: 'Composer (song)', type: 'toggle', label: 'CFG in Log-Probabilities',
+        hint: 'Blend the conditioned and unconditioned passes after normalising each to log-probabilities, '
+            + 'instead of on raw logits. Off = the reference blend.',
+        default: false,
+      },
+      {
+        key: 'yue2CfgRescale', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'CFG Rescale',
+        hint: 'Pull the guided distribution\'s spread back toward the conditioned pass\'s, so a high CFG Scale '
+            + 'changes which frames win without sharpening or flattening the whole distribution. 0 = off.',
+        default: 0, min: 0, max: 1, step: 0.05,
       },
       {
         key: 'yue2EndThreshold', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'End Threshold',

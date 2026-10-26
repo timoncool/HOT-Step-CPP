@@ -62,7 +62,7 @@ export interface Yue2SectionMatch {
 /** Match score to lyrics: the score's new sections (1-based bars) and the
  *  lyrics retagged to them. */
 export interface Yue2ScorePlan {
-  sections: Array<{ label: string; bar: number; block: number | null }>;
+  sections: Array<{ label: string; bar: number; block: number | null; tag: string | null }>;
   lyrics: string;
   unsure: Array<{ block: number; tag: string | null }>;
   unchanged: boolean;
@@ -153,8 +153,10 @@ export interface Yue2BuildTake {
   cropOf?: string;
   /** The codec frame its audio file starts at (a take renders from a lead-in before its new part); missing: 0. */
   audioStart?: number;
-  /** Where the next take resumes when a crop cut into a section it composes again. */
+  /** Where the next take resumes when a crop cut into a section it composes again, or kept part of the one it ran on into. */
   resume?: number;
+  /** The source section id (or improv) its prompt ran on into after `to`; missing when it composed an ending. */
+  after?: string;
   /** Ids of the occurrences it composed, from..to. */
   occurrences: string[];
   /** The style prompt it was sent, adapter trigger included (older takes: missing). */
@@ -168,7 +170,8 @@ export interface Yue2SourceSection { id: string; label: string; startBar: number
 export interface Yue2Arrangement {
   sections: Yue2SourceSection[];
   /** `lyrics`: the occurrence's own sung lines, when it has been given some. */
-  plan: Array<{ id: string; section: string; lyrics?: string }>;
+  /** section is a source section id, or 'improv' with its own bar count. */
+  plan: Array<{ id: string; section: string; lyrics?: string; bars?: number }>;
   /** The plan ends the song; until then a take runs a few seconds into the source section after the last one. */
   finished: boolean;
 }
@@ -216,6 +219,8 @@ export const yue2CoverApi = {
    *  before a section, the last bar). Fails (422) on anything it cannot convert exactly. */
   remeterScore: (abc: string, pickup: boolean) =>
     apiClient.post<{ abc: string; twoFourBars: number }>(`${BASE}/score/remeter`.replace(/^\/api/, ''), { abc, pickup }),
+  shiftBars: (abc: string, beats: number) =>
+    apiClient.post<{ abc: string }>(`${BASE}/score/shift-bars`.replace(/^\/api/, ''), { abc, beats }),
   matchSections: (input: Yue2CoverSourceInput & { abc: string; lyrics: string }) =>
     request<Yue2SectionMatch>('/sections/match', { method: 'POST', body: JSON.stringify(input) }),
   /** `lyrics` is the build's own text; without it the session follows params.lyrics. */
@@ -259,6 +264,8 @@ export const yue2CoverApi = {
     request<Yue2BuildSession>(`/build/${id}/trim`, { method: 'POST', body: JSON.stringify({ revision, take, seconds }) }),
   buildDelete: (id: string, revision: number, take: string) =>
     request<Yue2BuildSession>(`/build/${id}/takes/${take}?revision=${revision}`, { method: 'DELETE' }),
+  buildDeleteAll: (id: string) =>
+    request<{ ok: true }>(`/build/${id}`, { method: 'DELETE' }),
   planScoreSections: (input: Yue2CoverSourceInput & { abc: string; lyrics: string }) =>
     request<Yue2ScorePlan>('/sections/plan-score', { method: 'POST', body: JSON.stringify(input) }),
   suggestAssignments: (input: Yue2CoverSourceInput & { prepare: PrepareV2; useRecording?: boolean }) =>

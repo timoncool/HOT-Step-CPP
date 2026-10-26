@@ -9,11 +9,13 @@ their readers share these keys without importing area hooks.
 
 ## Keys and reads
 
-`snapshotOptions(domain, path, token?, options?, staleTime?)` splits a local
+`snapshotOptions(domain, path, options?, staleTime?)` splits a local
 API path into pathname and normalized search filters. Keys use
 `cover-lyrics/{lireek,cover,drafts,workflow}`, the pathname as id, the captured
-API base and the auth epoch whenever the read carries a token. Tokens never
-appear in keys. The cached shape is the endpoint's raw JSON. The existing
+API base and the auth epoch whenever a session token is set: the transport
+sends the bearer whenever one exists, so the key's auth scope follows the same
+accessor (`getAuthToken()`). Tokens never appear in keys. The cached shape is
+the endpoint's raw JSON. The existing
 public lireek wrappers retain their array-to-object projections and positional
 arguments; every read now accepts trailing `ReadOptions` and consumes its
 signal. Failed HTTP reads throw `ApiError`, including status and revision
@@ -25,8 +27,9 @@ Cover's filtered `/songs?source=cover-studio` response has a separate normalized
 `cover-lyrics/cover-songs` key. It is not the full-library wire shape. Successful
 song deletion cancels the old list, changes cached rows only after the server
 accepts deletion, cancels again and invalidates. Completion and song writers
-also call foundation's `invalidateSongViews`, refreshing canonical `songs`,
-`song`, `shell-queue/recent-songs`, `studios/recent-songs` and the Cover feed.
+also call foundation's `queryManager.songs.views` (through `songsChanged()` in
+`reads.ts`), refreshing canonical `songs`, `song`, `shell-queue/recent-songs`,
+`studios/recent-songs` and the Cover feed.
 The render waiter invalidates these views when a `cover-render` job succeeds,
 including renders completed without a stream subscriber.
 The reference browser uses `global-models/references`; the LM adapter picker
@@ -56,7 +59,8 @@ Workflow jobs use `sharedKeys.workflowJob(id, after)` with an auth epoch and
 an explicit `after`, including zero. Their cached shape is raw `WorkflowReplay`.
 Documents use `sharedKeys.workflowDocument(id)` and cache `{ document }`.
 Events invalidate every `after` variant for the captured job and all documents
-in its auth scope. No `cover-lyrics/workflow-job` or `workflow-document` cache
+in its auth scope, plus every song view, every lireek snapshot and that
+scope's drafts. No `cover-lyrics/workflow-job` or `workflow-document` cache
 remains. The workflow list keeps its area key and `kind` filter.
 
 This area has no audio lyric-sidecar reader or cache. Its editable lyrics and
@@ -76,7 +80,7 @@ remain API consumers in the historical import count, but own no server reads.
 | `cover-studio/CoverRecentSongs.tsx`, `RecentCovers.tsx` | Shared filtered cover-song query; no module list cache or fetch-in-flight flag; successful delete updates/invalidation; postprocess listeners clean up on unmount |
 | `cover-studio/SourcePanel.tsx` | Canonical reference list query, enabled while browser opens; upload invalidates |
 | `cover-studio/Yue2Build.tsx` | Session query keyed by captured session id; polls while pending; successful commands update their returned session |
-| `cover-studio/ArtistSettingsPanel.tsx`, `CoverArtistGrid.tsx`, `Yue2CoverPanel.tsx`, `Yue2CoverScore.tsx`, `SectionMatchReview.tsx`, `ScorePlanReview.tsx` | Types, forms, score/audio display only |
+| `cover-studio/ArtistSettingsPanel.tsx`, `CoverArtistGrid.tsx`, `Yue2CoverPanel.tsx`, `Yue2CoverScore.tsx`, `SectionMatchReview.tsx`, `ScorePlanReview.tsx`, `PrepareLyrics.tsx`, `PrepareStructure.tsx`, `SectionPlayback.tsx` | Types, forms, score/audio display only; the Prepare and section players' intervals time audio playback windows |
 | `lyric-studio/LyricStudioV2.tsx` | Observes artists, selected artist's albums, album detail, bulk queue lists and presets; URL restore guarded against navigation; image enrichment stays a command, attempted once per resource identity |
 | `lyric-studio/ProviderSelector.tsx` | Query providers, shared across both picker variants; imperative provider fallback uses the same Query snapshot |
 | `lyric-studio/PromptEditor.tsx` | Prompt query; editable buffer local; save/reset refresh and reset uses the fresh returned value |
@@ -94,12 +98,16 @@ remain API consumers in the historical import count, but own no server reads.
 | `stores/streamingStore.ts` | Existing run/queue reducers; Query-backed list/get recovery; stream bridge handles replay/invalidation |
 | Other cover/lyric files | Local score parsing, file input, URL helpers, resize handlers or prop-only presentation; no HTTP snapshot owner |
 
-Surviving raw fetches are multipart upload, `/analyze` commands, curated
-profile streaming, score approval/save commands and SSE text consumers.
-They never run as get-or-submit query functions. No component interval remains
-in either studio. Drafts and playlists deliberately hydrate an editable working
-copy; Query remains their sole HTTP read/cache owner. External model and
-caption helpers remain with their row owners.
+Surviving raw fetches are the `/analyze` command (`CoverStudio.tsx`), curated
+profile streaming (`CuratedProfileModal.tsx`) and the SSE text consumer
+(`consumeSSE` in `services/lireekApi.ts`). Uploads go through
+`apiClient.upload()`, and score approval/save commands through `apiClient`.
+They never run as get-or-submit query functions. The only component intervals
+left in either studio are the audio playback timers in `PrepareStructure.tsx`
+and `SectionPlayback.tsx`; none of them polls the server. Drafts and playlists
+deliberately hydrate an editable working copy; Query remains their sole HTTP
+read/cache owner. External model and caption helpers remain with their row
+owners.
 
 ## Runtime acceptance handoff
 

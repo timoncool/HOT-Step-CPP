@@ -7,7 +7,9 @@ several per generation from the Adapters section of the generation bar.
 
 What an adapter changes depends on the backend. On ACE-Step 1.5 the main adapter acts on
 the DiT, the part that renders audio, and an optional planner adapter acts on the LM that
-plans the song. On MiniMax-Music3 and YuE2 adapters act on the language model.
+plans the song. On MiniMax-Music3 and YuE2 adapters act on the language model. Stable
+Audio 3 adapters act on its DiT and have no picker in the generation bar: the Training
+Studio trains them and renders auditions with them (see [File formats](#file-formats)).
 
 ## Where to find it
 
@@ -23,8 +25,8 @@ The **Adapters** section of the generation bar. Its contents follow the active b
 A backend without adapter support shows a "not yet" panel instead.
 
 All three read from one adapters directory. By default that is the `adapters` folder in
-the install directory. Change it under Settings > Environment > **Adapters directory**.
-<!-- TODO(verify): whether changing Adapters directory takes effect without restarting the app. -->
+the data folder (see [Release data paths](#release-data-paths)). Change it under Settings >
+Environment > **Adapters directory**; the new folder takes effect after a restart.
 
 ## The adapters folder
 
@@ -44,13 +46,26 @@ adapters/
   yue2-nar-adapters/                YuE2 NAR (renderer) runs
   yue2-ar-adapters/                 YuE2 AR (composer) runs
   yue2-joint-adapters/              YuE2 joint runs, which save a NAR and an AR file per checkpoint
+  sa3-medium/<dataset>/<name>/<run>/  Stable Audio 3 training runs (raw checkpoints, not inference files)
 ```
 
-`<base>` is a short name for the DiT the adapter was trained on, such as `dit-xl-thirds`
-or `dit-turbo`. `<run>` is a date and time stamp like `2026-08-06_11-05-06`. Training the
-same dataset again adds a new run folder and never overwrites an old one.
+`dit-<base>` is a short name for the DiT the adapter was trained on, such as
+`dit-xl-thirds` or `dit-turbo`. `<run>` is a date and time stamp like
+`2026-08-06_11-05-06`. Training the same dataset again adds a new run folder and never
+overwrites an old one.
 
 ## File formats
+
+Stable Audio 3 Medium training publishes validated DoRA-rows GGUF files into
+`models/sa3-adapters/`, shared with StableStep. Its raw adapter and optimizer
+checkpoints remain in the training run folder and are not inference files.
+Training Studio's SA3 card has a catalogue picker and fixed-seed auditions with
+strength from 0 to 2. Strength 0 renders the base with an empty adapter list;
+strength 1 applies the full adapter. See [Stable Audio 3 training](training/sa3.md) for vocal
+stripping, the recipe and resume. This catalogue lives under the models root,
+separately from the ACE-Step, MiniMax-Music3 and YuE2 adapter directories above. On
+those three backends the same files are StableStep's adapters in the Post-Processing
+section. With Stable Audio 3 active, the generation bar has no picker for them.
 
 ACE-Step DiT adapters load from three shapes:
 
@@ -77,7 +92,8 @@ tensors. If those tensors are missing, loading fails instead of treating the fil
 plain LoRA. Keep the original config and weights together; replace an incomplete
 adapter with a complete export.
 
-MiniMax-Music3 adapters are PEFT `.safetensors` files trained on the MiniMax-Music3 LM.
+MiniMax-Music3 adapters are `.safetensors` files, PEFT LoRA or LyCORIS LoKr, trained on
+the MiniMax-Music3 LM.
 Each can have a sidecar named `<file>.safetensors.json` that records the trigger word,
 rank, dataset, step count, notes and recommended dial settings. The Training Studio writes
 one for every checkpoint.
@@ -88,8 +104,9 @@ file in a scanned folder that does not have it.
 
 ## ACE-Step 1.5
 
-The section has a **Simple** / **Advanced** toggle at the top. Simple loads one adapter.
-Advanced loads a stack and unlocks per-section control.
+The section has an **Adapter mode** switch, **Simple** or **Advanced**, under the
+**Runtime DoRA magnitudes** toggle. Simple loads one adapter. Advanced loads a stack and
+unlocks per-section control.
 
 ### Loading one adapter
 
@@ -98,7 +115,8 @@ Advanced loads a stack and unlocks per-section control.
    `.safetensors` file.
 3. Set **Adapter Scale** (0 to 4, default 1.0).
 
-<!-- TODO(verify): whether choosing adapter_model.safetensors inside a PEFT folder in Simple mode picks up the adapter_config.json beside it. Advanced mode lists the folder itself, which is known to work. -->
+For a PEFT adapter you can choose `adapter_model.safetensors` itself: the engine reads the
+`adapter_config.json` in the same folder.
 
 ### Stacking adapters
 
@@ -175,9 +193,10 @@ strength, even when the two bases are nearly identical. **Basin Re-base** correc
 2. Set **Re-base Strength (β)**, 0 to 1, default 0.75. At 1 you get home-base behaviour;
    lower keeps more of the loaded base's character.
 
-Re-base works in Merge and Runtime modes. It has been checked by ear in Merge mode only. It
-is skipped when per-section masking is active. It cannot move an adapter between model
-sizes (XL and 2B): nothing in the app does that.
+Re-base works in all three loading modes; in Low-Rank the correction is stored as
+full-size deltas. It has been checked by ear in Merge mode only. It is skipped when
+per-section directives or Active phase windows are in use. It cannot move an adapter
+between model sizes (XL and 2B): nothing in the app does that.
 
 ### Per-section adapters
 
@@ -194,17 +213,19 @@ Streetlights hum along the empty road
 ...
 ```
 
-Each `key=value` pair sets one adapter's weight for that section. A key is either the
-adapter's position in the stack (`#1`, `#2`, or a bare `1`, `2`), or its name: the file
-name without `.safetensors`, or the folder name for a folder adapter. Names are not case
-sensitive. Adapters from the Training Studio live in date-stamped run folders, so their name
-is the date stamp; position keys are easier there. The panel shows a two-line example built
-from your current stack.
+Each `key=value` pair, separated by `;` or `,`, sets one adapter's weight for that
+section. A key is either the adapter's position in the stack (`#1`, `#2`, or a bare `1`,
+`2`), or its name: the file name without `.safetensors`, or the folder name for a folder
+adapter. Names are not case sensitive. Adapters from the Training Studio live in
+date-stamped run folders, so their name is the date stamp; position keys are easier there.
+The panel shows a two-line example built from your current stack.
 
 How directives are read:
 
 - An adapter the directive does not mention gets 0 for that section.
-- A section with no directive, like the bridge above, uses the stack's normal scales.
+- A section with no directive, like the bridge above, uses the stack's normal scales. So
+  does a section whose directive names no adapter in the stack, which usually means a
+  typo; the server log lists the unknown keys.
 - Stack Mode applies per section: in Blend the weights are rescaled to Combined Strength,
   in Sum they are used as written. A directive of all zeros gives that section the base
   model alone.
@@ -255,9 +276,9 @@ for adapters that record no trigger.
    the weights, so planning runs at full speed and any dial change costs a re-merge of a
    few seconds. **GPU merging** (Merge only) can be turned off to merge with CPU help.
 4. Set **Strength**, **Attention** and **MLP** (0 to 2 each). The fold-out **Depth thirds
-   (advanced)** has Early, Middle and Late dials; leave them at 1.0 for renders you keep,
-   since the late third controls where songs end. **Recommended** resets all six to the
-   adapter's own suggestion.
+   (advanced)** has **Early third**, **Middle third** and **Late third** dials; leave them
+   at 1.0 for renders you keep, since the late third controls where songs end.
+   **Recommended** resets all six to the adapter's own suggestion.
 
 When the adapter has a trigger, **Add trigger to caption** puts it in the caption at its
 trained position. Leave it on unless you are placing the trigger yourself. If a run
@@ -275,8 +296,8 @@ structure and phrasing. An adapter trained on one half is refused by the other.
    final export at the top of each run and the earlier checkpoints under it. For adapters
    copied from another machine, set **Adapter folder**; every NAR and AR file in it,
    subfolders included, is added.
-2. Pick an adapter for either slot or both. Each row shows its trigger, dataset, rank,
-   steps and training loss.
+2. Pick an adapter for either slot or both. The picked adapter's card shows its trigger,
+   dataset, rank, steps and training loss.
 3. Set **Strength**, **Attention** and **MLP** (0 to 2), and optionally the depth thirds.
    Each dial saves when you let go of the slider, or when you leave or press Enter in its
    number box.
@@ -289,22 +310,24 @@ adapter file. It saves when you leave the box or press Enter; clear it to stop.
 The AR slot splits Strength in two. **Planner Strength** applies while the AR writes the
 score (melody, chords and sections); **Composer Strength** applies while it turns that
 score into audio. Planner Strength follows Composer Strength until you move it, and
-**Reset** makes it follow again. It needs Chain of Thought on. When the two differ, the
-score is planned in its own job, so each generation reloads the model twice: once to plan, once to render.
+**Reset**, which puts every dial in the slot back to 1.0, makes it follow again. It needs
+Chain of Thought on. When the two differ, the score is planned in its own job, so each
+generation reloads the model twice: once to plan, once to render.
 
 The picker sets the default for songs you queue from then on. Each song keeps the adapters
 it was queued with, including an album's own adapters when it comes from Lyric Studio, so
 changing the picker while songs wait does not change what they render with. Queued songs
 with the same adapters still render together in one batch.
 
-In [Cover Studio](studios/cover-studio.md), choose **Base YuE2** to clear both
-adapter slots for that cover, or choose an AR composer and NAR renderer pair.
+In [Cover Studio](studios/cover-studio.md), the **Render mode** sets the adapters for that
+cover: **Base YuE2** clears both slots, **Existing Artist** loads a Lyric Studio album's
+paired YuE2 adapters, and **Custom** takes the **AR composer** and **NAR renderer** you pick.
 The cover captures the pair and its strength settings when you click Generate;
 changing the global picker while it waits does not change the queued job. The
 AR strength is Cover Studio's own setting (0 to 10, default 0.6) and replaces the
 picker's AR scale for covers; values above 0.6 hurt adherence to the score. A
 build by section can change it until its first keep. The
-approved ABC score supplies the composition plan in either mode. An adapter
+approved ABC score supplies the composition plan in every mode. An adapter
 changes how its half of the model uses that plan, but the app does not promise
 to preserve the source performance or match a particular voice.
 
@@ -328,11 +351,13 @@ one or both halves, in naming the engine does not load. **Import adapter…** co
    slot and selects each available half. The original file is not changed.
 
 The trigger is read from the file's training tags, and the step count from its training
-info. These files carry no alpha, so the import uses the strength ComfyUI applies (alpha
-equal to the rank, scale 1.0). If the adapter sounds too strong or too weak, use the
-**Strength** dials. LoRA and LoKr adapters are both supported. Import accepts fused
-and separate projection names, plus `lora_A`/`lora_B` and `lora_down`/`lora_up` names.
-Adapters trained in this app never need importing.
+info. A file with no alpha imports at the strength ComfyUI applies (alpha equal to the
+rank, scale 1.0); one whose modules carry different alphas is refused. If the adapter
+sounds too strong or too weak, use the **Strength** dials. LoRA and LoKr adapters are
+both supported. Import accepts fused and separate projection names, plus
+`lora_A`/`lora_B` and `lora_down`/`lora_up` names. Adapters trained in this app never
+need importing; a file that is already a native YuE2 adapter is refused, so point
+**Adapter folder** at it instead.
 
 YuE2 weights are licensed CC BY-NC 4.0, with the authors' exception for individual
 creators, and an adapter trained on them carries the same terms. The panel shows the full
@@ -348,6 +373,8 @@ picker without a restart.
 - MiniMax-Music3 training saves a checkpoint folder at the save interval set for the run
   (`ckpt-100`, `ckpt-200`, ...), each with its own sidecar.
 - YuE2 training lists the final export and the step snapshots for every run.
+- Stable Audio 3 training publishes a validated GGUF to `models/sa3-adapters/` when a
+  run completes, and the Training Studio's SA3 card lists it.
 
 Later checkpoints are not always better. Which one to keep, and how to compare them by
 ear, is covered per backend in [ACE-Step training](training/ace-step.md),
@@ -358,10 +385,10 @@ ear, is covered per backend in [ACE-Step training](training/ace-step.md),
 | Symptom | Likely cause and fix |
 |---|---|
 | The output sounds like the base model | Turn on **No-adapter reference** and compare. If they match, check the scale, check that the trigger word is reaching the caption, and check the engine log for adapter warnings. In a stack, a Blend budget of 0.75 spread over several adapters leaves each one weak. |
-| The job fails with a model mismatch error, or the engine log says an adapter "merged no tensors" | The adapter was trained for a different model size, XL against 2B for the DiT, or a larger planner than the one loaded. Load the matching base. In a Merge-mode stack, a mismatched adapter only logs the warning and is left out while the others load. <!-- TODO(verify): Runtime-mode behaviour for one mismatched adapter in a stack. --> |
+| The job fails with a model mismatch error, or the engine log says an adapter "merged no tensors" | The adapter was trained for a different model size, XL against 2B for the DiT, or a larger planner than the one loaded. Load the matching base. In a Merge or Runtime stack, a mismatched adapter only logs the warning ("staged no deltas" in Runtime) and is left out while the others load. With per-section directives or Active phase windows every adapter must load, so one mismatched adapter fails the job. |
 | Coherent on its home base, falls apart on another | Use **Basin Re-base** with the home base selected. |
 | Weak or distorted PEFT adapter | `adapter_config.json` is missing from beside `adapter_model.safetensors`. |
-| DoRA adapter sounds off, or is still audible at strength 0 | DoRA needs Merge mode. At strength 0 a DoRA adapter still applies part of its rescale. |
+| DoRA adapter sounds off, or is still audible at strength 0 | Runtime and Low-Rank modes skip the magnitude rescale unless **Runtime DoRA magnitudes** is on; use Merge mode or turn the switch on. Where the rescale is applied, strength scales only the rescale: the learned weight change goes in at full size, so strength 0 still changes the sound. |
 | Merge fails on a ConvRot model | ConvRot models support Runtime and Low-Rank only. |
 | Out of memory with several adapters | Per-section directives and Active phase windows hold every adapter separately. Set **Adapter VRAM** to Q4, drop an adapter, or use Merge with **Low ¼** when you do not need per-section control. |
 | Out of memory in Merge mode | **HQ** stores merged weights at F32. Switch Merge VRAM to **Low ¼** or use Runtime. |
@@ -369,8 +396,7 @@ ear, is covered per backend in [ACE-Step training](training/ace-step.md),
 | A YuE2 adapter from ComfyUI is not listed, or is refused | It is a single joint file. Use **Import adapter…** in the YuE2 panel. |
 | A YuE2 pick has no effect yet | It merges on the next model load. Generate once, or check the slot's status line. |
 
-For reading the logs, see the troubleshooting page.
-<!-- TODO(verify): link troubleshooting.md once it exists; it is not in this page's approved link list. -->
+For reading the logs, see [Troubleshooting](troubleshooting.md#where-the-logs-are).
 
 ## Related
 
@@ -381,6 +407,8 @@ For reading the logs, see the troubleshooting page.
 - [ACE-Step training](training/ace-step.md)
 - [MiniMax-Music3 training](training/minimax-music3.md)
 - [YuE2 training](training/yue2.md)
+- [Stable Audio 3 training](training/sa3.md)
+- [Troubleshooting](troubleshooting.md)
 
 ## Release data paths
 

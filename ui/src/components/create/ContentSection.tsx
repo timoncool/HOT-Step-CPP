@@ -335,7 +335,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
             <ParamLabel
               label="Negative Prompt"
               className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
-              info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Sent to all backends.'
+              info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Used by ACE-Step 1.5 only; the other backends ignore it.'
             />
           </label>
           <textarea

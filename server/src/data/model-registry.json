@@ -225,7 +225,7 @@
       "id": "stem-separation",
       "family": "shared",
       "name": "Stem Separation",
-      "description": "All 4 models for multi-stem audio separation in Cover Studio. Required for the SuperSep pipeline.",
+      "description": "All 3 models for multi-stem audio separation in Cover Studio. Required for the SuperSep pipeline.",
       "fileIds": [
         "supersep-bs-roformer",
         "supersep-mel-band",
@@ -273,7 +273,7 @@
       "id": "yue2-recommended",
       "family": "yue2",
       "name": "YuE2 Recommended",
-      "description": "YuE2 — a second generation backend, separate from ACE-Step and MiniMax-Music3: an autoregressive language model (plan/semantic/nar stages) plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt. Q8_0 LM (near-lossless, NAR-stage rel-L2 vs bf16 output 0.019 against bf16's own 0.013 baseline — docs/plans/yue2/07-quant-ladder.md §5) plus the standard VAE. ~4.4 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2, a generation backend separate from ACE-Step and MiniMax-Music3: an autoregressive language model (plan/semantic/nar stages) plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt. Q8_0 LM (near-lossless: NAR-stage rel-L2 vs bf16 output 0.019, against bf16's own 0.013 baseline) plus the standard VAE and the companion decoder adapter. ~4.6 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "fileIds": [
         "yue2-lm-q8_0",
         "yue2-vae-standard-f32",
@@ -296,7 +296,7 @@
       "id": "yue2-full-precision",
       "family": "yue2",
       "name": "YuE2 Full Precision",
-      "description": "YuE2 at source precision (BF16 LM) plus the standard VAE — the reference quality bar the whole quant ladder is measured against (docs/plans/yue2/07-quant-ladder.md). Largest download and VRAM footprint of the four YuE2 packs. ~7.8 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 at source precision (BF16 LM) plus the standard VAE and the companion decoder adapter: the reference quality bar the whole quant ladder is measured against. Largest download and VRAM footprint of the four GGUF packs. ~7.9 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "fileIds": [
         "yue2-lm-bf16",
         "yue2-vae-standard-f32",
@@ -307,7 +307,7 @@
       "id": "yue2-compact-imatrix",
       "family": "yue2",
       "name": "YuE2 Compact (imatrix)",
-      "description": "YuE2 with the Q4_K_M-imat LM (imatrix-guided quantization; NAR-stage rel-L2 vs bf16 output 0.116 against bf16's own 0.013 baseline — docs/plans/yue2/07-quant-ladder.md §12/§14) plus the standard VAE. The usual choice for limited VRAM. ~3.0 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 with the Q4_K_M-imat LM (imatrix-guided quantization; NAR-stage rel-L2 vs bf16 output 0.116, against bf16's own 0.013 baseline) plus the standard VAE and the companion decoder adapter. The usual choice for limited VRAM. ~3.1 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "fileIds": [
         "yue2-lm-Q4_K_M-imat",
         "yue2-vae-standard-f32",
@@ -318,7 +318,7 @@
       "id": "yue2-tiny-imatrix",
       "family": "yue2",
       "name": "YuE2 Tiny (imatrix)",
-      "description": "YuE2 with the smallest LM this ladder ships, Q2_K-imat, plus the standard VAE. WARNING: audibly degraded — NAR-stage rel-L2 vs bf16 output is 0.389 against bf16's own 0.013 baseline (docs/plans/yue2/07-quant-ladder.md §12/§14), the second-worst measurement on the whole ladder. Pick this only for the smallest possible download/VRAM footprint and expect the flow-matching output to sound rougher than every other pack. ~2.2 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 with the smallest LM this ladder ships, Q2_K-imat, plus the standard VAE and the companion decoder adapter. WARNING: audibly degraded. NAR-stage rel-L2 vs bf16 output is 0.389 against bf16's own 0.013 baseline, the second-worst measurement on the whole ladder. Pick this only for the smallest possible download/VRAM footprint and expect the flow-matching output to sound rougher than every other pack. ~2.4 GB total. License: CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "fileIds": [
         "yue2-lm-Q2_K-imat",
         "yue2-vae-standard-f32",
@@ -360,6 +360,24 @@
         "yue2-minted-manifest",
         "yue2-minted-codes",
         "yue2-sheetsage2-f16"
+      ]
+    },
+    {
+      "id": "sa3-training",
+      "family": "shared",
+      "name": "Stable Audio 3 Training",
+      "description": "SA3 DoRA-rows training and audition dependencies: BF16 Medium Base with its own conditioner, distilled generation DiT, SAME encoder/decoder, T5Gemma, tokenizer files and vocal-stripping models. Quantized base variants are experimental and are not supported training bases. Powered by Stability AI.",
+      "fileIds": [
+        "sa3-training-base-bf16",
+        "stablestep-gguf-dit",
+        "stablestep-gguf-same-enc",
+        "stablestep-gguf-same-dec",
+        "stablestep-gguf-text-enc",
+        "stablestep-tokenizer",
+        "stablestep-tokenizer-config",
+        "stablestep-special-tokens",
+        "supersep-leap-xe-voc",
+        "supersep-leap-xe-inst"
       ]
     }
   ],
@@ -2057,6 +2075,731 @@
       ]
     },
     {
+      "id": "sa3-training-base-bf16",
+      "filename": "sa3-dit-base-BF16.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (BF16)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "BF16",
+      "sizeBytes": 2908305984,
+      "sha256": "9b75b6e470e756e867b50eb02f0174dea0db2d7f17790ec58a6aa9a411b45563",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Stable Audio 3 Medium Base for DoRA-rows adapter training. Includes the base's own prompt padding and seconds conditioner. Use alongside the SA3 training pack dependencies; keep the distilled generation weights installed. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "training"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq1_m-imat",
+      "filename": "sa3-dit-base-IQ1_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ1_M-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ1_M-imat",
+      "sizeBytes": 338479968,
+      "sha256": "c9d012cfd7dc7d39568094e4edae4d4f58ec6d4a07fa7d366c031b207d13dcf6",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq1_s-imat",
+      "filename": "sa3-dit-base-IQ1_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ1_S-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ1_S-imat",
+      "sizeBytes": 304666464,
+      "sha256": "cda21f33c22aa6f068ae3651f9c4149d53c0503cc5cf644fb206ab2fd0df8748",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq2_xs-imat",
+      "filename": "sa3-dit-base-IQ2_XS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ2_XS-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ2_XS-imat",
+      "sizeBytes": 439920480,
+      "sha256": "d16622e77efa0f47a6014e31de404d42156fd51a3a13422aa70e803c818773bf",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq2_xxs-imat",
+      "filename": "sa3-dit-base-IQ2_XXS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ2_XXS-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ2_XXS-imat",
+      "sizeBytes": 394835808,
+      "sha256": "d7359fad91976ed31d7af3e01ce04b39b54e99b8a67637b07fa182f6c30ed42e",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq3_xxs-imat",
+      "filename": "sa3-dit-base-IQ3_XXS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ3_XXS-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ3_XXS-imat",
+      "sizeBytes": 575174496,
+      "sha256": "1d580d5bc419fdbed77748e1320c41d4d924d7e7e54b5676c7801f1e703bf8f6",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-iq4_xs-imat",
+      "filename": "sa3-dit-base-IQ4_XS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (IQ4_XS-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "IQ4_XS-imat",
+      "sizeBytes": 789326688,
+      "sha256": "a4e60fe64cdb24b5e2c516e49260f752b6376ea941de83a1ab0824a2b30f249c",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-mxfp4",
+      "filename": "sa3-dit-base-MXFP4.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (MXFP4)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "MXFP4",
+      "sizeBytes": 789326528,
+      "sha256": "0f36f40c4abc49d4f70f4f9a8c908f3acba59a8b0aae36d11053766a71fb6d2d",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-nvfp4",
+      "filename": "sa3-dit-base-NVFP4.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (NVFP4)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "NVFP4",
+      "sizeBytes": 834411200,
+      "sha256": "a5312d6d5ad82e58f3b22aa43f5746927ad171d70cfa09c97d8bf20b4b81d4a7",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q2_k-imat",
+      "filename": "sa3-dit-base-Q2_K-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q2_K-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q2_K-imat",
+      "sizeBytes": 496276320,
+      "sha256": "6f11c4e1f666b5fd7196ef16e6f14f233c5e7212becbd63eab8fe29ca260ce72",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q2_k",
+      "filename": "sa3-dit-base-Q2_K.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q2_K)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q2_K",
+      "sizeBytes": 496276160,
+      "sha256": "c91c59aae0748cf8763282408e8bce706439587db0eebaaa7ca4167153f50cd4",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_l-imat",
+      "filename": "sa3-dit-base-Q3_K_L-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_L-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_L-imat",
+      "sizeBytes": 642801504,
+      "sha256": "984605fbe7a8178332a116f4421518e3d3bcccfc53adf953ddd037238679dca5",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_l",
+      "filename": "sa3-dit-base-Q3_K_L.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_L)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_L",
+      "sizeBytes": 642801344,
+      "sha256": "9462c5c31651c0180efd7b717d6bee7d90e35ec9ac8fc0f749bb3ea55b5cafb3",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_m-imat",
+      "filename": "sa3-dit-base-Q3_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_M-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_M-imat",
+      "sizeBytes": 642801504,
+      "sha256": "fada97b7b3af165f3d5313b2851dbe62668bf53072a64cfcac896c9c8b32c05e",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_m",
+      "filename": "sa3-dit-base-Q3_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_M)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_M",
+      "sizeBytes": 642801344,
+      "sha256": "6d223e235bde2ecf91861999332d9b064af3ac7fe00955c1a97c1794f2fa2e8b",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_s-imat",
+      "filename": "sa3-dit-base-Q3_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_S-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_S-imat",
+      "sizeBytes": 642801504,
+      "sha256": "7f480dfacf51dbd1cd33f8a29d40b5b668eeb506c80b08478d1aa578d93e5b02",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q3_k_s",
+      "filename": "sa3-dit-base-Q3_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q3_K_S)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q3_K_S",
+      "sizeBytes": 642801344,
+      "sha256": "45e8a9445e159d71ae6cc8ed00845b6557611ded032698e97e9140e33cda8bd9",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q4_k_m-imat",
+      "filename": "sa3-dit-base-Q4_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q4_K_M-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q4_K_M-imat",
+      "sizeBytes": 834411360,
+      "sha256": "b5e3068ed6c0f4d596836698406f72b89ab316a0cab6b26f4d491541f4d7eba8",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q4_k_m",
+      "filename": "sa3-dit-base-Q4_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q4_K_M)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q4_K_M",
+      "sizeBytes": 834411200,
+      "sha256": "b9587c8df7320f93ebce34d79d683e46d793bce4ed8cf62cc010ad6f9a53c113",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q4_k_s-imat",
+      "filename": "sa3-dit-base-Q4_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q4_K_S-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q4_K_S-imat",
+      "sizeBytes": 834411360,
+      "sha256": "3b908348c86286580b3c29688f5ab3cb4eac725b587c232de2662aac610c960f",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q4_k_s",
+      "filename": "sa3-dit-base-Q4_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q4_K_S)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q4_K_S",
+      "sizeBytes": 834411200,
+      "sha256": "cbc192f65e8af33913bc798c7db55f0221e3a79537645bdc9a5a5f26a10c12f9",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q5_k_m-imat",
+      "filename": "sa3-dit-base-Q5_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q5_K_M-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q5_K_M-imat",
+      "sizeBytes": 1014750048,
+      "sha256": "f59f80b6f57ce216295a255e1c2feada53ff3eb25b6a0cb649a63e76c0f2338c",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q5_k_m",
+      "filename": "sa3-dit-base-Q5_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q5_K_M)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q5_K_M",
+      "sizeBytes": 1014749888,
+      "sha256": "92443a23a8d24a9f9e3ecde5502537b8120a70e5da3a5f2a04e04851505ccdbc",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q5_k_s-imat",
+      "filename": "sa3-dit-base-Q5_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q5_K_S-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q5_K_S-imat",
+      "sizeBytes": 1014750048,
+      "sha256": "6358ba0e3cd5c6d5f72eece71606db8bed0ac1dccfb9c396c3efc5fe9b14bec5",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q5_k_s",
+      "filename": "sa3-dit-base-Q5_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q5_K_S)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q5_K_S",
+      "sizeBytes": 1014749888,
+      "sha256": "28b60fc7cd69d3dcb5490dd32ea45958d6f163f27144fc4bfa0485c4e3b0323c",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q6_k-imat",
+      "filename": "sa3-dit-base-Q6_K-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q6_K-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q6_K-imat",
+      "sizeBytes": 1206359904,
+      "sha256": "76fd8b5412c2310f3e9db2de9bfd2c0b73ffbadee1b8c42f969b2309c893bc4e",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q6_k",
+      "filename": "sa3-dit-base-Q6_K.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q6_K)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q6_K",
+      "sizeBytes": 1206359744,
+      "sha256": "30878548ee437e6dcbc723410e1db3bbcbdd36d916eefa912af2c73ebf7d7d64",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q8_0-imat",
+      "filename": "sa3-dit-base-Q8_0-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q8_0-imat)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q8_0-imat",
+      "sizeBytes": 1555766112,
+      "sha256": "c5d470dfdc69c8258fdb1edd64862414f57b9d4480dd5b0728d3148459a8a23a",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Activation-calibrated on 12 forwards using three synthetic reference clips; this small calibration set does not establish music-domain quality. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "sa3-training-base-q8_0",
+      "filename": "sa3-dit-base-Q8_0.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 Medium Base (Q8_0)",
+      "scale": null,
+      "variant": "training-base",
+      "quant": "Q8_0",
+      "sizeBytes": 1555765952,
+      "sha256": "9f0fd4d039448788ac6d6ed6f855bcb52c72efd9117848376b3ab99cd9910116",
+      "repo": "scragnog/Stable-Audio-3-Medium-Base-GGUF",
+      "description": "Experimental quantized Stable Audio 3 Medium Base, with original-precision memory tokens and conditioner. The current SA3 trainer requires BF16; this file is not a supported training base. Audible quality has not been verified. Powered by Stability AI. See the accompanying Stability AI Community License and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
       "id": "stablestep-gguf-dit",
       "filename": "sa3-dit-BF16.gguf",
       "role": "stablestep",
@@ -2066,9 +2809,710 @@
       "variant": null,
       "quant": "BF16",
       "sizeBytes": 2908308288,
+      "sha256": "550ecd0f7dd7b8bd30c3da8e6370e39393898fd1c9eace3e10714f5102e80492",
       "repo": "scragnog/HOT-Step-CPP-StableStep",
       "description": "GGML backend: Stable Audio 3 diffusion transformer (BF16 GGUF). Runs via GGML on CUDA, Vulkan or CPU — the fastest option on NVIDIA in current testing.",
       "tags": []
+    },
+    {
+      "id": "stablestep-gguf-dit-iq1_m-imat",
+      "filename": "sa3-dit-IQ1_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ1_M-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ1_M-imat",
+      "sizeBytes": 338482272,
+      "sha256": "e5a5d530c65a34e6a019f69767b476344b367e60b8c0db67bd2bc90245df6182",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-iq1_s-imat",
+      "filename": "sa3-dit-IQ1_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ1_S-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ1_S-imat",
+      "sizeBytes": 304668768,
+      "sha256": "5c4d8c59fd533ca8bc087d1c1fb2617e0489ed1c1a00dc8b5c6515345bc419f5",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-iq2_xs-imat",
+      "filename": "sa3-dit-IQ2_XS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ2_XS-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ2_XS-imat",
+      "sizeBytes": 439922784,
+      "sha256": "3c898035a9d518ab69e2872e74542f2d18dafdf614ce1f502a768f60147cbef0",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-iq2_xxs-imat",
+      "filename": "sa3-dit-IQ2_XXS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ2_XXS-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ2_XXS-imat",
+      "sizeBytes": 394838112,
+      "sha256": "0b8c3fd17b8d165e1dda1e1a57c4b9f9dfcbc329f63c82c8d075bf4567aaa0af",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-iq3_xxs-imat",
+      "filename": "sa3-dit-IQ3_XXS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ3_XXS-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ3_XXS-imat",
+      "sizeBytes": 575176800,
+      "sha256": "c664d93e38add5055fa5dcc7d90bd5eed386c7726cb254f46d0ad9e1539673be",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-iq4_xs-imat",
+      "filename": "sa3-dit-IQ4_XS-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (IQ4_XS-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "IQ4_XS-imat",
+      "sizeBytes": 789328992,
+      "sha256": "47215b0f735d1b9c5b33517e2f5c93b7e89d15f5b71914eb32eb8cd0c0659214",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-mxfp4",
+      "filename": "sa3-dit-MXFP4.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (MXFP4)",
+      "scale": null,
+      "variant": null,
+      "quant": "MXFP4",
+      "sizeBytes": 789328832,
+      "sha256": "1d1512ecc77fe0aa70bc09880d0727f94cd2f6f4e0a067c724460106ad776849",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-nvfp4",
+      "filename": "sa3-dit-NVFP4.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (NVFP4)",
+      "scale": null,
+      "variant": null,
+      "quant": "NVFP4",
+      "sizeBytes": 834413504,
+      "sha256": "ca84de0c286882faf19ea6b7e56f864aca8352d03bb0b5ffccbbc07aed439c60",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q2_k-imat",
+      "filename": "sa3-dit-Q2_K-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q2_K-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q2_K-imat",
+      "sizeBytes": 496278624,
+      "sha256": "22466e48b99fe590fa6b1b871a75e934c76ad9f576f200daad23fc6cf56f88df",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q2_k",
+      "filename": "sa3-dit-Q2_K.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q2_K)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q2_K",
+      "sizeBytes": 496278464,
+      "sha256": "b0953143fbe0d29efa28822f08d55bdfc6b75cf41bc9acc4c6b0cccb3ddca07a",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_l-imat",
+      "filename": "sa3-dit-Q3_K_L-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_L-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_L-imat",
+      "sizeBytes": 642803808,
+      "sha256": "faaf472dcfb425285e8574a2b57e54e53d85104d05d23e4919b1e33313bdd43e",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_l",
+      "filename": "sa3-dit-Q3_K_L.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_L)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_L",
+      "sizeBytes": 642803648,
+      "sha256": "214f7abecbd6c9ed497354c30fb1cd593364ab8e9d32a350b0b1a9e2396a1827",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_m-imat",
+      "filename": "sa3-dit-Q3_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_M-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_M-imat",
+      "sizeBytes": 642803808,
+      "sha256": "279711b08f3b1e0c5a0cf1c56798f07adcad1c494a7bc6233af70e2c959242d5",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_m",
+      "filename": "sa3-dit-Q3_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_M)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_M",
+      "sizeBytes": 642803648,
+      "sha256": "99ff1e103b59520749b77c3c1d6368b6e9e15f0fb00bb07a187964d7e7d2b1b3",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_s-imat",
+      "filename": "sa3-dit-Q3_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_S-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_S-imat",
+      "sizeBytes": 642803808,
+      "sha256": "38347267b83260ba484541434d5954a0822a6097836dfa662dbf6757a0e3b37e",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q3_k_s",
+      "filename": "sa3-dit-Q3_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q3_K_S)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q3_K_S",
+      "sizeBytes": 642803648,
+      "sha256": "f22139f1fdb79bba4717584575fc8daf733ca2301f8ea5df692cf7ad7dc6b407",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q4_k_m-imat",
+      "filename": "sa3-dit-Q4_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q4_K_M-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q4_K_M-imat",
+      "sizeBytes": 834413664,
+      "sha256": "d6c0b237a06c038a0725d5a3abc981639cf2c18e5e77cd81108ab7707d66d053",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q4_k_m",
+      "filename": "sa3-dit-Q4_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q4_K_M)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q4_K_M",
+      "sizeBytes": 834413504,
+      "sha256": "ee318fc0401e98bb850f3961a51d176bad8473e051d39af3b2f57c4bc540ec46",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q4_k_s-imat",
+      "filename": "sa3-dit-Q4_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q4_K_S-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q4_K_S-imat",
+      "sizeBytes": 834413664,
+      "sha256": "5861ca70df44f73be79db1a31777c1c52d894ae6d1285a92c8ae98442d268c49",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q4_k_s",
+      "filename": "sa3-dit-Q4_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q4_K_S)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q4_K_S",
+      "sizeBytes": 834413504,
+      "sha256": "39b928cd5784b61f0c7e685337cbaae876d568456d27061c188cdc7088e6f139",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q5_k_m-imat",
+      "filename": "sa3-dit-Q5_K_M-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q5_K_M-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q5_K_M-imat",
+      "sizeBytes": 1014752352,
+      "sha256": "6d15114971b34f783fa6e8d34ca9a9817def4ba4b72c9fa0f7f47366a0fbc87a",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q5_k_m",
+      "filename": "sa3-dit-Q5_K_M.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q5_K_M)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q5_K_M",
+      "sizeBytes": 1014752192,
+      "sha256": "2d32d4386fba36edd82162e1665b373224e9407be0e578e61188b63c5b76d83d",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q5_k_s-imat",
+      "filename": "sa3-dit-Q5_K_S-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q5_K_S-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q5_K_S-imat",
+      "sizeBytes": 1014752352,
+      "sha256": "4514c21df2d358427771a0b2a4cb984bb1d39af14db01937fe2c7ccb3f1b3934",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q5_k_s",
+      "filename": "sa3-dit-Q5_K_S.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q5_K_S)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q5_K_S",
+      "sizeBytes": 1014752192,
+      "sha256": "616d4cd94951b393e4204e56fc2aa4a688b97fb45f940d795f67006acdfcbba7",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Finite forward verified; misses strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q6_k-imat",
+      "filename": "sa3-dit-Q6_K-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q6_K-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q6_K-imat",
+      "sizeBytes": 1206362208,
+      "sha256": "b4c1371755978956688b2c240aa92373714f39545af87178a3174d38b4f26ef7",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Passes strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q6_k",
+      "filename": "sa3-dit-Q6_K.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q6_K)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q6_K",
+      "sizeBytes": 1206362048,
+      "sha256": "d6effbd48813292bf78b6b7896cc738ff77323b88a8e8ebeb9f3c0ee78b2dba2",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Passes strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q8_0-imat",
+      "filename": "sa3-dit-Q8_0-imat.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q8_0-imat)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q8_0-imat",
+      "sizeBytes": 1555768416,
+      "sha256": "e5427ee2caa2f9bd0015c86f20cfd066ae8b896f5df3511f56d4e9f43b909a0c",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Activation-calibrated on 12 forwards with synthetic reference clips. Passes strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
+    },
+    {
+      "id": "stablestep-gguf-dit-q8_0",
+      "filename": "sa3-dit-Q8_0.gguf",
+      "role": "stablestep",
+      "family": "shared",
+      "displayName": "SA3 DiT (Q8_0)",
+      "scale": null,
+      "variant": null,
+      "quant": "Q8_0",
+      "sizeBytes": 1555768256,
+      "sha256": "c98cc976feba2d99bcb2e73f08f0e772b3d2e53cccb7ba67a796f1637ac2ee2a",
+      "repo": "scragnog/HOT-Step-CPP-StableStep",
+      "description": "Experimental quantized Stable Audio 3 Medium generation DiT. Retains original-precision memory tokens and conditioner tensors. Audible quality has not been verified. BF16 remains the default. Passes strict single-forward BF16 parity. Powered by Stability AI. See the accompanying licence and NOTICE.",
+      "tags": [
+        "experimental"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE-STABILITY-AI-COMMUNITY.md"
+        },
+        {
+          "filename": "NOTICE"
+        }
+      ]
     },
     {
       "id": "stablestep-gguf-same-enc",
@@ -3747,7 +5191,7 @@
       "quant": "BF16",
       "sizeBytes": 7267839328,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Source precision — the reference quality bar the rest of the ladder below is measured against (NAR-stage rel-L2 0.013 vs its own output, docs/plans/yue2/07-quant-ladder.md §5). Required alongside one of the VAE decoders below; this file is ~7.3 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Source precision — the reference quality bar the rest of the ladder below is measured against (NAR-stage rel-L2 0.013 vs its own output). Required alongside one of the VAE decoders below; this file is ~7.3 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3768,7 +5212,7 @@
       "quant": "Q8_0",
       "sizeBytes": 3916164544,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Near-lossless: NAR-stage rel-L2 vs bf16 output is 0.019, next to bf16's own 0.013 baseline (docs/plans/yue2/07-quant-ladder.md §5). The recommended default. Required alongside one of the VAE decoders below; this file is ~3.9 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Near-lossless: NAR-stage rel-L2 vs bf16 output is 0.019, next to bf16's own 0.013 baseline. The recommended default. Required alongside one of the VAE decoders below; this file is ~3.9 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [
         "recommended"
       ],
@@ -3791,7 +5235,7 @@
       "quant": "Q6_K",
       "sizeBytes": 3050315200,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Still very close to source: NAR-stage rel-L2 vs bf16 output is 0.056, next to bf16's own 0.013 baseline (docs/plans/yue2/07-quant-ladder.md §5). Required alongside one of the VAE decoders below; this file is ~3.1 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Still very close to source: NAR-stage rel-L2 vs bf16 output is 0.056, next to bf16's own 0.013 baseline. Required alongside one of the VAE decoders below; this file is ~3.1 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3812,7 +5256,7 @@
       "quant": "Q5_K_M",
       "sizeBytes": 2730565056,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Good quality/size balance: NAR-stage rel-L2 vs bf16 output is 0.088, next to bf16's own 0.013 baseline (docs/plans/yue2/07-quant-ladder.md §5). Required alongside one of the VAE decoders below; this file is ~2.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Good quality/size balance: NAR-stage rel-L2 vs bf16 output is 0.088, next to bf16's own 0.013 baseline. Required alongside one of the VAE decoders below; this file is ~2.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3833,7 +5277,7 @@
       "quant": "Q4_K_M-imat",
       "sizeBytes": 2429623904,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Compact; the usual choice for limited VRAM. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.116 (vs 0.154 for the same quant without an imatrix), next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Compact; the usual choice for limited VRAM. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.116 (vs 0.154 for the same quant without an imatrix), next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3854,7 +5298,7 @@
       "quant": "Q4_K_S-imat",
       "sizeBytes": 2338332256,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Slightly smaller than Q4_K_M-imat, marginally lower quality. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.111, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.3 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Slightly smaller than Q4_K_M-imat, marginally lower quality. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.111, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.3 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3875,7 +5319,7 @@
       "quant": "IQ4_XS-imat",
       "sizeBytes": 2235571808,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). i-quant alternative to Q4_K_M-imat at a similar size. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.123, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.2 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). i-quant alternative to Q4_K_M-imat at a similar size. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.123, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.2 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3896,7 +5340,7 @@
       "quant": "NVFP4",
       "sizeBytes": 2506878400,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). 4-bit float, fastest on Blackwell (RTX 50-series) native FP4 kernels. Experimental: NAR-stage rel-L2 vs bf16 output is 0.194, next to bf16's own 0.013 baseline — worse than the smaller Q3_K_M-imat despite landing in the same size band (docs/plans/yue2/07-quant-ladder.md §5/§7). Required alongside one of the VAE decoders below; this file is ~2.5 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). 4-bit float, fastest on Blackwell (RTX 50-series) native FP4 kernels. Experimental: NAR-stage rel-L2 vs bf16 output is 0.194, next to bf16's own 0.013 baseline — worse than the smaller Q3_K_M-imat despite landing in the same size band. Required alongside one of the VAE decoders below; this file is ~2.5 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3917,7 +5361,7 @@
       "quant": "MXFP4",
       "sizeBytes": 2418798016,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). 4-bit float, portable variant. Experimental: NAR-stage rel-L2 vs bf16 output is 0.283, next to bf16's own 0.013 baseline — the worst-scoring type in its own size class, occasionally behind the strictly smaller Q3_K_M-imat (docs/plans/yue2/07-quant-ladder.md §5/§7). Required alongside one of the VAE decoders below; this file is ~2.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). 4-bit float, portable variant. Experimental: NAR-stage rel-L2 vs bf16 output is 0.283, next to bf16's own 0.013 baseline — the worst-scoring type in its own size class, occasionally behind the strictly smaller Q3_K_M-imat. Required alongside one of the VAE decoders below; this file is ~2.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3938,7 +5382,7 @@
       "quant": "Q3_K_M-imat",
       "sizeBytes": 2055282272,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Aggressive: quality loss is audible in the flow-matching (NAR) stage, verify before relying on it. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.213, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.1 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Aggressive: quality loss is audible in the flow-matching (NAR) stage, verify before relying on it. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.213, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~2.1 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3959,7 +5403,7 @@
       "quant": "Q3_K_S-imat",
       "sizeBytes": 1949310560,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Very aggressive: expect noticeable degradation in the flow-matching (NAR) stage. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.245, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~1.9 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). Very aggressive: expect noticeable degradation in the flow-matching (NAR) stage. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.245, next to bf16's own 0.013 baseline (§12/§14). Required alongside one of the VAE decoders below; this file is ~1.9 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -3980,7 +5424,7 @@
       "quant": "IQ3_XXS-imat",
       "sizeBytes": 1734143584,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). i-quant alternative below Q3_K_S-imat's size. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.262, next to bf16's own 0.013 baseline (§12/§14). Expect noticeable degradation in the flow-matching (NAR) stage. Required alongside one of the VAE decoders below; this file is ~1.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). i-quant alternative below Q3_K_S-imat's size. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.262, next to bf16's own 0.013 baseline (§12/§14). Expect noticeable degradation in the flow-matching (NAR) stage. Required alongside one of the VAE decoders below; this file is ~1.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -4001,7 +5445,7 @@
       "quant": "Q2_K-imat",
       "sizeBytes": 1690574432,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). WARNING: audibly degraded. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.389, next to bf16's own 0.013 baseline (§12/§14) — roughly halved from the same quant built without an imatrix (0.819), but still the second-worst measurement on the whole ladder. Required alongside one of the VAE decoders below; this file is ~1.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). WARNING: audibly degraded. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.389, next to bf16's own 0.013 baseline (§12/§14) — roughly halved from the same quant built without an imatrix (0.819), but still the second-worst measurement on the whole ladder. Required alongside one of the VAE decoders below; this file is ~1.7 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -4022,7 +5466,7 @@
       "quant": "IQ2_XS-imat",
       "sizeBytes": 1368911456,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). WARNING: audibly degraded — the floor of what still runs. Quantized against an importance matrix collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9); NAR-stage rel-L2 vs bf16 output is 0.431, next to bf16's own 0.013 baseline (§12/§14) — the worst measurement on the whole ladder. Required alongside one of the VAE decoders below; this file is ~1.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "YuE2 autoregressive language model — plans the semantic/acoustic token sequence from a freeform style + lyrics prompt (plan/semantic/nar stages). WARNING: audibly degraded — the floor of what still runs. Quantized against an importance matrix collected from 12 real generations across four languages/genres; NAR-stage rel-L2 vs bf16 output is 0.431, next to bf16's own 0.013 baseline (§12/§14) — the worst measurement on the whole ladder. Required alongside one of the VAE decoders below; this file is ~1.4 GB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -4043,7 +5487,7 @@
       "quant": "imatrix",
       "sizeBytes": 4218528,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "Calibration data used to build the imatrix-guided quant ladder above (Q4_K_M-imat through IQ2_XS-imat) — not a model file itself, not needed to run YuE2, and not part of any starter pack. Only useful if you plan to requantize the LM yourself with quantize.exe --imatrix. Collected from 12 real generations across four languages/genres (docs/plans/yue2/07-quant-ladder.md §9). ~4.2 MB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "Calibration data used to build the imatrix-guided quant ladder above (Q4_K_M-imat through IQ2_XS-imat) — not a model file itself, not needed to run YuE2, and not part of any starter pack. Only useful if you plan to requantize the LM yourself with quantize.exe --imatrix. Collected from 12 real generations across four languages/genres. ~4.2 MB. YuE2's weights are licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -4109,7 +5553,7 @@
       "sizeBytes": 1211632224,
       "sha256": "aaea8c9fb75bf83baf3b99bac27a0eba61029e747df703a11e91a53309695687",
       "repo": "scragnog/YuE2-GGUF",
-      "description": "Turns real audio into YuE2 semantic tokens — the reverse of what the LM does. Optional, and only useful for training: with it, `ace-train yue2-tokenize` fills the codec_ids slot in a YuE2 preprocess cache so a NAR adapter trains on ground-truth codes exactly as inference conditions, instead of the text-only regime. Not needed to generate music. One file holds both halves of the chain: MERT-v2-FullSong's mel frontend, ConvNext subsampler and first 21 Conformer blocks, plus Mothersuperior's 8-layer tokenizer head (docs/plans/yue2/12-tokenizer-oracle-pin.md). The head is joint_v9 (2026-09-16), which replaced joint_v4 here: same architecture and input, retrained on the 14,547-track minted corpus and then co-trained against the rendered audio rather than only the VAE latents. Measured on our own held-out YuE2 render it lifts exact top-1 from 16.1% to 19.1% and drops the adjacent-repeat rate from 6.6% to 5.4%. Codes are encoder-specific: a cache tokenized with the old head keeps its codes until you re-run yue2-tokenize with --force. Derived from YuE2-3B and licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "Turns real audio into YuE2 semantic tokens — the reverse of what the LM does. Optional, and only useful for training: with it, `ace-train yue2-tokenize` fills the codec_ids slot in a YuE2 preprocess cache so a NAR adapter trains on ground-truth codes exactly as inference conditions, instead of the text-only regime. Not needed to generate music. One file holds both halves of the chain: MERT-v2-FullSong's mel frontend, ConvNext subsampler and first 21 Conformer blocks, plus Mothersuperior's 8-layer tokenizer head. The head is joint_v9 (2026-09-16), which replaced joint_v4 here: same architecture and input, retrained on the 14,547-track minted corpus and then co-trained against the rendered audio rather than only the VAE latents. Measured on our own held-out YuE2 render it lifts exact top-1 from 16.1% to 19.1% and drops the adjacent-repeat rate from 6.6% to 5.4%. Codes are encoder-specific: a cache tokenized with the old head keeps its codes until you re-run yue2-tokenize with --force. Derived from YuE2-3B and licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {
@@ -4130,7 +5574,7 @@
       "quant": "F16",
       "sizeBytes": 1360020736,
       "repo": "scragnog/YuE2-GGUF",
-      "description": "SheetSage2 lead-sheet transcriber for YuE2 covers and optional cot=full adapter training. For covers, it turns a source recording into melody ABC for review before generation; supplying approved ABC skips transcription and this download. For training, `ace-train yue2-sheet` writes ABC into a YuE2 preprocess cache for the AR and NAR trainers' --abc-dropout. GGML port of Mothersuperior's SheetSage2, byte-exact against the reference decoder and grammar (docs/plans/yue2/23-sheetsage2-progress.md). Derived from YuE2-3B and licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
+      "description": "SheetSage2 lead-sheet transcriber for YuE2 covers and optional cot=full adapter training. For covers, it turns a source recording into melody ABC for review before generation; supplying approved ABC skips transcription and this download. For training, `ace-train yue2-sheet` writes ABC into a YuE2 preprocess cache for the AR and NAR trainers' --abc-dropout. GGML port of Mothersuperior's SheetSage2, byte-exact against the reference decoder and grammar. Derived from YuE2-3B and licensed CC BY-NC 4.0, with the authors' clarification that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial license (gezhang@umich.edu).",
       "tags": [],
       "companions": [
         {

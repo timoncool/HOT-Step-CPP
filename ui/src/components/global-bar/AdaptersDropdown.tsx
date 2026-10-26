@@ -594,7 +594,7 @@ export const AdaptersDropdown: React.FC = () => {
             <ParamLabel label={t('adapter.loadingMode')} rootClassName="flex mb-1.5"
               className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
               info={gp.adapterMode === 'runtime_lowrank'
-                ? "Applies raw adapter factors per step, never materializing full deltas — the lowest VRAM option (LoRA and LoKr; DoRA needs Merge). Basin re-base still works."
+                ? "Applies raw adapter factors per step instead of full deltas, the lowest VRAM option for LoRA and LoKr. DoRA magnitudes are skipped here unless Runtime DoRA magnitudes is on, which builds full-size deltas. Basin re-base still works."
                 : gp.adapterMode === 'runtime'
                 ? 'Keeps base weights intact and applies the adapter per step. Same quality, slower inference, saves VRAM.'
                 : 'Merges the adapter at F32 precision. Best quality and fast inference, but uses more VRAM during synthesis.'}

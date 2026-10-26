@@ -48,6 +48,7 @@ import {
 import { releaseMinimaxVramForAce } from '../minimax/generate.js';
 import type { GenerationJob, StageTiming } from '../../generation/jobTypes.js';
 import { SA3_MAX_DURATION_SEC } from './index.js';
+import { SA3_DEFAULT_DIT } from './models.js';
 
 const TASK = 'sa3-text2music';
 
@@ -61,6 +62,8 @@ interface Sa3GenerationDeps {
 /** The wire request, as sent. Stored in generation_params so a reproduce
  *  re-submits the real inputs. */
 interface Sa3SynthWire {
+  synthModel: string;
+  resolvedSynthModel?: string;
   caption: string;
   prompt: string;         // what was actually tokenised (== caption today)
   nTokens: number;
@@ -229,6 +232,7 @@ export async function runSa3Generation(job: GenerationJob, deps: Sa3GenerationDe
     log('INFO', `[SA3] Prompt: ${nTokens}/256 tokens`);
 
     const wire: Sa3SynthWire = {
+      synthModel: job.envelope.models.dit || SA3_DEFAULT_DIT,
       caption, prompt: caption, nTokens, durationSec, steps, sampler, seed, adapters, ...plugins,
     };
     logGenerationParams(job.id, wire as unknown as Record<string, unknown>);
@@ -247,6 +251,13 @@ export async function runSa3Generation(job: GenerationJob, deps: Sa3GenerationDe
     if ((job.status as string) === 'cancelled') throw new Error('Cancelled');
     const synthStart = performance.now();
     const wavBuf = await aceClient.submitSa3Synth({
+      synthModel: wire.synthModel,
+      onModelResolved(filename) {
+        wire.resolvedSynthModel = filename;
+        if (filename !== wire.synthModel) {
+          log('WARNING', `[SA3] DiT fallback: requested ${wire.synthModel}, loaded ${filename}`);
+        }
+      },
       tokens: ids,
       nTokens,
       durationSec,
@@ -319,6 +330,7 @@ export async function runSa3Generation(job: GenerationJob, deps: Sa3GenerationDe
       seed,
       duration: durationSec,
       sa3Request: wire,
+      sa3DitModel: wire.resolvedSynthModel ?? wire.synthModel,
       sa3: { steps, sampler, sample_rate: 44100, prompt_tokens: nTokens },
     };
 

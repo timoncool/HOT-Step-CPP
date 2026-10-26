@@ -52,9 +52,10 @@ Deep API/log detail lives in [reference.md](reference.md) in this folder.
 4. **Rebuild C++ only via `dev-rebuild.bat` at repo root — never `engine\build.cmd`
    directly, under any circumstances.** WHY: you cannot reliably tell whether the app
    is running; the Node server auto-respawns ace-server 3 s after a non-clean exit
-   (`server/src/index.ts:284-308`), and the respawned exe file-locks the linker
-   output — infinite loop. `dev-rebuild.bat` is safe even when the app is stopped
-   (its shutdown request is a suppressed no-op).
+   (`onExited` in `server/src/services/aceEngineProcess.ts:295-338`), and the
+   respawned exe file-locks the linker output — infinite loop. `dev-rebuild.bat`
+   is safe even when the app is stopped (its shutdown request is a suppressed
+   no-op).
 
 5. **Never push a `v*` tag to "test" a build.** WHY: any pushed `v*` tag triggers the
    full multi-platform Release workflow and drafts a GitHub Release. Throwaway compile
@@ -96,12 +97,22 @@ Bar: type-check clean. Zero errors.
 
 ```powershell
 cd D:\Ace-Step-Latest\hot-step-cpp\server; npx tsc --noEmit
+cd D:\Ace-Step-Latest\hot-step-cpp\server; npx tsc --noEmit -p scripts/tsconfig.json   # only if server/scripts/ changed
 cd D:\Ace-Step-Latest\hot-step-cpp\ui; npx tsc -b
 ```
 
-- `server/package.json` defines `"typecheck": "tsc --noEmit"`. The UI uses project
-  references (`ui/tsconfig.json` → `tsconfig.app.json` + `tsconfig.node.json`, both
-  `noEmit`-safe), so `npx tsc -b` type-checks without emitting JS.
+- `server/package.json` defines `"typecheck": "tsc --noEmit"`, which covers
+  `server/src/` only (`server/tsconfig.json` includes `src/**/*`); a touched
+  script under `server/scripts/` is checked only by the second command. The UI
+  uses project references (`ui/tsconfig.json` → `tsconfig.app.json` +
+  `tsconfig.node.json`, both `noEmit`-safe), so `npx tsc -b` type-checks without
+  emitting JS; `npx tsc --noEmit -p tsconfig.app.json` checks the app sources
+  alone. A bare `npx tsc --noEmit` in `ui/` checks nothing and exits 0, because
+  the root `ui/tsconfig.json` has `"files": []`.
+- Unit tests sit beside the code as `*.test.ts` (`node:test`). For the server, run
+  the files for the area you touched from `server/` with
+  `npx tsx --test <files>`; release gate tier 0 runs every `server/src` test
+  that way.
 - In dev mode (`dev.bat`) the server runs under `tsx watch` (`server/package.json`
   `"dev": "tsx watch src/index.ts"`) — it auto-restarts on save. Server-side bar =
   passing tsc **plus** a clean restart visible in the newest
@@ -109,7 +120,8 @@ cd D:\Ace-Step-Latest\hot-step-cpp\ui; npx tsc -b
 
 ## Tier 2 — C++ engine
 
-Bar: rebuild compiles AND the engine starts clean after relaunch (log check).
+Bar: rebuild compiles, the render receipt passes, AND the engine starts clean after
+relaunch (log check).
 
 1. Recompile **immediately** after editing any `engine/src/` or `engine/tools/`
    file — don't wait to be asked:
@@ -119,20 +131,32 @@ Bar: rebuild compiles AND the engine starts clean after relaunch (log check).
    ```
 
    What it does (verified in the script): POSTs `http://localhost:3001/api/shutdown`
-   (kills ace-server, Vite, and the Node server cleanly), waits up to 10 s for
-   `ace-server.exe` to exit, force-kills at 10 s, aborts at 15 s, then runs
-   `engine\build.cmd`.
+   (stops ace-server, the dev Vite server and the Node server cleanly), waits up to
+   10 s for `ace-server.exe` to exit, force-kills at 10 s, aborts at 15 s, then runs
+   `engine\build.cmd`, which runs `engine\verify-hooks.ps1` first and aborts on a
+   broken hook. A failed build prints `[dev-rebuild] BUILD FAILED` and exits 1.
+   Per AGENTS.md, never take a batch exit code as proof it ran: check the output
+   for the script's own `[dev-rebuild]` lines and a fresh `ace-server.exe`
+   timestamp (engine-dev-loop Procedure 1).
 
-2. **The rebuild does NOT restart the app.** Relaunch with `dev.bat` (detached) and check
-   `http://localhost:3000` before any runtime verification. `LAUNCH.bat` is the end-user prod
-   launcher — agents don't run it.
+   Then the render receipt AGENTS.md requires: with the GPU idle, run
+   `node tools/engine-smoke.mjs` (two fixed-seed `ace-synth --check` renders, no
+   server; exit 1 on NaN, silence, DC offset, clipping or a wrong length) and paste
+   its `[Check Batch0]` line and `ENGINE SMOKE:` verdict into the hand-off. A change
+   to the checker itself also runs `--self-test`. Details: engine-dev-loop
+   Procedure 4.
+
+2. **The rebuild does NOT restart the app.** Relaunch with
+   `pwsh -NoProfile -File tools\detach.ps1 dev.bat` (detached) and poll
+   `http://localhost:3000/api/health` before any runtime verification. `LAUNCH.bat`
+   is the end-user prod launcher — agents don't run it.
 
 3. Clean-start check — read the newest `<data root>/logs/<session>/ace_engine.log` and confirm:
    - model registry scan ran (`[Server] Scanning models in ...` / `[Registry] ...` lines),
    - `[Server] Listening on 127.0.0.1:8085` appears,
    - no crash/exception before the Listening line,
    - `node_console.log` has **no** `[ace-server] Restarting in 3 seconds...`
-     (that exact string = crash respawn, `server/src/index.ts:304`).
+     (that exact string = crash respawn, `server/src/services/aceEngineProcess.ts:329`).
 
    ```powershell
    $sess = (Get-ChildItem <data root>/logs | Sort-Object Name -Descending | Select-Object -First 1).FullName
@@ -146,21 +170,26 @@ Bar: rebuild compiles AND the engine starts clean after relaunch (log check).
    powershell -File D:\Ace-Step-Latest\hot-step-cpp\engine\verify-hooks.ps1
    ```
 
-   Exit 0 = good. Note: CLAUDE.md says "3 hook files" but the script checks **5**
-   things (the script is the truth): `pipeline-synth-ops.cpp → hot-step-sampler.h`
-   (loss is **SILENT** — compiles fine but all solvers/guidance/schedulers go dead),
+   Exit 0 = good. AGENTS.md's table lists the four upstream files whose hooks
+   break; the script checks more than that (Hooks 1 to 18, the script is the
+   truth): `pipeline-synth-ops.cpp → hot-step-sampler.h` (loss is **SILENT** —
+   compiles fine but all solvers/guidance/schedulers go dead),
    `model-store.h → hot-step-params.h`, `dit.h → adapter-merge.h` +
-   `adapter-runtime.h`, `tools/hot-step-server.cpp → hot-step-params.h`, and a
-   linker sentinel `hotstep_sampler_linked_` in `hot-step-sampler.h`.
+   `adapter-runtime.h`, `tools/hot-step-server.cpp → hot-step-params.h` plus each
+   backend family's include and route registration and the family weights gate,
+   the shared FSQ helpers, the linker sentinel `hotstep_sampler_linked_` in
+   `hot-step-sampler.h`, the HOT-ggml changes, and `engine/ggml` being clean at its
+   pinned commit. `engine\build.cmd` runs it before every compile.
 
 5. Lua plugins (`engine/plugins/`) need **no** rebuild, but they load at engine
    start — relaunch the app for a new/edited plugin to appear.
 
 ## Tier 3 — UI visuals
 
-Bar: `npx tsc -b` clean + Vite HMR applies the change without console errors +
-**the human confirms the visuals**. You cannot close this tier yourself. Ask the
-user to look and wait for their screenshot/feedback.
+Bar: `npx tsc -b` (or `npx tsc --noEmit -p tsconfig.app.json`) clean + Vite HMR
+applies the change without console errors + **the human confirms the visuals**.
+You cannot close this tier yourself. Ask the user to look and wait for their
+screenshot/feedback.
 
 ## Tier 4 — Audio quality
 
@@ -199,7 +228,7 @@ Full request/response/log detail: [reference.md](reference.md).
 4. **Submit a fast smoke request** — `skipLm: $true` skips the language-model phase
    (the "LM" that writes audio codes/metadata before the DiT diffusion transformer
    runs). Always pass `duration` explicitly: with skipLm the server defaults an
-   unset duration to **120 s** (`generate.ts:222`).
+   unset duration to **120 s** (`server/src/services/backends/ace/generate.ts:84`).
 
    ```powershell
    $body = @{
@@ -217,8 +246,8 @@ Full request/response/log detail: [reference.md](reference.md).
    Omit `skipLm` if your change touches the LM phase — then the smoke must
    exercise it.
 
-5. **Poll to completion** (status values: `pending | lm_running | synth_running |
-   saving | succeeded | failed | cancelled`):
+5. **Poll to completion** (status values: `pending | running | lm_running |
+   synth_running | saving | succeeded | failed | cancelled`):
 
    ```powershell
    do { Start-Sleep 3; $s = Invoke-RestMethod "http://localhost:3000/api/generate/status/$($job.jobId)";
@@ -227,18 +256,25 @@ Full request/response/log detail: [reference.md](reference.md).
    $s | ConvertTo-Json -Depth 5
    ```
 
-   Built-in watchdogs (`pollUntilDone`, `generate.ts:102-170`): 2 min with no
-   stage/progress change ⇒ "Generation stalled"; wall-clock default 45 min. A
-   first-ever TensorRT run legitimately shows
-   `Building TRT engine ... (first run only, ~5-10 min)` — do not panic-cancel it.
-   There is 1 automatic retry with a randomized seed on transient failure.
+   Built-in watchdogs (`server/src/services/generation/pollUntilDone.ts`): a
+   stage that ticks (`... Step n/total`) and goes quiet for 2 min makes the server
+   ask the engine; if the engine says it is still running, the job gets the 15 min
+   quiet window before it fails with "Generation stalled". Quiet stages (model
+   loads, adapter merge, VAE decode) get that window from the start, and the wall
+   clock defaults to 45 min. An engine crash or restart mid-render fails the job
+   with "Generation lost: ..." instead of waiting. A first-ever TensorRT run
+   legitimately shows `Building TRT engine ... (first run only, ~5-10 min)` — do
+   not panic-cancel it. There is 1 automatic retry with a randomized seed on
+   transient failure (the ACE backend's `policy.retry`, `maxAttempts: 2`).
 
 6. **Confirm outputs.** On success `$s.result.audioUrls` is like
    `["/audio/<uuid>.wav"]`. **The live data dir is `<data root>/library`, NOT the repo-root
-   `data\`** (verified: `config.data.dir` resolves relative to `server/src`,
-   `server/src/config.ts:191-199`; root `data/` is stale/legacy — never "verify"
-   outputs there). Files land in `<data root>/library\audio\`; DB row in the `songs` table
-   of `<data root>/library\hotstep.db` with the full request in `generation_params`.
+   `data\`** (`config.data.dir` comes from `resolveDataDir()`,
+   `server/src/config.ts:27-30`: `<data root>/library` when a data folder exists,
+   `server/data` in a dev checkout that has none; the repo-root `data/` is not the
+   library — never "verify" outputs there). Files land in
+   `<data root>/library\audio\`; DB row in the `songs` table of
+   `<data root>/library\hotstep.db` with the full request in `generation_params`.
 
 7. **Confirm the log.** Per-generation logs are buffered in memory and flushed
    **only at finish/fail** — mid-run, tail `node_console.log` (lines prefixed
@@ -250,7 +286,7 @@ Full request/response/log detail: [reference.md](reference.md).
    ```
 
    Success ends `GENERATION COMPLETED.`; failure ends `GENERATION FAILED: <error>`
-   (`server/src/services/logger.ts:145,167`).
+   (`server/src/services/logger.ts:179,201`).
 
 8. **Hand off to the human** (Tier 4): file path + seed + params. Do not delete
    the artifacts.
@@ -266,20 +302,29 @@ build is green, and the feature is dead in every download.
 
 ```powershell
 node D:\Ace-Step-Latest\hot-step-cpp\server\scripts\check-release-prereqs.mjs
-# --offline to skip the Hugging Face half
+# --offline skips the Hugging Face and TensorRT checks
 ```
 
 What it checks:
 
 1. **Weights** — every entry in `server/src/data/model-registry.json` exists in
-   the Hugging Face repo it names, at the size the registry claims, in a repo
-   that is public. Companion files (LICENSE) too.
+   the Hugging Face repo it names, at the size the registry claims (and the
+   sha256, when the entry declares one), in a repo that is public. Companion
+   files (LICENSE) too. Each entry also needs an id, filename, repo, positive
+   `sizeBytes` and a `tags` array.
 2. **Packs** — no pack references a file id that does not exist (that is how the
    Model Manager blanked in #120).
 3. **Runtime data** — everything in `server/src/data/` is packaged by
    `.github/workflows/release.yml`, which copies the directory wholesale for all
    three platforms. Put new runtime data there and it ships automatically; put it
    anywhere else and it will not.
+4. **Engine binaries** — every CMake executable target that `server/src` names
+   (dev-only tools excepted) appears in `release.yml`'s package lists. v1.2.1
+   shipped without `ace-train` and every release through v1.3 without
+   `ace-caption`.
+5. **The rest of the release path** — the layout checks below, the TensorRT
+   files `release.yml` downloads from Hugging Face, the latest Cache Warm run on
+   `master` (via `gh`), and `tools/docs/check-docs.mjs`.
 
 What it CANNOT check, so do it by hand:
 
@@ -313,23 +358,30 @@ node tools/docs/check-docs.mjs
 ```
 
 The checker fails on a UI folder with no page, a stale generated table, a broken
-relative link, an unindexed skill, or a studio page `FEATURES.md` does not link to.
-It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
+relative link, an unindexed skill, a studio page `FEATURES.md` does not link to,
+or a new native `<select>` or checkbox under `ui/src` (files that still have one
+are listed in its baseline, which `--update-ui-baseline` rewrites after a
+conversion). It also runs inside `check-release-prereqs.mjs` and in CI
+(`docs.yml`).
 
 ## Key files
 
 | Path | Role |
 |---|---|
 | `dev-rebuild.bat` | The ONLY sanctioned C++ rebuild entry point (shutdown → build) |
-| `engine/verify-hooks.ps1` | Post-upstream-sync check of the 5 fork hooks |
-| `server/src/routes/generate.ts` | Generation queue, POST `/api/generate`, status/queue/cancel endpoints, watchdogs |
+| `tools/engine-smoke.mjs` | Headless render receipt after an engine rebuild (`ENGINE SMOKE: PASS/FAIL`) |
+| `engine/verify-hooks.ps1` | Post-upstream-sync check of the fork hooks and the HOT-ggml pin (Hooks 1 to 18) |
+| `server/src/routes/generate.ts` | Generation queue, POST `/api/generate`, status/queue/cancel endpoints |
+| `server/src/services/backends/ace/generate.ts` | The ACE pipeline: LM phase, skip-LM defaults, synth rebuild, output files, `songs` insert |
+| `server/src/services/generation/pollUntilDone.ts` | Stall, quiet-window and wall-clock watchdogs |
+| `server/src/services/aceEngineProcess.ts` | Spawns ace-server; crash respawn and the crash limiter |
 | `server/src/routes/health.ts` | `GET /api/health` — engine readiness |
 | `server/src/routes/auth.ts` | `GET /api/auth/auto` — free Bearer token; `getUserId` guard |
 | `server/src/services/generation/translateParams.ts` | UI param names → engine `AceRequest` names |
 | `server/src/services/aceClient.ts` | HTTP client to ace-server :8085 (single-threaded httplib caveat) |
 | `server/src/services/logger.ts` | Session log folders + buffered per-generation logs |
 | `server/src/config.ts` | Ports, paths; `config.data.dir` = `<data root>/library` |
-| `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` | Per-session logs: `ace_engine.log`, `node_console.log`, `generations/gen_<jobId>_<task>.log` |
+| `<data root>/logs/YYYY-MM-DD_HH-MM-SS/` | Per-session logs: `ace_engine.log`, `node_console.log`, `generations/gen_<jobId>_<task>.log`, `training/<kind>_<jobId>.log` |
 | `<data root>/library/audio/` | Where generated audio actually lands |
 
 ## Failure signatures
@@ -337,13 +389,16 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
 | Symptom | Cause → fix |
 |---|---|
 | 503 `Engine not ready: ...` on POST /generate | ace-server still bootstrapping — wait; check `/api/health` `engine.bootStatus` |
+| 503 `Engine is paused for training preprocessing` | a training preprocess job owns the GPU and stopped the engine — wait for the job |
 | 401 Unauthorized | missing/stale Bearer token (in-memory, resets on Node restart) — re-hit `/api/auth/auto` |
-| `Generation stalled — no progress for Ns` | 2-min watchdog fired; engine wedged or emitting unrecognized progress — check `ace_engine.log` tail |
+| `Generation stalled — no progress for Ns (last stage: "...")` | stall watchdog fired after the quiet window; engine wedged or emitting unrecognized progress — check `ace_engine.log` tail |
+| `Generation lost: the engine crashed mid-render` / `... no longer knows this job` | the engine died or restarted under the job — read `ace_engine.log` for the crash |
 | `Generation failed on ace-server` | engine-side failure — the real error is in `ace_engine.log`, not the Node response |
 | `[ace-server] Restarting in 3 seconds...` in node_console.log | engine crashed; repeated ⇒ missing DLL or a bad C++ change |
-| `/api/health` bootStatus `Engine crashed N times — check logs for missing DLLs` | crash limiter gave up (`index.ts:296-302`) — fix the crash, relaunch |
+| `/api/health` bootStatus `Engine crashed 3 times — download a model in the Model Manager, or check the logs` | crash limiter gave up after 3 crashes in 30 s (`aceEngineProcess.ts:320-326`) — fix the crash, relaunch; it also restarts by itself once a model download lands |
+| `/api/health` `engine.noModels: true`, bootStatus `No models installed ...` | first run with an empty models folder, not a crash — download a model in the Model Manager |
 | Solvers/schedulers/guidance silently ignored after upstream sync (no error!) | lost `hot-step-sampler.h` hook — run `engine/verify-hooks.ps1` |
-| Adapter/sideband params vanish between LM and synth phases | LM echo drops ServerFields-only params; synth requests are rebuilt from the current request + LM fields only (`generate.ts:312-328`) — new sideband params must flow through that reconstruction, never a whitelist |
+| Adapter/sideband params vanish between LM and synth phases | LM echo drops ServerFields-only params; synth requests are rebuilt from the current request + LM fields only (`server/src/services/backends/ace/generate.ts:192-213`) — new sideband params must flow through that reconstruction, never a whitelist |
 | First run stuck on `Building TRT engine` 5–10 min | normal one-time TensorRT compile, not a hang |
 | HTTP timeouts against :8085 during a generation | normal — ace-server is single-threaded httplib and can't answer mid-DiT-step (`aceClient.ts:6-8`) |
 | Output file "missing" from repo-root `data\` | wrong directory — live outputs are in `<data root>/library\audio\` |
@@ -357,17 +412,18 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
   output pasted; skipped = SKIPPED with reason; no hedged "should work".
 - **VALIDATED:** audio quality is human-ear-only; `quality_scores` telemetry is
   advisory, never a verdict.
-- **VALIDATED:** live data dir is `<data root>/library`, root `data\` is stale
-  (`config.ts:191-199` + runtime log confirm).
-- **VALIDATED:** `verify-hooks.ps1` checks 5 hooks, not the 3 CLAUDE.md lists —
-  the script is the truth.
+- **VALIDATED:** live data dir is `<data root>/library`, root `data\` is not the
+  library (`resolveDataDir()`, `config.ts:27-30`; run
+  `cd server; npx tsx scripts/data-paths.ts` for the active paths).
+- **VALIDATED:** `verify-hooks.ps1` checks 18 numbered hooks, not only the 3
+  upstream files AGENTS.md lists — the script is the truth.
 - **VALIDATED (code):** `adapter_section_isolation` still exists on the wire
   (`aceClient.ts`, `translateParams.ts`) but the feature was reverted (commit
   `ee041e1`, broke musical continuity) — don't "fix" it back in or count it as active.
 - **UNVALIDATED:** basin re-base params `rebase_source`/`rebase_beta` exist in
   `translateParams.ts` but the cross-base fix is unvalidated — never report it working.
 - **DELIBERATE, not a bug:** draft-LM speculative decoding is disabled by a code
-  comment in `server/src/config.ts` (~line 117).
+  comment in `server/src/config.ts` (~line 232).
 - **VALIDATED (twice, in production):** local presence is not distribution.
   MM3 training required `mm3-rvq-*.gguf` + `mm3-enc-*.gguf` that had never been
   uploaded (#137, fixed 96d442fb); `mm3-corpus.json` was committed but not copied
@@ -379,7 +435,7 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
 
 - [reference.md](reference.md) — same folder: full API shapes, output-file table,
   log anatomy, all generate endpoints.
-- `CLAUDE.md` (repo root) — orientation map, build/git rules.
+- `AGENTS.md` (repo root, imported by `CLAUDE.md`) — orientation map, build/git rules.
 - `engine/docs/ARCHITECTURE.md` — engine internals, request JSON, generation modes.
 - `docs/dev/plugins-authoring.md` — Lua plugin authoring (plugins hot-load, no rebuild).
 - `docs/dev/releasing.md` — release process (any pushed `v*` tag triggers a full
@@ -389,4 +445,4 @@ It also runs inside `check-release-prereqs.mjs` and in CI (`docs.yml`).
 
 ## Release layout checks
 
-The prereq script checks each CI platform and both local assemblers through `release/check-layout.mjs`, then runs `server/scripts/release-layout.test.ts` with isolated profile/data fixtures. The Windows fixture runs the launcher against a stub server from another cwd. Linux/macOS default-path fixtures and shell syntax checks are not native engine coverage. Report a Cache Warm gate failure separately from layout/Hugging Face checks.
+The prereq script checks each CI platform and both local assemblers through `release/check-layout.mjs`, then runs `server/scripts/release-layout.test.ts` with isolated profile/data fixtures. The Windows fixture runs the launcher against a stub server from another cwd. The Linux and macOS cases check default profile paths only, and none of these fixtures starts a native engine. Report a Cache Warm gate failure separately from layout/Hugging Face checks.

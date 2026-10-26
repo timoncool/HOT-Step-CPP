@@ -128,6 +128,11 @@ export function translateParams(params: any): AceRequest {
   if (params.lmTopK !== undefined) req.lm_top_k = params.lmTopK;
   // Anti-loop repetition penalty on code sampling (local HOT-Step feature)
   if (params.lmRepPenalty !== undefined) req.lm_rep_penalty = params.lmRepPenalty;
+  // Opt-in code sampling extras (engine lm-cfg-extras.h); absent = off.
+  if (params.lmMinP !== undefined) req.lm_min_p = params.lmMinP;
+  if (params.lmCfgMinP !== undefined) req.lm_cfg_min_p = params.lmCfgMinP;
+  if (params.lmCfgLogprob !== undefined) req.lm_cfg_logprob = params.lmCfgLogprob;
+  if (params.lmCfgRescale !== undefined) req.lm_cfg_rescale = params.lmCfgRescale;
   if (params.lmRepWindow !== undefined) req.lm_rep_window = params.lmRepWindow;
   if (params.lmRepMode !== undefined) req.lm_rep_mode = params.lmRepMode;
   if (params.lmDryBase !== undefined) req.lm_dry_base = params.lmDryBase;

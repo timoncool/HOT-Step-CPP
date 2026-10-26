@@ -6,7 +6,7 @@
 
 Found 2026-08-25 on the best-ever album D run (crop 750): renders jumped in
 "like a cut" — no intro — despite `--crop-anchor song` and 40% of steps
-anchored at frame 0. Mechanism, confirmed by Rob's render-MLP A/B (lowering
+anchored at frame 0. Mechanism, confirmed by a render-MLP A/B (lowering
 MLP restores intros and spends identity):
 
 **Adapter weight deltas are position-independent.** A LoRA/LoKr cannot store
@@ -17,22 +17,29 @@ lean mid-flow from bar one. The position anchor cannot carry this alone: the
 base model was pretrained with frames starting right after the prompt, so
 anchored mid-song positions are patterns it has no strong machinery for.
 
-Fixes, in the shipped defaults:
+Fixes, in the 2026-08-25 defaults:
 - **Shares 55/15/30** (start/end/random — random is the implicit REMAINDER of
   the two UI fields, now displayed in the end-frac hint).
 - **Tiled starts** (`--crop-start-tiles 3`): half the start share stays at
   frame 0 (openings must dominate), half lands on aligned tiles at K and 2K at
   their true positions — the intro→build→verse ARC taught in order at
   3-second-step prices. `1` = the old frame-0-only behaviour. Effective mix at
-  defaults: ~27.5% true openings, ~27.5% arc tiles, 15% endings, 30% random.
+  those defaults: ~27.5% true openings, ~27.5% arc tiles, 15% endings, 30% random.
+
+The next day (2026-08-26) the defaults moved to **20/15/65 with tiles 1**: more
+than half of every run had been repeated exposure to the same few seconds of
+each track, and the random share is where the distinct samples live
+(`MM3_LM_DEFAULTS.cropStartFrac` / `cropStartTiles`). Since 2026-09-11 every
+track trains whole, so the crop mix only applies to a track longer than the
+window under `longTracks: 'crop'`.
 
 ## Structured crops v2: the random share is load-bearing
 
 85/15/0 (start/end/random) memorised: two DETERMINISTIC positions per song =
 16 distinct samples on an 8-song album, train loss 0.0003 by step 800, audible
-degradation from ~ck550. Defaults are now **40/15/45** with **steps 500,
-saveEvery 50, warmup 25** — variety restored, checkpoint grid fine enough to
-catch a 150-350 ear-optimum.
+degradation from ~ck550. Defaults then became **40/15/45** with **steps 500,
+saveEvery 50, warmup 25** (2026-08-24) — variety restored, checkpoint grid fine
+enough to catch a 150-350 ear-optimum.
 
 ## Structured crops and dataset size are COUPLED — 85/15 with no random share memorises
 
@@ -84,9 +91,10 @@ supervised position carries the song's real history exactly as it will at
 generation time, and 15% flush to the track end, which is the only place EOS
 is supervised. `beginning` cannot do the second and `random` cannot do either.
 
-**Whole-track training is not reachable on a 32 GB card.** 9 of 10 reference
-tracks exceed 4096 frames and the median would need ~17 GB of attention scores
-alone.
+**Whole-track training was not reachable on a 32 GB card under exact
+attention.** 9 of 10 reference tracks exceed 4096 frames and the median would
+need ~17 GB of attention scores alone. Flash attention removed that term, and
+since 2026-09-11 whole-track training is the recipe (SKILL.md).
 
 ## Crop length is QUADRATIC in VRAM, and that is why f16 lost
 
@@ -100,13 +108,13 @@ memory linear in S instead of quadratic. Measured on this corpus (RTX 5090,
 `mm3-lm-f16`/`mm3-lm-q8_0`, rank 256, checkpointed): flash moves the usable
 crop ceiling from ~4300 frames (exact, table below) to at least 11,178
 frames — this dataset's longest track, no OOM reached — before the same ~29 GB
-practical spill ceiling. **Default is still `exact`, the table below is
-unchanged, and none of this is in the recipe** — the shipped recipe trains at
-crop 750, where flash measures no benefit (checkpointed segments already hide
-the small softmax in allocator slack), and nothing trained under flash has
-been heard. Full numbers: `docs/dev/training-internals.md` MM3 section,
+practical spill ceiling. At crop 750 flash measures no benefit (checkpointed
+segments already hide the small softmax in allocator slack). It has been the
+in-app default since 2026-09-06 and the whole-song presets depend on it; the
+route falls back to `exact` on a Vulkan or Metal engine. Full numbers:
+`docs/dev/training-internals.md` MM3 section,
 `.claude/skills/flash-attn-training/SKILL.md` §3/§7. What fits in 30 GB
-**at `--attn exact`**, the only mode any shipped adapter has trained under:
+**at `--attn exact`**, the mode the in-app recipe used before 2026-09-06:
 
 | config | max crop | covers a 204 s track |
 |---|---|---|

@@ -20,6 +20,7 @@ static void jl(const char * fmt, ...) { (void) fmt; }
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -46,6 +47,46 @@ bool fresh_output(const std::filesystem::path & path, std::string * error) {
     return true;
 }
 void event(const char * stage, int step = -1) { std::cout << "{\"stage\":\"" << stage << "\"" << (step >= 0 ? ",\"step\":" + std::to_string(step) : "") << "}\n" << std::flush; }
+// Live interval edits (GH #307). The server rewrites --params-file while the
+// run trains; an unchanged mtime costs one stat, so this runs every step. A
+// file that does not parse is retried next step (it may be mid-write); a bad
+// value is logged and skipped; unknown keys are ignored. Only a revision newer
+// than --params-rev applies: older ones are already in the arguments, and an
+// edit made after the server built them, before startup, still lands.
+struct ParamsWatch { std::filesystem::file_time_type seen{}, bad{}; std::int64_t rev = 0; };
+void poll_params(yue2_aitk_runtime::Config & config, ParamsWatch & watch) {
+    if (config.params_file.empty()) return;
+    std::error_code ec;
+    const auto path = std::filesystem::u8path(config.params_file);
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec || mtime == watch.seen) return;
+    std::ifstream in(path, std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    yyjson_doc * doc = yyjson_read(text.data(), text.size(), 0);
+    yyjson_val * root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        if (mtime != watch.bad) std::fprintf(stderr, "[yue2-aitk] %s is not a JSON object; retrying next step\n", config.params_file.c_str());
+        watch.bad = mtime; yyjson_doc_free(doc); return;
+    }
+    watch.seen = mtime;
+    yyjson_val * rev = yyjson_obj_get(root, "rev");
+    if (!yyjson_is_uint(rev) || (std::int64_t) yyjson_get_uint(rev) <= watch.rev) { yyjson_doc_free(doc); return; }
+    watch.rev = (std::int64_t) yyjson_get_uint(rev);
+    const auto apply = [&](const char * key, std::int32_t * field, std::int32_t lo) {
+        yyjson_val * v = yyjson_obj_get(root, key);
+        if (!v) return;
+        if (!yyjson_is_uint(v) || yyjson_get_uint(v) < (std::uint64_t) lo || yyjson_get_uint(v) > (std::uint64_t) config.steps) {
+            std::fprintf(stderr, "[yue2-aitk] params: %s must be an integer from %d to %d; skipped\n", key, lo, config.steps);
+            return;
+        }
+        const auto value = (std::int32_t) yyjson_get_uint(v);
+        if (value != *field) std::fprintf(stderr, "[yue2-aitk] params: %s %d -> %d\n", key, *field, value);
+        *field = value;
+    };
+    apply("save_every", &config.save_every, 1);
+    apply("pause_at", &config.pause_at, 0);
+    yyjson_doc_free(doc);
+}
 std::string lower_hash(std::string value) {
     for (char & c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return value;
@@ -166,9 +207,19 @@ bool parse_resume_meta(const std::string & text, const std::string & checkpoint,
     { yyjson_val * v=yyjson_obj_get(root,"ar_loss_weight"); const double was=v&&yyjson_is_num(v)?yyjson_get_num(v):1.0; if(was!=double(config.ar_loss_weight)) std::fprintf(stderr,"[yue2-aitk] resume note: ar-loss-weight changed from %.9g to %.9g; the run continues with the new value\n", was, (double)config.ar_loss_weight); }
     { yyjson_val * v=yyjson_obj_get(root,"grad_accum"); const int was=v&&yyjson_is_int(v)?int(yyjson_get_sint(v)):1; if(was!=config.grad_accum) std::fprintf(stderr,"[yue2-aitk] resume note: grad-accum changed from %d to %d; the run continues with the new value\n", was, config.grad_accum); }
     yyjson_val * vrecipe=yyjson_obj_get(root,"recipe"), *vcp=yyjson_obj_get(root,"checkpoint_sha256"), *vds=yyjson_obj_get(root,"dataset_sha256"), *vsm=yyjson_obj_get(root,"source_manifest_sha256"), *vseed=yyjson_obj_get(root,"seed"), *vdev=yyjson_obj_get(root,"cuda_index"), *vstep=yyjson_obj_get(root,"completed_step"), *vcursor=yyjson_obj_get(root,"order_cursor"), *vorder=yyjson_obj_get(root,"order"), *vsampler=yyjson_obj_get(root,"sampler_state");
-    if (!str_field(vrecipe,&recipe) || recipe!="yue2-aitk-runtime-v1" || !str_field(vcp,&cp) || cp!=checkpoint || !str_field(vds,&ds) || ds!=dataset || !str_field(vsm,&sm) || sm!=source || !yyjson_is_uint(vseed) || yyjson_get_uint(vseed)!=seed || !yyjson_is_int(vdev) || yyjson_get_sint(vdev)!=cuda_index || !yyjson_is_int(vstep) || yyjson_get_sint(vstep)<0 || yyjson_get_sint(vstep)>INT_MAX || !yyjson_is_uint(vcursor) || !yyjson_is_arr(vorder) || yyjson_arr_size(vorder)!=item_count || !str_field(vsampler,&sampler)) return fail(error,"resume metadata binding mismatch");
+    if (!str_field(vrecipe,&recipe) || recipe!="yue2-aitk-runtime-v1" || !str_field(vcp,&cp) || cp!=checkpoint || !str_field(vds,&ds) || ds!=dataset || !str_field(vsm,&sm) || sm!=source || !yyjson_is_uint(vseed) || yyjson_get_uint(vseed)!=seed || !yyjson_is_int(vdev) || yyjson_get_sint(vdev)!=cuda_index || !yyjson_is_int(vstep) || yyjson_get_sint(vstep)<0 || yyjson_get_sint(vstep)>INT_MAX || !yyjson_is_uint(vcursor) || !yyjson_is_arr(vorder) || !str_field(vsampler,&sampler)) return fail(error,"resume metadata binding mismatch");
+    std::vector<size_t> saved_holdout;
+    if (yyjson_val * split = yyjson_obj_get(root, "holdout_items")) {
+        if (!yyjson_is_arr(split)) return fail(error, "resume hold-out split is malformed");
+        size_t i = 0, max = 0; yyjson_val * x = nullptr;
+        yyjson_arr_foreach(split, i, max, x) {
+            if (!yyjson_is_uint(x) || yyjson_get_uint(x) >= item_count) return fail(error, "resume hold-out split is malformed");
+            saved_holdout.push_back(static_cast<size_t>(yyjson_get_uint(x)));
+        }
+    }
     plan->completed=static_cast<int>(yyjson_get_sint(vstep)); plan->cursor=static_cast<size_t>(yyjson_get_uint(vcursor)); plan->sampler=std::move(sampler); plan->order.clear(); std::unordered_set<size_t> seen; size_t i=0,max=0; yyjson_val * x=nullptr; yyjson_arr_foreach(vorder,i,max,x) { if(!yyjson_is_uint(x) || yyjson_get_uint(x)>=item_count || !seen.insert(static_cast<size_t>(yyjson_get_uint(x))).second) return fail(error,"resume order is not a permutation"); plan->order.push_back(static_cast<size_t>(yyjson_get_uint(x))); }
-    if (plan->cursor>item_count || plan->completed<0) return fail(error,"resume cursor is out of range");
+    if (!yue2_aitk_runtime::detail::validate_resume_order(item_count, config.holdout_items, saved_holdout,
+                                                       plan->order, yyjson_get_uint(vcursor), error)) return false;
     if (binding) {
         auto history=[&](const char * key, std::vector<double> * out) {
             yyjson_val * a=yyjson_obj_get(root,key); if(!yyjson_is_arr(a)) return;
@@ -210,6 +261,10 @@ std::string make_resume_meta(const std::string & cp, const std::string & ds, con
     yyjson_mut_val * root=yyjson_mut_obj(doc), * arr=yyjson_mut_arr(doc);
     if (!root || !arr) { yyjson_mut_doc_free(doc); return {}; }
     yyjson_mut_doc_set_root(doc,root);
+    yyjson_mut_val * split = yyjson_mut_arr(doc);
+    if (!split) { yyjson_mut_doc_free(doc); return {}; }
+    for (size_t k : config.holdout_items) yyjson_mut_arr_add_uint(doc, split, k);
+    yyjson_mut_obj_add_val(doc, root, "holdout_items", split);
     if(cursor_weight>0) yyjson_mut_obj_add_real(doc,root,"cursor_weight",cursor_weight);
     yyjson_mut_obj_add_strcpy(doc,root,"recipe","yue2-aitk-runtime-v1"); yyjson_mut_obj_add_strcpy(doc,root,"checkpoint_sha256",cp.c_str()); yyjson_mut_obj_add_strcpy(doc,root,"dataset_sha256",ds.c_str()); yyjson_mut_obj_add_strcpy(doc,root,"source_manifest_sha256",sm.c_str()); yyjson_mut_obj_add_uint(doc,root,"seed",seed); yyjson_mut_obj_add_int(doc,root,"cuda_index",device); yyjson_mut_obj_add_int(doc,root,"completed_step",completed); yyjson_mut_obj_add_uint(doc,root,"order_cursor",cursor); for(size_t x:order) yyjson_mut_arr_add_uint(doc,arr,x); yyjson_mut_obj_add_val(doc,root,"order",arr); yyjson_mut_obj_add_strcpy(doc,root,"sampler_state",sampler.c_str());
     yyjson_mut_obj_add_strcpy(doc,root,"optimizer",config.optimizer.c_str()); yyjson_mut_obj_add_int(doc,root,"rank",config.rank); yyjson_mut_obj_add_real(doc,root,"alpha",config.alpha); yyjson_mut_obj_add_real(doc,root,"lr",config.lr); yyjson_mut_obj_add_int(doc,root,"warmup",config.warmup); yyjson_mut_obj_add_real(doc,root,"weight_decay",config.weight_decay); yyjson_mut_obj_add_real(doc,root,"prodigy_d0",config.prodigy_d0); yyjson_mut_obj_add_real(doc,root,"muon_lr_scale",config.muon_lr_scale); yyjson_mut_obj_add_int(doc,root,"muon_ns_steps",config.muon_ns_steps);
@@ -266,6 +321,8 @@ bool yue2_aitk_cancel_requested() { return g_cancel != 0; }
 void yue2_aitk_clear_cancel() { g_cancel = 0; }
 
 static int run_impl(Config config, std::string * error) {
+    ParamsWatch params_watch;
+    params_watch.rev = config.params_rev;
     if (!fresh_output(std::filesystem::u8path(config.output), error)) return 1;
     if (config.seed > UINT32_MAX) { fail(error, "native-v1 runtime seed must fit uint32_t"); return 1; }
     if (config.steps <= 0 || config.save_every <= 0 || config.cuda_index < 0 || config.cuda_index > 127) { fail(error, "invalid runtime configuration"); return 1; }
@@ -413,7 +470,8 @@ static int run_impl(Config config, std::string * error) {
         if (!dataset.trigger.empty()) adapter_meta.push_back({"style_template", dataset.style_template});
     }
     yue2_aitk::Yue2NativeSampler sampler(config.seed);
-    std::vector<size_t> order(dataset.items.size()); std::iota(order.begin(), order.end(), 0);
+    std::vector<size_t> order;
+    if (!detail::training_order(dataset.items.size(), config.holdout_items, &order, error)) return 1;
     size_t cursor = 0; int completed = 0;
     float cursor_weight=config.cursor_weight;
     if(!std::isfinite(cursor_weight)||cursor_weight<0||cursor_weight>10) { fail(error,"invalid lyric timing weight"); return 1; }
@@ -423,14 +481,14 @@ static int run_impl(Config config, std::string * error) {
         if (!yue2_aitk::yue2_aitk_read_resume(config.resume.c_str(), &resume_plan.record)) { fail(error, "cannot read resume record"); return 1; }
         if (!parse_resume_meta(resume_plan.record.runner_metadata, checkpoint_hash.hex(), dataset_hash.hex(), source_hash.hex(), config.seed, config.cuda_index, dataset.items.size(), &resume_plan, error,&cursor_weight,config.cursor_weight_explicit,config,&resume_binding)) return 1;
         if (resume_plan.completed > config.steps || resume_plan.completed > INT_MAX || resume_plan.record.state.step != resume_plan.completed) { fail(error, "resume completed step is invalid"); return 1; }
-        if (resume_plan.cursor >= dataset.items.size()) { fail(error, "resume order cursor is out of range"); return 1; }
         if (!sampler.import_rng_state(resume_plan.sampler)) { fail(error, "resume sampler state is invalid"); return 1; }
         if (resume_binding.planner_frozen_at >= 0 && config.nar_extra_steps <= 0 && !config.unfreeze_planner) { fail(error, "this run's planner is frozen; resume it with --nar-extra-steps (or --unfreeze-planner)"); return 1; }
         if (config.freeze_planner_now && config.nar_extra_steps <= 0) { fail(error, "--freeze-planner-now needs --nar-extra-steps (the decoder's budget after the freeze)"); return 1; }
         order = resume_plan.order; cursor = resume_plan.cursor; completed = resume_plan.completed;
     } else if (config.freeze_planner_now) {
         fail(error, "--freeze-planner-now needs --resume: it freezes the checkpoint's planner"); return 1;
-    } else { sampler.rng().shuffle(order); }
+    }
+    if (config.resume.empty() && !config.freeze_planner_now) { sampler.rng().shuffle(order); }
     if(cursor_weight>0) for(const auto & item:dataset.items) {
         const auto & binding=item.prompt.cursor;
         // present && !enabled && !instrumental = lyrical but untimed: allowed,
@@ -486,6 +544,20 @@ static int run_impl(Config config, std::string * error) {
             ggml_flash_attn_train_set_prec(bwd, GGML_PREC_BF16);
             yue2_aitk_graph::bf16_attention_supported() =
                 ggml_backend_supports_op(backend.value, fwd) && ggml_backend_supports_op(backend.value, bwd);
+        }
+        // bf16 mode casts the LoRA factors to BF16, so their activation backward
+        // is OUT_PROD with a BF16 src0. CUDA takes it; Metal and CPU refuse
+        // (#240), so those take mm-backward's mul_mat form, as GGUF bases do.
+        // Latched on the first backward, so it is set before any graph is built.
+        ggml_tensor * w = ggml_new_tensor_2d(probe, GGML_TYPE_BF16, 128, 16);
+        ggml_tensor * g = ggml_new_tensor_2d(probe, GGML_TYPE_F32, 16, 128);
+        if (!yue2_aitk_graph::strict_f32() &&
+            !ggml_backend_supports_op(backend.value, ggml_out_prod(probe, w, ggml_transpose(probe, g)))) {
+#ifdef _WIN32
+            _putenv("GGML_BACKWARD_MM=1");
+#else
+            setenv("GGML_BACKWARD_MM", "1", 1);
+#endif
         }
         ggml_free(probe);
     }
@@ -889,16 +961,22 @@ static int run_impl(Config config, std::string * error) {
             if (!config.eval_dataset.empty() && !yue2_aitk::read_dataset(config.eval_dataset, &held_out, error)) return 1;
             const auto & items = config.eval_dataset.empty() ? dataset.items : held_out.items;
             if (items.empty()) { fail(error, "the evaluation dataset has no items"); return 1; }
+            // Items to score: all of them, or (no --eval-dataset) the --holdout-items of the training dataset.
+            std::vector<size_t> eval_idx;
+            if (config.eval_dataset.empty() && !config.holdout_items.empty()) eval_idx = config.holdout_items;
+            else { eval_idx.resize(items.size()); std::iota(eval_idx.begin(), eval_idx.end(), size_t(0)); }
+            const std::int64_t eval_window = config.eval_nar_window >= 0 ? config.eval_nar_window : config.nar_crop_frames;
+            const std::uint64_t eval_seed = config.eval_seed_set ? config.eval_seed : config.seed;
             event("eval");
             std::ofstream out(std::filesystem::u8path(config.output) / "adapted-loss.jsonl", std::ios::binary);
             if (!out) { fail(error, "cannot create adapted-loss JSONL"); return 1; }
             const auto esc = [](const std::string & v) { std::string r; for (char c : v) { if (c == '"' || c == '\\') r += '\\'; if ((unsigned char) c >= 0x20) r += c; } return r; };
             const float levels[3] = {250.0f, 500.0f, 750.0f};
             double ar_b = 0.0, ar_a = 0.0, nar_b = 0.0, nar_a = 0.0, arw_b = 0.0, arw_a = 0.0; size_t tokens_total = 0;
-            for (size_t i = 0; i < items.size(); ++i) {
+            for (const size_t i : eval_idx) {
                 if (yue2_aitk_cancel_requested()) { fail(error, "cancelled"); return 1; }
                 const auto & item = items[i];
-                size_t window = config.nar_crop_frames > 0 ? (size_t) config.nar_crop_frames : item.song.semantic_tokens.size();
+                size_t window = eval_window > 0 ? (size_t) eval_window : item.song.semantic_tokens.size();
                 {
                     const auto & p = item.prompt;
                     const size_t used = std::max({p.retained_prefix_ids.size() + p.abc_ids.size(), p.dropped_prefix_ids.size(),
@@ -909,7 +987,7 @@ static int run_impl(Config config, std::string * error) {
                 double ce_b = 0.0, ce_a = 0.0, mse_b[3] = {0, 0, 0}, mse_a[3] = {0, 0, 0}; size_t tokens = 0;
                 Yue2AitkPrefixHost prefix_b, prefix_a;
                 for (int k = 0; k < 3; ++k) {
-                    yue2_aitk::Yue2NativeSampler item_sampler(config.seed * 1000003ull + 104729ull * (i + 1));
+                    yue2_aitk::Yue2NativeSampler item_sampler(eval_seed * 1000003ull + 104729ull * (i + 1));
                     auto sampled = item_sampler.sample(item.song, item.prompt, window, std::vector<float>{levels[k]}, 0.0f, 0, 0, 0.0f, base_targets);
                     if (k == 0) {
                         if (!yue2_aitk_joint::base_ar_ce(backend.value, model, sampled.batch, &ce_b, &tokens, error) ||
@@ -935,14 +1013,14 @@ static int run_impl(Config config, std::string * error) {
                      << ",\"nar_mse_adapted_t\":[" << mse_a[0] << "," << mse_a[1] << "," << mse_a[2] << "]}\n";
                 out << line.str() << std::flush; std::cout << line.str() << std::flush;
             }
-            const double n = double(items.size());
+            const double n = double(eval_idx.size());
             std::ostringstream summary; summary.precision(9);
-            summary << "{\"stage\":\"eval_adapted_summary\",\"items\":" << items.size() << ",\"adapter\":\"" << config.adapter_type << "\",\"step\":" << completed
-                    << ",\"held_out\":" << (config.eval_dataset.empty() ? "false" : "true")
+            summary << "{\"stage\":\"eval_adapted_summary\",\"items\":" << eval_idx.size() << ",\"adapter\":\"" << config.adapter_type << "\",\"step\":" << completed
+                    << ",\"held_out\":" << (config.eval_dataset.empty() && config.holdout_items.empty() ? "false" : "true")
                     << ",\"ar_ce_token_mean_base\":" << (tokens_total ? arw_b / tokens_total : 0.0) << ",\"ar_ce_token_mean_adapted\":" << (tokens_total ? arw_a / tokens_total : 0.0)
                     << ",\"ar_ce_mean_base\":" << ar_b / n << ",\"ar_ce_mean_adapted\":" << ar_a / n
                     << ",\"nar_mse_mean_base\":" << nar_b / n << ",\"nar_mse_mean_adapted\":" << nar_a / n
-                    << ",\"nar_timesteps\":[250,500,750],\"nar_window\":" << config.nar_crop_frames << ",\"ar_targets\":\"" << config.ar_targets << "\"}\n";
+                    << ",\"nar_timesteps\":[250,500,750],\"nar_window\":" << eval_window << ",\"ar_targets\":\"" << config.ar_targets << "\"}\n";
             out << summary.str() << std::flush; std::cout << summary.str() << std::flush;
             event("done");
             return 0;
@@ -1379,6 +1457,7 @@ static int run_impl(Config config, std::string * error) {
                     }
                 }
             }
+            poll_params(config, params_watch);
             if (completed % config.save_every == 0 || completed == end_step())
                 if (!save_checkpoint(completed)) { fail(error, "checkpoint publication failed"); return 1; }
             // Decoder stop: the reconstruction meter has flattened over the

@@ -5,6 +5,8 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { getDb } from '../db/database.js';
 import * as queue from './training/labelingQueue.js';
+import type { TrainingJob } from './training/labelingQueue.js';
+import { runYue2AceTrain } from './training/yue2TrainRunner.js';
 import { jobsDir } from './training/paths.js';
 import { readDuration } from './training/audioMeta.js';
 import { missingYue2SheetModels, readYue2CoverAbc, resolveYue2SheetModel } from './training/yue2Sheet.js';
@@ -41,6 +43,15 @@ export interface CoverSource { sourceId: string; sourceLabel: string; audioPath:
 type SavedSource = Pick<CoverSource, 'sourceId' | 'sourceLabel'> & { userId: string; name: string };
 type CoverInput = { sourceAudioUrl?: unknown; songId?: unknown; sourceLabel?: unknown; abc?: unknown; force?: unknown };
 
+// The source's vocal stem, separated once per audio content: MMS_FA places
+// words reliably on a stem, not on the full mix, and a score with no sung
+// melody takes its vocal rhythm from it.
+const coverStems = createCoverStemCache({
+  root: path.join(config.data.dir, 'tmp', 'cover-vocals'),
+  level: YUE2_STEMS_DEFAULT_LEVEL,
+  separate: (src, out, level) => separateOne(src, out, level, () => {}),
+});
+
 export function createYue2CoverService(deps = {
   queue,
   referenceDir: path.join(config.data.dir, 'references'),
@@ -49,16 +60,11 @@ export function createYue2CoverService(deps = {
   duration: readDuration,
   missingModels: missingYue2SheetModels,
   model: resolveYue2SheetModel,
-  run: runYue2CoverSheetJob,
+  run: (job: TrainingJob, audioPath: string, dir: string) => runYue2CoverSheetJob(job, audioPath, dir,
+    { missingModels: missingYue2SheetModels, run: runYue2AceTrain, vocalStem: coverStems.vocalStem }),
   datasetMatch: resolveCoverDatasetSource,
   toMp3: (file: string) => cachedMp3(file, path.join(config.data.dir, 'tmp', 'cover-mp3')),
-  // The source's vocal stem, separated once per audio content: MMS_FA places
-  // words reliably on a stem, not on the full mix.
-  vocalStem: createCoverStemCache({
-    root: path.join(config.data.dir, 'tmp', 'cover-vocals'),
-    level: YUE2_STEMS_DEFAULT_LEVEL,
-    separate: (src, out, level) => separateOne(src, out, level, () => {}),
-  }).vocalStem,
+  vocalStem: coverStems.vocalStem,
   align: (audio: Buffer, lyrics: string): Promise<{ words: Yue2AlignWord[] }> => yue2Align(audio, lyrics),
   // The same merged read as a sample edit, so split caption/lyrics files
   // are folded into <stem>.txt rather than shadowing the new lyrics. Like a

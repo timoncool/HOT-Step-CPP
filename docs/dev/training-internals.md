@@ -4,11 +4,137 @@ Resolve runtime paths first using the [data folder configuration](config.md#dev-
 `<data root>/...` paths below describe the managed layout; environment overrides
 can place individual children elsewhere.
 
-*The complete map of HOT-Step's native training system (Training Studio). Written as the handoff/continuation doc: everything an agent or contributor needs to keep working on this subsystem in a fresh session. Built 2026-07-27/28; all measurements from an RTX 5090 (32 GB, sm_120).*
+*The complete map of HOT-Step's native training system (Training Studio). Written as the handoff/continuation doc: everything an agent or contributor needs to keep working on this subsystem in a fresh session. Built 2026-07-27/28; measurements are from an RTX 5090 (32 GB, sm_120) unless a passage names another machine.*
+
+## Stable Audio 3 Medium training
+
+`trainSa3Runner.ts` owns preparation, `ace-train sa3-train`, engine restoration
+and publication. `GET /api/training/datasets/:id/sa3-train` returns readiness,
+defaults and saved runs; POST starts a new run or resumes one by `resumeRun`.
+Preparation calls real SuperSep level 5, preserves sources and writes a derived
+44.1 kHz stereo snapshot. `sa3Dataset.ts` maps parsed caption, genre, BPM, key
+and signature to plain prompt text. Lyrics never enter that prompt.
+
+The trainer freezes the Medium base DiT, SAME and T5Gemma. CUDA keeps the DiT
+base in BF16; adapters and optimizer state are F32. CPU upcasts adapter-site
+weights to F32 because its BF16 OUT_PROD is unsupported. The segmented backward
+graphs run on one backend, with an operation-support audit before execution;
+unsupported operations fail instead of falling back to another device.
+AdamW runs on host adapter masters. Do not describe the whole training loop as
+GPU-only. Defaults are rank/alpha 16, LR 1e-4, batch 1 and 1,000 steps.
+The seconds embedder is frozen in the server workflow.
+
+Runs live under `<adapters>/sa3-medium/<dataset>/<adapter>/<timestamp>/`.
+`run.json` records the recipe and model provenance; `train-manifest.json` and
+`dataset/` preserve the prepared snapshot. `state.gguf` contains resume state;
+`adapter-raw.gguf` contains raw training parameters. Neither is an inference
+adapter. `adapter.gguf` stores `dora-rows-v1` row scales against the inference
+DiT and is validated before atomic publication to `<models>/sa3-adapters/`.
+The local training base is distinct from the distilled inference DiT.
+
+Resume may increase total steps but keeps the other recipe fields. It reuses
+the snapshot and the engine checks model, conditioning and timing fingerprints.
+Cancellation writes `STOP`; startup/encoding cancellation has a 30-second kill
+fallback and may leave no checkpoint. The runner restores the engine in its
+cleanup path, including after failed training.
+
+For integration checks on an idle dev stack, create a dedicated test dataset
+and run `node tools/sa3-training-check.mjs --dataset <id> --out <new directory>`.
+The checker trains three steps with a 12-second crop, resumes to five, checks
+picker publication and renders two held-out captions at strengths 0 and 1 with
+seed 42. It keeps a JSON receipt and WAVs, checks finite/non-silent audio and
+requires the paired files to differ. This is a mechanical round-trip check,
+not a listening verdict or a 1,000-step quality pilot. Run its `--self-test`
+without models. GPU memory, operation placement and steady timings need
+separate receipts, on the same HEAD and recipe for each machine.
+
+### SA3 checkpoint previews and the segmented trainer
+
+`runSa3TrainJob` has two modes. Without `preview` settings it runs one trainer
+process to `run.steps` and publishes, as above. With them (`everySteps > 0` and
+at least one prompt; the `preview` option is accepted on a new run only and is
+saved in `run.json`) it follows YuE2's serial lifecycle:
+
+1. Stop the engine. `ace-train sa3-train` runs to the next preview step as an
+   absolute `--steps` bound with `--export-every 0`, saves `state.gguf` and its
+   inference export, and exits. `sa3NextBound` picks the bound; `run.goalSteps`
+   keeps progress and the chart at the logical goal. Total steps is not in the
+   resume fingerprint or the AdamW update, so only the process arguments change
+   between segments.
+2. `captureSa3Snapshot` (`sa3Snapshots.ts`) validates the export and keeps it
+   once as `<run>/snapshots/step-N.gguf`. A capture is never replaced.
+3. Restart the engine and render every prompt and seed (`renderSa3Previews`,
+   `sa3Preview.ts`), stop the engine, then resume with `--resume` in the same
+   run directory. A failed render is logged and training continues once the
+   engine is stopped again; a failed engine stop or restart aborts the run.
+4. Only the last step's export is published to `<models>/sa3-adapters/`. Its
+   snapshot is captured too, and its previews render after the engine is back,
+   never twice for a step.
+
+A resumed job first renders any captured step that still owes previews
+(`sa3PreviewPending` reads stored statuses, so a cut-off round counts as owed),
+and re-exports a preview step whose capture was lost by running `--steps` at the
+saved step. `tools/sa3-resume-proof.mjs` compares 12 uninterrupted steps with
+4+4+4 segments: restart states bitwise, draws exact, loss and final tensors
+within `abs 1e-6 + 1e-5*|ref|`. EMA is display state and resets, so it is not
+part of that evidence.
+
+Records live in `<run>/previews/index.json`, one per step, prompt and seed;
+audio is written before its record is committed. Types are in
+`server/src/contracts/training.ts`. Routes are scoped by the dataset and an
+opaque run id (`<adapterName>/<stamp>`, resolved by `sa3RunById` under the
+dataset's own runs, never a browser path):
+
+| Route | Purpose |
+|---|---|
+| `GET /datasets/:id/sa3-previews?run=` | `{ run, settings, previews }`; the newest run when `run` is omitted. A done record carries an `audioUrl`. |
+| `POST /datasets/:id/sa3-previews/render` | `{ run, step, settings? }`: renders or retries the step's cells that have no done render. 400 if the step has no captured snapshot, 409 with a job on the dataset, 503 with the engine down. Runs on the GPU lane. |
+| `GET /datasets/:id/sa3-previews/audio?run=&file=` | One WAV, only for a done record's own file name inside the run's `previews` folder (links resolved; it must stay inside the run). |
+
+Renders go to `/sa3-synth` with `snapshot_run=<dataset>/<adapter>/<stamp>` and
+`snapshot_step=N` (see [engine](engine.md#stable-audio-3-sampling)), so no
+filesystem path crosses the wire.
+
+### Training Studio shell and plug-ins
+
+Training Studio resolves one **effective target** above the tabs
+(`useTrainingTarget.ts`, rules in `trainingTargets.ts`): the persisted override
+(`hs-trainingTarget`, default `active`) or the active backend. A queued or
+running target-bound job pins the target to its own (`targetForJobKind`). The
+target feeds the phase stepper, dataset chips, Preprocess gate, Train page and
+previews, so changing a view cannot retarget a submitted job. An unknown stored
+value means `active`; an unregistered backend trains as ACE.
+
+Each target is one plug-in (`plugins/{ace,yue2,mm3,sa3}.tsx`, registry
+`trainingPlugins.tsx`). The static half is `TrainingTargetSpec` in
+`trainingTargets.ts` (`phases`, `reachablePhases`, `phaseLabels`,
+`prepareStages`, `trainStages`, `recipeFields`, `previewSource`). The rendering
+half is `TrainingPlugin` in `trainingPluginTypes.ts` (`chips`, `readiness`,
+`renderPrepare`, `renderOptimise`, `renderTrain`, `performAll`). Chip rules are
+pure functions in `plugins/chips.ts`; gate order is `resolveTrainGate`
+(`trainGates.ts`). A phase the target cannot stand on falls back to Train
+(`resolvePhase`). SA3 has `phases: ['dataset', 'train']`, so no Preprocess. The
+shell owns layout and selection; each plug-in owns its parameters and
+serialization, and server validation stays authoritative. This is not a generic
+form engine.
+
+The preview view is shared. `TrainingPreviewPanel.tsx` holds the settings
+block, field, checkpoint card and take rows (presentation only, no server
+state). YuE2's ladder, MM3's strip and the SA3 card all draw it and keep their
+own actions and scoring. `previewSource` records where each target's previews
+come from: `yue2-ladder`, `mm3-records`, `sa3-previews` or `none`. ACE is
+`none`: it has no checkpoint exports or renderer, so it keeps Audition. SA3
+previews are read through `ui/src/queries/sa3-previews/`.
+
+The SA3 asset block (`Sa3DatasetAssets`, `datasetAssets.ts`) is read fresh like
+the other backends' blocks, from the preparation and export receipts: prepared
+audio and clip count, the encoding cache only when its fingerprint validates,
+captured snapshots across the dataset's runs, and the newest published adapter.
+Readiness is never inferred from a finished run alone.
 
 ## YuE2 joint training
 
-The opt-in `fixed-recipe` method defaults to the bf16 LM base (the request's `base` is kept when set, and the standalone prepare route takes the same `base`), rank-64 LoRA (alpha 64) at the native four fused sites, one song per update, whole-song AR, a 1,500-frame NAR crop, CE weight 0.5 and KL weight 0.2. It uses AdamW through LmOptim with epsilon 1e-6, constant LR, an AR LR multiplier of 0.5, no condition dropout or lyric timing. Like every method it trains on a -14 LUFS cache, but nothing refuses another level. The server forces these values, apart from the base, even if a saved form contains other values. Its runner omits `--nar-drift` and retains the installed v9 companion decoder.
+The opt-in `fixed-recipe` method (the joint card's HOT-Approved button; `applyFixedRecipe` in `yue2JointTrainRunner.ts`) defaults to the bf16 LM base (the request's `base` is kept when set, and the standalone prepare route takes the same `base`), rank-64 LoRA (alpha 64) at the native four fused sites, 1,500 steps saved every 200 at seed 42, one song per update, whole-song AR, a 1,500-frame NAR crop, CE weight 0.5 and KL weight 0.2. It uses AdamW through LmOptim at LR 1e-4 with epsilon 1e-6, constant LR, an AR LR multiplier of 0.5, caption and lead-sheet dropout of 0.5 each, and no text or lyric dropout or lyric timing. Like every method it trains on a -14 LUFS cache, but nothing refuses another level. The server forces these values, apart from the base, even if a saved form contains other values. Its runner omits `--nar-drift` and retains the installed v9 companion decoder.
 
 The method's preparation mode removes lyric cues, keeps unsupported section headings in Title case, then applies its caption parser and NFC normalization. The style starts with the bare trigger word, or the dataset slug when no trigger is set, without duplicating an existing prefix. Native trigger injection stays off to avoid its "in the style of" wrapper. Preparation writes an isolated prepared-dataset cache index and marks the output manifest with `caption_grammar: fixed-recipe-v2`; the start path rejects a manifest without it. Older prepared datasets are automatically re-prepared on the next automatic preparation. Caption cleanup uses a temporary copy of the legacy manifest, leaving the old method cache index alone.
 
@@ -33,7 +159,11 @@ linear is a plain `mul_mat` over the GGUF weight (fused q|k|v and gate|up stay
 separate parts when their quant types differ, joined with `join_rows`), the head
 loss backs through a BF16 transpose of `output.weight` built at load, and the run
 sets `GGML_BACKWARD_MM=1` so no activation gradient is an `OUT_PROD` of a BF16 or
-quantized weight. Same seed, first step on CUDA: bf16 GGUF ar_ce 3.6378 / nar_mse
+quantized weight. In bf16 precision the LoRA factors are BF16 too, so on a backend
+that refuses a BF16 `OUT_PROD` (Metal and CPU) the trainer probes the op before the
+first backward and sets `GGML_BACKWARD_MM=1` for ConvRot runs as well (#240); CUDA and
+strict-f32 graphs are unchanged. The app still offers the ConvRot base only on CUDA
+builds (`yue2JointTrainRunner.ts`). Same seed, first step on CUDA: bf16 GGUF ar_ce 3.6378 / nar_mse
 1.18468 against ConvRot's 3.6373 / 1.18457. Preparation records a base only as
 provenance, so one prepared dataset serves every base; a mismatch is a warning.
 
@@ -73,8 +203,9 @@ the CPU backend.
 same trainer runs from ggml ops: `--optimizer adamw` (the CUDA 8-bit kernel) maps
 to LmOptim's AdamW, the head's CE + KL gradient is built from `soft_max`/`log`/
 `get_rows`/`set_rows` instead of `joint_loss_cuda.cu`, and attention uses the
-fused `FLASH_ATTN_TRAIN` ops where the backend has them (CUDA, CPU, Vulkan via
-`zzzz-vulkan-train-ops.patch`) and exact attention elsewhere
+fused `FLASH_ATTN_TRAIN` ops where the backend has them (CUDA, CPU, Metal, and Vulkan
+through the fork's `zzzz-vulkan-train-ops` change; the runner probes at start-up) and exact
+attention elsewhere
 (`YUE2_AITK_MATH_ATTENTION=1` forces it, for diagnosis). Exact attention keeps
 `[keys, S, heads]` probabilities per layer, which rules out whole songs, and on
 Vulkan it produced non-finite values in the AR forward (not root-caused; the
@@ -135,15 +266,22 @@ Direct-mode prefix and an integer-hash LoRA A with B = 0 (formula in
 B gradients, post-update B and step-2 losses to `<dir>/replay-native.json` plus raw
 F32 dumps, for a parity check against another trainer's numbers.
 
-In Training Studio, Joint Training is the default. Complete
-the latent, semantic-token and ABC cache stages, then prepare the joint dataset
-and train. Legacy keeps the existing separate AR/NAR workflow. The joint
-checkpoint picker applies both native adapters for generation.
+In Training Studio, Joint Training is the only YuE2 training workflow: the card
+always sends `trainingMethod: 'aitk'`, and the joint route refuses anything else.
+Complete the latent, semantic-token and ABC cache stages, then prepare the joint
+dataset and train; Start training runs any preparation that is missing. The
+separate Legacy AR and NAR runners and their routes remain for API callers. The
+joint checkpoint picker applies both native adapters for generation.
 
 ### Two training methods (2026-09-27)
 
-The trainer has two recipes; since the ear test the same evening the card offers only the
-second, and the Legacy seven-stage picker is gone from the UI (its runners and routes remain).
+The trainer had two recipes on this date; a third, `fixed-recipe`, is described at the top of
+this section. Since the ear test the same evening, base-matched is the card's default: its
+Fast, Balanced and Thorough presets (100, 200 and 300 updates of 4, 4 and 8 songs, a dim-128
+LoKr, 60 s decoder crops, ten checkpoints each; `YUE2_JOINT_PRESETS` in
+`server/src/contracts/trainingRecipes.ts`) all run it. The card's Legacy preset (2026-09-29)
+runs the tuned recipe and HOT-Approved runs `fixed-recipe`. The Legacy seven-stage picker is
+gone from the UI (its runners and routes remain).
 **Tuned** is every default above and below this section: Prodigy, the KL anchor and KL
 stop, lyric timing, the planner at a lower rate, the 60 s decoder crop; it stays in the server
 and engine so old runs resume and refine. **Base-matched**
@@ -199,28 +337,40 @@ Legacy "Save every: AR KL" (2026-10-06): a fresh tuned KL-stop run may carry `kl
 
 Stops and tails. Under `--lr-schedule wsd` with `--target-kl`, the tail starts when the KL trend line's slope says `reading + 0.5 × slope × lr_decay_steps` reaches the target, so a linear or cosine decay ends on the target; a reading at the target with no warning starts the tail as before. `--kl-overshoot-margin` (default 0.1, 0 = off) acts on the stop at once if the reading passes the target by that much during the tail. During decoder-only training `--recon-stop F` stops when a least-squares line through the last `--recon-stop-window` `nar_recon` readings (at least 3; the app passes 10) gains less than F across them; it was a two-point comparison until 2026-09-26, which the meter's 0.2-0.5% per-checkpoint jitter tripped on runs still improving 0.5-0.9% per 50 steps. The server option `reconKeepDelta` deletes a routine checkpoint whose `nar_recon` did not improve on the best kept one by that amount once a newer checkpoint lands (the newest is never deleted; rung checkpoints are exempt). Cleanup no longer moves the run directory (the rename failed on Windows file locks); it writes a `finished` marker in the run folder (`yue2RunFinished`), which drops the run from Finish scored (`finished` on `GET /yue2-review`) and from later otherRuns sweeps. Runs under the legacy `refined/` subfolder count as finished, and the index still relocates a run found there. Preview records carry `plan.attempts` (planner re-plans) and `composerReplans`, recovered from the seed the engine echoes back, which advances by 1000003 per recompose. The caption-source list is served by `GET /api/training/yue2-dataset-captions` keyed by dataset id, lyrics set or adapter path, composed from the dataset's sidecars (a `.yue2.txt` caption is the whole trained sentence; an ACE caption gets the genre/BPM/key tail), and matches the prepared manifest's style strings minus the trigger opener.
 
-Training Studio enables lyric-timing supervision for new joint runs by default.
-It reuses the vocal-stem and forced-alignment stages; turning the option off
-skips those optional stages and the cursor objective. The timing weight is
-configurable and recorded with the run. Existing Legacy controls and its
-separate AR/NAR workflow are unchanged.
+Lyric-timing supervision is optional. Training Studio has left it off for new
+joint runs since 2026-09-28 (`Yue2TrainStages.tsx`); the route still turns it on
+for a request that omits `lyricTiming`, at cursor weight 0.08. It reuses the
+vocal-stem and forced-alignment stages; turning the option off skips those
+optional stages and the cursor objective. Base-matched forces the cursor weight to
+0 and `fixed-recipe` forces lyric timing off, so only the tuned recipe trains the
+cursor. The timing weight is configurable and recorded with the run.
 
 Checkpoint previews select the AR adapter at `preview.arScale`, default 0.6, and the NAR adapter at 1.0. The joint form and batch ladder defaults carry the same AR scale. Manual renders accept `arScale`, falling back to the run's saved preview scale and then 0.6. Baseline previews select no adapters.
 
-Checkpoint previews are optional and disabled by default. They use the first
-eligible dataset track with a fixed default seed of 424242. Preview duration is
-bounded to 8–120 seconds and controls the semantic frame cap. Reaching that cap
-is a preview limit, not a natural ending. Preview audio is stored with the run
+Checkpoint previews are optional. The route leaves them off when a request omits
+the `preview` block; the joint card sends the parallel ladder block above (one
+300 s take per checkpoint, 12 decoder steps). Without a picked `previewSongId` they
+use the prepared dataset's first sung track, with a fixed default seed of 424242.
+Preview duration is bounded to 8 to 360 seconds (default 90), and
+`previewMaxFrames` (default 2250, at most 9000) caps the semantic frames. Reaching
+that cap is a preview limit, not a natural ending. Preview audio is stored with the run
 and remains playable after reopening it. Native AR and NAR exports from the
 same checkpoint should be selected together; their generation strengths remain
 independent and default to 1/1.
 
-The "Train multiple" control processes selected datasets sequentially:
-cache stages, optional timing preparation, joint preparation, then joint
-training. It uses shared recipe settings and separate output directories. The
-queue is held in browser memory, like the Legacy batch wizard, so the Training
-Studio tab must remain open until the queue finishes. A reload does not resume
-the queue automatically.
+The "Train multiple" control starts a server-owned batch (`yue2BatchRunner.ts`,
+`POST /api/training/yue2-batch`). It applies one recipe to every selected dataset
+and runs each dataset's stages in order: captions (when the recipe asks for
+auto-captioning), cache, codes, sheet, stems and align (with lyric timing), train,
+then the planner refinement for a tuned recipe (base-matched and `fixed-recipe` skip
+it, as does `autoRefine: false`). A stage is skipped when the dataset's own status route already
+reports it done, and every run gets its own output directory. The batch record
+lives in `<training dir>/yue2-batches/<id>.json` and is saved at every
+transition; after a server restart it comes back `paused` and resumes from the
+record with finished work kept. `GET /yue2-batch` and `GET`/`DELETE
+/yue2-batch/:id` read and cancel batches; `POST /yue2-batch/:id/items`, `/pause`
+and `/resume` change a running one, and `POST /yue2-batch/finish` finishes scored
+ladders.
 
 The native cache preparation command reuses complete full-song caches:
 
@@ -267,6 +417,30 @@ steps verified finite on an RTX 4090 over Vulkan, 47-95 s per song; not yet
 ear-tested, and not yet run on AMD). Model Manager's **YuE2 Joint Training Pack**
 contains the required weights; Legacy remains available on its supported backends.
 
+### Live interval edits (GH #307, 2026-10-23)
+
+`PATCH /datasets/:id/yue2-joint-runs/:jobId/params` with `{ saveEvery?, previewEvery? }`
+(whole numbers from 1 to the step cap) calls `updateYue2JointParams`. It changes the job's
+options, so later segments start with the new `--save-every` and preview cadence, and writes
+`<outDir>/.params.json` (`{ rev, save_every, pause_at? }`) for the trainer running now. Every
+segment gets `--params-file <outDir>/.params.json --params-rev <n>`, the edit revision its
+arguments already carry. `poll_params` in `yue2-aitk-runtime.cpp`
+runs once per step, before the save check: one `last_write_time`, and a read plus yyjson parse
+only when the mtime has moved. Measured on the RTX 5090 workstation: 1.7-2.0 µs for the stat
+and 17 µs for stat, read and parse, against steps of 0.3-5 s, so it polls every step.
+
+Only a revision above `--params-rev` applies. Older ones are already in the segment's
+arguments, and a `pause_at` left by an earlier segment would otherwise pause the next one at
+once; an edit made after the server built the arguments (while it waits for the engine to
+stop) still lands. A file that does not parse is retried next step (the server may be mid-write). An
+out-of-range value is logged and skipped. Unknown keys are ignored. `pause_at` is written only
+while the segment's pause comes from the preview cadence (not from a live plan check), as
+segment start + previewEvery, clamped to the step cap. The checkpoint validator
+(`yue2JointExpectedStep`) trusts only the engine: its `paused` event, its early stop, else the
+step cap. An edit can land after the trainer's last read, so the requested pause is not proof. The route answers 409 when the run is not training
+on this machine; the UI sends it with the training target, so a worker's run is reached
+through the worker. `klCheckpointEvery` is not editable live.
+
 ### YuE2 preparation operations
 
 `stages: ['joint']` with `mode: 'train-after-preparation'` is direct Start-training.
@@ -282,7 +456,13 @@ Optimise results live in `<source dir>/_hotstep-optimisation.json` (`yue2Optimis
 
 The job runs `ensureYue2PreparedDataset` (the same prepared dataset training uses, lyric timing off), then `ace-train yue2-joint-train --eval-base-loss` with `--cursor-weight 0 --ar-targets base --nar-crop-frames 1500 --seed 42` and the companion decoder. The engine loads the base, creates no adapter or optimizer, and for every item in dataset order prints `{"stage":"eval","item":i,...,"ar_ce","nar_mse","nar_mse_t":[...]}` and finally `{"stage":"eval_summary",...}`. Planner CE: `yue2_aitk_joint::base_ar_ce` (the frozen-teacher forward plus the head kernel at KL weight 0, full prompt, lead sheet kept). Decoder MSE: `nar_probe_prefix` + `nar_probe_predict(nar = nullptr)` against the flow target at t = 250 / 500 / 750, on a crop drawn by a per-item sampler seeded from `--seed` and the item index, so two runs agree bit for bit (checked on a 20-song album). It keeps the engine running (about 72 s for 20 songs on a 5090 beside a loaded engine). The bare `{"stage":"eval"}` event marks the start and carries no `item`.
 
-`--eval-adapted` (with `--resume`, so the run's own `--steps` and flags) scores an existing LoRA/DoRA/LoKr checkpoint the same way, on the same per-item samples, once with the base and once with the restored adapters (no dropout, no update, no optimizer step; the optimizer is only built because the resume path restores through it). The adapted decoder is conditioned by the ADAPTED planner prefix, as at generation. The held-out set is whatever prepared dataset `--eval-dataset` names (default: `--dataset`, reported as `"held_out":false`); a separate dataset was chosen over a seeded split so training order and RNG stay untouched. Output: `<output>/adapted-loss.jsonl` with `ar_ce_base/adapted`, `nar_mse_base/adapted` per item and an `eval_adapted_summary` line. Checked on the B4 LoRA and DoRA step-10 checkpoints, 4090-trained, scored on a 5090.
+`--eval-adapted` (with `--resume`, so the run's own `--steps` and flags) scores an existing LoRA/DoRA/LoKr checkpoint the same way, on the same per-item samples, once with the base and once with the restored adapters (no dropout, no update, no optimizer step; the optimizer is only built because the resume path restores through it). The adapted decoder is conditioned by the adapted planner prefix, as at generation. Output: `<output>/adapted-loss.jsonl` with `ar_ce_base/adapted`, `nar_mse_base/adapted` per item and an `eval_adapted_summary` line.
+
+`--holdout-items 0,2` excludes those zero-based prepared-dataset indices from every training shuffle. Indices must be distinct, in range, and leave at least one training item. Without `--eval-dataset`, adapted evaluation scores only this split and reports `"held_out":true`. A separate prepared dataset passed as `--eval-dataset` takes precedence and scores every item in that dataset. With neither option, evaluation scores the training dataset and reports `"held_out":false`.
+
+New resume metadata saves `holdout_items`, including an empty array for unsplit runs. Every resume, including evaluation, must supply the same split as a set; list order may differ. The saved training order must contain exactly the nonempty complement, with no duplicates, and the saved cursor must be strictly below that order's length. A checkpoint without split metadata is treated as an unsplit legacy run: it can resume with no hold-out, but adding a hold-out is rejected because those items may already have trained the adapter. Changing or removing a saved split also requires a new run. Resume never filters or resets the saved order or cursor.
+
+`--eval-nar-window N` overrides the adapted-evaluation crop in frames, with `0` selecting the whole song; without it, evaluation uses `--nar-crop-frames`. `--eval-seed N` overrides the per-item evaluation draws, defaulting to `--seed`. Both affect evaluation only. They add no automatic hold-out early stop; existing training stop meters remain unchanged.
 
 ### Dataset profiles (Dataset-Calibrated Training, in progress)
 
@@ -439,6 +619,11 @@ to move. The first mirror pass then fills in the rung weights the worker still h
 
 ## YuE2 NAR audio-domain loss
 
+`yue2-nar-train` gained two flags on 2026-10-17. `--companion` merges the
+tokenizer's companion decoder adapter under the NAR before training, as every
+render does, and the export records it; `--manifest` may repeat, so several
+caches train as one set.
+
 `ace-train yue2-nar-train --audio-loss <w>` adds `w * aux` to the flow MSE on steps
 whose `t <= --audio-tmax` (default 0.4). The clean-latent estimate
 `x0_hat = x_t - t * v_pred` is decoded through the frozen VAE over `--audio-frames`
@@ -502,15 +687,18 @@ Backend/runtime facts (endpoints, sampling knobs, replay) are in
 
 The same fused op as the DiT and AS1.5 LM trainers
 (`GGML_OP_FLASH_ATTN_TRAIN`/`_BACK`, closed 2026-09-01), now wired into the
-MM3 planner-LM trainer. **Default `exact`.** Refused together with
-`--prefix-frames > 0` or the new `--prefix-n > 0` — a frozen or trained KV
-prefix needs a rectangular mask the fused kernel does not take — both at the
-CLI (exit 2 before the model loads) and in the `mm3-train-lm` server route,
-which coerces `attnBackend` back to `exact` and echoes the resolved value in
-its response whenever either prefix flag is nonzero.
+MM3 planner-LM trainer. The CLI default is `exact`; the in-app recipe has used
+`flash` since 2026-09-06 (`MM3_LM_DEFAULTS.attnBackend`). On its first day the
+flag was refused together with `--prefix-frames > 0` or `--prefix-n > 0`,
+because a KV prefix makes the mask rectangular. Since 7070238e (2026-09-06)
+both LM trainers probe the fused op at `S_kv = n_pfx + S` and compose flash with
+either prefix. The `mm3-train-lm` and `mm3-resume-lm` routes now coerce
+`attnBackend` to `exact` only when the engine's GPU backend is Vulkan or Metal
+(`engineSupportsFlashAttnTraining()` in `aceTrain.ts`), and echo the resolved
+value in the response.
 
 Measured on an RTX 5090 (32 GB), `mm3-lm-f16` and `mm3-lm-q8_0` bases,
-`oasis_morningglory` (12 tracks, longest ~11,178 frames), rank 256/alpha 256,
+a 12-track album (longest ~11,178 frames), rank 256/alpha 256,
 Muon, checkpointed. Peak VRAM is whole-device `used` including the ~10.3 GB
 resident base:
 
@@ -538,10 +726,11 @@ card is ~29 GB used regardless of mode; past it step time balloons 2–8× befor
 flash`** — roughly 2.6× on this measurement. `--attn flash` resolves to tf32
 on this card; `--attn flash-f32` pins f32. Paired 20-step run at the shipped
 recipe's crop (750, same seed and crop sequence both arms): 2118 ms/step mean
-flash vs 2215 ms exact, maximum loss drift 1.9e-4 over 20 steps. **Not
-ear-validated** — the shipped recipe (below) trains at crop 750, where flash
-measures no benefit, so nothing has shipped a reason to turn it on yet. The
-whole-graph (non-checkpointed) finite-difference gate could not be run in any
+flash vs 2215 ms exact, maximum loss drift 1.9e-4 over 20 steps. On this date
+nothing had been heard and the recipe trained at crop 750, where flash measures
+no benefit. On 2026-09-06 flash tied exact in a blind test (68 vs 72 of 90) and
+joined the stacked recipe below; the whole-song presets since 2026-09-11 depend
+on it. The whole-graph (non-checkpointed) finite-difference gate could not be run in any
 mode on this 32 GB card — both the exact and flash naive arms need ~27.5 GB on
 top of the 16 GB f16 base — so flash is proven correct only on an F32-isolated
 2-layer slice, not the full model. Full per-frame numbers and fitting caveats:
@@ -567,11 +756,12 @@ top both times with no plan failures, while corrected PiSSA produced drone
 plans in half its renders (39.5) and LoRA sat at 60–64. One album so far; a
 second artist is the pending validation. The export is either the DELTA
 form (rank r, adapter-only, 0.7 GB at r128 F16) when a residual file sits
-beside the base, or an ordinary rank-2r LoRA (F16, 1.4 GB) when none does;
-see "PiSSA residual" below.
+beside the base, or an ordinary rank-2r LoRA (F16, 1.4 GB) when none does or
+`--pissa-standalone` is passed; see "PiSSA residual" below.
 Training loss reads high under it by construction (the trailing mean sat at
-2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app MM3 default is
-500 steps, the checkpoint rated by ear. Not resumable, like `--pissa`.
+2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app recipes stop on
+steps (`stopMode: 'steps'`), and the checkpoint rated by ear that day was the
+step-500 one. Not resumable, like `--pissa`.
 
 #### PiSSA residual: the frozen half shipped once (2026-09-09)
 
@@ -593,7 +783,10 @@ pair the older exports carried from the two files, so the runtime graph,
 merge mode and group scales are untouched. The delta file is not a plain
 LoRA (an external PEFT loader would apply (B-B0)(A-A0)); the AS1.5 LM loader
 refuses the marker. `engine/tools/pissa_cache_to_residual.py` converts an
-SVD cache into the file; it made the shipped one.
+SVD cache into the file; it made the shipped one. `mm3-lm-train
+--pissa-standalone` (CLI only, 2026-09-24) keeps the residual out of the run:
+nothing is written beside the base, and every checkpoint is an ordinary rank-2r
+PEFT LoRA on the original base for loaders that merge plain PEFT files.
 
 The shipped MM3 recipe since 2026-09-06 stacks four cost levers on top of
 HOT-PiZZA, each first tied against the default in a blind set and then heard
@@ -618,7 +811,13 @@ prefix, flash attention) and differ only in depth: **Fast** (300 steps),
 `--lr 8e-5`. Tracks longer than the window are left out of the run by default
 (`longTracks: "exclude"`, the engine's `--drop-over-frames`; the log names
 them) and the route refuses a request that exclusion would gut; `"crop"`
-trains them in window-sized crops instead. The engine clamps its sequence
+trains them in window-sized crops instead. A third value, `"excise"`, is meant
+to cut one repeated section out of each over-length track (`ace-train
+mm3-retarget`) and train the result whole, but the server half is unwired:
+`retargetDataset()` in `mm3Retarget.ts` has no caller and no UI offers it, so
+today `"excise"` trains like `"exclude"` without the gutting check. A
+`maxFrames` outside 64 to 9000 is a 400, not a silent clamp (cef52ded). The
+engine clamps its sequence
 buffers to the album's longest track, so an album of three-minute songs
 reserves memory for three-minute songs, not for the ceiling.
 
@@ -630,18 +829,23 @@ adapters ended 12 of 72 renders across six albums while the base model ended
 Whole-song training on the same albums ended about half of its renders and
 restored most of the vocal share. Cost on an RTX 5090 at rank 128: 6 to 12 s
 per step and a 29 GB peak (measured: 25.4 GB at 2000 frames, 26.8 at 4000,
-29.1 at 9000, linear in the sequence length), so it is a 32 GB recipe as
-shipped; rank 64 or the acoustic loss off would be the levers for a 24 GB
+29.1 at 9000, linear in the sequence length; these three anchors are the
+server's flash VRAM fit, `MM3_VRAM_MODEL.flash` in `mm3Train.ts`), so it is a
+32 GB recipe as shipped; rank 64 or the acoustic loss off would be the levers for a 24 GB
 card and neither has been heard under this regime.
 
-Since 2026-09-07 the default recipe also runs **prior preservation against
-base-model endings**: every 3rd step scores a 20 s excerpt of a base-model
-plan (its opening or its natural ending) against the frozen base, from a
-corpus shipped under `<training>/mm3-reg-corpus/base-endings-k500`
-(`tools/mm3-reg-corpus`). Without it, adapters on this recipe ran to the
-300 s ceiling in 6 of 6 renders; with it 3 of 6 ended naturally. The step
-count grows by half so the artist still gets 500 updates. Send
-`regularisation: null` to turn it off, or name your own corpus.
+From 2026-09-07 to 2026-09-09 the default recipe also ran **prior preservation
+against base-model endings**: every 3rd step scored a 20 s excerpt of a base-model
+plan (its opening or its natural ending) against the frozen base, from a corpus
+built by `tools/mm3-reg-corpus` and shipped as bundled data
+(`server/src/data/mm3-reg-corpus/base-endings-k500`). Without it, adapters on
+that recipe ran to the 300 s ceiling in 6 of 6 renders; with it 3 of 6 ended
+naturally, and the step count grew by half so the artist still got 500 updates.
+It was a workaround for the dataset-wide caption, which broke endings; once that
+caption was removed the prior only cost likeness. Prior preservation is now off
+unless the request names a corpus: `regularisation: { datasetId, every, topK }`
+for another dataset with codes, or `{ corpusDir, every, topK }` for a folder
+holding `dataset.json`, `.mm3.txt` captions and `codes/` (the shipped corpus).
 
 Two cost knobs for any PiSSA-family run (2026-09-06): `--pissa-cache-dir <dir>`
 stores the SVD init factors once per base file / rank / oversample / iters /
@@ -650,7 +854,9 @@ pure function of those, so a hit is bit-exact; the in-app trainer keeps the
 cache under `<adapters>/mm3-lm-adapters/_pissa-init-cache/`); the init now
 logs its wall time either way. `--pissa-frozen-f16` holds the frozen A0/B0
 pair in F16, halving the ~1.3 GB it costs at r128, at the price of an init
-that cancels to f16 precision rather than exactly — unheard, off by default.
+that cancels to f16 precision rather than exactly. It is off by default at the
+CLI and on in the in-app recipe since 2026-09-06, where it was heard as part of
+the stacked recipe.
 
 ### Six adapter parameterizations, both LM trainers (2026-09-04/05)
 
@@ -712,7 +918,7 @@ What was left after that was arithmetic, not a bug: rank 64 genuinely does not
 fit. Each reflection retains its running `x`, its broadcast `v` and its
 correction, all `[in, S]` F32 and all backward inputs, so the activation cost
 is linear in rank AND in the crop with no allocator trick to remove it. On a
-32 GB card at crop 750 (`mm3-lm-q8_0` + `mm3-depth-f16`, `oasis_morningglory`,
+32 GB card at crop 750 (`mm3-lm-q8_0` + `mm3-depth-f16`, a 12-track album,
 36 layers, checkpointed, AdamW, acoustic loss on, seed 42, mean over 10 steps):
 
 | `--hra --rank` | trainable params | worst segment | peak VRAM | ms/step |
@@ -781,9 +987,13 @@ End-to-end adapter training **entirely in C++/GGML — no Python anywhere**:
 
 ```
 Dataset creation → Tensor preprocessing → LM LoRA training (0.6B/1.7B/4B)
-                                        → DiT LoRA training (LoKR planned)
+                                        → DiT LoRA/LoKR training
                                         → Pure-LM audition (A/B, no DiT influence)
 ```
+
+That is the ACE-Step pipeline, which most of the sections below describe. The
+MM3, YuE2 and SA3 trainers above are further `ace-train` subcommands with their
+own cards in the same Training Studio.
 
 Side-Step (`D:\Ace-Step-Latest\Side-Step`, local) is the Python reference implementation this system reaches parity with; its dev sanctioned porting. Dataset/sidecar formats are byte-compatible with Side-Step; tensor caches deliberately are not (safetensors, not pickle).
 
@@ -814,9 +1024,9 @@ YuE2 chains use `POST /api/training/ops/preparation/`. The command carries the d
 
 For ACE, stored defaults are a separate partial layer used by the batch pipeline. The interactive request projects the resolved form once; it must not spread stored pipeline values underneath fields omitted by the interactive projection. Explicit zero and false overrides remain values, not missing fields. Engine-selected model, device and other deferred values are reported as deferred rather than guessed by the browser.
 
-Frozen contracts (types, routes, JSONL event schemas, CLI) are duplicated verbatim between `server/src/services/training/types.ts` and `ui/src/services/trainingApi.ts` — **kept in sync by hand, deliberately**.
+Frozen contracts (types, routes, JSONL event schemas, CLI) are duplicated verbatim between `server/src/services/training/types.ts` and `ui/src/services/trainingApi.ts` — **kept in sync by hand, deliberately**. Newer shared shapes are imported by the UI instead of copied: `server/src/contracts/training.ts` (target ids, the SA3 asset block, recipe and preview shapes) and `server/src/contracts/trainingRecipes.ts` (the recipe seed values).
 
-Job model: one global promise-chain queue (`labelingQueue.ts`), SSE streams with replayable capped buffers, `_meta.json` persistence, `TrainingMetricEvent` for training numbers. GPU jobs stop the ace-server child first (`stopEngine`, default on) and restart it in a `finally`.
+Job model: two promise-chain queues in `labelingQueue.ts` (`laneFor`), a GPU lane for trainers, preprocess and other engine work and a network/CPU lane for labeling, each serial and both running at once (one global chain until 2026-07-30). SSE streams with replayable capped buffers, `_meta.json` persistence, `TrainingMetricEvent` for training numbers. GPU jobs stop the ace-server child first (`stopEngine`, default on) and restart it in a `finally`.
 
 ### Cover-laundered codes (the dense-mix gate, 2026-08-31)
 
@@ -825,14 +1035,14 @@ real audio -> rec7 state encoder (`mm3-rec7-*.gguf`) -> the released depth
 chain -> the flow DiT's own stitched window latents -> champion RVQ encode.
 The champion under-encodes buried vocals on real dense mixes; rendering the
 track back through the model first puts the vocal where the codes can carry
-it. Ear-validated A/B (Deftones, 2026-08-31): the laundered-codes adapter won
-on every axis at identical training curves.
+it. Ear-validated A/B (a dense-mix album, 2026-08-31): the laundered-codes
+adapter won on every axis at identical training curves.
 
 Fully native (no python at runtime; the rec7 GGUF carries the LM's two 16k-row
 semantic table slices so the 8B never runs — its weights load only for the
 depth chain's token embedding). ~1.4x realtime per track, 359 s cap (the
 pipeline's 9000-frame ceiling). Gated everywhere: the codes card has a
-"Cover-launder" checkbox writing to `mm3-codes-laundered/` (a sibling cache,
+"Cover-launder the codes" toggle writing to `mm3-codes-laundered/` (a sibling cache,
 never a replacement), and the train form only offers "Train on cover-laundered
 codes" when that cache exists. Both off = byte-identical to the pipeline
 before the gate existed — the launder is a new subcommand plus additive
@@ -843,32 +1053,33 @@ cosine 0.999999 measured) and the phase-0 latents-direct measurement (stitched
 flow latents vs DAV re-encode: cosine 0.9936 on owned spans; raw window tails
 are 0.57 — the stitch uses `mm3_window_crop` at latent granularity for exactly
 that reason). Convert encoders with
-`engine/tools/convert-rvq-encoder.py --head --m3` (adds the state head + LM
-slices to the standard V4 GGUF).
+`engine/tools/convert-rvq-encoder.py --head <head.pt> --m3 <checkpoint dir>` (adds
+the state head + LM slices to the standard V4 GGUF).
 
 ## Key design facts (the ones that bite)
 
 **Data & labeling**
 - Sidecars (`<stem>.txt`) live **next to the audio**; `dataset.json` in the source folder — Side-Step-compatible on purpose. Studio-private state (audio_codes, provenance, raw analyzer results) lives in `<data root>/library/training/datasets/<slug>/labels/`.
-- Labeling is engine-free: Essentia (BPM/key, cached by size+mtime) ∥ Genius lyrics (relaxed collab matching — "Electric Callboy & BABYMETAL" broke exact primary-artist equality) → Gemini captions **with the audio attached** (96 kbps MP3 inline; the local caption is *omitted* from the prompt to avoid anchoring). `ace-understand` is out of the default flow (weak captions, hallucinated lyrics, J-pop prior); still reachable via API `useUnderstand:true`.
+- Labeling is engine-free: Essentia (BPM/key, cached by size+mtime) ∥ Genius lyrics (relaxed collab matching — a two-artist collaboration credit broke exact primary-artist equality) → Gemini captions **with the audio attached** (96 kbps MP3 inline; the local caption is *omitted* from the prompt to avoid anchoring), or local MOSS captions, which also hear the audio (other chat providers rewrite text only). The same caption pass writes the YuE2 sentence to `<stem>.yue2.txt` and, under MOSS, the MM3 Structured Caption to `<stem>.mm3.txt` (`CaptionOptions.wantYue2` / `wantMm3`). `ace-understand` is out of the default flow (weak captions, hallucinated lyrics, J-pop prior); still reachable via API `useUnderstand:true`.
 - Optional `essentiaTempo.minTempo/maxTempo` values become `rhythm` keys in the extractor's YAML profile; no bounds means no profile and Essentia's defaults. The label cache also keys on these bounds. An embedded BPM tag replaces Essentia's estimate only when it is a half or double tempo match (within 2 BPM); without such a match, the Essentia value is kept. The Review grid's ½ and 2× buttons save a manual BPM correction before dataset build.
 - Dataset language is **declared, not detected** (`default_language`, forced-write on every label pass).
 - Lyrics *absence* never writes `is_instrumental` — only lyrics presence writes `false`.
 
 **FSQ (critical correctness area)**
 - `engine/src/fsq-quant.h` is the single source of truth. The reference path is **ResidualFSQ `preserve_symmetry`**: soft clamp `c=1+1/(L−1)` → `tanh(z/c)·c` → hard clamp → `floor((L−1)(w+1)/2+0.5)`. NOT `FSQ.bound` (that branch never executes in vqp). Encode verified 13046/13046 vs the checkpoint's own tokenizer.
-- `verify-hooks.ps1` has 2 FSQ hooks — upstream syncs must not revert this.
+- `verify-hooks.ps1` Hook 5 guards both FSQ files (`fsq-detok.h` must include `fsq-quant.h`, and neither it nor `fsq-tok.h` may carry upstream's own quantizer copy) — upstream syncs must not revert this.
 - Side-Step's stored `lm_codes.jsonl` are a **bf16 ceiling** (~85% identity); engine-F32 vs fp32-reference is the honest gate (99.0%).
 
 **LM trainer**
 - Hand-rolled loop (`lm-optim.h`): ggml-opt can't grad-clip and its grad accessor crashes with dynamic graphs. Persistent grad accumulators indexed by forward-node order, **in-graph** global-norm clip at 1.0, AdamW nodes, Side-Step-exact LR schedule (`lr(0)=0`, 5% warmup, cosine→0.1).
-- ggml gap catalogue: `out_prod` F32-only (the central constraint), no upstream backward for flash-attn (closed 2026-09-01 by HOT-Step's own `GGML_OP_FLASH_ATTN_TRAIN`/`_BACK` ops — CPU + CUDA, GQA, additive masks, bitwise-deterministic; see `docs/dev/ggml-fork.md`) / `SET_ROWS` (KV cache) / fused swiglu; CE labels are dense one-hot; `CONCAT` has no backward (use `ACC`); rms_norm backward is wrong on **non-contiguous (permuted) inputs** — norm before permute.
+- ggml gap catalogue: `out_prod` F32-only upstream (the central constraint; the HOT-ggml fork's `bf16-out-prod` change, Hook 7, lets ggml-cuda's `OUT_PROD` take a BF16 `src0`), no upstream backward for flash-attn (closed 2026-09-01 by HOT-Step's own `GGML_OP_FLASH_ATTN_TRAIN`/`_BACK` ops — CPU + CUDA, GQA, additive masks, bitwise-deterministic; see `docs/dev/ggml-fork.md`) / `SET_ROWS` (KV cache) / fused swiglu; CE labels are dense one-hot; `CONCAT` has no backward (use `ACC`); rms_norm backward is wrong on **non-contiguous (permuted) inputs** — norm before permute.
 - 4B fits ~12 GB via per-layer checkpoint segments + a transient per-layer F32 window + chunked-CE head (BF16 embedding). Naive path preserved byte-identical for 0.6B/1.7B.
-- `--weights bf16` (experimental): backward surgery rewrites `out_prod(W_f32,gT)` → `mul_mat(cont(transpose(W_bf16)),g)`. **1.256× at 4B** measured; gradient cos ~0.9992 vs F32 (BF16 rounding compounds sub-linearly with depth; partly ggml-cuda's dst-BF16 rounding, only fixable by a vendor patch). Zero vendor patches shipped; `engine/ggml` submodule is clean upstream.
+- `--weights bf16` (experimental): backward surgery rewrites `out_prod(W_f32,gT)` → `mul_mat(cont(transpose(W_bf16)),g)`. **1.256× at 4B** measured; gradient cos ~0.9992 vs F32 (BF16 rounding compounds sub-linearly with depth; partly ggml-cuda's dst-BF16 rounding, only fixable by a vendor patch). When this was measured `engine/ggml` was stock upstream; it is now the HOT-ggml fork, whose changes are listed in [ggml-fork.md](ggml-fork.md).
 - `--batch` intentionally **not built** — measured amortisable overhead below the bar where it matters (4B: 9.3% < 10%); flag exits 2 citing the numbers.
-- Defaults (Side-Step parity, from real runs): target loss **4.0** (not 0.4!), GA 2, epochs 75, milestone step 1.0, lr 1e-4.
-- Self-test: `ace-train train-lm --self-test` — T1–T13 (+T14–T17 bf16, report-not-gate). T5/T4 finite differences run **TF32-off in a child process** (cuBLAS TF32 noise defeats central differences; gradients were always right). Known pre-existing 4B rough edges: T11e/T12 slightly over bars (BF16-dtype-resolution class).
-- **`--attn exact|flash` (2026-09-02).** Same fused flash-attention forward/backward as the DiT (the HOT-ggml `flash-attn-train` change), with the causal mask as one triangular −INF fill — the kernel skips all-−INF tiles, so causal training gets roughly half its attention compute free. **Default `exact`; the Training Studio checkbox ships off.** What it buys, measured on this box (4B, low-VRAM path, `albumF` substituted for the absent album I fixture, paired/interleaved): against the shipped arm (`exact --attn-head-block 8`) flash is **5.5% faster per micro-step** and **3.8% lower peak VRAM**; against an equal-shape reference (`exact --attn-head-block 0`) it is only **1.2% faster** — almost all of the win is the head-block copies going away, not the fused kernel, which is the opposite split from the DiT (there the fused kernel is the win and equal-shape flash is 8.5% *slower*). Attention-only bound from `fattn-train-test --bench-lm`: 0.74×/0.79×/0.80× of the blocked arm at S=1024/2113/3500. On the naive path (0.6B/1.7B, no per-layer checkpointing) flash's linear-in-S attention state roughly **doubles the auto-fit `maxLen`** on 0.6B (3136→6208 tokens) and clears a 600 s dataset's `skippedLong` count from 2 to 0; on 1.7B the same dataset only gets a 1.27× lift and still skips one long track. 50-epoch same-seed drift (flash vs exact) is the same class as the already-shipped `--weights bf16` deviation — smaller on two of three measures, ~20% larger on final CE from a single seed, no error bar yet. Not yet ear-validated (`--attn exact --attn-head-block 8` remains the safe default until that lands). Full numbers, VRAM-model refit, and the pre-existing bugs it surfaced (an MM3 export assert, an exact-mode auto-fit OOM crash) are in `.claude/skills/flash-attn-training/SKILL.md` §3/§7.
+- CLI defaults (Side-Step parity, from real runs): target loss **4.0** (not 0.4!), GA 2, epochs 75, milestone step 1.0, lr 1e-4, LoRA r16/α32, AdamW. The app's own defaults (the form seed `ACE_LM_FORM_DEFAULTS` in `server/src/contracts/trainingRecipes.ts`, and the `train-lm` route fallbacks the batch pipeline's empty option bag lands on) keep target 4.0, GA 2 and lr 1e-4 but run up to 150 epochs with milestones off; the rest of the app recipe is in the next block.
+- **Staged target chain** (2026-08-29, route default): `targetLoss` is the final target, and the route prepends every rung of the 2.0 → 1.5 ladder that sits above it, one `ace-train` leg per rung chained with `--init-adapter`, so each rung restarts the optimizer state and LR schedule. At the default target 4.0 no rung applies and the run is one leg. `targetLossStages` pins the list; an explicit `initAdapter` (a resume) collapses it to the final target. The form sends `initAdapter: 'latest'` by default: the newest run of that adapter name with weights (never a `-calibrated` bake), or a fresh run when there is none.
+- Self-test: `ace-train train-lm --self-test` — T1–T13 (+T14–T17 bf16, report-not-gate; T18–T21 cover `--attn flash`, T22 anchors the graph sizes). T5/T4 finite differences run **TF32-off in a child process** (cuBLAS TF32 noise defeats central differences; gradients were always right). Known pre-existing 4B rough edges: T11e/T12 slightly over bars (BF16-dtype-resolution class).
+- **`--attn exact|flash` (2026-09-02).** Same fused flash-attention forward/backward as the DiT (the HOT-ggml `flash-attn-train` change), with the causal mask as one triangular −INF fill — the kernel skips all-−INF tiles, so causal training gets roughly half its attention compute free. **The CLI default is `exact`.** The Training Studio and the route have defaulted to `flash` since 2026-09-03, but the route turns it back to `exact` whenever the soft-prompt KV prefix is on, and that prefix has been on by default since 2026-09-04, so a default run trains exact attention (the engine has accepted flash with a prefix since 7070238e; see the next block). What it buys, measured on this box (4B, low-VRAM path, `albumF` substituted for the absent album I fixture, paired/interleaved): against the shipped arm (`exact --attn-head-block 8`) flash is **5.5% faster per micro-step** and **3.8% lower peak VRAM**; against an equal-shape reference (`exact --attn-head-block 0`) it is only **1.2% faster** — almost all of the win is the head-block copies going away, not the fused kernel, which is the opposite split from the DiT (there the fused kernel is the win and equal-shape flash is 8.5% *slower*). Attention-only bound from `fattn-train-test --bench-lm`: 0.74×/0.79×/0.80× of the blocked arm at S=1024/2113/3500. On the naive path (0.6B/1.7B, no per-layer checkpointing) flash's linear-in-S attention state roughly **doubles the auto-fit `maxLen`** on 0.6B (3136→6208 tokens) and clears a 600 s dataset's `skippedLong` count from 2 to 0; on 1.7B the same dataset only gets a 1.27× lift and still skips one long track. 50-epoch same-seed drift (flash vs exact) is the same class as the already-shipped `--weights bf16` deviation — smaller on two of three measures, ~20% larger on final CE from a single seed, no error bar yet. Not yet ear-validated. Full numbers, VRAM-model refit, and the pre-existing bugs it surfaced (an MM3 export assert, an exact-mode auto-fit OOM crash) are in `.claude/skills/flash-attn-training/SKILL.md` §3/§7.
 
 **LM trainer — caption dropout and prior preservation** (2026-09-02, both DEFAULT OFF)
 
@@ -878,18 +1089,27 @@ buys looping plans. These are the two levers the MM3 LM trainer already had and 
 Both are opt-in at the CLI; with both off the trainer emits the same graphs, consumes the same RNG and
 produces the same loss trajectory it did before they existed (verified against a purpose-built
 pre-change binary: same 4B run, `--order fixed --epochs 1 --limit 4`, per-step `loss`/`gradNorm`/
-`clipScale` identical to the last printed digit). **The Training Studio and the batch pipeline default
-both ON since 2026-09-03** (`captionDropout 0.3`, `regEvery 3`, cached teacher): in the 3-artist
+`clipScale` identical to the last printed digit). **The Training Studio and the batch pipeline turned
+both ON on 2026-09-03** (`captionDropout 0.3`, `regEvery 3`, cached teacher): in the 3-artist
 render-scored experiment (`docs/plans/lm-attr-probe/RESULTS.md` §6–7) that combination measured best on
 loudness and timbre at the control's loop rate; caption dropout alone hurt, and the live teacher was
-worse than the cached flat-tail prior. The server drops prior preservation to off with a warning when no
-other 600 s corpus exists, and drops caption dropout when the variant has no trigger word, so a default
-run never fails on those two refusals. Neither lever is ear-validated yet. The same day's other default
-changes for `train-lm`: **LoRA rank 128 / alpha 256** (LoKr dim 128 remains selectable),
-**Prodigy** as the optimizer (`--optimizer prodigy`, ported into train-lm from mm3-lm-train: the step
-size is estimated online, `--lr` becomes a schedule multiplier forced to 1.0, `--prodigy-d0` seeds the
-estimate at 1e-6), **`--weights bf16`** (the DiT's bf16-mirror counterpart, 1.256× at 4B) and
-**`--attn flash`** on. Explicit values still win, and resumes adopt the source run's identity. The only flags-off output change is an additive
+worse than the cached flat-tail prior. The same day's other default changes for `train-lm` were LoRA
+rank 128 / alpha 256, **Prodigy** as the optimizer (`--optimizer prodigy`, ported into train-lm from
+mm3-lm-train: the step size is estimated online, `--lr` becomes a schedule multiplier forced to 1.0,
+`--prodigy-d0` seeds the estimate at 1e-6), **`--weights bf16`** (the DiT's bf16-mirror counterpart,
+1.256× at 4B) and **`--attn flash`** on.
+
+**Since 2026-09-04 the default is the joint soft-prompt recipe** (arm 05 of that day's listening test,
+best by ear and on the eval): LoRA rank 16 / alpha 32 with AdamW at lr 1e-4, an artist token named
+after the adapter (k 32, token LR 5e-3) plus an 8-column KV prefix, caption dropout 0.3, prior
+preservation **off** (`regEvery 0`: arm 05 trained without it, and the run that combined it with the
+soft prompt was the one that memorised), target loss 4.0, `--weights bf16`. With the soft prompt on,
+r128 + Prodigy overfit in a handful of epochs. `attnBackend` still defaults to `flash`,
+but the prefix makes the route run it as `exact` (above). The form seed is `ACE_LM_FORM_DEFAULTS` and
+the route fallbacks match it, so a batch-pipeline run trains the same recipe. A default caption dropout
+on a variant with no trigger word is dropped with a warning; an explicit one is a 400, as is an explicit
+`regEvery` when no other 600 s corpus exists. Neither lever is ear-validated yet. Explicit values still
+win, and resumes adopt the source run's identity. The only flags-off output change is an additive
 `"captionDropout":0` on the `start` event and a `caption_dropout` key in `lm_train_log.json`.
 
 - **`--caption-dropout <p>`** (0..1, default 0). Each style micro-step draws from a per-epoch
@@ -944,8 +1164,8 @@ estimate at 1e-6), **`--weights bf16`** (the DiT's bf16-mirror counterpart, 1.25
     **raw**, and MM3’s shared capture code (`lm_ckpt_capture_topk`) is untouched.
   - **READ THE COVERAGE NUMBER — ACE is not MM3 here.** MM3 scores 16,385 classes and its top-64
     routinely covers >99% of the base’s probability mass. ACE scores **217,204** and its base sits
-    at CE ~9 on another artist’s codes, i.e. thousands of effective classes: measured on
-    president-vs-boston, top-64 covers **18.5%** and top-256 only **24.0%**. With the uniform tail
+    at CE ~9 on another artist’s codes, i.e. thousands of effective classes: measured on one
+    artist's run regularised on a second artist's songs, top-64 covers **18.5%** and top-256 only **24.0%**. With the uniform tail
     the target is then mostly floor: it says "stay flat" much more than "stay the base". Whether
     that still buys anything is **unmeasured** past a smoke test. The trainer logs a `warn` below
     50%. `--reg-topk` (max 256) sharpens the picture a little; the real fix is `--reg-teacher live`
@@ -965,7 +1185,7 @@ estimate at 1e-6), **`--weights bf16`** (the DiT's bf16-mirror counterpart, 1.25
   - **The mask is PER POSITION, and that is not a detail.** "Softmax over the audio-code range
     only" is right at a code position and wrong everywhere else: with `--loss-on-cot` (the default)
     a reg row's supervised span starts at `<think>`, so ~13% of its positions are CoT YAML text
-    (measured on boston at 4B). A code-only target there renormalises 65,535 logits the base has
+    (measured on that regularisation corpus at 4B). A code-only target there renormalises 65,535 logits the base has
     driven to near zero — noise — and demands total code probability 1.0 at a position where the
     base emits text, i.e. it trains the model to emit codes instead of a plan. So the range mask is
     applied only where the row's own ground-truth token IS an audio code; elsewhere the teacher is
@@ -989,7 +1209,7 @@ Usage (4B, low-VRAM by default):
 
 ```
 ace-train train-lm --stages train,export ^
-  --codes  <data root>/library\training\tensors\president\<variant>\lm_codes.jsonl ^
+  --codes  <data root>/library\training\tensors\<dataset>\<variant>\lm_codes.jsonl ^
   --out    <run dir> --models models --lm acestep-5Hz-lm-4B-BF16.gguf ^
   --caption-dropout 0.25 ^
   --reg-every 3 --reg-codes <other artist>\lm_codes.jsonl,<another>\lm_codes.jsonl ^
@@ -1007,9 +1227,9 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 **DiT trainer**
 - Trainable graph is **bit-identical** to the inference forward (17 debug-tensor diff = 0.0). Unfused load via `g_dit_load_no_fuse` (mirrors `g_qwen3_load_no_fuse`; the zero-stub-adapter trick is dead).
 - F32 mirror streamed from the GGUF via CPU-backend load (a GPU-copy mirror transiently costs +5–8 GB and OOMs cards the steady state fits).
-- Crop-window training (random window/step). **Two attention formulations** (`--attn`, 2026-09-01): `exact` is the original `mul_mat → soft_max_ext → mul_mat` graph, whose retained O(S²·Nh) softmax made full-song full-depth ≈ 68 GB and capped crops at ~1000–1250 frames at 24 GB; `flash` (the Training Studio default) routes both self- and cross-attention through HOT-Step's own fused flash-attention forward+backward (the HOT-ggml `flash-attn-train` change, TF32 tensor cores on sm_80+, f32 everywhere else), whose attention memory is linear in S — on a 32 GB card the auto-fit then picks full-song crops at full 32-layer depth (measured: crop 3846 on a ~5600-frame album, 3.08× the exact cap, 28.1 GB), and per attention site it is *faster* than the cuBLAS chain at every crop (0.94×/0.64×/0.49× at S=625/1250/3000). `flash-f32` pins the strict scalar kernels. Exact mode's graph is byte-identical to pre-2026-09 runs; the `--layers` top-K ladder still describes exact mode and is due a flash-mode re-derivation (plan-doc B1). **The flat "<16 GB card refused" rule is gone (2026-09-02).** The trainer now refuses only when the cheapest configuration the auto-fit can express — K=2 (or your pinned depth), `crop_min`, the widest checkpoint split, batch 1, at this run's adapter/mirror/attention settings — does not fit free VRAM after the reserve; the fatal quotes that floor, the configuration it is, how much of it is the frozen-weight mirror, and the priced settings that would lower it most. Measured on `dit-xl-thirds` (`--attn flash --mirror bf16`, LoRA r16): a card with **12 GB free trains at full 32-layer depth** at crop 410 with 4 checkpoint segments. The real wall below that is the frozen base itself — its bf16 mirror is 8133 MB, so ~8.3 GB is the floor for this base at any settings, and 8 GB and 6 GB are correctly refused. `capabilities.trainDit.minVramMb` (8192) is a UI banner hint only; nothing refuses on it.
+- Crop-window training, one window per step. Since 2026-08-29 the app draws song-anchored structured crops (`--crop-anchor song`, start and end shares 0.2 each, the rest random; `dit_sample_crop_structured` in `dit-data.h`), and since 2026-09-03 `crop_max` defaults to 800 frames in every attention mode: long auto-fit crops lost three ear A/Bs to short ones, so the cap is a quality guard and flash mode no longer lifts it. An explicit `--crop-max` still wins both ways. **Two attention formulations** (`--attn`, 2026-09-01): `exact` is the original `mul_mat → soft_max_ext → mul_mat` graph, whose retained O(S²·Nh) softmax made full-song full-depth ≈ 68 GB and capped crops at ~1000–1250 frames at 24 GB; `flash` (the Training Studio default) routes both self- and cross-attention through HOT-Step's own fused flash-attention forward+backward (the HOT-ggml `flash-attn-train` change, TF32 tensor cores on sm_80+, f32 everywhere else), whose attention memory is linear in S — on a 32 GB card the auto-fit then picked full-song crops at full 32-layer depth until that cap (measured: crop 3846 on a ~5600-frame album, 3.08× the exact cap, 28.1 GB), and per attention site it is *faster* than the cuBLAS chain at every crop (0.94×/0.64×/0.49× at S=625/1250/3000). `flash-f32` pins the strict scalar kernels. Exact mode's graph is byte-identical to pre-2026-09 runs; the `--layers` top-K ladder still describes exact mode and is due a flash-mode re-derivation (plan-doc B1). **The flat "<16 GB card refused" rule is gone (2026-09-02).** The trainer now refuses only when the cheapest configuration the auto-fit can express — K=2 (or your pinned depth), `crop_min`, the widest checkpoint split, batch 1, at this run's adapter/mirror/attention settings — does not fit free VRAM after the reserve; the fatal quotes that floor, the configuration it is, how much of it is the frozen-weight mirror, and the priced settings that would lower it most. Measured on `dit-xl-thirds` (`--attn flash --mirror bf16`, LoRA r16): a card with **12 GB free trains at full 32-layer depth** at crop 410 with 4 checkpoint segments. The real wall below that is the frozen base itself — its bf16 mirror is 8133 MB, so ~8.3 GB is the floor for this base at any settings, and 8 GB and 6 GB are correctly refused. `capabilities.trainDit.minVramMb` (8192) is a UI banner hint only; nothing refuses on it.
 - Product loss = flow_snr (window-normalized — batch-1 mean normalization is silently a no-op, the trap) + channel_balance from `channel_stats.json`; lr default **5e-4** (1e-4 measurably does not train).
-- Defaults: **LoRA** epochs 400, r128/α256, lr 5e-4, GA 4; **LoKR** epochs **250**, dim512/α512/factor 6, lr **2e-3**, GA **4**, target-loss 0.6, loss-weighting `none`. Genre ratio 30%, target-MLP **on** for both. DiT target-loss 0.4 requires Side-Step-length runs; epoch cap is the practical stop.
+- Defaults (form seeds `ACE_DIT_FORM_DEFAULTS` / `ACE_DIT_LOKR_FORM_DEFAULTS` in `server/src/contracts/trainingRecipes.ts`; the `train-dit` route fallbacks match, and an omitted `adapterType` is LoKR): the card opens on **LoKR** (dim512/α512/factor 6, lr **2e-3**, weight decay 0.001, loss-weighting `none`); **LoRA** is r128/α256, lr 5e-4, loss-weighting `flow_snr`. Both use GA 4, genre ratio 30%, target-MLP **on**, Prodigy (since 2026-09-03; it forces `--lr` to 1.0, so the LR values apply to AdamW and Muon), `--mirror bf16-f32`, `--bwd mm` and flash attention. The quality dial sets Fast / Balanced / Thorough to 150 / 500 / 900 epochs at target loss 0.3 / 0.3 / 0.2; the route default is 500 epochs at 0.3. The next three bullets argue from the 2026-07-30 values (LoRA 400 epochs, LoKR 250, target 0.6). The CLI's own target loss is 0.4, which needs Side-Step-length runs; the epoch cap is the practical stop.
 - **LoKR lr and grad-accum move together** (2026-07-30 five-run A/B on one album dataset). The old 1e-2 @ GA 20 reproduced Side-Step's effective batch of 20 by accumulation; 2e-3 @ GA 4 is the same effective LR per sample under linear scaling and measured *identical* epochs-to-target (227 vs 228) with better-behaved gradients (median grad-norm 0.062 vs 0.031 — the √5 a 5× smaller batch predicts — and no warmup spike, where GA 20 peaked at 13.5 on epoch 1). Setting one without the other is an untested config.
 - **The 250-epoch LoKR horizon is a schedule fix, not a shortcut.** Every 400-horizon run stopped with the cosine only halfway down (LR still ~50% of peak), so it never decayed *into* the target. 250 cut epochs-to-0.6 from 228 → 203 and audio-seconds-to-target by 14% — the only one of five knobs tested that reduced the work required rather than rearranging it. Don't go much lower: that run used 203 of its 250, and a horizon under the epochs actually needed strands the LR at its 10% floor with the tail unfinished.
 - **Time-to-target is set by audio-seconds seen, not epochs or update count.** ~85,000 audio-seconds to reach 0.6, stable to ±5% across a 5× change in update count and a 1.8× change in window length. Changing grad-accum or crop length only re-slices it; only the schedule shape (above) and engine throughput move it.
@@ -1026,7 +1246,7 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 - **`--profile-step <n>` / `--profile-ops`** are the tools that found it, and they stay: per-micro-step buckets (assemble/upload/build/backward/alloc/compute/readback/free) plus graph node and scheduler split counts, and a per-node op/shape histogram for one warmed-up step. `dit_train_log.json` now carries `runtime.backend` / `graph_nodes` / `sched_splits` / `profile_ms`, so a finished run explains itself — before this, "was that run even on CUDA?" was unanswerable after the fact.
 
 **Muon optimizer** (2026-07-30, `--optimizer adamw|muon`, shared by both trainers via `lm-optim.h`)
-- **DEFAULT for the DiT** since the ear test. Measured on one album dataset (LoKR dim512+MLP, 32 layers, crop/depth pinned): **161 epochs to ma5 0.6 vs AdamW's 227** — 1.41× more sample-efficient — and ~1.23× on wall-clock once bucketed. A real run reached 0.6 in ~5 min and the adapter was judged perfect by ear. AdamW is unchanged and one dropdown away.
+- **The DiT default from the 2026-07-30 ear test until 2026-09-03**, when Prodigy replaced it; Muon and AdamW stay selectable. Measured on one album dataset (LoKR dim512+MLP, 32 layers, crop/depth pinned): **161 epochs to ma5 0.6 vs AdamW's 227** — 1.41× more sample-efficient — and ~1.23× on wall-clock once bucketed. A real run reached 0.6 in ~5 min and the adapter was judged perfect by ear.
 - **Per PARAMETER, not global.** 2-D parameters with a short side ≥ `--muon-min-dim` (16) get orthogonalised-momentum (Newton-Schulz) updates; everything else stays on AdamW. A LoKR `w1` is `[4,5]` — orthogonalising a 4-dimensional subspace is vacuous — so on a DiT LoKR run the split is **448 Muon / 352 AdamW**. Every published Muon uses this hybrid.
 - **The LR does NOT mean AdamW's.** Muon's update is normalised by construction, so per element it is ~20× smaller; `--muon-lr-scale` multiplies the shared schedule for Muon parameters only. Sweep on the DiT: 5 undershoots, **20 matches**, 50 overshoots. `--muon-lr-scale` and the base `--lr` are not independent.
 - **Free VRAM:** one momentum buffer instead of two — 16315 → 15443 MB trainer-owned at LoKR dim512 (**872 MB**). `dit-vram.h` still charges for both, so the auto-fit is conservative, not wrong.
@@ -1036,7 +1256,7 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 
 **DiT micro-batching + gradient checkpointing** (2026-07-29, `docs/plans/2026-07-29-dit-batching-checkpointing.md`)
 - `--batch <n>` (default **1** = OFF, range 1-16): crops per micro-batch, drawn from that many DIFFERENT songs (Side-Step DataLoader parity — B same-song crops was never on the table). Clamped down to the dataset's own song count with a `warn` when the variant has fewer songs than requested; further clamped by ggml's CUDA `REPEAT_BACK` cap on `Nkv·max(S,enc_S)·B` (GQA head-expansion backward — **both** attentions expand, and cross-attention's token axis is the dataset's padded `enc_S`, not the crop), and by the C4 auto-fit's own VRAM order (crop shrinks first, then checkpoint segments rise, then B itself gives with a warn — **before** depth is ever touched, since depth is the quality axis). `--grad-accum` counts **micro-batches**, not samples — effective samples/optimizer-step is `batch × grad-accum`.
-- **Why the batch default is 1** (changed 2026-07-29 from 5, on the measurement below): batching is ~2.5× SLOWER at full depth on a 32 GB card and ~2.4× faster on shallow / partial-depth runs, so it ships off and is opt-in for the shallow case. The same default is mirrored in `DitTrainArgs`, the `ace-train` usage text, the `/api/training/train-dit` route fallback, `TrainDitOptions` (both mirror files) and `TRAIN_DIT_DEFAULTS` (which `TRAIN_DIT_LOKR_DEFAULTS` spreads, so LoKR inherits it). `--ckpt` stays at 1 (auto), and auto resolves to a single unsegmented run whenever full depth fits — `seg_candidates()` tries 1 first — so the default pair is the monolithic graph.
+- **Why the batch default is 1** (changed 2026-07-29 from 5, on the measurement below): batching is ~2.5× SLOWER at full depth on a 32 GB card and ~2.4× faster on shallow / partial-depth runs, so it ships off and is opt-in for the shallow case. The same default is mirrored in `DitTrainArgs`, the `ace-train` usage text, the `POST /api/training/datasets/:id/train-dit` route fallback, `TrainDitOptions` (both mirror files) and `ACE_DIT_FORM_DEFAULTS` (which `ACE_DIT_LOKR_FORM_DEFAULTS` spreads, so LoKR inherits it; `TrainDitForm.tsx` re-exports them as `TRAIN_DIT_DEFAULTS` / `TRAIN_DIT_LOKR_DEFAULTS`). `--ckpt` stays at 1 (auto), and auto resolves to a single unsegmented run whenever full depth fits — `seg_candidates()` tries 1 first — so the default pair is the monolithic graph.
 - **Mixed-length batches mask the pad in ATTENTION, not just in the loss.** When any element of a micro-batch is padded (a song shorter than the crop), `dit_batch_assemble` switches the self-attention mask from the shared `[S,S]` broadcast to a per-element `[S,S,1,B]` pair: `sa` (sliding window + padded KV columns) for `layer_type 0` and `sa_pad` (padded KV columns only, no window) for `layer_type 1`, which otherwise takes no self-attention mask at all. Without this the pad reaches every valid query as an attention KEY and from there the adapter gradients — the design-B4 loss mask cannot stop it, since it only zeroes the padded frames' own loss contribution. Padded QUERY rows are deliberately left unmasked (a fully-masked softmax row is NaN); they are inert anyway, because a zero output gradient contributes exactly zero to dQ/dK/dV. Self-test rungs SB3/SC2 gate it by dirtying the padded INPUT and requiring loss and every adapter gradient to move by EXACTLY 0. The unpadded case keeps the `[S,S]` fast path, and B=1 can never pad.
 - **Grad-accum weighting is an element share.** A micro-batch's `t_lossgrad` is `elems_in_micro_batch / elems_in_window`, not `1/n_micro_batches`: the in-graph `t_lw` already normalises within a micro-batch, so `sum_mb (nb/wlen) * loss_mb` telescopes to Side-Step's global mean-of-per-sample-means over the whole optimizer window. The two agree while every micro-batch is full; a short tail of `nb < B` elements used to be over-weighted by `B/nb`. At B=1 the two forms are algebraically identical, so the `--batch 1 --ckpt 0` anchor is untouched.
 - `--ckpt <n>` (default **1** = auto): hand-rolled segmented-recompute checkpointing — `0` disables it (byte-identical to the pre-batching monolithic graph), `1` lets the VRAM fit pick a segment count, `2-32` pins it. Mechanism: one no-grad forward over the whole trained stack to capture segment-boundary activations, then segments rebuilt LAST→FIRST with grads, each feeding the next via a `spike-s3`-style surrogate loss (`sum(seg_out ⊙ G)`) seeded from the boundary gradient above it; adapter grads accumulate in-place across every segment's graph compute (`lm-optim.h` untouched — it never needed to change, since PARAM-flagged boundary tensors get their own grad slot through the existing `ggml_build_backward_expand` machinery). Bit-exact vs `--ckpt 0` at the same seed/batch (self-test SC1-SC3).
@@ -1046,7 +1266,7 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 - Throughput (RTX 5090, 32 GB, LoKR dim512+MLP, full available depth = 32 layers, `--mirror bf16`, 10 epochs, same seed, tiny 5-song smoke tensors): `--batch 1 --ckpt 0` (yesterday's behavior) auto-fit a 674-frame crop and ran ~13.5 audio-seconds of training content per wall-clock second; `--batch 5 --ckpt auto` was forced to 4 checkpoint segments to fit batch 5 at full depth at all (batch 5 does **not** fit full-depth on this card with `--ckpt 0` — the auto-fit correctly reduces B to 1 rather than touch depth, confirming the C4 order), auto-fit a smaller 524-frame crop, and ran ~5.3 audio-seconds/wall-second — **~2.5× SLOWER**, not the ≥3× hoped for. Layers=8 (shallow, LoRA rank-16, no MLP) tells the opposite story: the grid's own probe timings show batching there is ~2.4× **faster** per crop. Read together: batching's ROI is depth/shape-dependent — a already-compute-bound full-depth 32-layer graph on a fast card gets little from wider batches while paying checkpointing's ~30-40% extra-forward tax and a forced-smaller crop; a shallow/small graph that under-uses the GPU at batch 1 gets a real win. Neither Side-Step's 0.223 s/(60 s crop) anchor nor the ≥3× target is met at full depth on this card/config — reported honestly per the design's own instruction to do so; smaller-depth or larger-VRAM configurations are the likelier place batching pays off and are untested here.
 - bf16-mirror A/B (same-seed loss-curve diff, `--mirror f32` vs `--mirror bf16`) repeated at `--batch 5` (LoRA rank-16, `--layers 8`, `--ckpt 0`, 10 epochs): max abs loss delta **7.9e-5**, max relative delta **5.8e-5** — essentially unchanged from the original batch-1 measurement (7.6e-5), so amendment A2's CUDA GEMM-route change (batched-cublas at B>1) does not measurably widen the f32/bf16 drift.
 - **`--mirror bf16-f32` (2026-09-02) is the mode to reach for, not `bf16`.** `bf16` does not merely store the frozen weight in BF16 — it rounds activations and gradients to BF16 at every trainable-layer GEMM, and the adapters that come out of it sound coarse and "bitty" by ear. `bf16-f32` keeps the BF16 store and casts each weight to F32 at its `mul_mat` site, so the arithmetic is the f32 mirror's while residency is the bf16 mirror's.
-- Measured on mika (32-layer XL base, LoKR dim 512 + MLP, `--attn flash --bwd mm --optimizer muon`, 12 same-seed epochs, crop pinned 552): `bf16-f32` is **bit-identical to `--mirror f32`** on `loss`/`ma5`/`raw`/`gnorm` at every epoch — to the last digit of the full-precision run log, and the two exported `lokr_weights.safetensors` share an MD5 — where `bf16` diverges from epoch 1 and reaches 7.8e-3 by epoch 12 (and 2.0e-2 at epoch 6, where its `gnorm` reads 20.7 against 13.0). Mirror 8133 MB vs f32's 15893 MB; trainer-owned peak 14370 MB vs bf16's 14190 MB and f32's 21997 MB — the transient F32 window costs 180 MB, not 7.8 GB. Unpinned, the flash auto-fit picks crop **1542** against f32's 610 and bf16's 1632. It is not free: ~3.21 s/epoch against f32's 2.56 and bf16's 2.17 (+25% over f32 at equal crop), which the 2.5× crop repays.
+- Measured on one album dataset (32-layer XL base, LoKR dim 512 + MLP, `--attn flash --bwd mm --optimizer muon`, 12 same-seed epochs, crop pinned 552): `bf16-f32` is **bit-identical to `--mirror f32`** on `loss`/`ma5`/`raw`/`gnorm` at every epoch — to the last digit of the full-precision run log, and the two exported `lokr_weights.safetensors` share an MD5 — where `bf16` diverges from epoch 1 and reaches 7.8e-3 by epoch 12 (and 2.0e-2 at epoch 6, where its `gnorm` reads 20.7 against 13.0). Mirror 8133 MB vs f32's 15893 MB; trainer-owned peak 14370 MB vs bf16's 14190 MB and f32's 21997 MB — the transient F32 window costs 180 MB, not 7.8 GB. Unpinned, the flash auto-fit picked crop **1542** against f32's 610 and bf16's 1632 (before the 800-frame default cap). It is not free: ~3.21 s/epoch against f32's 2.56 and bf16's 2.17 (+25% over f32 at equal crop), which the 2.5× crop repays.
 - Loss curves at the throughput bench's Side-Step-parity LR (0.01) do **not** cleanly descend over just 10 toy epochs on a 5-song dataset — the cosine schedule (tuned for hundreds of production epochs) compresses its whole warmup+decay into 10-20 steps, producing a noisy rise-then-plateau in both the batch-1 and batch-5 runs. A same-config re-run at LR 0.001 descends cleanly in both (ma5 1.27→1.04 at batch 1, 1.34→1.09 at batch 5) confirming the mechanism itself is sound — the non-descent at LR 0.01 is a toy-bench artifact (LR schedule too aggressive for a 10-epoch/5-song smoke run), not a regression.
 
 **`--bwd <outprod|mm>` — the mul_mat-backward reformulation** (2026-07-29, the HOT-ggml `mm-backward` change)
@@ -1062,7 +1282,7 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 - **Defaults are deliberately split three ways.** The engine default is `outprod` (a bare `ace-train` invocation is unchanged). The **server** defaults **train-dit to `mm`** and **train-lm to `outprod`** — the LM's `weights` already defaults to `bf16`, so an LM default of `mm` would brick the *default* LM job on the collision above. `buildTrainLmArgs`/`buildTrainDitArgs` always emit `--bwd` so an older `ace-train.exe` rejects it loudly instead of silently running the slow path. Surfaced as "Backward GEMM" in both Advanced drawers; recorded in the `start` JSONL event and in `dit_train_log.json` / `lm_train_log.json`'s `config.bwd`.
 
 **Trigger words (embedded in the adapter)**
-- The tag was always trained in — `preprocess-run.h:192-204` bakes `custom_tag` into the caption before text encoding, and `lm-extract.h` re-applies it — but export used to drop it, leaving inference to guess the trigger from the filename (wrong for our adapters: the dir is `<name>-<size>`, not the tag).
+- The tag was always trained in — `pp_caption_text` in `preprocess-run.h` bakes `custom_tag` into the caption before text encoding, and `lm-extract.h` re-applies it — but export used to drop it, leaving inference to guess the trigger from the filename (wrong for our adapters: the dir is `<name>-<size>`, not the tag).
 - Both trainers now write `hot_step_trigger`, `hot_step_trigger_position` and `modelspec.trigger_phrase` into the adapter's safetensors `__metadata__`. Tensors and `adapter_config.json` are untouched, so ComfyUI/PEFT/Side-Step load it exactly as before. **Not** `adapter_config.json` — PEFT does `LoraConfig(**json)` and unknown keys are a version-dependent TypeError.
 - Source of the value: `--trigger`/`--trigger-position` flags, else the variant's `preprocess_meta.json` (`custom_tag`/`tag_position`). The **variant meta, not the dataset row**, is authoritative — a dataset's tag can be edited after preprocessing, in which case the tensors (and the adapter) carry the old one.
 - **All three positions are real, and `replace` means the caption IS the trigger (2026-08-12).** Before this, `replace` applied no tag at all during preprocessing (verbatim Side-Step), so the Build panel's "Instead of the caption" option silently trained a *captionless, triggerless* adapter and export refused to embed a trigger for it. Now `pp_caption_text` collapses the caption to the tag, `lm_apply_tag` matches, and `lm_trigger_normalize` embeds it. Under `replace` the sidecar's descriptive caption **and** the genre ratio are both discarded — only the `# Metas` block (bpm/timesignature/keyscale/duration) and the lyric prompt still vary per sample.
@@ -1079,7 +1299,7 @@ Same again with the live teacher (drop `--reg-topk`, it does nothing here):
 
 **Audition (pure-LM preview)**
 - `POST /codes-decode`: codes → `detok_ggml_decode` → tail-call the existing VAE decode worker (layouts are byte-identical; zero changes to `/vae`). Deterministic; full song ≈ 3.1 s warm.
-- A/B = two `/lm` calls, same explicit `lm_seed`, base side **must** byte-match an adapterless run (V5 hard gate). Base LM auto-derived from the adapter's `-<size>` suffix (`pickLmFor`) — never let the engine's `resolve_name` fallback pick (sticky 0.6B met a 4B adapter: "36 layers but model has 28").
+- A/B = two `/lm` calls, same explicit `lm_seed`, base side **must** byte-match an adapterless run (V5 hard gate). Base LM auto-derived from the adapter's `lm-<size>` parent folder, with the `-<size>` name suffix as the legacy fallback (`lmSizeOfAdapterPath`, then `pickLmFor`) — never let the engine's `resolve_name` fallback pick (sticky 0.6B met a 4B adapter: "36 layers but model has 28").
 - LM-echo sideband trap: never forward the `/lm` reply into another request — build requests fresh (see `generation-request-flow` skill).
 
 **Adapter parameterizations beyond LoRA/LoKr (2026-09-04)**
@@ -1091,21 +1311,21 @@ All are `train-dit --adapter-type lora` variants (rsLoRA and LoRA+ also in `trai
 | `--rslora` | scale `alpha/sqrt(r)` in-graph | `use_rslora: true`; honoured by merge, runtime and the LM loader — trainer and loaders MUST agree or every adapter merges at the wrong strength silently | config + merge log |
 | `--lora-plus-ratio f` | B tensors at `f x` A's LR (paper 16). AdamW-rule tensors only; Muon ignores `lr_mul` | none (training-only) | per-tensor group log |
 | `--hira` | `W + W (.) (BA)` — a full `[in,out]` delta per site, materialised in-graph | `peft_type: HIRA`; merge = Hadamard with the base; runtime low-rank path REFUSES | `HOTSTEP_DIT_ST_HIRA=1` T4; merge 352 pairs |
-| `--hra` | HRA (Householder Reflection Adaptation): `y = W (R x)`, `R = H_{r-1}..H_0`, `H = I - 2vv^T/||v||^2`, r = `--rank` (even; pairs start equal so R = I). Orthogonal fine-tuning without the Cayley inverse OFT/BOFT need, which ggml cannot express. Each reflection is a matvec + broadcast divide + K=1 outer-product matmul on the site's input (not `ggml_repeat`: REPEAT's shape template may not need gradients) | `R - I` has rank <= r, so `W(R-I) = (W U) Q^T` (Q = basis of span(v), U = (R-I)Q) is an EXACT rank-r plain LoRA (alpha = r); `W U` runs on the GPU through the adapter's scheduler handle; raw vectors in `hra_vectors.safetensors` for the resume. Step time ~10x a LoRA's at r=8 (the reflections run on every site's activations): 25 s vs 2.5 s per epoch on the mj_dangerous smoke | `HOTSTEP_DIT_ST_HRA=1` T4 (16 probes, max rel 5.6e-4); 2-epoch smoke; resume (352 tensors); merge 352 pairs |
+| `--hra` | HRA (Householder Reflection Adaptation): `y = W (R x)`, `R = H_{r-1}..H_0`, `H = I - 2vv^T/||v||^2`, r = `--rank` (even; pairs start equal so R = I). Orthogonal fine-tuning without the Cayley inverse OFT/BOFT need, which ggml cannot express. Each reflection is a matvec + broadcast divide + K=1 outer-product matmul on the site's input (not `ggml_repeat`: REPEAT's shape template may not need gradients) | `R - I` has rank <= r, so `W(R-I) = (W U) Q^T` (Q = basis of span(v), U = (R-I)Q) is an EXACT rank-r plain LoRA (alpha = r); `W U` runs on the GPU through the adapter's scheduler handle; raw vectors in `hra_vectors.safetensors` for the resume. Step time ~10x a LoRA's at r=8 (the reflections run on every site's activations): 25 s vs 2.5 s per epoch on a one-album smoke | `HOTSTEP_DIT_ST_HRA=1` T4 (16 probes, max rel 5.6e-4); 2-epoch smoke; resume (352 tensors); merge 352 pairs |
 | `--pissa` | init only: A/B start on W's top-r singular directions (GPU randomized SVD: q = r+8 columns, 2 power iterations, host QR + Jacobi on the small side) and the mirror's base keeps the residual `W - s B0 A0`, so the first forward is exactly W. Rank 16 captures ~50% of the weight energy on this DiT (random subspace: ~0.6%) | plain PEFT LoRA of rank 2r on the ORIGINAL base: `s(BA - B0A0) = s[B,-B0][A;A0]`, `r` and `lora_alpha` doubled; A0/B0 live in `pissa_init.L<l>.safetensors` beside the run. Merge and runtime need nothing new. NOT resumable (refused) | init energy diagnostic; 2-epoch smoke; merge |
 | `--loha` | `W + (B1A1) (.) (B2A2)` (LyCORIS LoHa), rank = `--rank`, effective rank up to r^2 | LyCORIS `lycoris_layers_<l>_<site>.hada_w{1,2}_{a,b}` + `.alpha` inside `adapter_model.safetensors`, `peft_type: LOHA`; `adapter_merge_loha` mirrors the LoKr merge; runtime REFUSES | `HOTSTEP_DIT_ST_LOHA=1` T4; merge 352 modules |
 
 - **A trained cond leaf changes the checkpoint plan.** The plan normally segments only the trained window and runs the frozen layers forward-only — exact for adapters, WRONG for anything the frozen layers consume: the V1 artist token feeds every layer's cross-attention, and the window plan dropped ~96% of its gradient (SC1 with `HOTSTEP_DIT_ST_ARTIST=4`: rel 1.01 vs monolithic, same at 1 and 2 segments; whole-stack plan: projection 1.0000, rel 1.7e-4). With a token the plan now spans all layers at the same layers-per-segment (`vm.full_stack_ckpt`), `--ckpt 0` is forced on, and the backward is correspondingly longer. Any future trained leaf below `lora_lo` needs the same.
 - HiRA and LoHa hold weight-sized F32 tensors per site for backward: `dit_hira_apply_arena_bytes(..., n_full)` (2 for HiRA, 3 for LoHa) is in the VRAM model and the auto-fit.
-- **FD-gate trap (hit twice):** an init that pins one factor to exactly zero (LoRA B, LoHa B2) makes the other factors' gradients exactly 0, and T4's `rel = |fd-g| / max(|fd|,|g|,1e-6)` then scores f32 noise against zero and fails. The rung sets `cfg.b_sigma`; every new parameterization's init must honour it. The self-test switches live in the FD child's cfg block (dit-selftest.h ~3770), not the first `b_sigma` block — the wrong block validates nothing.
+- **FD-gate trap (hit twice):** an init that pins one factor to exactly zero (LoRA B, LoHa B2) makes the other factors' gradients exactly 0, and T4's `rel = |fd-g| / max(|fd|,|g|,1e-6)` then scores f32 noise against zero and fails. The rung sets `cfg.b_sigma`; every new parameterization's init must honour it. The self-test switches live in the FD child's cfg block (dit-selftest.h ~3870), not the first `b_sigma` block — the wrong block validates nothing.
 - Resume: `--init-adapter` restores DoRA's `m` (absent = keeps the norm init, i.e. a plain-LoRA source resumed as DoRA) and LoHa's four factors through their LyCORIS keys; HiRA shares LoRA's A/B names. Round-tripped 2026-09-04 (1056 and 1408 tensors, epoch 1 at the source loss).
 
 **Soft prompts on the AS1.5 LM (artist tokens + KV prefix, 2026-09-03/04)**
 - `train-lm --artist-token <name> [--artist-token-k 32] [--artist-token-init <caption word>] [--artist-token-lr 5e-3] [--prefix-n 8]`. The token is k learned embedding rows behind a placeholder spliced into every caption (`prompt.h` `lm_append_user_span`, shared with inference so the k==0 prompt is byte-identical); the prefix is n trainable K/V columns per layer riding the frozen-KV-prefix machinery (no RoPE on prefix K; every row sees it; forces head-blocked attention OFF — the 4B's blocked path asserts on a prefix mask).
 - **One file:** everything lands in `adapter_model.safetensors` — `hot_step.artist_token.{vec,meta}`, `hot_step.prefix.L<l>.{k,v}`, `hot_step.prefix.meta` (site 1 = as15_lm, 2 = mm3_lm). The LM loader installs them when the adapter is selected; the engine applies the token at the prompt offset and seeds the prefix into the Phase-2 KV cache. `HOTSTEP_ARTIST_TOKEN` is only a standalone override.
-- Soft-prompt tensors get their own LR group (`--artist-token-lr`, always AdamW, even under Muon/Prodigy). They learn ~50x faster than the LoRA, so `--target-loss 1.5` fires early on a joint run — use 0.
+- Soft-prompt tensors get their own LR group (`--artist-token-lr`, always AdamW, even under Muon/Prodigy). They learn ~50x faster than the LoRA, so `--target-loss 1.5` fires early on a joint run (17 epochs, and the eval then showed a 6 s verbatim replay of training codes). The app's joint recipe stops at 4.0 instead: the arm picked by ear stopped at 3.87 (epoch 42) with no replay.
 - **Resume:** `--init-adapter` adopts the trained token/prefix from the file (lm-train-run.h, after the prefix init). The server therefore emits the soft-prompt flags on EVERY leg of a staged chain; a k/n that differs from the source run is refused as a shape mismatch.
-- Measured (mj_dangerous, 4B, `lm-adapter-eval.ts`, one run each): joint LoRA+token+prefix and LoRA-only both TOWARD; k=8 edged LoRA-only on transitions only; **k=32 won every metric** (unigram JS 0.739 vs 0.771; transitions 0.0121 vs 0.0177, under the album's own 0.0178 floor). Ear tests staged, unheard. Both trainers' Training Studio controls exist; the DiT-side contextualised token (V4) still needs the preprocess-stage encoders differentiated.
+- Measured (one album, 4B, `lm-adapter-eval.ts`, one run each): joint LoRA+token+prefix and LoRA-only both TOWARD; k=8 edged LoRA-only on transitions only; **k=32 won every metric** (unigram JS 0.739 vs 0.771; transitions 0.0121 vs 0.0177, under the album's own 0.0178 floor). The 2026-09-04 listening test then picked the joint k=32 arm (arm 05) by ear, and it became the app default (see the caption dropout block above). Both trainers' Training Studio controls exist; the DiT-side contextualised token (V4) still needs the preprocess-stage encoders differentiated.
 - Gradient sanity for anything touching the embedding stage: pin the token with `--lr 1e-12` and compare naive vs checkpointed loss/gnorm (9.354661/9.354632 agreed). `LmCkptRun::embed_build` alone STOPS uploading token ids — a get_rows hook needs `embed_uses_tok` or it reads a stale buffer (loss 24.5 vs 9.35, no error).
 
 ## Build & verification rules
@@ -1114,7 +1334,7 @@ All are `train-dit --adapter-type lora` variants (rsLoRA and LoRA+ also in `trai
 - `hot-step-server.cpp` (ace-server) changes: full `dev-rebuild.bat` cycle (app goes down; restart it with `dev.bat`). Never `build.cmd` directly, never `--clean-first`.
 - Self-tests are the regression net: `ace-train train-lm --self-test`, `ace-train train-dit --self-test`, `ace-train spike …` (gemmbench, bf16layer, dit2 — the measurement harnesses that justified every design call; keep them).
 - GPU discipline for agents: `nvidia-smi` before runs, stay under ~29 GB total, never kill the user's python/node/ace-server, bounded runs while the machine is in use.
-- TypeScript: `server` `npx tsc --noEmit`; `ui` `npx tsc -p tsconfig.app.json --noEmit` (one pre-existing error in `globalParamsStore.ts:449` — `lmAdapter` vs `lmAdapters` in `types.ts:347` — is NOT ours).
+- TypeScript: `server` `npx tsc --noEmit` (covers `server/src/` only; `server/scripts/` needs `npx tsc --noEmit -p scripts/tsconfig.json`); `ui` `npx tsc -p tsconfig.app.json --noEmit` (a bare `npx tsc --noEmit` in `ui/` checks nothing, see AGENTS.md).
 
 ## Measured reference numbers
 
@@ -1133,9 +1353,9 @@ All are `train-dit --adapter-type lora` variants (rsLoRA and LoRA+ also in `trai
 1. ~~One `dev-rebuild` owed~~ — **done**: the 2026-07-28 17:05 rebuild (during the SuperSep work) postdates every one of those source edits; `ace-train train-dit --help` shows `--no-target-mlp` and `ace-server.exe` carries the audition fixes.
 1b. **Trigger stamper awaits approval**: `node server/scripts/stamp-adapter-triggers.mjs --datasets D:\Ace-Step-Latest\Datasets-LoRA-LoKR` prints the proposed table for 179 adapters (28 from real dataset.json ground truth, 151 from the filename). Nothing is written without `--apply`. Also outstanding: the per-adapter **manual trigger override** UI — the server already accepts `triggerSpecs` entries with `source:'override'` and a `path`, but no control emits them yet.
 2. **bf16 listen test**: train twin LM adapters (f32-window vs `--weights bf16`), A/B via audition; ship-call by ear.
-3. **LoKR for DiT** (`dit-adapter.h` has the parameterization seam ready) — the preferred adapter type.
-4. **ConvRot bases**: refused by the trainer pending a convrot spike (`…-convrot-*` GGUFs exist).
-5. **BF16 `out_prod` vendor patch**: would ~2.5× DiT crop @24 GB, unlock 12 GB cards, and remove the bf16-lever's dst-rounding error — requires forking the ggml submodule (CI re-inits from upstream; see the rejected-P1 analysis in the levers plan).
+3. ~~**LoKR for DiT**~~: done. `train-dit --adapter-type lokr` (`dit-adapter-lokr.h`), and the ACE card and `train-dit` route default to it.
+4. **ConvRot bases**: `train-dit` still refuses a DiT GGUF that carries `acestep.convrot_map` (`convrot-unsupported`, `dit-mirror.h`) pending a convrot spike (`…-convrot-*` GGUFs exist). The YuE2 joint trainer has its own CUDA `CONVROT8` path for its ConvRot base.
+5. ~~**BF16 `out_prod` vendor patch**~~: settled. `engine/ggml` is now the HOT-ggml fork, and its `bf16-out-prod` change (Hook 7) gives ggml-cuda's `OUT_PROD` a BF16 `src0`. Small cards were unlocked another way: flash attention plus the bf16 mirror train at full depth on 12 GB free (DiT trainer above).
 6. **Top-K DiT adapter quality** on small cards: runs, but musical usefulness unmeasured.
 7. Micro-batching: closed with measurements; revisit only if the graph-build overhead picture changes.
 8. UI `minVram` hint string may be optimistic at r128+MLP defaults.

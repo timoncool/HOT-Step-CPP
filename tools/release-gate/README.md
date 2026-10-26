@@ -12,17 +12,26 @@ node tools/release-gate/run.mjs --url http://localhost:3000 --update-goldens --t
 ```
 
 Exit 0 is GO, exit 1 is NO-GO, exit 2 means it could not run (app busy, boot
-failed). The summary goes to `logs/release-gate/<stamp>/summary.md`, one log
-and one TAP file per tier sit beside it, and the renders land in
-`_experiments/_LISTENING/<stamp>-release-gate/` with a score sheet.
+failed). The summary goes to `logs/release-gate/<stamp>/summary.md` and
+`summary.json`, one log and one TAP file per tier sit beside it, and the renders
+land in `_experiments/_LISTENING/<stamp>-release-gate/` with a score sheet.
+
+Other flags: `--skip 6` runs every tier but training (lists and ranges such as
+`0-2,5` work for `--tiers` and `--skip`), `--offline` passes `--offline` to the
+prerequisites check in tier 0, and `--no-listen` leaves the renders unstaged.
+`--help` prints the usage.
+
+<!-- TODO(verify): "the half-hour subset" is an estimate; no full gate run is recorded under logs/release-gate/ in this checkout. -->
 
 ## Modes
 
 | Flag | App under test |
 |---|---|
 | none | Attaches to `--url` (default `http://localhost:3001`). Agents pass `--url http://localhost:3000` to attach through the Vite dev server instead of the raw Node port. Refuses to start if a generation or training job is running. Preprocess and training will stop and restart the engine, as they do from the UI. |
-| `--zip <file>` or `--dir <folder>` | Extracts or uses a release build, boots its bundled Node on `--port` 3199 with the engine on `--engine-port` 18085, and points it at this checkout's `models/` and `adapters/` (`--models`, `--adapters` to change). The data directory is the extracted folder's own, so it starts as a fresh install. Shut down at the end unless `--keep`. |
-| `--dev` | Spawns `tsx src/index.ts` from this tree on :3199 with an empty data directory under the run folder. |
+| `--zip <file>` or `--dir <folder>` | Extracts or uses a release build, boots its bundled Node on `--port` 3199 with the engine on `--engine-port` 18085, and points it at this checkout's `models/` and `adapters/` (`--models`, `--adapters` to change; when your data folder has moved, pass the `models` and `adapters` paths that `cd server && npx tsx scripts/data-paths.ts` prints). The data directory is the extracted folder's own, so it starts as a fresh install. Shut down at the end unless `--keep`. |
+| `--dev` | Spawns `tsx src/index.ts` from this tree on :3199 with `DATA_DIR` (the library) set to an empty folder under the run folder. |
+
+<!-- TODO(verify): bootApp in run.mjs sets HOT_STEP_ROOT but not HOT_STEP_DATA_ROOT or HOT_STEP_PROFILE_DIR. A release build then takes its data folder from the profile pointer (an installed release's folder, if one exists) or creates a sibling HOT-Step-Data and writes that pointer, so it is not a fresh install in the run folder. Fix the code, then drop this note. -->
 
 Testing the extracted zip is the point: a feature can work here because this
 machine holds a file the archive never got (#137, #139). Only the packaged
@@ -43,6 +52,8 @@ run. Everything else runs to completion so one report shows every failure.
 | 5 | analyze, supersep, stem-studio extract, mastering, a post-process re-run, MIDI transcription on a render. Missing binaries and models skip. | yes |
 | 6 | A dataset from this run's renders; build, preprocess, one epoch of DiT LoRA then a render with it, one epoch of 0.6B LM LoRA then a render with it; MM3 codes plus five planner steps; YuE2 joint train five steps. Trainers whose models are absent skip. | yes |
 | 7 | Fixed-seed renders per backend compared to stored spectral fingerprints in `goldens/` | warn only (`--strict-golden` to block) |
+
+<!-- TODO(verify): tier 2's log check (generationLog in lib.mjs) looks under <app root>/logs, but an app with a data folder writes <data root>/logs, so the check skips with "generation log not on this disk" there. Fix the lookup, then drop this note. -->
 
 Tier 3 is the one the others cannot replace. The hook in
 `pipeline-synth-ops.cpp` that routes through `hot-step-sampler.h` fails silently:

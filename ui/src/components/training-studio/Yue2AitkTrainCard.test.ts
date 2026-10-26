@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
+import { register } from 'node:module';
 import test from 'node:test';
-import { createPresetLoadGate } from './Yue2AitkTrainCard';
+
+// The card imports CSS, which the node loader cannot. Stub it for this file.
+register('data:text/javascript,' + encodeURIComponent(
+  'export async function load(url, ctx, next) { if (url.endsWith(".css")) return { format: "module", source: "export default {}", shortCircuit: true }; return next(url, ctx); }'));
+const { createPresetLoadGate } = await import('./Yue2AitkTrainCard');
 
 test('a delayed preset response cannot submit the old form through batch or exposed Start', async () => {
   const gate = createPresetLoadGate();

@@ -351,8 +351,12 @@ if not defined DETECTED (
 
 REM Delegate to build.cmd — handles vcvars, ORT, cuDNN, and cmake build.
 REM HOT_STEP_CMAKE_FLAGS env var overrides the default CUDA-only cmake flags.
+REM build.cmd changes directory and does not restore it, so keep our cwd.
+pushd "%HOTSTEP_REPO_DIR%"
 call engine\build.cmd
-if errorlevel 1 (
+set "ENGINE_RC=!errorlevel!"
+popd
+if not "!ENGINE_RC!"=="0" (
     echo.
     echo   ERROR: Engine build failed!
     echo   Check the output above for errors.
@@ -367,14 +371,43 @@ echo   Engine build complete.
 REM --- UI build ---
 :build_ui
 echo   Building UI...
-pushd ui
-REM Use npx vite build directly — bypasses tsc strict type-checking which
-REM may fail on transient TypeScript errors on master during development.
-call npx vite build
-if errorlevel 1 (
-    echo   WARNING: UI build had issues. The app may still work with old UI.
+if not exist "%HOTSTEP_REPO_DIR%ui\package.json" (
+    echo   ERROR: ui\package.json not found in %HOTSTEP_REPO_DIR%
+    goto :fail
 )
+pushd "%HOTSTEP_REPO_DIR%ui" || goto :fail
+if not exist "node_modules\.bin\vite.cmd" (
+    echo   UI dependencies missing, running npm ci...
+    call npm ci --no-audit --no-fund
+    if errorlevel 1 (
+        echo   npm ci failed, retrying with npm install...
+        call npm install --no-audit --no-fund
+        if errorlevel 1 (
+            echo   ERROR: UI npm install failed. See errors above.
+            popd
+            goto :fail
+        )
+    )
+)
+REM Marker file: dist\index.html must end up newer than this.
+set "UI_MARKER=%TEMP%\hotstep_ui_build_marker.txt"
+echo marker> "%UI_MARKER%"
+REM vite build from the local install only. Skips the tsc step of
+REM "npm run build", which may fail on transient TypeScript errors on master.
+call "node_modules\.bin\vite.cmd" build
+if errorlevel 1 (
+    echo   ERROR: UI build failed. See errors above.
+    popd
+    goto :fail
+)
+powershell.exe -NoProfile -Command "if ((Test-Path 'dist\index.html') -and (Get-Item 'dist\index.html').LastWriteTime -gt (Get-Item $env:UI_MARKER).LastWriteTime) { exit 0 } else { exit 1 }"
+set "UI_FRESH_RC=!errorlevel!"
+del "%UI_MARKER%" 2>nul
 popd
+if not "!UI_FRESH_RC!"=="0" (
+    echo   ERROR: ui\dist\index.html was not rebuilt by the UI build.
+    goto :fail
+)
 echo   UI build complete.
 
 REM ── Phase 5: Validation & Report ────────────────────────────────────

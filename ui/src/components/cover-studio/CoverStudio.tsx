@@ -50,7 +50,7 @@ import { useBackendStore } from '../../stores/backendStore';
 import { fetchYue2CaptionSource, resolveYue2Caption, yue2PickAtEnqueue, type Yue2SourceTrack } from '../../utils/yue2CaptionSource';
 import { yue2CoverApi, type Yue2CoverDatasetMetadata, type Yue2CoverJob, type Yue2CoverReadiness,
   type Yue2ScoreSection } from '../../services/yue2CoverApi';
-import { Yue2CoverPanel, COVER_AR_DEFAULT, clampCoverAr } from './Yue2CoverPanel';
+import { Yue2CoverPanel, COVER_AR_DEFAULT, clampCoverAr, COVER_GUIDE_DEFAULT, coverGuideBlock, type CoverGuideState } from './Yue2CoverPanel';
 import { resolveYue2Render, type Yue2RenderMode } from './yue2RenderMode';
 import { Yue2CoverScore } from './Yue2CoverScore';
 import { CoverResizeHandle } from './CoverResizeHandle';
@@ -75,6 +75,8 @@ import { coverLyricWorkflowApi as workflowApi } from '../../queries/cover-lyrics
 // serializes anyway, this keeps the client-side recombine→submit→poll ordered.
 const _coverQueue: Array<() => Promise<void>> = [];
 let _coverRunning = false;
+/** Builds with a Save song queued or rendering: Delete build waits, because the render reads the build's files. */
+const _savingBuilds = new Map<string, number>();
 // Survives Cover Studio remounts (it unmounts when you leave the tab) so a
 // previously-sent library track isn't re-applied every time you revisit (#61).
 let _lastConsumedCoverTs = 0;
@@ -208,6 +210,19 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   });
   const [yue2Ar, setYue2Ar] = useState(() => restore('yue2Ar', ''));
   const [yue2Nar, setYue2Nar] = useState(() => restore('yue2Nar', ''));
+  // #304: Base renders with no adapters, so a pair picked in the model picker
+  // was silently dropped. Custom's empty slots take the picker's pair, and a
+  // studio with no mode saved, loaded or clicked yet opens in Custom when the
+  // picker holds both halves. A saved mode always wins.
+  const modeChosen = useRef(restore<string | null>('pairMode', null) !== null);
+  const chooseRenderMode = (mode: Yue2RenderMode) => { modeChosen.current = true; setRenderMode(mode); };
+  const pickerAr = String(yue2Models?.defaults?.lmAdapterAr ?? '');
+  const pickerNar = String(yue2Models?.defaults?.lmAdapterNar ?? '');
+  useEffect(() => {
+    if (pickerAr) setYue2Ar(v => v || pickerAr);
+    if (pickerNar) setYue2Nar(v => v || pickerNar);
+    if (pickerAr && pickerNar && !modeChosen.current) { modeChosen.current = true; setRenderMode('custom'); }
+  }, [pickerAr, pickerNar]);
   const [selectedYue2ArtistId, setSelectedYue2ArtistId] = useState<number | null>(() => restore('selectedYue2ArtistId', null));
   const [selectedYue2LyricsSetId, setSelectedYue2LyricsSetId] = useState<number | null>(() => restore('selectedYue2LyricsSetId', null));
   const eligibleIds = new Set(allPresets.filter(p => p.yue2_ar_adapter_path && p.yue2_nar_adapter_path).map(p => p.lyrics_set_id));
@@ -229,6 +244,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [coverBpm, setCoverBpm] = useState(() => restore('coverBpm', 120));
   const [coverKeyShift, setCoverKeyShift] = useState(() => restore('coverKeyShift', 0));
   const [coverCfgScale, setCoverCfgScale] = useState(() => restore('coverCfgScale', 1));
+  const [coverGuide, setCoverGuide] = useState<CoverGuideState>(() => ({ ...COVER_GUIDE_DEFAULT, ...restore('coverGuide', {}) }));
   // Cover's own AR strength; it replaces the adapter picker's AR scale in every Cover request.
   const [coverArStrength, setCoverArStrength] = useState(COVER_AR_DEFAULT);
   const [coverLyricSchedule, setCoverLyricSchedule] = useState<'off' | 'bias' | 'mask'>(() => restore('coverLyricSchedule', 'off'));
@@ -433,6 +449,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => { persist('coverBpm', coverBpm); }, [coverBpm]);
   useEffect(() => { persist('coverKeyShift', coverKeyShift); }, [coverKeyShift]);
   useEffect(() => { persist('coverCfgScale', coverCfgScale); }, [coverCfgScale]);
+  useEffect(() => { persist('coverGuide', coverGuide); }, [coverGuide]);
   useEffect(() => { persist('coverLyricSchedule', coverLyricSchedule); }, [coverLyricSchedule]);
   useEffect(() => { persist('captionMode', captionMode); }, [captionMode]);
   useEffect(() => { persist('sheetAbc', sheetAbc); }, [sheetAbc]);
@@ -443,7 +460,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // The editing fields, mirrored into this browser's revisioned server draft.
   // coverDraftId/Revision stay local: they point at the workflow's cover-draft.
   const draft = useStudioDraftMirror('cover', token, { 'cover-studio-sourceFileName': sourceFileName, 'cover-studio-sourceAudioUrl': sourceAudioUrl, 'cover-studio-sourceAssetId': sourceAssetId, 'cover-studio-sourceSongId': sourceSongId, 'cover-studio-metadata': metadata, 'cover-studio-analysis': analysis, 'cover-studio-songArtist': songArtist, 'cover-studio-songTitle': songTitle, 'cover-studio-lyrics': lyrics, 'cover-studio-lyricsSource': lyricsSource, 'cover-studio-datasetAnalysis': datasetAnalysis, 'cover-studio-selectedArtistId': selectedArtistId, 'cover-studio-selectedPreset': selectedPreset, 'cover-studio-artistCaption': artistCaption, 'cover-studio-audioCoverStrength': audioCoverStrength, 'cover-studio-coverNoiseStrength': coverNoiseStrength, 'cover-studio-coverNoiseMethod': coverNoiseMethod, 'cover-studio-tempoScale': tempoScale, 'cover-studio-pitchShift': pitchShift, 'cover-studio-bpmCorrection': bpmCorrection, 'cover-studio-bpmOverride': bpmOverride, 'cover-studio-keyOverride': keyOverride, 'cover-studio-noFsq': noFsq, 'cover-studio-coverInstrumental': instrumental, 'cover-studio-sourceLatentUrl': sourceLatentUrl, 'cover-studio-coverVocalLanguage': vocalLanguage, 'cover-studio-coverTimbreOverride': timbreOverridePath, 'cover-studio-sepLevel': sepLevel,
-    'cover-studio-sourceMode': sourceMode, 'cover-studio-advancedMode': advancedMode, 'cover-studio-pairMode': renderMode, 'cover-studio-yue2Ar': yue2Ar, 'cover-studio-yue2Nar': yue2Nar, 'cover-studio-coverVoices': coverVoices, 'cover-studio-keepChords': keepChords, 'cover-studio-coverTempoMode': coverTempoMode, 'cover-studio-coverBpm': coverBpm, 'cover-studio-coverKeyShift': coverKeyShift, 'cover-studio-coverCfgScale': coverCfgScale, 'cover-studio-coverLyricSchedule': coverLyricSchedule, 'cover-studio-captionMode': captionMode, 'cover-studio-sheetAbc': sheetAbc, 'cover-studio-scoreSections': scoreSections, ...prep.draftFields, 'cover-studio-scoreTempoScale': scoreTempoScale, 'cover-studio-sheetAudioUrl': sheetAudioUrl, 'cover-studio-approvedSheet': approvedSheet, 'cover-studio-selectedYue2ArtistId': selectedYue2ArtistId, 'cover-studio-selectedYue2LyricsSetId': selectedYue2LyricsSetId, 'cover-studio-coveringBand': coveringBand, 'cover-studio-buildMode': buildMode, 'cover-studio-buildSessionId': buildSessionId, 'cover-studio-buildLyricsDraft': buildLyricsDraft, ...(draftName ? { 'cover-studio-draftName': draftName } : {}) },
+    'cover-studio-sourceMode': sourceMode, 'cover-studio-advancedMode': advancedMode, 'cover-studio-pairMode': renderMode, 'cover-studio-yue2Ar': yue2Ar, 'cover-studio-yue2Nar': yue2Nar, 'cover-studio-coverVoices': coverVoices, 'cover-studio-keepChords': keepChords, 'cover-studio-coverTempoMode': coverTempoMode, 'cover-studio-coverBpm': coverBpm, 'cover-studio-coverKeyShift': coverKeyShift, 'cover-studio-coverCfgScale': coverCfgScale, 'cover-studio-coverGuide': coverGuide, 'cover-studio-coverLyricSchedule': coverLyricSchedule, 'cover-studio-captionMode': captionMode, 'cover-studio-sheetAbc': sheetAbc, 'cover-studio-scoreSections': scoreSections, ...prep.draftFields, 'cover-studio-scoreTempoScale': scoreTempoScale, 'cover-studio-sheetAudioUrl': sheetAudioUrl, 'cover-studio-approvedSheet': approvedSheet, 'cover-studio-selectedYue2ArtistId': selectedYue2ArtistId, 'cover-studio-selectedYue2LyricsSetId': selectedYue2LyricsSetId, 'cover-studio-coveringBand': coveringBand, 'cover-studio-buildMode': buildMode, 'cover-studio-buildSessionId': buildSessionId, 'cover-studio-buildLyricsDraft': buildLyricsDraft, ...(draftName ? { 'cover-studio-draftName': draftName } : {}) },
     { ...(sourceAssetId ? { sourceAssetId } : {}), ...(sourceSongId ? { sourceSongId } : {}) });
   // Loading a draft sets the same state the controls edit. Its uploaded source
   // gets a fresh cover-draft from the stored analysis (no re-analysis, no job
@@ -496,6 +513,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (Object.hasOwn(f, 'cover-studio-advancedMode')) setAdvancedMode(f['cover-studio-advancedMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-pairMode')) {
       const mode = f['cover-studio-pairMode'];
+      modeChosen.current = true;
       setRenderMode(mode === 'pair' ? 'custom' : mode === 'artist' || mode === 'custom' ? mode : 'base');
     }
     if (Object.hasOwn(f, 'cover-studio-yue2Ar')) setYue2Ar(f['cover-studio-yue2Ar'] as never);
@@ -506,6 +524,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (Object.hasOwn(f, 'cover-studio-coverBpm')) setCoverBpm(f['cover-studio-coverBpm'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverKeyShift')) setCoverKeyShift(f['cover-studio-coverKeyShift'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverCfgScale')) setCoverCfgScale(f['cover-studio-coverCfgScale'] as never);
+    if (Object.hasOwn(f, 'cover-studio-coverGuide')) setCoverGuide({ ...COVER_GUIDE_DEFAULT, ...(f['cover-studio-coverGuide'] as object) });
     if (Object.hasOwn(f, 'cover-studio-coverLyricSchedule')) setCoverLyricSchedule(f['cover-studio-coverLyricSchedule'] as never);
     if (Object.hasOwn(f, 'cover-studio-captionMode')) setCaptionMode(f['cover-studio-captionMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-sheetAbc')) setSheetAbc(f['cover-studio-sheetAbc'] as never);
@@ -1070,6 +1089,21 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const applyRemeter = () => {
     if (remeterOpen?.abc && prep.applyStructuralOp({ kind: 'replace', abc: remeterOpen.abc })) setRemeter(null);
   };
+  // Bar lines a beat or more off the song's downbeats: the same preview, then one edit.
+  const [barShift, setBarShift] = useState<{ from: string; beats: number; abc?: string; error?: string } | null>(null);
+  const barShiftOpen = barShift?.from === sheetAbc ? barShift : null;
+  const previewBarShift = async (beats: number) => {
+    if (!token) return;
+    const from = sheetAbc;
+    const settle = (result: object) => setBarShift(current =>
+      current?.from === from && current.beats === beats ? { ...current, ...result } : current);
+    setBarShift({ from, beats });
+    try { settle(await yue2CoverApi.shiftBars(from, beats)); }
+    catch (err) { settle({ error: (err as Error).message }); }
+  };
+  const applyBarShift = () => {
+    if (barShiftOpen?.abc && prep.applyStructuralOp({ kind: 'replace', abc: barShiftOpen.abc })) setBarShift(null);
+  };
 
   // The original source, never a recombined mix: its vocal stem is what the
   // aligner reads, and its path is what finds the dataset song.
@@ -1281,6 +1315,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     const qId = addManualQueueItem({ title, artistName: String(buildSession.params.artistName || ''), caption: String(buildSession.params.caption || '') });
     updateManualQueueItem(qId, { stage: _coverRunning ? 'Queued…' : 'Preparing…' });
     setIsGenerating(true);
+    _savingBuilds.set(sessionId, (_savingBuilds.get(sessionId) ?? 0) + 1);
     enqueueCoverJob(async () => {
       try {
         const res = await generateApi.submit(params as any);
@@ -1290,7 +1325,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         // still the open one; any other outcome keeps it for a retry.
         if (outcome === 'succeeded') finishSavedBuild(sessionId);
       } catch (err: any) { failManualQueueItem(qId, err.message || 'Generation failed'); }
-      finally { if (_coverQueue.length === 0) { setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage(''); } }
+      finally {
+        const left = (_savingBuilds.get(sessionId) ?? 1) - 1;
+        if (left > 0) _savingBuilds.set(sessionId, left); else _savingBuilds.delete(sessionId);
+        if (_coverQueue.length === 0) { setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage(''); }
+      }
     });
     showToast('Saving the build as a song: it is in the queue');
   };
@@ -1314,8 +1353,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       blocked={buildSession ? '' : typeof draftParams === 'string' ? `${draftParams} on the Prepare page.` : !canGenerate ? 'Finish the Prepare page first.' : ''}
       busy={build.busy} error={build.error} caption={buildCaption(params ?? undefined)}
       onOccurrenceLyrics={edits => void build.occurrenceLyrics(edits)}
-      onGenerate={generateBuildTakes} onPlan={planBuild} onCancel={() => void build.cancel()} onKeep={(take, crop) => void build.keep(take, crop)} onDelete={take => void build.remove(take)}
-      onUndo={section => void build.undo(section)} onStartOver={build.startOver} onSave={saveBuild}
+      onGenerate={generateBuildTakes} onPlan={planBuild} onCancel={() => void build.cancel()} onKeep={(take, crop, count) => void build.keep(take, crop, count)} onDelete={take => void build.remove(take)}
+      onUndo={section => void build.undo(section)} onStartOver={build.startOver} onDeleteBuild={() => buildSession && _savingBuilds.has(buildSession.id) ? showToast('A Save song render is queued for this build; delete it once that finishes.') : void build.deleteBuild()} onSave={saveBuild}
       onCrop={(take, frame, mode) => void build.crop(take, frame, mode)} onTrim={(take, seconds) => void build.trim(take, seconds)} onPreview={() => void build.preview()}
       onBack={() => setBuildMode(false)} />;
   };
@@ -1373,7 +1412,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     instrumental: renderInstrumental, source: 'cover-studio',
     ...(sourceMode === 'audio' ? { sourceAudioUrl: approvedSheet.audioUrl } : {}),
     yue2Cover: sourceMode === 'audio'
-      ? { sourceId: approvedSheet.sourceId, sourceLabel: approvedSheet.sourceLabel, ...coverChoices }
+      ? { sourceId: approvedSheet.sourceId, sourceLabel: approvedSheet.sourceLabel, ...coverChoices,
+          ...(coverGuide.on && !coverGuideBlock(coverKeyShift, coverTempoMode)
+            ? { guide: (({ on: _on, ...rest }) => rest)(coverGuide) } : {}) }
       : { sourceKind: 'musicxml', ...coverChoices },
     yue2Abc: approvedSheet.abc, yue2Prepare: prep.doc, yue2Cot: keepChords ? 'full' : 'melody', yue2Pick: pair };
     return { params, title };
@@ -1844,6 +1885,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             {prep.step === 'structure'
               ? <PrepareStructure prep={prep} sourceAudioUrl={sourceMode === 'audio' ? sourceAudioUrl : ''} scorePlaying={scorePlaying}
                 onPlayScore={playScore} scoreStarts={scoreStarts} onHighlight={setScoreHighlight}
+                planFromLyrics={token && lyrics.trim() && sourceMode === 'audio' && sourceAudioUrl
+                  ? () => yue2CoverApi.planScoreSections({ ...sectionSource(), abc: prep.doc.abc, lyrics }) : undefined}
                 onConfirmed={() => void handleApproveSheet()}>
                 {mainMeter(sheetAbc) === '2/4' && !remeterOpen &&
                   <button type="button" onClick={() => void previewRemeter(false)} disabled={sheetPreparing}
@@ -1867,6 +1910,34 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
                     <button type="button" onClick={applyRemeter} disabled={!remeterOpen.abc}
                       className="text-xs text-cyan-700 dark:text-cyan-300 disabled:opacity-40">Apply 4/4</button>
                     <button type="button" onClick={() => setRemeter(null)} className="text-xs text-zinc-500">Cancel</button>
+                  </div>
+                </div>}
+                {sheetAbc.trim() && !barShiftOpen && <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="text-zinc-500">Bar lines off?</span>
+                  {([[-1, 'A beat earlier', 'after'], [1, 'A beat later', 'before']] as const).map(([beats, label, when]) =>
+                    <button key={beats} type="button" onClick={() => void previewBarShift(beats)} disabled={sheetPreparing}
+                      title={`Move every bar line ${label.toLowerCase()}, keeping each note where it sounds. Use it when the bar-1 click lands a beat ${when} the song's downbeat. Shows a preview before applying.`}
+                      className="rounded-md border border-cyan-500/50 px-2 py-1 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-40">{label}</button>)}
+                </div>}
+                {barShiftOpen && <div className="space-y-2 rounded-lg border border-cyan-500/30 p-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                    <button type="button" onClick={() => void previewBarShift(barShiftOpen.beats === 1 ? -1 : barShiftOpen.beats - 1)}
+                      className="rounded-md border border-zinc-300 dark:border-white/10 px-2">−</button>
+                    <span>Bar lines {Math.abs(barShiftOpen.beats)} beat{Math.abs(barShiftOpen.beats) > 1 ? 's' : ''} {barShiftOpen.beats < 0 ? 'earlier' : 'later'}</span>
+                    <button type="button" onClick={() => void previewBarShift(barShiftOpen.beats === -1 ? 1 : barShiftOpen.beats + 1)}
+                      className="rounded-md border border-zinc-300 dark:border-white/10 px-2">+</button>
+                  </div>
+                  {barShiftOpen.error ? <p role="alert" className="text-xs text-red-500">The bar lines cannot be moved: {barShiftOpen.error}</p>
+                    : !barShiftOpen.abc ? <p className="text-xs text-zinc-500">Moving…</p>
+                    : <>
+                      <p className="text-xs text-zinc-500">Every note keeps its time; notes across a new bar line are tied and section starts move with their bar lines.
+                        Applying replaces this cover's score (the dataset files are not changed) and can be undone above; the structure then needs confirming again.</p>
+                      <AbcChart abc={barShiftOpen.abc} disabled height={240} playingBar={null} onAbcChange={() => {}} />
+                    </>}
+                  <div className="flex gap-3">
+                    <button type="button" onClick={applyBarShift} disabled={!barShiftOpen.abc}
+                      className="text-xs text-cyan-700 dark:text-cyan-300 disabled:opacity-40">Apply</button>
+                    <button type="button" onClick={() => setBarShift(null)} className="text-xs text-zinc-500">Cancel</button>
                   </div>
                 </div>}
               </PrepareStructure>
@@ -1907,6 +1978,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         <CoverResizeHandle label="Resize lyrics and score column" direction="horizontal" onMouseDown={e => startResize(e, scoreWidth, setScoreWidth, 320, 1200)} />
         {/* Right: Artist + Settings */}
         {yue2Mode ? <div className="min-w-[300px] flex-1 flex flex-col min-h-0" style={{ flexBasis: settingsWidth }}>
+          {renderMode === 'base' && (pickerAr || pickerNar) && <p className="px-4 pt-3 text-xs text-amber-600 dark:text-amber-400">
+            {t('cover.yue2BaseIgnoresLora')}</p>}
           <Yue2CoverPanel
           caption={artistCaption} onCaptionChange={value => { setArtistCaption(value); setCaptionMode('custom'); }}
           captionMode={captionMode} onCaptionMode={selectCaptionSource}
@@ -1919,7 +1992,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           buildStatus={buildSession ? `Build in progress: ${Math.min(nextBuild, buildSession.sections.length)} of ${buildSession.sections.length} sections` : ''}
           onStartOverBuild={buildSession ? build.startOver : undefined}
           instrumental={renderInstrumental} onInstrumentalChange={() => showToast('Instrumental follows the lyrics: mark every section Instrumental in Assign lyrics, or give a section words.')}
-          renderMode={renderMode} onRenderMode={setRenderMode}
+          renderMode={renderMode} onRenderMode={chooseRenderMode}
           ar={yue2Ar} nar={yue2Nar} onAr={setYue2Ar} onNar={setYue2Nar}
           arOptions={adapterOptions('ar')} narOptions={adapterOptions('nar')}
           keepChords={keepChords} onKeepChords={setKeepChords}
@@ -1931,6 +2004,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           cfgScale={coverCfgScale} onCfgScale={setCoverCfgScale}
           arStrength={coverArStrength} onArStrength={v => setCoverArStrength(clampCoverAr(v))}
           lyricSchedule={coverLyricSchedule} onLyricSchedule={setCoverLyricSchedule}
+          guide={coverGuide} onGuide={setCoverGuide} hasSourceAudio={sourceMode === 'audio'}
           canGenerate={canGenerate} isGenerating={isGenerating} onGenerate={handleGenerate}
           footer={draftsFold}
         />

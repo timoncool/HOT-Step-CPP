@@ -33,6 +33,7 @@ the job snapshot. EventSource and its flush timer close on unmount.
 |---|---|
 | `midi-studio/MidiStudio.tsx` | Status/jobs queries and canonical shared songs; upload/transcribe/token/download/delete commands |
 | `midi-studio/MidiPlayer.tsx` | Notes query; live note SSE and playback remain streams/client state |
+| `midi-studio/MidiExportPanel.tsx` | Notes query (tempo grid, channels); MIDI re-export and ABC lead-sheet commands, and a re-export invalidates the notes and jobs |
 | `midi-studio/midiSynth.ts` | WebAudio scheduling only |
 | `stem-studio/StemStudio.tsx` | Model query, Query-observed extraction progress and result; editable mixer remains local |
 | `stem-studio/SourceSelector.tsx` | Filtered recent-song query; upload command |
@@ -47,6 +48,10 @@ the job snapshot. EventSource and its flush timer close on unmount.
 | `insta-gen/InspirePreview.tsx` | Form props and types only |
 | `storm/StormPage.tsx` | Observes the canonical plugins key/read directly; dropdown projection uses `select` |
 | `storm/StormLiveControls.tsx` | LLM generation commands and audio controls |
+| `storm/DriftPanel.tsx` | Not on Query yet: polls `/api/generate/storm/control?streamId=` every 2 s with raw `fetch` into component state while the stream plays, and posts drift changes as commands ([tanstack-query.md](../../../../docs/dev/tanstack-query.md) F3, P4) |
+| `compare-studio/CompareStudio.tsx`, `stores/compareStore.ts` | Not on Query yet: session list, session, take analysis, diff and song search are read with direct `compareApi` calls into a hand-rolled store; scores, takes and archive are commands (tanstack-query.md F3) |
+| `compare-studio/SessionView.tsx`, `TakeRow.tsx`, `DiffTrace.tsx` | Types, store state and store actions (score, remove take); no reads of their own |
+| `compare-studio/useAbEngine.ts` | Take audio fetched as media for the A/B engine; no snapshot |
 | `storm/AiContinuePresetModal.tsx` | Uses shared `PresetCollection`/`SettingDocument`; their Query adoption belongs to shell-queue's owned service files |
 | `assistant/AssistantPanel.tsx` | Provider query; chat remains a streaming command |
 | `hooks/useStreamAudio.ts` | STORM stream/control/stop commands, analysis commands, WebAudio and device recording timers |
@@ -55,8 +60,9 @@ the job snapshot. EventSource and its flush timer close on unmount.
 `shared.ts` keeps the exact canonical `{ songs }` wire shape. Models use the
 global-models options so model installation invalidates studio selectors too.
 The recent-song endpoint has a distinct response and filtered key, with no
-worker/backend scope because it is a local library resource. Song writers in
-the shell integration must also invalidate `resourceKey('studios/recent-songs')`.
+worker/backend scope because it is a local library resource. `SONG_VIEWS`
+includes `resourceKey('studios/recent-songs')`, so every song write in the
+shell invalidates it.
 
 Workflow reads use `sharedKeys.workflowJob(id, after)` and
 `sharedKeys.workflowDocument(id)`, with the auth session and captured id. Their
@@ -105,7 +111,7 @@ launch the app or claim visual/network acceptance.
 | Repaint/Layer/Insta-Gen | `/api/workflows/jobs/:id` and `/documents/:id`; existing `/jobs/:id/events` stream drives invalidation |
 | Insta-Gen | `/api/inspire/llm/providers`, `/llm/prompt`; prompt save/reset invalidates its query |
 | Assistant | `/api/assistant/providers`; `/chat` remains a streaming POST |
-| Storm | Shared `/api/plugins` registry; audio `/api/generate/storm/stream`, `/control`, `/stop` remain command/stream traffic |
+| Storm | Shared `/api/plugins` registry; audio `/api/generate/storm/stream`, `/control`, `/stop` remain command/stream traffic; the Drift panel polls `GET /api/generate/storm/control?streamId=` every 2 s while playing |
 
 1. Delay a MIDI list/progress response beyond 1.5 seconds. Confirm one cycle
    remains in flight, delete its row while delayed, release the response, and

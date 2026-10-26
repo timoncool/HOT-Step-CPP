@@ -847,7 +847,7 @@ export const GenerationDropdown: React.FC = () => {
         onChange={gp.setBatchSize} min={1} max={9} step={1}
         defaultValue={GLOBAL_PARAM_DEFAULTS.batchSize}
         infoMeta="default 1 · range 1-9"
-        info="How many takes to render from one request. The LM plans that many variations, then the DiT renders each in turn as its own song. With the LM off, or for cover and repaint tasks, extra takes reuse the same plan with a different random seed each." />
+        info="How many takes to render from one request. The LM plans once and every take reuses that plan with its own random DiT seed, the same as with the LM off or for cover and repaint tasks. The DiT renders the takes one after another as separate songs." />
     </div>
   );
 };

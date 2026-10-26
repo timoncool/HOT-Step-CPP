@@ -5,6 +5,7 @@
 #include "task-types.h"
 #include "yyjson.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -35,6 +36,10 @@ void request_init(AceRequest * r) {
     r->lm_cfg_scale         = 2.0f;
     r->lm_cfg_cutoff_ratio  = 1.0f;
     r->lm_top_p             = 0.9f;
+    r->lm_min_p             = 0.0f;
+    r->lm_cfg_min_p         = 0.0f;
+    r->lm_cfg_logprob       = false;
+    r->lm_cfg_rescale       = 0.0f;
     r->lm_top_k             = 0;
     r->lm_rep_penalty       = 1.0f;
     r->lm_rep_window        = 64;
@@ -259,6 +264,18 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "lm_top_p")) && yyjson_is_num(v)) {
         r->lm_top_p = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lm_min_p")) && yyjson_is_num(v)) {
+        r->lm_min_p = std::min(1.0f, std::max(0.0f, (float) yyjson_get_num(v)));
+    }
+    if ((v = yyjson_obj_get(obj, "lm_cfg_min_p")) && yyjson_is_num(v)) {
+        r->lm_cfg_min_p = std::min(1.0f, std::max(0.0f, (float) yyjson_get_num(v)));
+    }
+    if ((v = yyjson_obj_get(obj, "lm_cfg_logprob")) && yyjson_is_bool(v)) {
+        r->lm_cfg_logprob = yyjson_get_bool(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lm_cfg_rescale")) && yyjson_is_num(v)) {
+        r->lm_cfg_rescale = std::min(1.0f, std::max(0.0f, (float) yyjson_get_num(v)));
     }
     if ((v = yyjson_obj_get(obj, "lm_rep_penalty")) && yyjson_is_num(v)) {
         r->lm_rep_penalty = (float) yyjson_get_num(v);
@@ -529,6 +546,18 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
     if (all || r->lm_top_p != def.lm_top_p) {
         yyjson_mut_obj_add_real(doc, root, "lm_top_p", r->lm_top_p);
+    }
+    if (all || r->lm_min_p != def.lm_min_p) {
+        yyjson_mut_obj_add_real(doc, root, "lm_min_p", r->lm_min_p);
+    }
+    if (all || r->lm_cfg_min_p != def.lm_cfg_min_p) {
+        yyjson_mut_obj_add_real(doc, root, "lm_cfg_min_p", r->lm_cfg_min_p);
+    }
+    if (all || r->lm_cfg_logprob != def.lm_cfg_logprob) {
+        yyjson_mut_obj_add_bool(doc, root, "lm_cfg_logprob", r->lm_cfg_logprob);
+    }
+    if (all || r->lm_cfg_rescale != def.lm_cfg_rescale) {
+        yyjson_mut_obj_add_real(doc, root, "lm_cfg_rescale", r->lm_cfg_rescale);
     }
     if (all || r->lm_top_k != def.lm_top_k) {
         yyjson_mut_obj_add_int(doc, root, "lm_top_k", r->lm_top_k);

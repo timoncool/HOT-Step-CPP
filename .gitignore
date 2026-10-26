@@ -85,6 +85,11 @@ tools/codegraph/node_modules/
 !tools/listening-save.mjs
 !tools/listening-save.test.mjs
 !tools/engine-smoke.mjs
+!tools/sa3-training-reference.py
+!tools/sa3-training-block-fixture.py
+!tools/sa3-training-step-fixture.py
+!tools/sa3-training-check.mjs
+!tools/sa3-synth-model-check.mts
 !tools/yue2-aitk-reference/
 !tools/yue2-aitk-reference/**
 !tools/yue2-vae-train/
@@ -117,6 +122,7 @@ tools/discord-claude/persona.md
 engine/tests/*.log
 
 # Python
+.venv-sa3-reference/
 __pycache__/
 *.pyc
 *.pyo

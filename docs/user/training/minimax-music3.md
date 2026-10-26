@@ -1,6 +1,6 @@
 # MiniMax-Music3 training
 
-This guide covers training a MiniMax-Music3 (MM3) planner adapter in the [Training Studio](../studios/training-studio.md): what it changes, what the dataset needs, which recipe to pick and how to judge the checkpoints. MM3 must be the active backend, because the Training Studio trains for whichever backend is selected in the top bar. For how the trainer works inside, see [training internals](../../dev/training-internals.md).
+This guide covers training a MiniMax-Music3 (MM3) planner adapter in the [Training Studio](../studios/training-studio.md): what it changes, what the dataset needs, which recipe to pick and how to judge the checkpoints. MM3 must be the training target: make MiniMax-Music3 the active generation backend with the engine picker at the top of the sidebar, and leave the **Training target** picker above the phase tabs on **Active generation backend**. For how the trainer works inside, see [training internals](../../dev/training-internals.md).
 
 ## What you can train
 
@@ -19,10 +19,9 @@ form or DiT adapter picker to the app; the LM method controls below are unchange
 
 Create and label the dataset in the Dataset phase as for any backend (see [Training Studio](../studios/training-studio.md)). MM3 adds three requirements.
 
-Per-track MM3 captions. The trainer reads a Structured Caption from a `<stem>.mm3.txt` file beside each audio file, and refuses a run with no captions at all. These files are written by a caption pass with MOSS (local) or Gemini as the provider, from either Label or Enhance labels. Both listen to the track; BPM and key are then taken from the local analysis, because the captioners get them wrong. Do not rename the ACE-Step `.txt` sidecars to `.mm3.txt`: an ACE caption trains the wrong genre, and the rename puts the lyrics in the prompt twice. Lyrics come from the normal sidecar.
-<!-- TODO(verify): that mm3-condition takes lyrics from the <stem>.txt sidecar (inferred from the skill's "lyrics twice" note, not traced in code). -->
+Per-track MM3 captions. The trainer reads a Structured Caption from a `<stem>.mm3.txt` file beside each audio file, skips a track that has none, and refuses a run with no captions at all. These files are written by a caption pass with MOSS (local) or Gemini as the provider, from either Label or Enhance labels. Both listen to the track; BPM and key are then taken from the local analysis, because the captioners get them wrong. Do not rename the ACE-Step `.txt` sidecars to `.mm3.txt`: an ACE caption trains the wrong genre, and the rename puts the lyrics in the prompt twice. Lyrics come from `dataset.json`, which Build writes from the normal sidecars.
 
-RVQ codes. The trainer learns from codes, not audio. On the Codes page (the Preprocess slot, relabelled for MM3), press Export codes once per dataset. It took about a minute for 12 whole tracks in testing. The engine pauses while it runs.
+RVQ codes. The trainer learns from codes, not audio. On the Codes page (the Preprocess slot, relabelled for MM3), press Export codes once per dataset. The Codes page is a collapsible stage card like YuE2's preparation stages, and the **Codes** chip on the dataset card turns on when the export exists. It took about a minute for 12 whole tracks in testing. The engine pauses while it runs.
 
 Track length under six minutes. The recipe trains every track as one whole sequence, up to 9000 frames (360 s). Longer tracks are left out and named in the log. The server refuses a run that this would cut by more than half.
 
@@ -90,7 +89,7 @@ The engine is paused while training runs, so you cannot generate until it finish
 
 ## Picking a checkpoint
 
-Checkpoints land straight in the MM3 adapter folder, so each one shows up in the LM Adapter dropdown as soon as it is saved. Each checkpoint gets a 40-second preview in the preview strip.
+Checkpoints land straight in the MM3 adapter folder, so each one shows up in the LM Adapter dropdown as soon as it is saved. Each checkpoint gets a 40-second preview in the **Previews** list under the running job. The preview settings sit in the collapsible **Audio previews during training** block, the shared block YuE2 and Stable Audio 3 also use; turning off **Render previews during training** sets both cadences (steps and minutes) to zero.
 
 Do not pick by held-out loss. It bottoms out early and then rises, while the checkpoint that sounds right came 1 to 8 times later in the sweeps behind this recipe. The held-out loss measures how well the adapter generalises to unseen songs, and the goal here is a clone of the seen ones. Treat it as an alarm for a run going badly wrong, nothing more.
 

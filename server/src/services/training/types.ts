@@ -9,6 +9,21 @@
 // ─── Core enums ────────────────────────────────────────────────────────────
 export type TagPosition = 'prepend' | 'append' | 'replace';
 
+/** SA3 Medium DoRA-rows. Resume uses the saved recipe and prepared snapshot;
+ * only the total step target may be increased. */
+export interface StartSa3TrainingRequest {
+  adapterName?: string;
+  steps?: number;
+  rank?: number;
+  alpha?: number;
+  learningRate?: number;
+  duration?: number;
+  seed?: number;
+  checkpointEvery?: number;
+  exportEvery?: number;
+  resumeRun?: string;
+}
+
 export type MergePolicy =
   | 'fill_missing'        // default: only write fields currently empty
   | 'overwrite_caption'
@@ -17,7 +32,7 @@ export type MergePolicy =
 
 export type TrainingJobKind =
   | 'label' | 'enhance-genius' | 'enhance-caption' | 'enhance-yue2-caption' | 'build'
-  | 'preprocess' | 'train-lm' | 'train-dit'
+  | 'preprocess' | 'train-lm' | 'train-dit' | 'sa3-train'
   | 'audition' | 'lm-calibrate' | 'dit-calibrate'
   // MiniMax-Music3 (docs/plans/2026-08-20-mm3-training-server-design.md §2.1).
   // Both are GPU-lane and both stop the engine: an MM3 training step peaks at

@@ -120,8 +120,8 @@ const ROLE_INFO: Record<string, string> = {
   supersep: 'Native GGML stem separation models for Cover Studio. BS-Roformer splits audio into six stems, Mel-Band RoFormer separates lead and backing vocals, and MDX23C isolates drum components. Install the model files for the separation stages you use.',
   whisper: 'OpenAI Whisper models for transcribing actual sung lyrics with word-level timestamps. Enable Whisper Lyrics in Post-Processing to use.',
   moss: 'MOSS-Music-8B — the only model here that ANALYSES audio rather than generating it. It captions your own tracks locally in the Training Studio, writing what it actually hears instead of rewriting a text analysis, and emits both the ACE-Step caption format and MM3 Structured Captions from a single pass. Pick one LM (Q8_0 recommended) plus the audio tower, which is required and never quantised. Nothing else in the app depends on these — they are only used when you choose MOSS as the caption provider.',
-  mm3: 'MiniMax-Music3 — a separate generation backend with its own models: a language model plus a 5-way split flow stack (depth decoder, condition encoder, DiT, vocoder — the LM and DiT are the two you must pick; the rest default to auto). All required roles load together, needing ~24 GB of VRAM. Switch to it via the Backend toggle in the top bar. A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
-  yue2: 'YuE2 — a third generation backend: a language model plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt (no headed caption template). Pick the LM plus exactly one VAE (Standard or Legacy — not both). Switch to it via the Backend toggle in the top bar. YuE2 is licensed CC BY-NC 4.0, but its authors have clarified that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial licence (gezhang@umich.edu). A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
+  mm3: 'MiniMax-Music3 — a separate generation backend with its own models: a language model plus a 5-way split flow stack (depth decoder, condition encoder, DiT, vocoder — the LM and DiT are the two you must pick; the rest default to auto). All required roles load together, needing ~24 GB of VRAM. Switch to it with the engine picker at the top of the sidebar. A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
+  yue2: 'YuE2 — a third generation backend: a language model plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt (no headed caption template). Pick the LM plus exactly one VAE (Standard or Legacy — not both). Switch to it with the engine picker at the top of the sidebar. YuE2 is licensed CC BY-NC 4.0, but its authors have clarified that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial licence (gezhang@umich.edu). A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
   // mm3Trt is NOT here — unlike every other entry in this record, it's new
   // text (the reviewer flagged it for i18n), so it's translated at its one
   // call site via t('models.mm3Trt.info') instead of joining this
@@ -622,7 +622,7 @@ const StableStepTab: React.FC<{
       {missing.length > 0 && (
         <div className="flex items-center justify-between px-1">
           <span className="text-[11px] text-zinc-500">
-            {files.length - missing.length}/{files.length} files installed &middot; GGML weights ~5.8 GB
+            {files.length - missing.length}/{files.length} files installed &middot; StableStep needs 4 GGUFs (~5.8 GB)
           </span>
           <button
             onClick={handleDownloadAll}
@@ -649,8 +649,10 @@ const StableStepTab: React.FC<{
                 GGML backend (universal — CUDA/Vulkan/CPU)
               </h4>
               <p className="text-[10px] text-zinc-500 leading-relaxed">
-                4 GGUF files (~5.8 GB). Runs on CUDA, Vulkan and CPU. Also
-                requires the tokenizer files below.
+                StableStep needs 4 of these GGUF files (~5.8 GB): SA3 DiT (GGML), SAME Encoder,
+                SAME Decoder and T5Gemma Text Encoder. The quantized SA3 DiT files are experimental
+                and used by the Stable Audio 3 backend; the SA3 Medium Base files are for adapter
+                training. Runs on CUDA, Vulkan and CPU. Also requires the tokenizer files below.
               </p>
             </div>
             {ggufFiles.map(f => (

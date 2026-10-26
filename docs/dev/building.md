@@ -36,6 +36,7 @@ CMake 3.21 or later is required (`engine/CMakeLists.txt`).
 | Xcode Command Line Tools 16+ | `xcode-select --install`. Provides the Metal SDK and compiler |
 | CMake 3.21+ | `brew install cmake` |
 | PowerShell 7 (`pwsh`) | `brew install powershell`. `engine/build-mac.sh` runs the hook check `engine/verify-hooks.ps1` with it and stops if `pwsh` is missing |
+| Ninja (optional) | `brew install ninja`. `engine/build-mac.sh` uses it when it is installed, and Unix Makefiles otherwise |
 | Node.js 20 to 24 LTS | `brew install node@24` |
 | Essentia (optional) | BPM and key detection. `bash tools/essentia/build-macos.sh Essentia`, or set `ESSENTIA_BIN` |
 
@@ -74,8 +75,11 @@ make install     # npm install in server/ and ui/
 make run         # ./launch.sh, production mode
 ```
 
-`make check-config`, `make check-node` and `make clean CONFIRM=1` are also available;
-`make help` lists every target. The Makefile picks the backend on its own: CUDA when a
+`make dev` runs `dev.sh` (Vite on :3000 and the server under `tsx watch`), `make dev-ui`
+runs Vite alone, `make build-ui` rebuilds `ui/dist`, and `make open` opens the Vite UI when
+it is running and :3001 otherwise (`OPEN_URL=` overrides). `make check-config`,
+`make check-node` and `make clean CONFIRM=1` are also available; `make help` lists every
+target. The Makefile picks the backend on its own: CUDA when a
 driver is visible (the CUDA bridge under `/usr/lib/wsl/lib` on WSL, `/usr/local/cuda`
 on native Linux), Vulkan if `glslc` is present, CPU otherwise. Force one with
 `BACKEND=cuda`, `BACKEND=vulkan` or `BACKEND=cpu`. The steps below are the same work run
@@ -126,15 +130,15 @@ through `dev-rebuild.bat`.
 ### macOS
 
 ```
-cd engine
-mkdir build && cd build
-cmake .. -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release -j $(sysctl -n hw.ncpu)
-cd ../..
+bash engine/build-mac.sh          # Release
+bash engine/build-mac.sh Debug    # Debug
 ```
 
-The Metal shader library is embedded in the binary, so no `.metallib` file is needed at
-runtime. CI adds `-DGGML_BACKEND_DL=OFF` for the macOS build.
+`build-mac.sh` runs `engine/verify-hooks.ps1` through `pwsh` and stops before CMake if a
+hook is missing, then configures `engine/build/` with `-DGGML_METAL=ON
+-DGGML_METAL_EMBED_LIBRARY=ON -DGGML_BACKEND_DL=OFF` (Ninja when installed) and builds on
+every core. The Metal shader library is embedded in the binary, so no `.metallib` file is
+needed at runtime. CI's macOS build uses the same Metal flags.
 
 ### Linux
 
@@ -149,7 +153,9 @@ cd ../..
 ```
 
 `engine/` also holds `buildcuda.sh`, `buildvulkan.sh`, `buildcpu.sh`, `buildall.sh`,
-`buildhip.sh` (ROCm) and `build-mac.sh`.
+`buildhip.sh` (ROCm) and `build-mac.sh`. `buildhip.sh` deletes `engine/build/` and
+rebuilds from scratch on every run, because a cache from another backend breaks a HIP
+configure.
 
 ## Get the models
 
@@ -189,9 +195,9 @@ launchers below are the end-user path.
 | Command | Mode | What starts |
 |---|---|---|
 | `LAUNCH.bat` | Production (Windows) | Builds `ui/dist` if it is missing, then runs `npx tsx src/index.ts` in `server/` in a restart loop. Open `http://localhost:3001`. End-user path — agents use `dev.bat` |
-| `dev.bat` | Development (Windows) | Two minimised windows: the server through `server/restart-loop.cmd` (`npx tsx watch src/index.ts`, with `HOT_STEP_DEV=1`), and Vite with `npx vite --port 3000 --host`. Open `http://localhost:3000` |
-| `launch.sh` | Production (macOS, Linux) | The Node server, using a bundled, Homebrew or system Node in that order |
-| `dev.sh` | Development (macOS) | Vite with `npx vite --port 3000 --host` and the server with `tsx watch src/index.ts` (`HOT_STEP_DEV=1`), in a restart loop like `dev.bat`'s. Open `http://localhost:3000` |
+| `dev.bat` | Development (Windows) | Two minimised windows: the server through `server/restart-loop.cmd` (`npx tsx watch src/index.ts`, with `HOT_STEP_DEV=1`), and Vite with `npx vite --port 3000 --host`. Then `open-browser-if-needed.mjs` opens `http://localhost:3000` unless a tab is already connected; `dev.bat --no-browser` (what `tools/detach.ps1` passes) skips it |
+| `launch.sh` | Production (macOS, Linux) | The Node server in a restart loop, using a bundled, Homebrew or system Node in that order. Installs server dependencies if missing, and builds `ui/dist` if missing when UI dependencies are installed |
+| `dev.sh` | Development (macOS, Linux) | Vite with `npx vite --port 3000 --host` and the server with `tsx watch src/index.ts` (`HOT_STEP_DEV=1`), in a restart loop like `dev.bat`'s. Installs missing dependencies and rebuilds `better-sqlite3` when it does not load under the current Node. Open `http://localhost:3000` |
 
 No `.env` is needed for a standard setup. The server finds the engine binary and
 `<data root>/models/` on its own. [config.md](config.md) lists everything you can override.
@@ -201,10 +207,11 @@ In dev mode, Vite serves the UI with hot module reload and proxies `/api`, `/aud
 under `server/src` changes. That restart kills any running generation or training job, so
 check that the app is idle before editing server code while it runs.
 
-`HOT_STEP_DEV=1` tells `POST /api/shutdown` that the Vite process on port 3000 belongs to
-the app. Shutdown kills it only after confirming it is a Node process running Vite.
+`HOT_STEP_DEV=1` tells `POST /api/shutdown` on Windows that the Vite process on port 3000
+belongs to the app. Shutdown kills it only after confirming it is a Node process running
+Vite.
 
-On macOS, `dev.sh` does both jobs itself. `tsx watch` keeps running after the server
+On macOS and Linux, `dev.sh` does both jobs itself. `tsx watch` keeps running after the server
 exits, so `dev.sh` watches the server process. When the server exits after writing
 `.restart-requested` (in-app Restart, or a finished worker update), `dev.sh` stops Vite
 and `tsx`, then starts both again from the current checkout. After Quit, Ctrl-C or
@@ -224,8 +231,12 @@ Do not run `npm run build` during development. Type-check instead:
 
 | Folder | Command |
 |---|---|
-| `server/` | `npx tsc --noEmit` |
+| `server/` | `npx tsc --noEmit` (or `npm run typecheck`) |
+| `server/scripts/` | `npx tsc --noEmit -p scripts/tsconfig.json`, run from `server/` |
 | `ui/` | `npx tsc --noEmit -p tsconfig.app.json` (or `npx tsc -b`) |
+
+The `server/` check covers only `server/src/`: `server/tsconfig.json` includes
+`src/**/*`, so a changed script is not checked unless you run the `scripts/` command too.
 
 A bare `npx tsc --noEmit` in `ui/` checks nothing and exits 0. `ui/tsconfig.json` has
 `"files": []` and only references `tsconfig.app.json` and `tsconfig.node.json`, so the root
@@ -249,9 +260,9 @@ drains, or when a `.gguf` appears in the models folder (checked every 5 s).
   `ace-server.exe` to exit, force-killing it after 10 seconds and giving up after 15; then
   calls `engine\build.cmd`. It is safe when the app is not running.
 - **Work-channel reservations are optional.** The rebuild runs without joining a channel by
-  default, even when `<data root>/library/collaboration.db` exists. If you are using the HOT-Step work
-  channel, set `HOTSTEP_WORK_CHANNEL=1` for the rebuild to reserve `app-server`, `gpu` and
-  `engine-build` through `work-run.ps1`. See the [work-channel guide](../../tools/mcp-lyricstudio/README.md#resource-reservations-and-guarded-commands).
+  default, even when `data/collaboration.db` exists at the checkout root. If you are using the
+  HOT-Step work channel, set `HOTSTEP_WORK_CHANNEL=1` for the rebuild to reserve `app-server`,
+  `gpu` and `engine-build` through `work-run.ps1`; it does so only when that database exists. See the [work-channel guide](../../tools/mcp-lyricstudio/README.md#resource-reservations-and-guarded-commands).
 - **It does not restart the app.** Start it again with `dev.bat`, detached (the shutdown also
   killed Vite); `LAUNCH.bat` is the end-user prod launcher.
 - **Check the build yourself.** Look for `error C` or `error LNK` lines in the output and
@@ -304,11 +315,13 @@ others). [ggml-fork.md](ggml-fork.md) lists each one and explains why it exists.
 - **`engine/verify-hooks.ps1` is the check to trust.** It greps for the symbols and marker
   comments themselves: the three upstream include hooks (`pipeline-synth-ops.cpp` includes
   `hot-step-sampler.h`, `model-store.h` includes `hot-step-params.h`, `dit.h` includes
-  `adapter-merge.h` and `adapter-runtime.h`), the MiniMax-Music3 and YuE2 route hooks in
-  `hot-step-server.cpp`, the `hotstep_sampler_linked_` linker sentinel, one check per
-  HOT-ggml change (hooks 7-16), and that `engine/ggml` is clean at the pinned commit
-  (Hook 17). Exit 0 means all present. `build.cmd` and `build-mac.sh` run it before every
-  compile.
+  `adapter-merge.h` and `adapter-runtime.h`), the `hot-step-server.cpp` hooks (its
+  `hot-step-params.h` include, the MiniMax-Music3 and YuE2 route hooks, and the model-family
+  boot gate), that `fsq-detok.h` and `fsq-tok.h` use the shared FSQ quantizer in
+  `fsq-quant.h`, the `hotstep_sampler_linked_` linker sentinel, one check per HOT-ggml change (hooks 7 to 16
+  and 18), and that `engine/ggml` is clean at the pinned commit (Hook 17). Exit 0 means all
+  present. `build.cmd` and `build-mac.sh` run it before every compile; `buildall.cmd`,
+  `buildcuda.cmd` and `buildvulkan.cmd` do not.
 
   ```
   powershell -File engine\verify-hooks.ps1        # Windows
@@ -331,9 +344,11 @@ others). [ggml-fork.md](ggml-fork.md) lists each one and explains why it exists.
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `release.yml` | Push of any `v*` tag, or manual preflight | Tag pushes build every platform and draft a release after the Windows archive gate passes. Manual preflight builds and tests all five Windows variants and uploads artifacts only |
-| `cache-warm.yml` | Push to `master` touching `engine/ggml` or `engine/CMakeLists.txt`, or manual | Builds the engine on `master` so tag builds can reuse the CMake cache. No packaging |
-| `rocm-build.yml` | Push or PR touching `engine/`, or manual | Compile-only ROCm/HIP check. Marked `continue-on-error`, so check the job, not the run colour |
+| `cache-warm.yml` | Push to `master` touching `engine/ggml`, `engine/CMakeLists.txt` or the workflow itself, or manual | Builds the engine on `master` so tag builds can reuse the CMake cache. No packaging |
+| `rocm-build.yml` | Push or PR touching `engine/` or the workflow itself, or manual | Compile-only ROCm/HIP check. Marked `continue-on-error`, so check the job, not the run colour |
 | `essentia.yml` | Called by `release.yml`, or manual | Builds the Essentia bundle for Linux and macOS |
+| `docs.yml` | Push to `master`, or any PR | Runs `node tools/docs/check-docs.mjs` on Node 24 |
+| `runpod-image.yml` | A published GitHub release, or manual on a `v*` tag | Builds the `runpod` Docker target and pushes it to GHCR. See the [RunPod guide](runpod.md) |
 
 `release.yml` build matrix:
 
@@ -343,7 +358,11 @@ others). [ggml-fork.md](ggml-fork.md) lists each one and explains why it exists.
 | Linux | `ubuntu-22.04` | `cuda13.1`, `cuda12.8`, `cuda12-volta`, `vulkan`, `rocm`, `cpu` |
 | macOS | `macos-15` | Metal |
 
-<!-- TODO(verify): rocm-build.yml says ROCm builds are not shipped, but release.yml's Linux matrix has a rocm variant and the release job collects every build artifact. Confirm whether a ROCm archive is published. -->
+The Linux `rocm` variant is packaged and published with the other archives
+(`HOT-Step-CPP-v<version>-linux-x64-rocm.tar.gz`). It covers RDNA2 to RDNA4
+(`gfx1030;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201`) and does not bundle the ROCm runtime,
+so users install ROCm themselves. `rocm-build.yml` is a separate compile check on engine
+pushes and pull requests.
 
 Each build job checks out `engine/ggml` at the pinned HOT-ggml commit and builds it as is.
 Windows and Linux build with Ninja; macOS uses the default generator. Any pushed `v*` tag
@@ -399,10 +418,11 @@ does not depend on it. Inspect its evidence even when the overall workflow is gr
 The trial downloads `lm-0.6b-q80`, `dit-std-base-q4km`, `embedding-q8` and `vae-bf16`
 from the registry, checks their file sizes, and requires the total to remain
 3,277,122,752 bytes. Downloads have a separate ten-minute budget and no model cache.
-It runs the packaged `ace-lm` and `ace-synth` sequentially with a shared five-minute
-inference budget, including model loading. The request is ten seconds, the LM's
-minimum supported duration, with one DiT step and flash attention disabled.
-The child processes use the packaged CPU backends and Windows system paths.
+It starts the packaged `ace-server` on `127.0.0.1:18085` with `--no-fa`, waits up to
+30 seconds for it to report healthy, then sends the request to `/lm` and the LM's
+output to `/synth`, with a shared five-minute inference budget that includes model
+loading. The request is ten seconds, the LM's minimum supported duration, with one
+DiT step. The server uses the packaged CPU backends and Windows system paths.
 
 The `cpu-generation-trial` artifact contains `download.json`, `inference.json`, CPU
 details, request JSON, process logs and any output WAV. Download timing is separate
@@ -428,11 +448,17 @@ Layout of a Windows package, as assembled by `release.yml`:
 | `runtime/node.exe` | Portable Node 24.18.0 |
 | `server/server.mjs` | The server bundled with esbuild (`release/esbuild.config.mjs`) |
 | `server/ffmpeg.exe` | From the `ffmpeg-static` package |
+| `server/node_modules/` | `better-sqlite3` with its native addon built for the bundled Node, plus `bindings` and `file-uri-to-path` |
 | `server/data/` | Everything from `server/src/data/`, copied whole |
-| `engine/` | `ace-server`, `ace-train`, `ace-caption`, `ace-midi`, `mastering`, `mp3-codec`, `neural-codec`, `quantize`, `vst-host`, the ggml DLLs for the variant, and `engine/plugins/` |
+| `engine/` | `ace-server`, `ace-train`, `ace-caption`, `ace-midi`, `mastering`, `mp3-codec`, `neural-codec`, `quantize`, `vst-host`, the ggml DLLs for the variant, the MSVC runtime DLLs, `engine/plugins/`, and the `.variant` marker (plus `.cuda-version` on CUDA) that the first-launch runtime download reads |
+| `ui/dist/` | The built UI |
+| `Essentia/`, `noise_samples/` | Copied from the repo |
+| `presets/yue2-plan-play/` | Profile presets users import by hand, from `docs/user/presets/` |
 | `plugins/` | The repo-root plugin overlay |
 | `VERSION` | The release version, shown by the app |
-| `.env.example` | Copied from the repo root |
+| `build-info.json` | The package's exact identity: tag, source commit, channel, OS, arch and asset variant. See [Releasing](releasing.md#build-identity) |
+| `.env.example` | `release/.env.example`, which leaves the managed paths unset |
+| `profile-path.mjs`, `README.txt` | From `release/` |
 | `HOT-Step.bat` | Launcher. Sets `HOT_STEP_ROOT` and runs `runtime\node.exe server\server.mjs` |
 | `open-browser-if-needed.mjs` | Browser helper the launcher starts on the bundled Node. It waits for `/api/health`, skips if a tab is already connected, and otherwise opens the URL through `explorer.exe` |
 
@@ -449,14 +475,16 @@ To build a package locally:
 
 | Platform | Command |
 |---|---|
-| Windows | `.\release\build-release.ps1 [-Version "1.5.0"] [-Variant cuda\|vulkan\|cpu] [-BuildBackend all\|cuda\|vulkan\|cpu] [-SkipEngine] [-SkipUI]`, output in `release/out/` |
-| macOS | `./package-release.sh [--skip-build] [--version=1.2.0]`, output `HOT-Step-CPP-v<version>-macOS-arm64.tar.gz` |
+| Windows | `.\release\build-release.ps1 [-Version "1.5.0"] [-Variant cuda -CudaAsset cuda13.1\|cuda12.8\|cuda12-volta \| -Variant vulkan\|cpu] [-BuildBackend all\|cuda\|vulkan\|cpu] [-SkipEngine] [-SkipUI] [-NodeVersion 24.18.0]`, output in `release/out/` |
+| macOS | `./package-release.sh [--skip-build] [--version=1.2.0]`, output `HOT-Step-CPP-v<version>-macOS-arm64.tar.gz`. It bundles Node 22.22.2, where CI bundles 24.18.0 |
 
 `-BuildBackend` defaults to `all`, preserving the local build of CUDA, Vulkan and CPU
 backends. `-Variant` chooses the archive name and packaged GPU DLL. For a local CPU-only
 release test, use `-Variant cpu -BuildBackend cpu`; use matching `cuda` or `vulkan`
 values for those backends. A single build backend must match `-Variant`, including
-with `-SkipEngine`, and mismatches fail before staging is changed.
+with `-SkipEngine`, and mismatches fail before staging is changed. `-Variant cuda` also
+needs `-CudaAsset`, the CI asset the build stands in for, because `build-info.json` records
+an exact variant and the script will not guess one from the toolkit.
 
 | Build backend | GGML_CUDA | GGML_VULKAN | Packaged GPU DLL |
 |---|---|---|---|

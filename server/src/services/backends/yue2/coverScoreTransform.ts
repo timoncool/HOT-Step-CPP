@@ -388,18 +388,250 @@ export function remeterTwoFourToFourFour(abc: string, pickup: boolean): CoverRem
   });
   const result = [...header, ...body, ...lines.slice(end)].join(nl);
 
-  // The source's own `Z` bars may be mis-timed; the result must play right as written.
+  checkSameMusic(abc, result, 'Re-metering');
+  return { abc: result, twoFourBars };
+}
+
+/** Throws unless `result` plays every note of `abc` at the same pitch, start
+ *  and length. The source's own `Z` bars may be mis-timed; the result must
+ *  play right as written. */
+function checkSameMusic(abc: string, result: string, change: string) {
   const before = soundingNotes(explicitRests(abc)), after = soundingNotes(result);
   const same = (x: number[], y?: number[]) => !!y && x[0] === y[0] && Math.abs(x[1] - y[1]) < 1e-9 && Math.abs(x[2] - y[2]) < 1e-9;
   if (Math.abs(before.total - after.total) > 1e-9) {
-    throw new Error('Re-metering would change the length of the score, so the score was left as it was.');
+    throw new Error(`${change} would change the length of the score, so the score was left as it was.`);
   }
   const [from, to] = [before.tracks, after.tracks];
   const track = from.length === to.length
     ? from.findIndex((t, i) => t.length !== to[i].length || t.some((note, j) => !same(note, to[i][j]))) : 0;
   if (track >= 0) {
     const j = from[track]?.findIndex((note, k) => !same(note, to[track]?.[k])) ?? -1;
-    throw new Error(`Re-metering would change the music (track ${track + 1}, note ${j + 1}), so the score was left as it was.`);
+    throw new Error(`${change} would change the music (track ${track + 1}, note ${j + 1}), so the score was left as it was.`);
   }
-  return { abc: result, twoFourBars };
+}
+
+// ── Bar-line shift ──
+//
+// Moves every bar line `beats` beats later (earlier when negative) in every
+// voice, for a transcription whose downbeats landed a beat off. The notes keep
+// their time, so later turns the first beats into a pickup bar and earlier
+// shortens bar 1; the last bar takes what is left. A note a new bar line cuts
+// becomes tied notes, and accidentals are written wherever the new bars would
+// carry them differently, for abcjs (by letter and octave) and YuE2 (by letter)
+// alike. Section markers move with their bar lines; one at the very start
+// stays. abcjs then checks every note keeps its pitch, start and length.
+
+/** Ticks per L: unit: exact for lengths down to 1/64 and for thirds, fifths and sevenths. */
+const TICKS = 20160;
+const SHIFT_TOKEN = /"[^"]*"|![^!]*!|\[K:([^\]]*)\]|\[[A-Za-z]:[^\]]*\]|\[([^\]"]*)\]([\d/]*)|(\^\^|\^|__|_|=)?([A-Ga-g])([,']*)([\d/]*)|([zx])([\d/]*)|Z(\d*)|\(\d|\s+|./g;
+const CHORD_NOTE = /(\^\^|\^|__|_|=)?([A-Ga-g])([,']*)/g;
+const gcd = (a: number, b: number): number => b ? gcd(b, a % b) : a;
+
+interface ShiftPitch { step: number; index: number; letter: string; octaves: string; alter: number }
+/** One note, chord or rest; `prefix` holds its chord symbols, decorations, slur and [K:] fields. */
+interface ShiftEvent { prefix: string; key: string | null; rest: string | null; pitches: ShiftPitch[]; ticks: number; tie: boolean; suffix: string }
+interface ShiftVoice {
+  events: ShiftEvent[]; ends: number[]; meters: string[]; time: number; head: string; meter: string;
+  sig: number[]; carry: Map<number, number>; tied: Map<number, number>; prefix: string; key: string | null;
+}
+
+function shiftTicks(length: string): number {
+  const m = /^(\d*)(\/*)(\d*)$/.exec(length);
+  if (!m || (m[2].length > 1 && m[3])) throw new Error(`Unsupported note length "${length}".`);
+  const ticks = Number(m[1] || 1) * TICKS / (m[2] ? Number(m[3] || 2 ** m[2].length) : 1);
+  if (!Number.isInteger(ticks) || ticks <= 0) throw new Error(`Unsupported note length "${length}".`);
+  return ticks;
+}
+
+function lengthText(ticks: number): string {
+  const g = gcd(ticks, TICKS), n = ticks / g, d = TICKS / g;
+  return d === 1 ? (n === 1 ? '' : String(n)) : `${n === 1 ? '' : n}/${d}`;
+}
+
+/** Reads one music line into the voice's events and bar ends, pitching each note as abcjs does. */
+function readShiftLine(line: string, v: ShiftVoice, unit: { n: number; d: number }) {
+  if (UNSUPPORTED_BAR.test(unquoted(line))) {
+    throw new Error('Repeats, endings, double bars, voice overlays, comments and inline meter or length changes are not supported.');
+  }
+  const pitch = (mark: string | undefined, letter: string, octaves: string): ShiftPitch => {
+    const step = STEP_LETTERS.indexOf(letter.toUpperCase());
+    const index = 7 * ((letter === letter.toUpperCase() ? 4 : 5)
+      + (octaves.match(/'/g)?.length ?? 0) - (octaves.match(/,/g)?.length ?? 0)) + step;
+    // A tie continuation keeps the tied pitch and carries nothing.
+    let alter = v.tied.get(index);
+    if (alter === undefined) {
+      alter = mark === undefined ? v.carry.get(index) ?? v.sig[step] : MARK[mark];
+      if (mark !== undefined) v.carry.set(index, alter);
+    }
+    return { step, index, letter, octaves, alter };
+  };
+  const push = (rest: string | null, pitches: ShiftPitch[], ticks: number) => {
+    v.events.push({ prefix: v.prefix, key: v.key, rest, pitches, ticks, tie: false, suffix: '' });
+    v.time += ticks;
+    v.prefix = ''; v.key = null;
+    v.tied = new Map();
+  };
+  const barEnd = () => {
+    if (v.time === (v.ends.at(-1) ?? 0)) throw new Error('An empty bar is not supported.');
+    v.ends.push(v.time); v.meters.push(v.meter); v.carry = new Map();
+  };
+  for (const m of line.matchAll(SHIFT_TOKEN)) {
+    const [token, key, chord, chordLength, mark, letter, octaves, length, rest, restLength, bars] = m;
+    const last = v.events.at(-1);
+    if (key !== undefined) { v.sig = keySignature(key); v.key = key; v.prefix += token; }
+    else if (/^["!]|^[(.~]$/.test(token)) v.prefix += token;
+    else if (chord !== undefined) {
+      const notes = [...chord.matchAll(CHORD_NOTE)];
+      if (!notes.length || notes.map(n => n[0]).join('') !== chord) throw new Error(`Unsupported chord "${token}".`);
+      push(null, notes.map(n => pitch(n[1], n[2], n[3])), shiftTicks(chordLength));
+    } else if (letter) push(null, [pitch(mark, letter, octaves)], shiftTicks(length));
+    else if (rest) push(rest, [], shiftTicks(restLength));
+    else if (bars !== undefined) {
+      if (v.time !== (v.ends.at(-1) ?? 0)) throw new Error('A Z rest must fill its bars.');
+      const count = Math.max(1, Number(bars || 1));
+      for (let i = 0; i < count; i++) { if (i) barEnd(); push('z', [], barUnits(v.meter, unit) * TICKS); }
+    } else if (token === '-') {
+      if (!last?.pitches.length) throw new Error('A tie must follow a note.');
+      last.tie = true;
+      v.tied = new Map(last.pitches.map(p => [p.index, p.alter]));
+    } else if (token === ')') { if (last) last.suffix += token; }
+    else if (token === '|') barEnd();
+    else if (!/^\s+$/.test(token)) throw new Error(`"${token}" is not supported (nor are tuplets, grace notes or broken rhythms).`);
+  }
+  if (!/\|\s*$/.test(line)) throw new Error('Every music line must end with a bar line.');
+}
+
+export function shiftBarLines(abc: string, beats: number): { abc: string } {
+  const nl = abc.includes('\r\n') ? '\r\n' : '\n';
+  const lines = abc.split(/\r?\n/);
+  let end = lines.length;
+  while (end > 0 && !lines[end - 1].trim()) end--;
+  const keyLine = lines.findIndex(line => /^K:/.test(line));
+  if (keyLine < 0) throw new Error('The score has no K: line.');
+  const header = lines.slice(0, keyLine + 1);
+  const meterField = header.find(line => /^M:/.test(line));
+  if (!meterField) throw new Error('The score has no M: line.');
+  const startMeter = fraction(meterField.slice(2)).text;
+  const unit = fraction(header.find(line => /^L:/.test(line))?.slice(2) ?? impliedLength(startMeter));
+  const beatTicks = (meter: string) => TICKS * unit.d / (fraction(meter).d * unit.n);
+  if (!Number.isInteger(beats) || !beats || Math.abs(beats) >= fraction(startMeter).n) {
+    throw new Error(`Shift by a whole number of beats, less than a ${startMeter} bar.`);
+  }
+  const shift = beats * beatTicks(startMeter);
+  const headerSig = keySignature(header.at(-1)!.slice(2));
+
+  const voices = new Map<string, ShiftVoice>();
+  const markers: Array<{ line: string; time: number }> = [];
+  let voice: ShiftVoice | null = null;
+  const open = (id: string, head: string) => {
+    if (!voices.has(id)) voices.set(id, { events: [], ends: [], meters: [], time: 0, head, meter: startMeter,
+      sig: [...headerSig], carry: new Map(), tied: new Map(), prefix: '', key: null });
+    return voices.get(id)!;
+  };
+  for (const line of lines.slice(keyLine + 1, end)) {
+    const text = line.trim();
+    if (!text) throw new Error('A blank line inside the score ends the tune.');
+    if (text.startsWith('%') && !text.startsWith('%%') && text.slice(1).trim()) {
+      const times = new Set([...voices.values()].map(v => v.time));
+      if (times.size > 1) throw new Error(`The voices disagree on where section "${text.slice(1).trim()}" starts.`);
+      markers.push({ line, time: [...times][0] ?? 0 });
+      continue;
+    }
+    if (text.startsWith('%')) throw new Error('Comments and directives inside the score are not supported.');
+    if (/^V:/.test(text)) { voice = open(text.slice(2).trim().split(/\s+/)[0], line); continue; }
+    voice ??= open('', '');
+    if (/^M:/.test(text)) { voice.meter = fraction(text.slice(2)).text; continue; }
+    if (/^K:/.test(text)) { voice.sig = keySignature(text.slice(2)); voice.key = text.slice(2); voice.prefix += `[${text}]`; continue; }
+    if (/^[A-Za-z]:/.test(text)) throw new Error(`A ${text.slice(0, 2)} line inside the score is not supported.`);
+    readShiftLine(line, voice, unit);
+  }
+  if (voices.has('') && voices.size > 1) throw new Error('Music before the first V: line is not supported in a score with voices.');
+  const all = [...voices.entries()];
+  const lead = all[0]?.[1];
+  if (!lead?.ends.length) throw new Error('The score has no bars.');
+  if (all.some(([, v]) => v.prefix || v.time !== lead.time || v.ends.join() !== lead.ends.join())) {
+    throw new Error('The voices disagree on bar lengths.');
+  }
+
+  // Every old bar line moved by the shift, inside the score.
+  const total = lead.time;
+  const ends = [...new Set([0, ...lead.ends].map(t => t + shift).filter(t => t > 0 && t < total))].sort((a, b) => a - b);
+  ends.push(total);
+  // A new bar keeps the meter of the old bar under its middle when it is that long, or is written as so many beats.
+  const meters = ends.map((stop, i) => {
+    const start = i ? ends[i - 1] : 0;
+    const meter = lead.meters[lead.ends.findIndex(t => t > (start + stop) / 2)];
+    const length = stop - start, beat = beatTicks(meter);
+    if (length === barUnits(meter, unit) * TICKS) return meter;
+    if (length % beat) throw new Error('The bars are not whole beats long.');
+    return `${length / beat}/${fraction(meter).d}`;
+  });
+  // The new bar each section starts on.
+  const starts = markers.map(marker => {
+    const time = marker.time && marker.time + shift;
+    const bar = time ? ends.indexOf(time) + 1 : 0;
+    if (time >= total || (time && !bar)) throw new Error(`Section "${marker.line.trim().slice(1).trim()}" would move off the score.`);
+    return bar;
+  });
+
+  // Each voice's events cut at the new bar lines.
+  const markOf = (alter: number) => alter > 0 ? '^'.repeat(alter) : alter < 0 ? '_'.repeat(-alter) : '=';
+  const out = all.map(([id, v]) => {
+    const bars: Array<{ text: string; rest: boolean }> = [];
+    let text = '', rest = true, t = 0, bar = 0, sig = [...headerSig], tied = new Set<number>();
+    let exact = new Map<number, number>(), letters = new Map<number, number>();
+    for (const e of v.events) {
+      let left = e.ticks, first = true;
+      while (left > 0) {
+        const take = Math.min(left, ends[bar] - t), lastPart = take === left;
+        if (first && e.key !== null) sig = keySignature(e.key);
+        const tie = lastPart ? e.tie : !e.rest;
+        const notes = e.pitches.map(p => {
+          const held = tied.has(p.index);
+          const abcjsAlter = held ? p.alter : exact.get(p.index) ?? sig[p.step];
+          const yue2Alter = letters.get(p.step) ?? sig[p.step];
+          if (!held) exact.set(p.index, p.alter);
+          letters.set(p.step, p.alter);
+          return (abcjsAlter === p.alter && yue2Alter === p.alter ? '' : markOf(p.alter)) + p.letter + p.octaves;
+        });
+        const prefix = first ? e.prefix : '', suffix = lastPart ? e.suffix : '';
+        text += prefix + (e.rest ?? (notes.length > 1 ? `[${notes.join('')}]` : notes[0])) + lengthText(take) + (tie ? '-' : '') + suffix;
+        rest &&= !!e.rest && !prefix && !suffix;
+        tied = tie ? new Set(e.pitches.map(p => p.index)) : new Set();
+        first = false; t += take; left -= take;
+        if (t === ends[bar]) {
+          bars.push({ text, rest });
+          text = ''; rest = true; bar++;
+          exact = new Map(); letters = new Map();
+        }
+      }
+    }
+    return { id, head: v.head, bars };
+  });
+
+  // Lines of up to four bars, broken at a section or a meter change.
+  const body: string[] = [];
+  const running = new Map<string, string>();
+  for (let i = 0; i < ends.length;) {
+    starts.forEach((bar, k) => { if (bar === i) body.push(markers[k].line); });
+    let j = i + 1;
+    while (j < ends.length && j - i < 4 && meters[j] === meters[i] && !starts.includes(j)) j++;
+    for (const v of out) {
+      if (v.id) body.push(v.head);
+      if ((running.get(v.id) ?? startMeter) !== meters[i]) { body.push(`M:${meters[i]}`); running.set(v.id, meters[i]); }
+      // abcjs times a `Z` by the header meter, so only those bars, in a score with voices, use one.
+      const tokens: string[] = [];
+      for (const bar of v.bars.slice(i, j)) {
+        const run = tokens.at(-1)?.match(/^Z(\d*)$/);
+        if (!bar.rest || !v.id || meters[i] !== startMeter) tokens.push(bar.text);
+        else if (run) tokens[tokens.length - 1] = `Z${Number(run[1] || 1) + 1}`;
+        else tokens.push('Z');
+      }
+      body.push(tokens.map(token => `${token}|`).join(''));
+    }
+    i = j;
+  }
+  const result = [...header, ...body, ...lines.slice(end)].join(nl);
+  checkSameMusic(abc, result, 'Shifting the bar lines');
+  return { abc: result };
 }

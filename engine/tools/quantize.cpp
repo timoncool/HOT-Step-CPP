@@ -234,6 +234,15 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
     if (n_dims < 2) {
         return false;
     }
+    // SA3 concatenates these learned tokens with F32 activations. Its loader
+    // can promote BF16/F16 tokens to F32, but cannot dequantize them.
+    if (strcmp(arch, "sa3-dit") == 0 && name_is(name, "model.transformer.memory_tokens")) {
+        return false;
+    }
+    // The CPU conditioner loader accepts only BF16, F16 and F32 weights.
+    if (strcmp(arch, "sa3-dit") == 0 && strncmp(name, "conditioner.", 12) == 0) {
+        return false;
+    }
     if (strstr(arch, "text-enc") && strstr(name, "embed_tokens")) {
         return false;
     }

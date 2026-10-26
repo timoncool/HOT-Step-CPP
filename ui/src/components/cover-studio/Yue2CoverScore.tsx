@@ -9,6 +9,7 @@ import { downloadAbcMidi } from '../../utils/abcMidi';
 import { barAtChar, barRanges } from '../../utils/abcSectionMove';
 import { AbcChart } from './AbcChart';
 import { MusicXmlImport } from './MusicXmlImport';
+import { Toggle } from '../shared/Toggle';
 import { startPlayer, stopPlayer, type AbcPlayer, type ScoreRange } from './prepareView';
 import type { Yue2CoverJob, Yue2CoverReadiness } from '../../services/yue2CoverApi';
 
@@ -48,6 +49,8 @@ interface Props {
 }
 
 type Tune = ReturnType<typeof abcjs.renderAbc>[number];
+/** abcjs's drum track: one wood-block hit at the start of every full bar, so a bar line off the song's downbeat is heard. */
+const BAR_CLICK = { drum: 'd 76 110', drumBars: 1, drumIntro: 0 };
 type TimingEvent = InstanceType<typeof abcjs.TimingCallbacks>['noteTimings'][number];
 
 /** Colours each rendered note and bar by its score section and draws a
@@ -174,6 +177,8 @@ export const Yue2CoverScore: React.FC<Props> = p => {
   const [view, setView] = useState<'abc' | 'chart'>(() =>
     localStorage.getItem('cover-studio-abcView') === 'chart' ? 'chart' : 'abc');
   useEffect(() => { localStorage.setItem('cover-studio-abcView', view); }, [view]);
+  const [click, setClick] = useState(() => localStorage.getItem('cover-studio-barClick') !== 'off');
+  useEffect(() => { localStorage.setItem('cover-studio-barClick', click ? 'on' : 'off'); }, [click]);
   const [playingBar, setPlayingBar] = useState<number | null>(null);
   const onSectionRef = useRef(p.onSection);
   const onMoveRef = useRef(p.onMoveSection);
@@ -208,6 +213,8 @@ export const Yue2CoverScore: React.FC<Props> = p => {
     <button type="button" onClick={() => downloadAbcMidi(p.abc, `score-${p.sourceKey || 'cover'}`)}
       title={t('cover.prepare.score.downloadMidiInfo')}
       className="text-[11px] text-cyan-700 dark:text-cyan-300 hover:underline">{t('cover.prepare.score.downloadMidi')}</button>
+    <Toggle size="sm" accent="cyan" checked={click} onChange={setClick} label="Bar click"
+      info="Plays a click on beat 1 of every bar, so a score whose bar lines are a beat off the song is easy to hear." />
   </div>;
   const editor = view === 'chart' && p.abc.trim()
     ? <AbcChart abc={p.abc} disabled={busy || p.readOnly} height={boxHeight ?? 320} playingBar={playingBar}
@@ -355,9 +362,9 @@ export const Yue2CoverScore: React.FC<Props> = p => {
         if (range?.loop) void playRangeRef.current(range); else endRange();
       },
     }, { displayLoop: false, displayRestart: true, displayPlay: true, displayProgress: true, displayWarp: false });
-    void synth.setTune(tunes[0], false).catch(() => {});
+    void synth.setTune(tunes[0], false, click ? BAR_CLICK : {}).catch(() => {});
     return () => { range = null; try { synth.pause(); } catch { /* the player was never started */ } onPlayingRef.current(false); };
-  }, [p.abc, p.sourceMode, p.sourceKey, p.readOnly]);
+  }, [p.abc, p.sourceMode, p.sourceKey, p.readOnly, click]);
 
   return (
     <div className="min-h-0 flex-shrink-0 border-t border-zinc-200 dark:border-white/10 p-4 space-y-3 overflow-y-auto max-h-[calc(100%-160px)]" style={{ height: p.height }}>

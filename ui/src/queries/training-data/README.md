@@ -36,18 +36,21 @@ snapshots.
 | Scan preview | `training-data/scan-preview` | Worker-scoped; New dataset and each batch import row |
 | MM3 and YuE2 caption files | `training-data/sample-mm3`, `sample-yue2` | Seed the drawer's editors |
 | Lyric Studio export preview | `training-data/lyric-studio-preview` | Seeds the artist/album fields |
+| SA3 training status | `training-data/sa3-status` | Worker-scoped; polls while a job is active. Built inline in `components/training-studio/Sa3TrainCard.tsx`, not in `queries.ts` ([tanstack-query.md](../../../../docs/dev/tanstack-query.md) F4#17) |
 
-The last four rows are one-shot reads with `staleTime` 0: each open asks the
-server, and concurrent reads share a request. They seed forms, so no
-background refetch may write over the user's edits:
+The folder listing, scan preview, caption file and export preview rows are
+one-shot reads with `staleTime` 0: each open asks the server, and concurrent
+reads share a request. They seed forms, so no background refetch may write
+over the user's edits:
 
 - Folder picker and New dataset cancel the read they replace, unless the new
   read has the same key, in which case it joins.
-- The sample drawer observes its caption files with `useQuery`, so Query
-  cancels the read when the drawer moves to another sample or worker. The
-  editor is seeded only by the first answer fetched for each key, never by a
-  cached copy or a later refetch. A confirmed save writes the server's answer
-  into the entry.
+- The sample drawer observes its caption files with `useQuery`
+  (`components/training-studio/useCaptionFile.ts`), so Query cancels the read
+  when the drawer moves to another sample or worker. The editor is seeded only
+  by the first answer fetched on each visit to a key, never by a cached copy
+  or a later refetch; returning to a sample is a new visit and seeds again. A
+  confirmed save writes the server's answer into the entry.
 - The audition handoff reads the dataset's revision through the local
   `training-data/dataset` entry (`worker` null), whatever "Train on" says,
   because audition previews and drafts are local.
@@ -58,7 +61,9 @@ Creating, renaming and deleting datasets, sample edits, labelling,
 preprocessing, preparation start/pause/resume/cancel, pipeline and batch
 starts, exports and draft handoffs are explicit commands with the worker
 captured before they start. They never retry. A successful command updates or
-invalidates the entries of the scope it was made in. The preparation context
+invalidates the entries of the scope it was made in; `trainingStore` runs its
+commands through `writeAndInvalidate` (`../writes.ts`) with keys built from the
+captured worker. The preparation context
 read at submission and recipe/preset resolution are part of building a
 submission, so they run once as explicit operations, not cached reads.
 
@@ -74,7 +79,7 @@ lists every training-data file and its disposition. Files with reads:
 | `BatchImportWizard.tsx` | query (browse, scan preview); pipeline start is a command |
 | `FolderPicker.tsx` | query (browse) |
 | `NewDatasetWizard.tsx` | query (scan preview); create is a command |
-| `SampleDrawer.tsx` | query (caption files); edits are client state, saves are commands |
+| `SampleDrawer.tsx`, `useCaptionFile.ts` | query (caption files); edits are client state, saves are commands |
 | `SendToLyricStudio.tsx` | query (export preview); export is a command |
 | `sendAuditionToCustomGen.ts` | query (local dataset revision); draft creation is a command |
 | `PipelineStageProgress.tsx`, `useTrainingStream.ts` | shared SSE; job refresh through Query |

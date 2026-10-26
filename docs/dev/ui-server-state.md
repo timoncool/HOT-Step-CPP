@@ -7,9 +7,12 @@ React context. Server-sent event streams stay as the push channel and drive
 the cache through the bridge below. They never become a second fetch owner.
 
 This page is the contract every area builds on. The code lives in
-`ui/src/queries/` (`client.ts`, `contract.ts`, `keys.ts`, `sseBridge.ts`) and
-the transports in `ui/src/services/` (`api.ts`, `trainingApi.ts`,
-`httpClient.ts`, `sharedEventSource.ts`).
+`ui/src/queries/` (`client.ts`, `contract.ts`, `keys.ts`, `sseBridge.ts`,
+`invalidation.ts`, `writes.ts`) and the transports in `ui/src/services/`
+(`api.ts`, `trainingApi.ts`, `httpClient.ts`, `axiosClient.ts`,
+`sharedEventSource.ts`). The audit and migration plan that tracks where the
+code still falls short of this contract is
+[tanstack-query.md](tanstack-query.md).
 
 ## The client
 
@@ -65,9 +68,14 @@ Shared local resources omit `worker` and `backend`. A key never holds a
 credential: `session` is an opaque counter. `normalizeFilters` drops
 `undefined` and `''` and sorts the keys, so equal requests share an entry.
 
-Invalidate with `resourceKey(resource, scope?, id?)`. Matching is per slot, so
-`resourceKey('training-data/datasets', { worker: 'A' })` hits every dataset
-list on worker A and nothing on B or this PC.
+Build an invalidation prefix with `resourceKey(resource, scope?, id?)`.
+Matching is per slot, so `resourceKey('training-data/datasets', { worker: 'A' })`
+hits every dataset list on worker A and nothing on B or this PC. Pass the
+prefix to `queryManager` (`queries/invalidation.ts`): `queryManager.keys(client,
+...keys)`, `queryManager.filter(client, filter)` for a predicate, or a named
+group such as `queryManager.songs.views(client)`. `invalidation.ts` is meant
+to be the only file that calls `QueryClient.invalidateQueries`; one component
+still calls it directly (tanstack-query.md F4#17).
 
 ### Capture the target in the key
 
@@ -84,12 +92,14 @@ const datasetsQuery = (worker: string | null) => queryOptions({
 
 ### Auth sessions
 
-`AuthProvider` calls `startAuthSession(queryClient, token)` before the new
-token reaches any consumer, and exposes the result as `sessionEpoch` on
-`useAuth()`. A changed token bumps the epoch, cancels the old epoch's
-in-flight auth-scoped queries and removes them. Public keys are untouched.
-Build auth keys with `{ auth: true }` and read `sessionEpoch` from `useAuth()`
-in the component, so it re-renders when the epoch moves.
+`AuthProvider` calls `setAuthToken(token)` (`services/axiosClient.ts`) and
+`startAuthSession(queryClient, token)` before the new token reaches any
+consumer, and exposes the result as `sessionEpoch` on `useAuth()`. The
+transport reads the bearer from that accessor, so no read or command passes a
+token. A changed token bumps the epoch, cancels the old epoch's in-flight
+auth-scoped queries and removes them. Public keys are untouched. Build auth
+keys with `{ auth: true }` and read `sessionEpoch` from `useAuth()` in the
+component, so it re-renders when the epoch moves.
 
 ### Shared resources
 
@@ -107,7 +117,7 @@ consumer before making it, and adds invalidation for the events it handles.
 
 | Key | Canonical read | Cached shape | Owner |
 |---|---|---|---|
-| `sharedKeys.songs()` | `songApi.list(token, { signal })` | `{ songs: Song[] }`, normalized | shell-queue |
+| `sharedKeys.songs()` | `songApi.list({ signal })` | `{ songs: Song[] }`, normalized | shell-queue |
 | `sharedKeys.song(id)` | `songApi.get(id, { signal })` | `{ song: Song }`, normalized | shell-queue |
 | `sharedKeys.plugins()` | `apiClient.get('/plugins', { signal })` | raw registry JSON | global-models |
 | `sharedKeys.capabilities(backend)` | `apiClient.get('/capabilities?backend=<id>', { signal })` | raw JSON | global-models |
@@ -116,8 +126,8 @@ consumer before making it, and adds invalidation for the events it handles.
 | `sharedKeys.gpus()` | `settingsApi.getGpus({ signal })` | raw `GpusResponse` | shell-queue |
 | `sharedKeys.adapterScan(folder)` | `adapterApi.scan(folder, { signal })` | raw scan response | global-models |
 | `sharedKeys.browse(dir, filter?)` | `adapterApi.browse(dir, filter, { signal })` | raw `BrowseResponse` | shell-queue |
-| `sharedKeys.workflowJob(id, after = 0)` | `apiClient.get('/workflows/jobs/<id>?after=<after>', { token, signal })` | `WorkflowReplay` | shell-queue |
-| `sharedKeys.workflowDocument(id)` | `apiClient.get('/workflows/documents/<id>', { token, signal })` | `{ document: WorkflowDocument }` | shell-queue |
+| `sharedKeys.workflowJob(id, after = 0)` | `apiClient.get('/workflows/jobs/<id>?after=<after>', { signal })` | `WorkflowReplay` | shell-queue |
+| `sharedKeys.workflowDocument(id)` | `apiClient.get('/workflows/documents/<id>', { signal })` | `{ document: WorkflowDocument }` | shell-queue |
 | `sharedKeys.preparation(id)` | `getYue2Preparation(id, { signal })` | `Yue2PreparationSummary` | training-data |
 | `sharedKeys.preparationJob(id)` | `getYue2PreparationJob(id, { signal })` | job summary or null | training-data |
 | `sharedKeys.peaks(audioUrl)` | `GET /api/audio/peaks?url=<audioUrl>`, 4xx/5xx thrown | raw `Peaks`, may carry `unsupported` | shell-queue |
@@ -140,26 +150,44 @@ since only a rewrite changes them.
 Song rows appear in several areas' feeds. `SONG_VIEWS` in `keys.ts` lists
 every one of them: the two shared song keys, `shell-queue/recent-songs`,
 `studios/recent-songs` and `cover-lyrics/cover-songs`. Any song write, delete,
-completion or reconnect calls `invalidateSongViews(client)`, or passes
-`SONG_VIEWS` as a reconnect list, rather than naming feeds itself. An area may
-also edit its own feed in place first. `invalidateSidecars(client)` refreshes
-lyric sidecars after a crop or retranscription.
+completion or reconnect calls `queryManager.songs.views(client)` (or names the
+`song:written` event in a `writeAndInvalidate` plan), or passes `SONG_VIEWS`
+as a reconnect list, rather than naming feeds itself. An area may also edit
+its own feed in place first. `queryManager.sidecars.all(client)` refreshes
+lyric sidecars after a crop or retranscription. The older names
+`invalidateSongViews` and `invalidateSidecars` still exist as re-exports of
+those two groups until the P6 re-org in tanstack-query.md removes them.
 
 `sharedKeys.songs()` is auth-scoped: read `token` and `sessionEpoch` from
-`useAuth()`, build the key in render, and keep the token in the `queryFn`
-closure, never in the key. `sharedKeys.song(id)` also carries the epoch, but
-its canonical read, `songApi.get(id, { signal })`, sends no bearer token. The
-epoch there only drops the entry at sign-out; it is not an auth guarantee. The
-workflow keys are auth-scoped like the songs list. Polling cadence stays per observer
+`useAuth()`, build the key in render and gate the query on the token
+(`enabled: !!token`). The token never goes in the key or the `queryFn`; the
+transport adds the bearer itself. `sharedKeys.song(id)` also carries the
+epoch, so the entry is dropped at sign-out. Since the axios request
+interceptor attaches the bearer to every request, its read,
+`songApi.get(id, { signal })`, carries the token too. The workflow keys are
+auth-scoped like the songs list. Polling cadence stays per observer
 (`refetchInterval`), so a consumer that wants faster VRAM updates sets its own
 interval without touching the owner's options.
 
 Each area keeps its own options, hooks and event mappings in
 `ui/src/queries/<area>/`, with resources named `<area>/<name>`. The areas are
 `training-data`, `training-runs`, `global-models`, `cover-lyrics`, `studios`
-and `shell-queue`.
+and `shell-queue`. `queries/sa3-previews/` is a folder of its own, but its
+resource, `training-runs/sa3-previews`, belongs to the training-runs area.
 
 ## Transports
+
+`ApiClient` (`httpClient.ts`) sends every JSON request through one axios
+instance (`axiosClient.ts`), with a 60 s default timeout that slow routes
+raise with `ClientOptions.timeout`. Its request interceptor adds the bearer
+from the auth session accessor. Its response interceptor is the one place a
+failure becomes an `ApiError` and gets logged or toasted (`handleFailure`):
+GET failures never toast, since reads show their error inline and retry per
+the policy above; aborts never surface; a request can opt out with
+`ClientOptions.silent`. Multipart `upload()` stays on XHR for its progress
+events and `streamEvents()` stays on fetch, and both report failures through
+the same `handleFailure`. The filters and status messages are in
+[tanstack-query.md](tanstack-query.md#global-error-filtering-in-the-response-interceptor).
 
 Every read in `api.ts` takes a trailing `opts?: ReadOptions` (`{ signal }`).
 Positional callers are unchanged, songs are still normalized, and errors are
@@ -191,6 +219,11 @@ Reads throw on failure. Never catch an error into an empty result inside a
   (`TrainingTarget`). Never read the selection inside `onSuccess`.
 - No automatic retry. A submit happens once, when the user asks.
 - On success, invalidate the related lists and details for the captured scope.
+  Outside a component, `writeAndInvalidate(client, command, plan)`
+  (`queries/writes.ts`) runs the command and then the plan: `events(...)` for
+  named events, `keysPlan(...)` for keys the write already knows. Uploads use
+  the `useUpload()` mutation, which wraps `apiClient.upload` with progress and
+  abort.
 - Mutations take no signal. Cancelling a read aborts that read; it never
   cancels a server job. Stopping a job is its own explicit mutation.
 - No generic get-or-submit query functions.
@@ -214,7 +247,8 @@ stream drops and reopens. The first open does nothing, because the server
 replays its buffer on connect. The caller captures its scope when it starts
 the bridge: the URL and every key `map` builds come from that capture. The
 returned teardown unsubscribes and drops pending invalidations, and nothing
-the old stream delivers afterwards touches the cache.
+the old stream delivers afterwards touches the cache. Coalesced invalidations
+flush through `invalidateKeys` in `invalidation.ts`.
 
 ```ts
 useEffect(() => bridgeEvents(queryClient, {
@@ -226,6 +260,17 @@ useEffect(() => bridgeEvents(queryClient, {
     : undefined,
 }), [jobId, worker]);
 ```
+
+## Sanctioned exceptions
+
+Three unusual patterns are deliberate. They stay, and new code copies them
+only for the same reason.
+
+| Pattern | Where | Why it stays |
+|---|---|---|
+| A disabled query as a stream's cache slot: `enabled: false`, a `queryFn` that never runs, `initialData: []` | `components/model-manager/useDownloadStream.ts:16–19`, key `global-models/downloads` | The download SSE bridge (`queries/global-models/downloads.ts`) replaces the whole entry with each validated frame, so there is no snapshot to fetch |
+| A read-only POST with its request body in the key's `filters` (a "queryable POST") | `services/yue2CoverApi.ts:199–203`, `cover-lyrics/cover` for `/source-metadata` and `/sections/review` | An idempotent read that needs a body. Every distinct body is a new cache entry until `gcTime` reaps it, so the body should hold only fields that change the answer |
+| A `useQuery` mounted only for its side effect, with its result unused | `components/global-bar/BackendToggle.tsx:32` (`global-models/backends`), `components/global-bar/MonitorBar.tsx:29` (`global-models/monitor`) | The observer keeps the entry fetched, and the monitor polled, for the store projections that read it (`backendStore`, `vstChainStore`). The entry's liveness follows the component's mount |
 
 ## Consumer manifest
 
@@ -249,7 +294,9 @@ Dispositions were reconciled against the integration audit's ledger in
 `a9748d5d`, then updated for the R1, R2 and R5 fixes. A row now holds the
 ledger's wording in place of the single values above. Counts in the first 187
 rows are still those at `0ae4bf36`. The rows after them are the 23 files the
-audit found, then files added since, counted when appended.
+audit found, then files added since, counted when appended. The last 25 rows
+were appended at `be3c85f8` (2026-10-23) for files that met the criteria but
+had no row. Of the listed files only `hooks/usePolling.ts` no longer exists.
 
 | File | Area | Services | fetch | SSE | Timers | Disposition |
 |---|---|---|---|---|---|---|
@@ -464,3 +511,28 @@ audit found, then files added since, counted when appended.
 | `utils/mm3CaptionSource.ts` | shell-queue | - | - | - | - | Query-backed lireek read; client caption assembly |
 | `utils/paramProfiles.ts` | shell-queue | - | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `queries/shell-queue/lyrics.ts` | shell-queue | - | 1 | - | - | Query owner for shared `lrc`/`lyrics-json` (R5); owner and transport for shared `score-abc` |
+| `components/compare-studio/CompareStudio.tsx` | studios | compareApi | - | - | - | Open: song search calls `compareApi` directly and session state comes from `stores/compareStore.ts`; no Query owner ([tanstack-query.md](tanstack-query.md) F3) |
+| `components/compare-studio/DiffTrace.tsx` | studios | compareApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/compare-studio/SessionView.tsx` | studios | compareApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/compare-studio/TakeRow.tsx` | studios | compareApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/compare-studio/useAbEngine.ts` | studios | - | 1 | - | - | Binary audio transport for the A/B engine's takes |
+| `components/cover-studio/PrepareLyrics.tsx` | cover-lyrics | yue2CoverApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/PrepareStructure.tsx` | cover-lyrics | yue2CoverApi | - | - | 1 | Client/types/props; the interval loops a recording's playback window, no server reads |
+| `components/cover-studio/SectionPlayback.tsx` | cover-lyrics | - | - | - | 2 | Client audio playback timers; no server reads |
+| `components/midi-studio/MidiExportPanel.tsx` | studios | midiStudioApi | - | - | - | Query consumer (`studios/midi-notes`); export and ABC lead-sheet commands, export invalidates notes and jobs |
+| `components/settings/AdapterReferencesAction.tsx` | shell-queue | lireekApi | - | - | - | Explicit cleanup command; `lireekApi` invalidates the lireek snapshots after it |
+| `components/settings/UpdatesPanel.tsx` | shell-queue | updatesApi | - | - | - | Query: `shell-queue/updates`, polled every 2 s while a check runs; Check now is a mutation that writes its result into the entry |
+| `components/storm/DriftPanel.tsx` | studios | - | 4 | - | 1 | Open: 2 s raw-fetch poll of `/api/generate/storm/control` into component state; drift POSTs are commands ([tanstack-query.md](tanstack-query.md) F3, P4) |
+| `components/training-studio/Sa3TrainCard.tsx` | training-runs | api, sa3PreviewApi, trainingApi | - | - | - | Query consumer: component-local `training-data/sa3-status`, `training-runs/sa3-previews`, `global-models/sa3-adapters` and audition `shell-queue/generation-status`; start, cancel, render and audition are mutations; one direct `invalidateQueries` ([tanstack-query.md](tanstack-query.md) F4#17) |
+| `components/training-studio/plugins/ace.tsx` | training-runs | trainingApi, trainingRecipesApi | - | - | - | Query consumer (ACE LM/DiT status and recipes); scoped training-store actions submit |
+| `components/training-studio/plugins/chips.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainGates.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainingPluginTypes.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainingTargets.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `queries/sa3-previews/queries.ts` | training-runs | sa3PreviewApi | - | - | - | Query owner/policy; area contract applies |
+| `queries/writes.ts` | foundation | httpClient | - | - | - | Query owner/policy: shared write helpers (`writeAndInvalidate`, `useUpload`) |
+| `services/axiosClient.ts` | foundation | apiError | 1 | - | - | Transport: the axios instance, its fetch adapter and the global error catch |
+| `services/compareApi.ts` | studios | httpClient | - | - | - | Transport; its reads have no Query caller yet (`stores/compareStore.ts`) |
+| `services/sa3PreviewApi.ts` | training-runs | httpClient | - | - | - | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/updatesApi.ts` | shell-queue | httpClient | - | - | - | Transport; area Query caller owns reads, commands/streams explicit |
+| `stores/compareStore.ts` | studios | compareApi | - | - | - | Open: session list, session, analysis and diff reads held in a hand-rolled store, not Query ([tanstack-query.md](tanstack-query.md) F3) |

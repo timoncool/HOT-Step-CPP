@@ -106,6 +106,9 @@ export interface TrainingJob {
    *  An AbortController does nothing to a spawned process — cancelJob() kills
    *  this directly. */
   child?: ChildProcess;
+  /** Graceful trainer cancellation; the GPU lane stays held until close/restart. */
+  cancelChild?: () => void;
+  cleanupPending?: boolean;
 }
 
 const jobs = new Map<string, TrainingJob>();
@@ -175,7 +178,7 @@ export function getJob(id: string): TrainingJob | undefined {
 
 export function activeJobForDataset(datasetId: string): TrainingJob | undefined {
   for (const job of jobs.values()) {
-    if (job.datasetId === datasetId && (job.status === 'queued' || job.status === 'running')) return job;
+    if (job.datasetId === datasetId && (job.status === 'queued' || job.status === 'running' || job.cleanupPending)) return job;
   }
   return undefined;
 }
@@ -386,6 +389,7 @@ function laneFor(job: TrainingJob): 'gpu' | 'net' {
     case 'preprocess':
     case 'train-lm':
     case 'train-dit':
+    case 'sa3-train':
     case 'audition':
     case 'lm-calibrate':   // drives /lm generations — engine must be up, GPU-serial
     case 'dit-calibrate':  // drives /synth + /vae — same rule
@@ -484,7 +488,7 @@ export function cancelJob(id: string): boolean {
     // A spawned child (ace-train) ignores the AbortController entirely — kill
     // the whole tree, or a cancelled preprocess job keeps the GPU for hours and
     // leaves an ffmpeg grandchild transcoding into <out>/.tmp/.
-    killJobChild(job);
+    if (job.cancelChild) job.cancelChild(); else killJobChild(job);
     // Rows this job had queued/in flight go back to their on-disk state at once,
     // or they would render "Queued…"/"Working…" (and read-only) forever.
     clearTransientStatuses(job.datasetId, job.sampleIds);
@@ -494,15 +498,19 @@ export function cancelJob(id: string): boolean {
     endStream(job);
     console.log(`[Training] Job ${id} cancelled`);
   }
-  // §2.8 — DELETE always removes the job from the map. The finished `_meta.json`
-  // keeps it visible in GET /jobs, and dropping it here bounds memory: every job
-  // holds up to MAX_EVENTS events, some carrying a full sample with lyrics.
-  jobs.delete(id);
+  // Finished metadata remains on disk. A graceful trainer keeps its admission
+  // reservation until the child exits and the engine restart settles.
+  if (!job.cleanupPending) jobs.delete(id);
   return true;
 }
 
 export function isCancelled(job: TrainingJob): boolean {
   return job.status === 'cancelled' || job.controller.signal.aborted;
+}
+
+export function releaseJobCleanup(job: TrainingJob): void {
+  job.cleanupPending = false;
+  if (isCancelled(job)) jobs.delete(job.id);
 }
 
 export function finishJob(job: TrainingJob, status: TrainingJobStatus, error?: string): void {
@@ -1707,6 +1715,15 @@ export function startTrainDitJob(datasetId: string, opts: unknown): TrainingJob 
   enqueue(job, async (j) => {
     const { runTrainDitJob } = await import('./trainDitRunner.js');
     await runTrainDitJob(j);
+  });
+  return job;
+}
+
+export function startSa3TrainJob(datasetId: string, opts: unknown): TrainingJob {
+  const job = createJob('sa3-train', datasetId, [], opts);
+  enqueue(job, async j => {
+    const { runSa3TrainJob } = await import('./trainSa3Runner.js');
+    await runSa3TrainJob(j);
   });
   return job;
 }

@@ -24,6 +24,10 @@ export function selectFinishable(rest: readonly Yue2ReviewRow[], queued: Readonl
   return rest.filter(r => r.best && !r.finished && !r.live && r.status !== 'running' && !queued.has(r.refineRun));
 }
 
+export function awaitingReview(row: Yue2ReviewRow): boolean {
+  return row.unscored > 0 && !row.reviewed && !row.finished;
+}
+
 export const ReviewPanel: React.FC = () => {
   const { t } = useTranslation();
   const openDataset = useTrainingStore(s => s.openDataset);
@@ -48,9 +52,8 @@ export const ReviewPanel: React.FC = () => {
   };
   // "Reviewing complete" on the Refine tab counts as scored; a finished
   // (linked and cleaned up) ladder has nothing left to review.
-  const awaiting = (r: Yue2ReviewRow) => r.unscored > 0 && r.previews > 0 && !r.reviewed && !r.finished;
-  const pending = rows.filter(awaiting);
-  const rest = rows.filter(r => !awaiting(r));
+  const pending = rows.filter(awaitingReview);
+  const rest = rows.filter(r => !awaitingReview(r));
   // Scored ladders can be finished in one go on the server: NAR further
   // training from the best-scored rung, then link + cleanup (yue2BatchRunner).
   // Finish always runs on this machine, so its batch is read from the local
@@ -113,7 +116,7 @@ export const ReviewPanel: React.FC = () => {
       <div className="flex items-center gap-2">
         <ListChecks size={16} className="text-amber-500" />
         <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-100">{t('trainingStudio.review.title', 'Awaiting review')}</span>
-        <span className="text-[11px] text-zinc-500">{t('trainingStudio.review.intro', 'Runs with previews and rungs you have not scored yet. Click one to listen and score.')}</span>
+        <span className="text-[11px] text-zinc-500">{t('trainingStudio.review.intro', 'Runs with rungs you have not scored yet. Click one to render previews, listen and score.')}</span>
         <span className="flex-1" />
         <button type="button" onClick={() => void load()} disabled={loading} className="p-1.5 rounded-lg border border-zinc-300/70 dark:border-white/10 text-zinc-500 hover:bg-zinc-500/10"><RefreshCw size={13} className={loading ? 'animate-spin' : ''} /></button>
       </div>
@@ -134,7 +137,7 @@ export const ReviewPanel: React.FC = () => {
         </button>
       </div>}
       {error && <div className="text-xs text-red-600 dark:text-red-400">{error}</div>}
-      {pending.length === 0 && !loading && <p className="text-xs text-zinc-500">{t('trainingStudio.review.empty', 'Nothing waiting. Ladders appear here once their rung previews exist.')}</p>}
+      {pending.length === 0 && !loading && <p className="text-xs text-zinc-500">{t('trainingStudio.review.empty', 'Nothing waiting. Runs appear here once they have a saved checkpoint pair.')}</p>}
       <div className="flex flex-col gap-2">{pending.map(r => <Row key={r.refineRun} r={r} />)}</div>
       {finishable.length > 0 && <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 flex flex-col gap-2">
         <div className="flex items-center gap-2">
@@ -167,7 +170,7 @@ export const ReviewPanel: React.FC = () => {
           </div>
         </>}
       </div>}
-      {rest.length > 0 && <details className="mt-2"><summary className="cursor-pointer text-[11px] text-zinc-500">{t('trainingStudio.review.done', 'Scored or without previews ({{n}})', { n: rest.length })}</summary>
+      {rest.length > 0 && <details className="mt-2"><summary className="cursor-pointer text-[11px] text-zinc-500">{t('trainingStudio.review.done', 'Scored or finished ({{n}})', { n: rest.length })}</summary>
         <div className="mt-2 flex flex-col gap-2 opacity-80">{rest.map(r => <Row key={r.refineRun} r={r} />)}</div></details>}
     </div>
   );

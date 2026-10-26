@@ -117,19 +117,15 @@ test('take crop: the in point only on a first-section take, a second clear of th
   const later = { ...first, from: 1, to: 1, prefix: 150, starts: [0, 150, 220] };
   assert.equal(moveCropEdge(later, none, 'in', 2).in, null);
   assert.equal(moveCropEdge(later, none, 'out', 1).out, 6.04);
-  // Inside the section it composed needs a choice; at or past the next section's start does not.
+  // Inside the section it composed, or inside the one it ran on into, needs a choice; at a section's start does not.
   assert.equal(cropNeedsMode(later, { ...none, out: 7 }), true);
   assert.equal(cropNeedsMode(later, { ...none, out: 8.8 }), false);
+  assert.equal(cropNeedsMode(later, { ...none, out: 9.2 }), true);
   assert.equal(cropNeedsMode(later, none), false);
 });
 
-test('a drag picks the part of a take to keep; a cut with nothing after it ends the song only when the plan does', async () => {
-  const { selectCrop, advanceLabel } = await import('./Yue2Build');
-  const first = { id: 'a', from: 0, to: 0, frames: 250, starts: [0, 200], audioUrl: '', seed: 1, occurrences: ['o0'] } as any;
-  assert.deepEqual(selectCrop(first, 1.234, 8), { in: 1.24, out: 8, mode: null });
-  // A later take cannot start later: only its end moves.
-  const later = { ...first, from: 1, to: 1, prefix: 150, starts: [0, 150, 220] };
-  assert.deepEqual(selectCrop(later, 6.5, 7.6), { in: null, out: 7.6, mode: null });
+test('a cut with nothing after it ends the song only when the plan does', async () => {
+  const { advanceLabel } = await import('./Yue2Build');
   assert.equal(advanceLabel('verse', 'chorus', false), 'moves on to chorus');
   assert.equal(advanceLabel('verse', null, true), 'keeps verse cut short and ends the song');
   assert.match(advanceLabel('verse', null, false), /next section you add starts at the cut/);
@@ -139,4 +135,14 @@ test('locked build settings read as one line', () => {
   assert.equal(settingsSummary({ voices: 'vocal', tempo: 'free', keyShift: 0, cfgScale: 1, arStrength: 0.6 }, 'C major'),
     'vocal melody only, free tempo, source key, condition strength 1, AR strength 0.6');
   assert.match(settingsSummary({ voices: 'both', tempo: 96, keyShift: 2, cfgScale: 1.2, arStrength: 0.5 }, 'C major'), /^vocal \+ instrumental line, 96 BPM, \+2 st \(D major\)/);
+});
+
+test('an improv is its own occurrence with its bars, added by bar count, unsung', async () => {
+  const { planItems, editedPlan, occurrenceLines } = await import('./Yue2Build');
+  const session = arranged(['s0', 'improv'], 1);
+  session.arrangement.plan[1].bars = 8;
+  const items = planItems(session);
+  assert.deepEqual(items.map(i => [i.id, i.section, i.improv]), [['o0', 0, undefined], ['o1', -1, 8]]);
+  assert.deepEqual(editedPlan(items, 1, { improv: 4 }), ['o1', 'improv:4']);
+  assert.equal(occurrenceLines('[S0]\nwords\n', session, items[1]), null);
 });

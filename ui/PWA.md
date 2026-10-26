@@ -1,11 +1,21 @@
 # PWA and phone sheets
 
-Production builds register `/sw.js`. Vite generates a worker identity from the
-bundle, manifest and icons. Installation precaches the HTML and built assets;
-activation retires only older `hotstep-shell-` caches. Navigations, manifest and
-icons revalidate online and fall back to the shell offline. API, audio,
-references, range requests and cross-origin traffic bypass the worker. Offline
-mode loads the interface; generation and library requests still need the server.
+Production builds register `/sw.js` (`src/main.tsx`). Vite generates a worker
+identity from the bundle, manifest and icons (the `hotstep-app-shell` plugin in
+`vite.config.ts` fills `public/sw.js`'s build and asset placeholders).
+Installation precaches the HTML, built assets, manifest and icons; activation
+retires only older `hotstep-shell-` caches. Navigations, manifest and icons
+revalidate online; offline, a navigation falls back to the cached shell and the
+manifest and icons to their cached copies. Non-GET requests, `/api`, `/audio`,
+`/references`, `/mm3`, `/socket.io`, `/ws`, media files, range requests and
+cross-origin traffic bypass the worker. Offline mode loads the interface;
+generation and library requests still need the server.
+
+Completion notifications come from `useJobProgressWatcher`
+(`src/hooks/useJobProgress.ts`): when a queue item succeeds while the tab is
+hidden, it shows one through the service worker registration, falling back to
+a page `Notification`, with the song id as its data. Permission is asked only
+from a user gesture: the first Generate click asks once.
 
 Notification clicks focus an existing window and deliver `open-song` after the
 mounted listener acknowledges readiness. A new or still-loading window receives

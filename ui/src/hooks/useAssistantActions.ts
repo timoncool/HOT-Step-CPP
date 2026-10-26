@@ -52,6 +52,9 @@ const LABEL_MAP: Record<string, string> = {
   lmCfgScale: 'LM CFG Scale',
   lmTopK: 'LM Top-K',
   lmTopP: 'LM Top-P',
+  lmMinP: 'LM Min-P',
+  lmCfgMinP: 'LM CFG Plausibility',
+  lmCfgRescale: 'LM CFG Rescale',
   lmNegativePrompt: 'LM Negative Prompt',
   // Post-processing
   postProcessingEnabled: 'Post-Processing',
@@ -139,6 +142,9 @@ export function useAssistantActions() {
     lmCfgScale: gp.setLmCfgScale,
     lmTopK: gp.setLmTopK,
     lmTopP: gp.setLmTopP,
+    lmMinP: gp.setLmMinP,
+    lmCfgMinP: gp.setLmCfgMinP,
+    lmCfgRescale: gp.setLmCfgRescale,
     lmNegativePrompt: gp.setLmNegativePrompt,
     // Post-processing
     postProcessingEnabled: gp.setPostProcessingEnabled,

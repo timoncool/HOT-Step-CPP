@@ -1,6 +1,8 @@
 // Source checks for every release assembler, including local packaging.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { BUILD_INFO_FILE, buildInfoErrors } from './build-info.mjs';
 
 export function checkReleaseLayout(root) {
   const errors = [];
@@ -19,6 +21,7 @@ export function checkReleaseLayout(root) {
     for (const file of ['profile-path.mjs', 'README.txt', 'HOT-Step.']) {
       if (!src.includes(file)) errors.push(`${name}: missing ${file}`);
     }
+    if (!/release[\\/]build-info\.mjs|"build-info\.mjs"/.test(src) || !src.includes('--package')) errors.push(`${name}: does not write and check build-info.json`);
     if (!/server[\\/]src[\\/]data[\\/](?:\*|\.)/.test(src)) errors.push(`${name}: resources must copy wholesale into server/data`);
     if (!/(?:\$dataOut|SRVOUT\/data|STAGING_DIR\}\/server\/data)/.test(src)) errors.push(`${name}: missing app-owned server/data target`);
     if (/(?:mkdir[^\n]*|New-Item[^\n]*)(?:\$(?:DIST|dist)|\$\{STAGING_DIR\})\/(?:models|adapters)/.test(src)) errors.push(`${name}: creates mutable folders inside app`);
@@ -39,4 +42,42 @@ export function checkReleaseLayout(root) {
     if (/powershell|pwsh/i.test(src)) errors.push(`${launcher}: spawns PowerShell, which behaviour-based antivirus quarantines`);
   }
   return errors;
+}
+
+const BACKEND_LIB = /ggml-(cuda|vulkan|hip)\.(?:dll|so|dylib)$/;
+
+/** Checks an assembled package root against the asset it is meant to be. */
+export function checkPackageBuildInfo(root, { os, variant }) {
+  let info;
+  try { info = JSON.parse(fs.readFileSync(path.join(root, BUILD_INFO_FILE), 'utf8')); }
+  catch (e) { return [`${BUILD_INFO_FILE}: ${e.code === 'ENOENT' ? 'missing' : 'unreadable'}`]; }
+  const errors = buildInfoErrors(info).map(e => `${BUILD_INFO_FILE}: ${e}`);
+  if (info?.os !== os || info?.variant !== variant) errors.push(`${BUILD_INFO_FILE}: is ${info?.os} ${info?.variant}, expected ${os} ${variant}`);
+  if (errors.length) return errors;
+  let version = '';
+  try { version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim().replace(/^v/, ''); } catch { errors.push('VERSION: missing'); }
+  if (info.tag && version !== info.tag.slice(1)) errors.push(`${BUILD_INFO_FILE}: tag ${info.tag} disagrees with VERSION ${version}`);
+  const engine = path.join(root, 'engine');
+  const libs = fs.existsSync(engine) ? fs.readdirSync(engine).map(f => f.match(BACKEND_LIB)?.[1]).filter(Boolean) : [];
+  const backend = variant.startsWith('cuda') ? 'cuda' : variant === 'rocm' ? 'hip' : variant === 'vulkan' ? 'vulkan' : null;
+  if (backend && !libs.includes(backend)) errors.push(`engine: ${variant} package has no ggml-${backend} library`);
+  for (const lib of libs) if (lib !== backend) errors.push(`engine: ${variant} package ships a ggml-${lib} library`);
+  // The coarse markers are optional (local packagers skip them) but must agree when present.
+  const marker = f => { try { return fs.readFileSync(path.join(engine, f), 'utf8').trim(); } catch { return null; } };
+  const coarse = backend === 'cuda' ? 'cuda' : variant;
+  if (![null, coarse].includes(marker('.variant'))) errors.push(`engine/.variant: expected ${coarse}, found ${marker('.variant')}`);
+  const major = backend === 'cuda' ? variant.match(/^cuda(\d+)/)[1] : null;
+  if (![null, major].includes(marker('.cuda-version'))) errors.push(`engine/.cuda-version: expected ${major ?? 'none'}, found ${marker('.cuda-version')}`);
+  return errors;
+}
+
+// node release/check-layout.mjs --package <root> --os <os> --variant <variant>
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const opts = {};
+  for (let i = 2; i < process.argv.length; i += 2) opts[process.argv[i].replace(/^--/, '')] = process.argv[i + 1];
+  const errors = opts.package ? checkPackageBuildInfo(opts.package, opts)
+    : checkReleaseLayout(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+  for (const e of errors) console.error(`check-layout: ${e}`);
+  if (errors.length) process.exit(1);
+  console.log(`check-layout: ${opts.package ? `${opts.package} ${opts.variant}` : 'assemblers'} OK`);
 }

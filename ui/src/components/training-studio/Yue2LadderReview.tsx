@@ -22,7 +22,7 @@ import {
 } from '../../services/trainingApi';
 import { Toggle } from '../settings/SettingsPrimitives';
 import { ParamLabel } from '../shared/ParamLabel';
-import { PreviewPlayer } from './PreviewPlayer';
+import { TrainingPreviewRung, type PreviewTake } from './TrainingPreviewPanel';
 
 import { cleanupReviewRung, pickFromLadder, selectReviewRung, type ReviewPick } from '../../services/trainingReviewApi';
 
@@ -75,6 +75,18 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
   const rungName = (step: number) => blind
     ? t('trainingStudio.refine.blindRung', 'Rung {{label}}', { label: labelFor(step) || '?' })
     : t('trainingStudio.refine.rungStep', 'Step {{step}}', { step });
+  // This ladder's records as the shared take rows; the sheet, seed and plan
+  // wording stays here because only YuE2 has lead sheets.
+  const takeRows = (takes: Yue2JointPreviewRecord[], step: number): PreviewTake[] => takes.map((p, i) => {
+    const take = t('trainingStudio.refine.take', 'Take {{n}}', { n: i + 1 });
+    if (!(p.audioUrl && p.status === 'done')) return { id: p.id, text: `${take}: ${p.status === 'done' && !p.file ? t('trainingStudio.refine.audioPruned', 'audio removed by cleanup') : p.status}${p.error ? ` — ${p.error}` : ''}${p.score?.verdict ? ` · plan ${p.score.verdict}` : ''}${p.score?.flags?.length ? ` · ${p.score.flags[0]}` : ''}`, label: take };
+    return {
+      id: p.id, src: `${p.audioUrl}&format=mp3`, downloadSrc: p.audioUrl,
+      downloadName: `${datasetName || 'preview'}_${blind ? `rung${labelFor(step)}` : `step${step}`}_take${i + 1}_seed${p.seed}.wav`,
+      label: `${take}${p.sheet === 'own' ? ` · ${t('trainingStudio.refine.sheetOwn', "this rung's plan")}` : p.sheet === 'shared' ? ` · ${blind ? t('trainingStudio.refine.blindSharedSheet', 'shared sheet from Rung {{label}}', { label: labelFor(p.sheetStep ?? 0) || '?' }) : t('trainingStudio.refine.sheetShared', 'shared sheet from step {{s}}', { s: p.sheetStep })}` : ''}${p.seedKind === 'fixed' ? ` · ${t('trainingStudio.refine.seedFixed', 'same seed on every rung: compare rungs on this one')}` : p.seedKind === 'random' ? ` · ${t('trainingStudio.refine.seedRandom', 'random seed: a new song, not comparable with other rungs')}` : ''}`,
+      sublabel: `${p.seconds} s · seed ${p.seed}${p.endReason && p.endReason !== 'completed' ? ` · ${p.endReason}` : ''}${p.score?.verdict ? ` · plan ${p.score.verdict}` : ''}${p.score?.flags?.length ? ` · ⚠ ${p.score.flags.join('; ')}` : ''}${p.plan ? ` · planner replans ${p.plan.attempts.length - 1}` : ''}${typeof p.composerReplans === 'number' ? ` · composer replans ${p.composerReplans}` : ''}`,
+    };
+  });
   const fail = (err: unknown) => onError?.(err instanceof Error ? err.message : String(err));
   const draftOpts = renderOpts.draft ? { odeSteps: 12, narCacheRatio: 0 } : {};
 
@@ -272,10 +284,9 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
         {visibleLadder.map(c => {
           const stats = rungStats(c.step);
           const { mine, plannerReplans, composerReplans, hasReplanData, flaggedTakes, flagReasons, overall } = stats;
-          return <div key={c.step} id={`${idPrefix}-${c.step}`}
-            className={`rounded-lg border p-3 ${picked === c.dir ? 'border-emerald-500/60 bg-emerald-500/5' : c.step === bestStep ? 'border-sky-500/70' : c.rung ? 'border-amber-500/40' : 'border-zinc-300/70 dark:border-white/10'}`}>
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-              <span className="font-semibold text-zinc-800 dark:text-zinc-100">{rungName(c.step)}</span>
+          return <TrainingPreviewRung key={c.step} id={`${idPrefix}-${c.step}`} title={rungName(c.step)} takes={takeRows(mine, c.step)}
+            className={picked === c.dir ? 'border-emerald-500/60 bg-emerald-500/5' : c.step === bestStep ? 'border-sky-500/70' : c.rung ? 'border-amber-500/40' : 'border-zinc-300/70 dark:border-white/10'}
+            badges={<>
               {!blind && c.rung && c.kl !== undefined && <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 text-[10px] font-semibold">{t('trainingStudio.refine.rungBadge', 'rung')}</span>}
               {!blind && !c.rung && <span className="text-[10px] text-zinc-500">{t('trainingStudio.refine.routineSave', 'routine save')}</span>}
               {c.step === bestStep && <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-700 dark:text-sky-300 text-[10px] font-semibold">{t('trainingStudio.refine.bestBadge', 'best by score')}</span>}
@@ -284,7 +295,8 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
               {hasReplanData && <span className="font-mono text-zinc-500" title={blind ? undefined : t('trainingStudio.refine.replansInfo', 'planner / composer re-plans across this rung\'s takes; rising counts are a sign of over-training')}>{t('trainingStudio.refine.replans', 'replans {{p}}/{{c}}', { p: plannerReplans, c: composerReplans })}</span>}
               {flaggedTakes.length > 0 && <span className="font-mono text-red-600 dark:text-red-400" title={flagReasons}>{t('trainingStudio.refine.planFlags', 'plan flags {{n}}/{{takes}}', { n: flaggedTakes.length, takes: stats.doneTakes.length })}</span>}
               {overall && <span className="font-mono text-sky-700 dark:text-sky-300" title={t('trainingStudio.refine.overallInfo', 'overall = (likeness + (6 − corruption)) / 2, minus a soft penalty for replan load')}>{t('trainingStudio.refine.overall', 'overall {{n}}', { n: overall.overall.toFixed(2) })}</span>}
-              <span className="flex-1" />
+            </>}
+            actions={<>
               <button type="button" onClick={() => void render(c.step)} disabled={rendering !== null}
                 className="px-2 py-1 rounded-lg text-[11px] border border-zinc-300/70 dark:border-white/10 hover:bg-zinc-500/10 disabled:opacity-40">
                 {rendering === c.step ? t('trainingStudio.refine.rendering', 'Rendering…') : mine.length ? t('trainingStudio.refine.render', 'Render more') : t('trainingStudio.refine.renderFirst', 'Render')}
@@ -293,7 +305,7 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
                 className={`px-2 py-1 rounded-lg text-[11px] font-semibold border disabled:opacity-40 ${picked === c.dir ? 'border-emerald-500 text-emerald-700 dark:text-emerald-300' : 'border-zinc-300/70 dark:border-white/10 hover:bg-zinc-500/10'}`}>
                 {picked === c.dir ? t('trainingStudio.refine.picked', 'In use') : t('trainingStudio.refine.use', 'Use this rung')}
               </button>
-            </div>
+            </>}>
             <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px]">
               {(['likeness', 'corruption'] as const).map(key => <div key={key} className="flex items-center gap-1">
                 <span className="text-zinc-500 w-16">{key === 'likeness' ? t('trainingStudio.refine.scoreLikeness', 'Likeness') : t('trainingStudio.refine.scoreCorruption', 'Corruption')}</span>
@@ -308,12 +320,7 @@ export const Yue2LadderReview = forwardRef<Yue2LadderReviewHandle, {
               <div className="font-semibold">{t('trainingStudio.refine.noCleanPlan', 'This checkpoint is not writing good plans: no clean lead sheet in {{n}} tries.', { n: stats.unclean[0].plan!.attempts.length })}</div>
               <div className="mt-0.5">{t('trainingStudio.refine.noCleanPlanDetail', 'The take below was rendered from the least-flagged plan anyway. Flags on it:')} {(stats.unclean[0].score?.flags ?? stats.unclean[0].plan!.attempts[stats.unclean[0].plan!.attempts.length - 1].flags ?? []).join('; ') || t('trainingStudio.refine.noCleanPlanBroken', 'the judge rejected every plan')}</div>
             </div>}
-            {mine.length > 0 && <div className="mt-2 flex flex-col gap-2">
-              {mine.map((p, i) => p.audioUrl && p.status === 'done'
-                ? <PreviewPlayer key={p.id} src={`${p.audioUrl}&format=mp3`} downloadSrc={p.audioUrl} downloadName={`${datasetName || 'preview'}_${blind ? `rung${labelFor(c.step)}` : `step${c.step}`}_take${i + 1}_seed${p.seed}.wav`} label={`${t('trainingStudio.refine.take', 'Take {{n}}', { n: i + 1 })}${p.sheet === 'own' ? ` · ${t('trainingStudio.refine.sheetOwn', "this rung's plan")}` : p.sheet === 'shared' ? ` · ${blind ? t('trainingStudio.refine.blindSharedSheet', 'shared sheet from Rung {{label}}', { label: labelFor(p.sheetStep ?? 0) || '?' }) : t('trainingStudio.refine.sheetShared', 'shared sheet from step {{s}}', { s: p.sheetStep })}` : ''}${p.seedKind === 'fixed' ? ` · ${t('trainingStudio.refine.seedFixed', 'same seed on every rung: compare rungs on this one')}` : p.seedKind === 'random' ? ` · ${t('trainingStudio.refine.seedRandom', 'random seed: a new song, not comparable with other rungs')}` : ''}`} sublabel={`${p.seconds} s · seed ${p.seed}${p.endReason && p.endReason !== 'completed' ? ` · ${p.endReason}` : ''}${p.score?.verdict ? ` · plan ${p.score.verdict}` : ''}${p.score?.flags?.length ? ` · ⚠ ${p.score.flags.join('; ')}` : ''}${p.plan ? ` · planner replans ${p.plan.attempts.length - 1}` : ''}${typeof p.composerReplans === 'number' ? ` · composer replans ${p.composerReplans}` : ''}`} />
-                : <div key={p.id} className="text-[11px] text-zinc-500">{t('trainingStudio.refine.take', 'Take {{n}}', { n: i + 1 })}: {p.status === 'done' && !p.file ? t('trainingStudio.refine.audioPruned', 'audio removed by cleanup') : p.status}{p.error ? ` — ${p.error}` : ''}{p.score?.verdict ? ` · plan ${p.score.verdict}` : ''}{p.score?.flags?.length ? ` · ${p.score.flags[0]}` : ''}</div>)}
-            </div>}
-          </div>;
+          </TrainingPreviewRung>;
         })}
       </div>}
       {bestStep !== undefined && <div className="hidden md:block fixed right-4 bottom-4 z-40 max-w-xs rounded-xl border border-zinc-300/70 dark:border-white/10 bg-white/90 dark:bg-zinc-900/90 shadow-xl p-3">

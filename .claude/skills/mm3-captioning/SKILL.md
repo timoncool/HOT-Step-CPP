@@ -1,6 +1,6 @@
 ---
 name: mm3-captioning
-description: Explains MiniMax-Music3's Structured Caption format (Global Metadata / Vocal Details / Arrangement) and the vendored upstream music-caption-rewriter reference library. Use when formatting a caption/prompt for the MiniMax-Music3 backend (mm3-* engine, /api/generate with backend=minimax), building the prompt-assembly / request-translator increment for MM3, wiring Lyric Studio output toward an MM3 caption, or debugging genre drift / low adherence in MM3 generations.
+description: Explains MiniMax-Music3's Structured Caption format (Global Metadata / Vocal Details / Arrangement) and the vendored upstream music-caption-rewriter reference library. Use when formatting a caption/prompt for the MiniMax-Music3 backend (mm3-* engine, /api/generate with the minimax-m3 backend active), building the prompt-assembly / request-translator increment for MM3, wiring Lyric Studio output toward an MM3 caption, or debugging genre drift / low adherence in MM3 generations.
 ---
 
 # MiniMax-Music3 Captioning
@@ -90,7 +90,7 @@ Example templates worth opening as calibration references (plain-text label form
 not markdown):
 - `upstream/templates/acoustic-blues-folk_0001.txt` — sparse solo-instrument
   arrangement, good minimal-instrumentation example.
-- `upstream/templates/index-east-asian-modern.md` cards → templates therein, if
+- `upstream/references/index-east-asian-modern.md` cards → templates therein, if
   MM3 output needs to match HOT-Step's existing East-Asian-heavy adapter/dataset mix.
 - Any `index-hip-hop-rap.md` or `index-metal-heavy-rock.md` card, for genres where
   our current ACE-Step captions already lean on strong groove/production language —
@@ -100,7 +100,9 @@ not markdown):
 
 Cross-checked `upstream/SKILL.md`'s Output Contract against
 `D:\Ace-Step-Latest\mm3-weights\fixtures\tok_prompt_template.txt`, the literal
-prompt-assembly template the reference pipeline builds:
+prompt-assembly template the reference pipeline builds (the engine's port is
+`mm3_assemble_prompt`, `engine/src/minimax/mm3-request.h:527-535`):
+<!-- TODO(verify): D:\Ace-Step-Latest\mm3-weights\ was absent on the dev machine on 2026-10-23; confirm where the fixture lives now. -->
 
 ```
 <|im_start|><|caption_start|>Energetic synthwave with driving bass, retro drums, and soaring lead synths. 120 BPM, A minor.<|caption_end|><|lyrics_start|>[start]
@@ -135,6 +137,14 @@ Findings:
   Structured Caption, keep it under the shared 5,000-token budget alongside lyrics,
   and don't assume the pipeline needs or wants markdown syntax anywhere in the
   string it hands to `<|caption_start|>`.
+- Two safety nets now sit on the way out. The engine's `mm3_clean_caption`
+  (`mm3-request.h:388`, a port of the reference `encoders.py:56-79`) strips markdown
+  headings, bullets, bold/italic and horizontal rules before the caption is
+  wrapped, so `**bold**` or `###` in the box never reach the model as syntax. The
+  server's `repairMm3CaptionHeadings` (`server/src/services/backends/minimax/generate.ts:221`)
+  re-inserts a missing `Global Metadata` / `Vocal Details` / `Arrangement` heading
+  when that section's first label is present, and leaves a plain one-line
+  caption alone. Neither repairs a caption written in the wrong dialect.
 
 ## Empirical context (measured 2026-08-13)
 
@@ -190,11 +200,16 @@ This supersedes nothing above; it is the layer under "THE GENRE MUST BE
 SPECIFIC" in `MM3_CAPTION_SYSTEM_PROMPT`. Specific *and attested and consistent
 with the prose*. The structural fix is retrieval — few-shot the caption writer
 with 2-3 real templates from the routed family — designed in
-`docs/plans/2026-08-21-mm3-prompt-translator.md`.
+`docs/plans/2026-08-21-mm3-prompt-translator.md`. A deterministic, no-LLM form of
+that idea shipped as the caption composer: `POST /api/lireek/mm3/compose`
+(`server/src/services/lireek/mm3Compose.ts`, corpus `server/src/data/mm3-corpus.json`
+built from these 1,000 templates) selects real template prose for the routed
+family, so it cannot emit off-family vocabulary. Details: the mm3-backend skill's
+`reference/features.md`.
 
 **Confound to control first:** the caption is consumed ONLY by the LM (the flow
 DiT's uncond branch is `zeros_like(condition)`, not an empty prompt —
-`engine/src/minimax/mm3-dit-graph.h:459`). Never judge caption adherence on a
+`engine/src/minimax/mm3-dit-graph.h:84-88`). Never judge caption adherence on a
 quantised LM; q8_0/NVFP4/MXFP4 degrade exactly the stage being measured.
 
 ## The format is MANDATORY, not preferred (ear-verified 2026-08-14)
@@ -208,7 +223,7 @@ A controlled A/B settled this for training data. One track (the album-A artist,
 - **Arm B** — the SAME content restructured into the three sections, 503 words,
   `Basic Attributes` synthesised from the sidecar's bpm/key/signature.
 
-Rob's verdict by ear: **B better "by a massive margin"; most A takes were not even
+The user's verdict by ear: **B better "by a massive margin"; most A takes were not even
 the right genre (1 of 5 was), while B was on-genre and sounded far better.**
 
 Consequences, both load-bearing:
@@ -235,6 +250,7 @@ adjacent. Ears decided it; keep it that way.
 
 Artifacts: `M:\HOT-Step-CPP\_experiments\caption-ab-2026-08-14\` (10 WAVs, both
 captions, `results.json`, and the runner).
+<!-- TODO(verify): this folder was not found on 2026-10-23 (no M:\HOT-Step-CPP); confirm where the artifacts were moved. -->
 
 ## RESOLVED 2026-08-15: caption from the AUDIO with `ace-caption --mode mm3`
 
@@ -243,7 +259,7 @@ traps, not for the recommendation.
 
 **MOSS-Music-8B, ported natively by the other agent, writes MM3 Structured
 Captions from the audio.** `ace-caption --models <gguf dir> --src-audio <file>
---mode mm3 --ffmpeg <path>`. Rob's ear test — same track, same lyrics, same 5
+--mode mm3 --ffmpeg <path>`. The user's ear test — same track, same lyrics, same 5
 seeds, both arms declaring IDENTICAL `Basic Attributes` so the only variable was
 the prose:
 
@@ -258,13 +274,13 @@ the caption alone. Caption quality is that dominant.
 Two things to carry forward:
 
 1. **Override `Basic Attributes` with Essentia.** MOSS is unreliable on the two
-   facts the sidecar already knows exactly — on `03-burn` it said ~102 BPM /
+   facts the sidecar already knows exactly — on one album track it said ~102 BPM /
    C# minor where Essentia has 90 / E major. Tempo is a documented MOSS blind
    spot and key behaves the same. `engine/tools/mm3-caption-hybrid.py` keeps
    every section MOSS heard and rebuilds only that line from
    `bpm`/`keyscale`/`timesignature`.
 2. **The genre word must be SPECIFIC.** A bug in the hybrid collapsed every
-   track to the umbrella "Rock", which is precisely the failure Rob described in
+   track to the umbrella "Rock", which is precisely the failure the user described in
    the losing arm. Prefer "Pop-Punk"/"Punk Rock"/"Emo" over "Rock", and search
    every source that observed the track (MOSS's body, the Gemini caption), most
    specific first — not just MOSS's own `Basic Attributes` line.
@@ -323,13 +339,16 @@ judged.
 
 ## Lyric Studio writes MM3 captions natively (2026-08-17)
 
-Lyric Studio's Generate Lyrics now produces **two** captions per song. They are
-separate DB fields and neither is a reformatting of the other:
+Lyric Studio's Generate Lyrics produced **two** captions per song from this date
+(a third, `caption_yue2`, has since been added for YuE2 by its own
+`writeYue2Caption` call). They are separate DB fields and none is a reformatting
+of another:
 
 | field | backend | shape |
 |---|---|---|
 | `generations.caption` | ACE-Step 1.5 | 2-4 sentences of flowing description |
 | `generations.caption_mm3` | MiniMax-Music3 | the three-heading Structured Caption above (3 headings + 13 labels) |
+| `generations.caption_yue2` | YuE2 | YuE2's own caption format (not covered here) |
 
 Where it lives — all prompt text is single-sourced in
 `server/src/services/lireek/prompts.ts` (`MM3_CAPTION_SYSTEM_PROMPT`,
@@ -354,10 +373,14 @@ Four design points, each load-bearing:
    `validateMm3Caption` passes 998 of those 1,000 (the two misses run
    `* Primary:` inline). It is advisory: it drives ONE retry and never rejects,
    because a partly-malformed Structured Caption still beats an ACE caption.
-4. **Consumers pick by ACTIVE backend**, via `ui/src/utils/captionForBackend.ts`.
+4. **Consumers pick by ACTIVE backend**, via `ui/src/utils/captionForBackend.ts`
+   (server-side twin `captionForEngine` in `server/src/services/generation/resolve/captionSource.ts`,
+   used when `/api/resolve/preview` builds the request).
    Read it live from `backendStore`, never from a queued param snapshot:
-   `routes/generate.ts` routes on `getActiveBackendId()` and ignores the
-   request's `backend` field entirely.
+   `/api/generate` runs a job on the backend that is active at submit (or the
+   explicit `backendOverride`), frozen into the job's envelope; the request's
+   `backend` field is log-only, and a resolved body's `expectedBackend` gets a
+   409 if the active backend changed in between.
 
 **Open — no backfill.** The ~1,485 generations written before this all have
 `caption_mm3 = ''` and fall back to their ACE caption on MM3. A bulk backfill
@@ -373,25 +396,28 @@ plan-only, same six seeds, candidates off:
 
 | lyrics | caption (a training track's own, verbatim) | natural endings |
 |---|---|---|
-| 5528 | castaway | 1/6 |
-| 5528 | warning | 4/6 |
-| 5530 | warning | 4/6 |
-| 5530 | castaway | 4/6 |
+| 5528 | track X | 1/6 |
+| 5528 | track Y | 4/6 |
+| 5530 | track Y | 4/6 |
+| 5530 | track X | 4/6 |
 
 - It is the caption x lyrics PAIR, not the song and not the caption alone.
-- Single-sentence edits of the failing caption flip it: Warning's tempo/key/genre
+- Single-sentence edits of the failing caption flip it: track Y's tempo/key/genre
   line alone -> 4/6; deleting the outro sentence ('ad-libs over fading guitar
   feedback and sustained synth tones') alone -> 4/6. A boundary case, not a
   banned word: the 1000 official templates say 'fade' in 377 and 'outro' in 723.
 - A training caption with new lyrics is a style prompt, not a lookup key: no run
-  of four semantic codes is shared with the training track; Rob's ear: unique
+  of four semantic codes is shared with the training track; the user's ear: unique
   album B songs. That is what the Automatic caption source (nearest-tempo
-  dataset track) in Lyric Studio / Create relies on.
+  dataset track) in Lyric Studio / Create relies on: `pickNearestMm3Track` /
+  `resolveMm3Caption` in `server/src/services/generation/resolve/captionSource.ts`
+  (modes `auto`, `track`, `custom`), ported from `ui/src/utils/mm3CaptionSource.ts`.
 - The shared dataset-wide caption (a comma list with no arc) took the same
   recipe to 0/6 and was removed as a feature.
 - Lyric Studio's own generated MM3 captions are being screened the same way
   (`_experiments/2026-09-07-mm3-eos-probe/caption_stage2b.py`); if they
   underperform training captions, the caption prompt is the lever.
+  <!-- TODO(verify): _experiments/2026-09-07-mm3-eos-probe/ was not found under the checkout or D:\Ace-Step-Latest\_experiments on 2026-10-23, and no result of that screen is recorded here. -->
 
 ## Directory contents
 

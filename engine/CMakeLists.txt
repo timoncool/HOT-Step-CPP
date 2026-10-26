@@ -1010,6 +1010,22 @@ if(BUILD_TESTING)
     add_test(NAME sa3-dora-load COMMAND sa3-dora-load-test)
     set_tests_properties(sa3-dora-load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+    # SA3 training gate: one DiT block's backward (placement, finite
+    # differences, official-trainer replay). Skips (77) without the replay fixture.
+    add_executable(sa3-train-grad-test tests/test-sa3-train-grad.cpp)
+    link_ggml_backends(sa3-train-grad-test)
+    target_link_libraries(sa3-train-grad-test PRIVATE yyjson)
+    add_test(NAME sa3-train-grad COMMAND sa3-train-grad-test)
+    set_tests_properties(sa3-train-grad PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    # SA3 trainer parity: full official-trainer steps, AdamW, export round trip,
+    # SAME and T5Gemma (ace-train sa3-train-check). Skips (77) without the step
+    # fixtures (tools/sa3-training-step-fixture.py) or the converted base DiT.
+    set(SA3_TRAIN_DATA ${CMAKE_CURRENT_SOURCE_DIR}/../_experiments/sa3-training)
+    add_test(NAME sa3-train-check COMMAND ace-train sa3-train-check --fixtures ${SA3_TRAIN_DATA}/step
+             --base-dit ${SA3_TRAIN_DATA}/base/sa3-dit-base-BF16.gguf --models ${CMAKE_CURRENT_SOURCE_DIR}/models)
+    set_tests_properties(sa3-train-check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
     # YuE2 joint/AITK DoRA graph fixture: LoRA identity at m == nrm, rescale
     # forward/backward, exact vs expanded row norms.
     add_executable(yue2-aitk-dora-test tests/test-yue2-aitk-dora.cpp)

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { checkpointRecords, isCheckpointLadder } from './yue2AitkRuns.js';
+import { checkpointRecords, isCheckpointLadder, rungsOf, type Yue2AitkCheckpointRecord, type Yue2AitkRunRecord } from './yue2AitkRuns.js';
 import { readYue2ArRun } from './yue2ArRuns.js';
 import { readYue2Run } from './yue2Runs.js';
 import { uniqueDatasetTrigger } from './datasetTrigger.js';
@@ -278,4 +278,13 @@ test('base-matched and fixed-recipe runs are checkpoint ladders; tuned runs are 
   assert.equal(isCheckpointLadder({ method: 'fixed-recipe' }), true);
   assert.equal(isCheckpointLadder({ method: 'tuned' }), false);
   assert.equal(isCheckpointLadder(undefined), false);
+});
+
+test('a tuned run with no KL rungs gets every complete checkpoint as a rung', () => {
+  const run = { options: {} } as Yue2AitkRunRecord;
+  const full = { step: 100, dir: 'a', arPath: 'ar', narPath: 'nar' } as Yue2AitkCheckpointRecord;
+  const partial = { step: 50, dir: 'b' } as Yue2AitkCheckpointRecord;
+  assert.deepEqual(rungsOf(run, [full, partial]).map(c => !!c.rung), [true, false]);
+  const kept = { ...partial, rung: true } as Yue2AitkCheckpointRecord;
+  assert.deepEqual(rungsOf(run, [full, kept]).map(c => !!c.rung), [false, true]);
 });

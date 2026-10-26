@@ -135,6 +135,8 @@ export interface TranscribeParams {
   sourceFileName: string;
   songId?: string;
   model: MuscriptorModel;
+  /** speculative decoding (large only; the server defaults it on) */
+  speculative?: boolean;
 }
 
 // ── API Functions ────────────────────────────────────────────────────────

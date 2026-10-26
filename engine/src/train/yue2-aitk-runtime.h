@@ -4,6 +4,7 @@
 // status contract are shared by ace-train and the CUDA runner; model loading
 // and the training loop remain in yue2-aitk-runtime.cpp.
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 #include <unordered_set>
 #include <cstdlib>
 #include <cmath>
@@ -25,6 +27,8 @@ struct Config {
     std::int32_t steps = 0;
     std::int32_t save_every = 250;
     std::int32_t pause_at = 0; // absolute step; 0 disables preview pauses
+    std::string params_file;   // JSON re-read between steps when it changes: rev, save_every, pause_at
+    std::int32_t params_rev = 0; // the file revision these arguments already carry
     float cursor_weight = 0.08f;
     bool cursor_weight_explicit = false;
     std::uint64_t seed = 0;
@@ -135,6 +139,16 @@ struct Config {
     // --eval-base-loss recipe). No update, no dropout. Pass the run's --steps.
     bool eval_adapted = false;
     std::string eval_dataset;
+    // Opt-in hold-out inside the training dataset: these items (0-based, dataset
+    // order) are left out of training, and --eval-adapted without --eval-dataset
+    // scores only them (pass the same list when resuming a run that used it).
+    // Empty = unchanged.
+    std::vector<size_t> holdout_items;
+    // --eval-adapted window (frames; 0 = whole song) and seed of its per-item
+    // draws. Defaults: --nar-crop-frames and --seed, as before.
+    std::int32_t eval_nar_window = -1;
+    std::uint64_t eval_seed = 0;
+    bool eval_seed_set = false;
     // Spike guard. A step whose pre-clip gradient norm exceeds spike_factor x
     // the median of the last 50 applied steps skips its update (0 = off; it
     // arms once 20 norms are in the window, and the window restarts when the
@@ -301,7 +315,7 @@ inline void usage(FILE * out) {
     std::fprintf(out,
         "ace-train yue2-joint-train --checkpoint <ConvRot.safetensors> "
         "--dataset <schema1-manifest.json> --output <new-run-dir> "
-        "--steps N --save-every N --seed N --device CUDA0 [--resume <record>] [--pause-at N] "
+        "--steps N --save-every N --seed N --device CUDA0 [--resume <record>] [--pause-at N] [--params-file <json> [--params-rev N]] "
         "[--cursor-weight 0.08 (0 disables lyric timing)] [--rank N] [--alpha F] "
         "[--adapter-type lora|lokr|dora] [--lokr-dim 32] [--lokr-factor 8] "
         "[--optimizer adamw|adamw-lm|prodigy|muon] [--cautious] [--lr F] [--warmup N] [--weight-decay F] "
@@ -312,6 +326,8 @@ inline void usage(FILE * out) {
         "[--nar-drift (log the decoder's drift from base and its reconstruction error at every checkpoint)] "
         "[--meter-only (with --resume: write the checkpoint's meters.json and exit)] "
         "[--eval-adapted (with --resume: held-out base vs adapted planner CE and decoder MSE to <output>/adapted-loss.jsonl, no training)] [--eval-dataset <dataset.json> (the held-out set for --eval-adapted)] "
+        "[--holdout-items I,J,.. (leave these dataset items out of training; --eval-adapted without --eval-dataset scores only them)] "
+        "[--eval-nar-window N (--eval-adapted window: default --nar-crop-frames, 0 = whole song)] [--eval-seed N (seed of the --eval-adapted draws: default --seed)] "
         "[--eval-base-loss (no training: per-item base planner CE and decoder flow MSE to <output>/base-loss.jsonl)] "
         "[--recon-stop F (planner frozen: stop when a line fitted through the last --recon-stop-window 3 reconstruction readings gains under F)] [--recon-reset (with --resume: empty window)] "
         "[--unfreeze-planner (with --resume: train the planner on past its freeze)] [--kl-checkpoint-every 0.1 (a checkpoint at each KL rung)] "
@@ -331,6 +347,52 @@ inline void usage(FILE * out) {
 }
 
 namespace detail {
+// Shared by fresh-run filtering and resume validation. Dataset indices are
+// stable; the split is a set, while the training order retains its shuffle.
+inline bool training_order(size_t item_count, const std::vector<size_t> & holdout,
+                           std::vector<size_t> * order, std::string * error) {
+    std::vector<bool> held(item_count, false);
+    for (size_t k : holdout) {
+        if (k >= item_count || held[k]) {
+            if (error) *error = "--holdout-items must contain distinct in-range indices";
+            return false;
+        }
+        held[k] = true;
+    }
+    if (holdout.size() >= item_count) {
+        if (error) *error = "--holdout-items leaves no training item";
+        return false;
+    }
+    order->clear();
+    for (size_t k = 0; k < item_count; ++k) if (!held[k]) order->push_back(k);
+    return true;
+}
+
+inline bool validate_resume_order(size_t item_count, const std::vector<size_t> & holdout,
+                                  const std::vector<size_t> & saved_holdout,
+                                  const std::vector<size_t> & order, uint64_t cursor,
+                                  std::string * error) {
+    std::vector<size_t> expected, saved_expected;
+    if (!training_order(item_count, holdout, &expected, error) ||
+        !training_order(item_count, saved_holdout, &saved_expected, error)) return false;
+    // Missing metadata is passed as an empty split: legacy runs saw all items.
+    if (expected != saved_expected) {
+        if (error) *error = "resume hold-out split mismatch; start a new run";
+        return false;
+    }
+    auto sorted = order;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted != expected) {
+        if (error) *error = "resume order must be the nonempty complement of the hold-out split";
+        return false;
+    }
+    if (cursor >= order.size()) {
+        if (error) *error = "resume order cursor is out of range";
+        return false;
+    }
+    return true;
+}
+
 inline bool decimal_u64(const char * text, std::uint64_t * out) {
     if (!text || !*text || !out) return false;
     std::uint64_t value = 0;
@@ -427,6 +489,11 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
                 if(error)*error="--cursor-weight must be finite and within [0,10]"; return ParseResult::error;
             }
             parsed.cursor_weight=weight; parsed.cursor_weight_explicit=true;
+        } else if (!std::strcmp(arg, "--params-file")) {
+            if (!detail::value(arg, argc, argv, &i, &parsed.params_file, error)) return ParseResult::error;
+        } else if (!std::strcmp(arg, "--params-rev")) {
+            std::string value_text; if (!detail::value(arg, argc, argv, &i, &value_text, error) ||
+                !detail::decimal_i32(value_text.c_str(), &parsed.params_rev)) { if (error) *error = "--params-rev must be a nonnegative integer"; return ParseResult::error; }
         } else if (!std::strcmp(arg, "--pause-at")) {
             std::string value_text; if (!detail::value(arg, argc, argv, &i, &value_text, error) ||
                 !detail::decimal_i32(value_text.c_str(), &parsed.pause_at)) { if (error) *error = "--pause-at must be a nonnegative integer"; return ParseResult::error; }
@@ -587,6 +654,24 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
             parsed.eval_adapted = true;
         } else if (!std::strcmp(arg, "--eval-dataset")) {
             if (!detail::value(arg, argc, argv, &i, &parsed.eval_dataset, error)) return ParseResult::error;
+        } else if (!std::strcmp(arg, "--holdout-items")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error)) return ParseResult::error;
+            parsed.holdout_items.clear(); size_t pos = 0;
+            while (pos <= text.size()) {
+                size_t comma = text.find(',', pos); if (comma == std::string::npos) comma = text.size();
+                const std::string part = text.substr(pos, comma - pos); std::uint64_t v = 0;
+                if (!detail::decimal_u64(part.c_str(), &v) || std::find(parsed.holdout_items.begin(), parsed.holdout_items.end(), size_t(v)) != parsed.holdout_items.end()) {
+                    if (error) *error = "--holdout-items must be distinct item indices like 0,2"; return ParseResult::error;
+                }
+                parsed.holdout_items.push_back(size_t(v)); pos = comma + 1;
+            }
+        } else if (!std::strcmp(arg, "--eval-nar-window")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_i32(text.c_str(), &parsed.eval_nar_window) || parsed.eval_nar_window < 0) { if (error) *error = "--eval-nar-window must be 0 (whole song) or a positive frame count"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--eval-seed")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_u64(text.c_str(), &parsed.eval_seed)) { if (error) *error = "--eval-seed must be an unsigned decimal integer"; return ParseResult::error; }
+            parsed.eval_seed_set = true;
         } else if (!std::strcmp(arg, "--meter-only")) {
             parsed.meter_only = true; parsed.nar_drift = true;
         } else if (!std::strcmp(arg, "--nar-extra-steps")) {

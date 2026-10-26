@@ -3,7 +3,7 @@
 import { Router } from 'express';
 import fs from 'node:fs';
 import { aceClient } from '../services/aceClient.js';
-import { APP_VERSION, config } from '../config.js';
+import { APP_VERSION, BUILD_INFO, config } from '../config.js';
 import { engineReady, engineBootStatus, engineNoModels, engineDevice, backendFamily } from '../engineState.js';
 import { startupCommit, dirtyCheckout } from '../services/training/workerUpdate.js';
 import type { HealthResponse } from '../contracts/health.js';
@@ -55,6 +55,12 @@ router.get('/', async (_req, res) => {
     version: APP_VERSION,
     commit: startupCommit,
     dirty: dirtyCheckout(),
+    build: {
+      tag: BUILD_INFO?.tag ?? null,
+      sha: BUILD_INFO?.sha ?? (startupCommit || null),
+      variant: BUILD_INFO?.variant ?? null,
+      channel: BUILD_INFO?.channel ?? null,
+    },
     engineBuiltAt: (() => { try { return fs.statSync(config.aceServer.exe).mtime.toISOString(); } catch { return null; } })(),
     aceServer: {
       status: aceStatus,

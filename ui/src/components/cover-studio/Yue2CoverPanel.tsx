@@ -56,6 +56,11 @@ interface Props {
   onArStrength: (value: number) => void;
   lyricSchedule: 'off' | 'bias' | 'mask';
   onLyricSchedule: (value: 'off' | 'bias' | 'mask') => void;
+  /** Follow source (audio sources only): the recording steers the composer too. */
+  guide: CoverGuideState;
+  onGuide: (value: CoverGuideState) => void;
+  /** False for a MusicXML score, which has no recording to follow. */
+  hasSourceAudio: boolean;
   canGenerate: boolean;
   isGenerating: boolean;
   onGenerate: () => void;
@@ -72,6 +77,25 @@ export const CoverArStrength: React.FC<{ value: number; onChange: (v: number) =>
     onChange={v => onChange(clampCoverAr(v))} defaultValue={COVER_AR_DEFAULT} autoLabel=""
     tooltip="How hard the AR adapter steers the musical plan, for covers only (the adapter picker's AR scale is ignored here). Values above 0.6 hurt adherence to the score: on one seed, 1.0 matched 11% of chords against 89% at 0.6."
     disabled={disabled} />;
+
+/** Follow source settings. `on` is UI state; the rest travels as yue2Cover.guide. */
+export interface CoverGuideState {
+  on: boolean;
+  scale: number;
+  k: number;
+  restrict: boolean;
+  schedule: 'flat' | 'up' | 'down' | 'sin' | 'inv_sin';
+  lfo: 'off' | 'sine' | 'triangle' | 'saw' | 'square';
+  lfoPeriodSec: number;
+  lfoDepth: number;
+}
+export const COVER_GUIDE_DEFAULT: CoverGuideState = {
+  on: false, scale: 0.5, k: 32, restrict: false, schedule: 'flat', lfo: 'off', lfoPeriodSec: 8, lfoDepth: 0.5,
+};
+/** Why Follow source cannot apply with these settings, or ''. Mirrors the server's check. */
+export const coverGuideBlock = (keyShift: number, tempoMode: string) =>
+  keyShift !== 0 ? 'Off while the pitch is shifted: the guide would pull the render back to the source key.'
+    : tempoMode === 'set' ? 'Off while a BPM is set: the guide follows the source\'s own timing.' : '';
 
 /** Column width in px, padding included, above which the settings switch from
  *  one column to paired rows. */
@@ -158,6 +182,42 @@ export const Yue2CoverPanel: React.FC<Props> = p => {
     formatDisplay={v => v === 0 ? 'Source key' : `${v > 0 ? '+' : ''}${v} st → ${transposeKey(keyLabel, v)}`}
     helpText={keyLabel ? `Source: ${keyLabel}. Shift within twelve semitones.` : 'No supported score key found.'} />;
   const arStrengthEl = <CoverArStrength value={p.arStrength} onChange={p.onArStrength} />;
+  const g = p.guide;
+  const setG = (patch: Partial<CoverGuideState>) => p.onGuide({ ...g, ...patch });
+  const guideBlock = coverGuideBlock(p.keyShift, p.tempoMode);
+  const guideEl = p.hasSourceAudio && <div className="space-y-2">
+    <div className="flex items-center justify-between">
+      <ParamLabel label="Follow source" info="Lets the source recording steer the composer, not just its transcribed score. The real-audio tokenizer reads the recording and, for every 40 ms, lists the semantic codes that best describe it; the composer then leans toward those. Needs the YuE2 semantic tokenizer (yue2-tok-f16) from the Model Manager. Reading the recording takes a few seconds the first time and is cached." />
+      <Toggle accent="cyan" checked={g.on} onChange={v => setG({ on: v })} aria-label="Follow source" />
+    </div>
+    {g.on && <EditableSlider label="Source adherence" value={g.scale} min={0} max={1} step={0.05}
+      onChange={v => setG({ scale: v })} defaultValue={COVER_GUIDE_DEFAULT.scale} disabled={!!guideBlock}
+      helpText={guideBlock || 'Share of each moment taken from the source. 0.5 kept 83% of a test render on the source\'s top codes; 1.0 kept all of it.'} />}
+  </div>;
+  const guideAdvancedEl = p.hasSourceAudio && g.on && <div className="space-y-2 pt-2">
+    <EditableSlider label="Source candidates" value={g.k} min={1} max={64} step={1}
+      onChange={v => setG({ k: Math.round(v) })} defaultValue={COVER_GUIDE_DEFAULT.k}
+      helpText="How many of the tokenizer's best codes per moment count as the source. Fewer follows it more literally." />
+    <div className="flex items-center justify-between">
+      <ParamLabel label="Only source candidates" info="Forbid every code outside the candidates, so the composer can only choose among them. Adherence then decides how it chooses." />
+      <Toggle accent="cyan" checked={g.restrict} onChange={v => setG({ restrict: v })} aria-label="Only source candidates" />
+    </div>
+    <ParamLabel label="Adherence over the song" info="Shapes Source adherence from start to end: Flat keeps it constant, Rising starts free and ends close to the source, Falling the reverse, Arc peaks mid-song, Dip frees the middle." />
+    <StyledSelect accent="pink" value={g.schedule} onChange={v => setG({ schedule: v as CoverGuideState['schedule'] })}
+      options={[{ value: 'flat', label: 'Flat' }, { value: 'up', label: 'Rising' }, { value: 'down', label: 'Falling' },
+        { value: 'sin', label: 'Arc (peaks mid-song)' }, { value: 'inv_sin', label: 'Dip (free mid-song)' }]} />
+    <ParamLabel label="Adherence wobble" info="Swings Source adherence up and down periodically, so the render drifts away from the source and back." />
+    <StyledSelect accent="pink" value={g.lfo} onChange={v => setG({ lfo: v as CoverGuideState['lfo'] })}
+      options={[{ value: 'off', label: 'Off' }, { value: 'sine', label: 'Sine' }, { value: 'triangle', label: 'Triangle' },
+        { value: 'saw', label: 'Saw' }, { value: 'square', label: 'Square' }]} />
+    {g.lfo !== 'off' && <>
+      <EditableSlider label="Wobble period (s)" value={g.lfoPeriodSec} min={0.5} max={60} step={0.5}
+        onChange={v => setG({ lfoPeriodSec: v })} defaultValue={COVER_GUIDE_DEFAULT.lfoPeriodSec} />
+      <EditableSlider label="Wobble depth" value={g.lfoDepth} min={0} max={1} step={0.05}
+        onChange={v => setG({ lfoDepth: v })} defaultValue={COVER_GUIDE_DEFAULT.lfoDepth}
+        helpText="1 swings adherence all the way down to 0 at the bottom of each cycle." />
+    </>}
+  </div>;
   const advancedEl = <details className="text-xs text-zinc-600 dark:text-zinc-400">
     <summary className="cursor-pointer">Advanced</summary>
     <EditableSlider label="Condition strength" value={p.cfgScale} min={0.1} max={2} step={0.05}
@@ -170,6 +230,7 @@ export const Yue2CoverPanel: React.FC<Props> = p => {
         { value: 'bias', label: 'Soft (bias toward the score\'s timing)' },
         { value: 'mask', label: 'Hard (hide lyrics until timed)' },
       ]} />
+    {guideAdvancedEl}
   </details>;
   // Render progress and cancel live in the queue; this only adds to it.
   const generateEl = <div className="space-y-2">
@@ -206,12 +267,13 @@ export const Yue2CoverPanel: React.FC<Props> = p => {
         {voicesEl}{tempoEl}
         {pitchEl}{bpmEl}
         <div className="col-span-2">{arStrengthEl}</div>
+        {guideEl && <div className="col-span-2">{guideEl}</div>}
         <div className="col-span-2">{advancedEl}</div>
         <div className="col-span-2">{generateEl}</div>
       </div>
       : <div className="space-y-3">
         {renderModeEl}{artistGridEl}{sourceEl}{captionSourceEl}{captionEl}{instrumentalEl}
-        {voicesEl}{keepChordsEl}{tempoEl}{bpmEl}{pitchEl}{arStrengthEl}{advancedEl}{generateEl}
+        {voicesEl}{keepChordsEl}{tempoEl}{bpmEl}{pitchEl}{arStrengthEl}{guideEl}{advancedEl}{generateEl}
       </div>}
   </div>
   );

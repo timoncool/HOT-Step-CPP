@@ -250,3 +250,30 @@ test('undo makes a spine\'s candidates keepable again; a kept ending locks the p
   assert.equal(editPlan(ranOn, ['s2'], true).plan.length, 6);
   assert.equal(editPlan(ranOn, [], false).finished, false);
 });
+
+test('an improv is rest bars in the meter in force, in every voice, sung by nobody', () => {
+  // After the chorus the meter is 2/4 at L:1/16: a bar is z8.
+  const out = composeArrangement(score, lyrics, [VERSE, CHORUS, { improv: 4 }, OUTRO]);
+  const lines = out.abc.split('\n');
+  const at = lines.indexOf('% Improv');
+  assert.deepEqual(lines.slice(at, at + 5), ['% Improv', 'V: Vocal', 'z8|z8|z8|z8|', 'V: Ins', 'z8|z8|z8|z8|']);
+  assert.deepEqual(scoreSections(out.abc).map(s => [s.label, s.startBar]), [['verse', 1], ['chorus', 3], ['Improv', 5], ['outro', 9]]);
+  assert.deepEqual(barLengths(out.abc)[2], [1, 1, 1, 1]);
+  assert.deepEqual(out.occurrences[2], { section: -1, startBar: 5, bars: 4, abcStart: Array.from(lines.slice(0, at).join('\n')).length + 1, lyric: null });
+  assert.equal(out.lyrics, composeArrangement(score, lyrics, [VERSE, CHORUS, OUTRO]).lyrics);
+  assert.equal(out.textPairingMatches, true);
+  // At the start, before any meter change: 4/4 at L:1/16 is z16.
+  assert.match(composeArrangement(score, lyrics, [{ improv: 2 }, VERSE]).abc, /% Improv\nV: Vocal\nz16\|z16\|\nV: Ins\nz16\|z16\|/);
+  assert.throws(() => composeArrangement(score, lyrics, [{ improv: 3 }]), /No such section/);
+});
+
+test('plan edits add improvs by bar count; the source runs on after the last source section', () => {
+  const s: ArrangedSession = migrateLegacySession(legacy(), id => codes[id]);
+  const arrangement = editPlan(s, ['s2', 'improv:8'], false);
+  assert.deepEqual(arrangement.plan.slice(2), [{ id: 'o5', section: 's2' }, { id: 'o6', section: 'improv', bars: 8 }]);
+  assert.equal(lookaheadSection(arrangement), 3);
+  assert.throws(() => editPlan(s, ['improv:3'], false), /2, 4, 8, 16 bars/);
+  // Keeping an upcoming improv by its id keeps its bars.
+  const kept = editPlan({ ...s, arrangement }, ['o6', 'o5'], false);
+  assert.deepEqual(kept.plan.slice(2), [{ id: 'o6', section: 'improv', bars: 8 }, { id: 'o5', section: 's2' }]);
+});

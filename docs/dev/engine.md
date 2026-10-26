@@ -2,9 +2,9 @@
 
 `engine/` is the C++17/GGML inference and training engine behind HOT-Step. It
 started as a fork of [acestep.cpp](https://github.com/ServeurpersoCom/acestep.cpp)
-(ACE-Step 1.5 on GGML) and now also carries two more model families, MiniMax-Music3
-(MM3) and YuE2, plus a training toolchain, a Lua sampler-plugin host and optional
-TensorRT paths.
+(ACE-Step 1.5 on GGML) and now also carries three more model families, MiniMax-Music3
+(MM3), YuE2 and Stable Audio 3 (SA3), plus a training toolchain, a Lua sampler-plugin
+host and optional TensorRT paths.
 
 This page is the map. For the request JSON and every CLI flag, see
 [engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md). For how the three
@@ -18,13 +18,15 @@ toolchains, see [building.md](building.md).
 | `engine/src/` | Engine modules, header-only for the most part. `acestep-core` compiles only `request.cpp`, `model-store.cpp`, `pipeline-lm.cpp`, `pipeline-synth.cpp`, `pipeline-synth-ops.cpp` and `pipeline-understand.cpp` |
 | `engine/src/minimax/` | MiniMax-Music3 backend (`mm3-*.h`) |
 | `engine/src/yue2/` | YuE2 backend (`yue2-*.h`) and the SheetSage2 lead-sheet transcriber (`sheetsage-*.h`) |
+| `engine/src/sa3-*.h` | Stable Audio 3: the DiT (`sa3-dit-ggml.h`), SAME autoencoder (`sa3-same-ggml.h`), T5Gemma text encoder (`sa3-t5gemma-enc.h`), the sampling loop behind `/sa3-refine` and `/sa3-synth` (`sa3-refine.h`), the checkpoint-preview resolver (`sa3-preview-resolver.h`) and the boot probe (`sa3-families.h`) |
 | `engine/src/train/` | Trainers and dataset preprocessors used by `ace-train` |
 | `engine/src/moss/` | MOSS-Music captioner used by `ace-caption` |
-| `engine/src/solvers/`, `schedulers/`, `guidance/` | Older C++ sampler registries. The live sampler resolves solvers, schedulers and guidance through the Lua plugin registry instead; `guidance/apg-core.h` is still used for the native `apg()` bridge |
-| `engine/tools/` | One `.cpp` per binary, plus Python converters (`convert-*.py`) and fixture scripts |
+| `engine/src/solvers/`, `schedulers/`, `guidance/` | Older C++ sampler registries. The live sampler resolves solvers, schedulers and guidance through the Lua plugin registry instead. Still in use: the `*-interface.h` types the Lua host passes (`SolverState` and the rest), `guidance/apg-core.h` for the native `apg()` bridge, and `scheduler_clamp()` from `schedulers/scheduler-registry.h` |
+| `engine/tools/` | One `.cpp` per binary, a few headers they share (`beat-this.h`, `midi-grid.h`, `monitor-chain.h` and others), Python converters (`convert-*.py`) and fixture scripts |
+| `engine/tests/` | Unit tests: the sources of the CMake test targets, and standalone files whose header gives the compile line |
 | `engine/plugins/` | Bundled Lua plugins: `solvers/`, `schedulers/`, `guidance/` |
 | `engine/ggml/` | ggml submodule, pinned to the HOT-ggml fork (see [The ggml fork](#the-ggml-fork)) |
-| `engine/vendor/` | yyjson, LuaJIT 2.1, cpp-httplib, pocketfft, VST3 SDK |
+| `engine/vendor/` | yyjson, LuaJIT 2.1, cpp-httplib, minimp3, pocketfft, VST3 SDK |
 | `engine/deps/` | Optional vendored SDK: `tensorrt/` |
 
 ## Binaries
@@ -33,7 +35,7 @@ All targets are defined in `engine/CMakeLists.txt`.
 
 | Binary | Source | What it does |
 |---|---|---|
-| `ace-server` | `tools/hot-step-server.cpp` | The HTTP server the app runs. ACE-Step `/lm`, `/synth`, `/understand` plus every HOT-Step endpoint and the `/mm3/*` and `/yue2/*` families |
+| `ace-server` | `tools/hot-step-server.cpp` | The HTTP server the app runs. ACE-Step `/lm`, `/synth`, `/understand` plus every HOT-Step endpoint, the `/mm3/*` and `/yue2/*` families and the SA3 routes |
 | `ace-lm` | `tools/ace-lm.cpp` | ACE-Step 5 Hz LM from the command line: request JSON in, `request0.json`..`requestN-1.json` out |
 | `ace-synth` | `tools/ace-synth.cpp` | ACE-Step text encoder, DiT and VAE from the command line: request JSONs in, MP3 or WAV out |
 | `ace-understand` | `tools/ace-understand.cpp` | Reverse pipeline: audio in, caption, lyrics and metadata out |
@@ -42,21 +44,33 @@ All targets are defined in `engine/CMakeLists.txt`.
 | `ace-train` | `tools/ace-train.cpp` | Training toolchain, one subcommand per job (see [Training subcommands](#training-subcommands)) |
 | `neural-codec` | `tools/neural-codec.cpp` | ACE-Step VAE encode and decode, with optional Q8/Q4 latent compression |
 | `mp3-codec` | `tools/mp3-codec.cpp` | Standalone MP3 encoder and decoder |
-| `quantize` | `tools/quantize.cpp` | GGUF requantizer for ACE-Step, MM3 and YuE2 files, with optional `--imatrix` |
+| `quantize` | `tools/quantize.cpp` | GGUF requantizer for ACE-Step, MM3, YuE2 and SA3 DiT files, with optional `--imatrix` |
 | `mastering` | `tools/mastering.cpp` | Reference-based mastering (the matchering algorithm) |
 | `vst-host` | `tools/vst-host.cpp` | VST3 host: `--scan`, `--gui`, `--process`, `--process-chain`, `--monitor`. Each plugin gets a 10 s warm-up pre-roll of the track's opening, fed time-reversed so plugin buffers hold the song's own start when the real pass begins. `--monitor` (Windows, WASAPI) plays a track through the chain live, driven by a control file the server rewrites atomically with an increasing `seq`; see the note below |
 | `yue2-probe` | `tools/yue2-probe.cpp` | YuE2 bring-up and parity CLI (`--info`, `--load`, `--tokenize`, `--ar-parity` and more) |
 | `sa3-ggml-test`, `fattn-train-test`, `moss-ggml-test`, `bs-roformer-test`, `mdx23c-test` | `tools/*-test.cpp` | Parity tests against reference outputs |
 | `yue2-train-gemm-precision-test` | `tools/yue2-train-gemm-precision-test.cpp` | The YuE2 trainer's BF16 GEMMs against `YUE2_AITK_PRECISION=strict-f32`, forward and backward, at YuE2 shapes on the first GPU |
+| `yue2-convrot8-cpu-numeric-test`, `yue2-*-metal-*-test` | `tools/yue2-*.cpp` | YuE2 training-op gates: the CPU ConvRot8 kernels bit for bit against a scalar oracle, and each Metal training kernel against the CPU backend or the Metal kernel it replaced. The Metal ones skip without a Metal device |
+| `yue2-rms-double-round-test`, `yue2-linear-lora-round-test`, `yue2-clip-non-finite-test`, `yue2-head-loss-device-test` | `tools/yue2-*.cpp` | YuE2 trainer checks: whether two graph simplifications are bit-exact, that a non-finite gradient still fails the clip, and that the device head loss matches the host mode |
+| `yue2-nar-op-bench`, `yue2-mul-bf16-dispatch-profile` | `tools/yue2-*.cpp` | Timing diagnostics with no pass or fail: Metal kernel throughput at YuE2 NAR shapes, and the dispatch cost of the trainer's BF16 multiply |
+| `yue2-vae-lifetime-test` | `tests/test-yue2-vae-lifetime.cpp` | YuE2 VAE decoder cache lifetime (see [YuE2](#yue2-plan-compose-render)) |
 | `convrot-graph-probe` | `tools/convrot-graph-probe.cpp` | ConvRot8 under repeated CUDA graph capture and replay (CUDA only, see [ggml-fork.md](ggml-fork.md)) |
 
-`fattn-train-test --backend cpu\|cuda\|vulkan` (default `cpu`, both arms on CPU) resolves the
-requested GPU backend by registry device name, never by "first GPU device found" — with CUDA
+`-DBUILD_TESTING=ON` adds CTest targets the default build leaves out: `test-monitor-chain`,
+the DoRA fixtures (`dora-common-test`, `dora-runtime-test`, `mm3-dit-dora-test`,
+`sa3-dora-load-test`, `yue2-aitk-dora-test`), the SA3 training gates (`sa3-train-grad-test`
+and an `ace-train sa3-train-check` run) and `yue2-recompose-test`. The two SA3 training
+gates exit 77, which CTest counts as skipped, when their fixtures or the base DiT are absent.
+
+`fattn-train-test --backend cpu\|cuda\|vulkan\|metal` (default `cpu`, both arms on CPU) resolves
+the requested GPU backend by registry device name, never by "first GPU device found": with CUDA
 and Vulkan both loaded, `--backend cuda` cannot land on Vulkan or vice versa. A requested
 backend that is not loaded is a hard failure (prints the loaded device list), never a silent
-CPU fallback. `--prec tf32` stays CUDA-only; Vulkan runs f32 at the same 1e-4 tolerance as CPU.
-`--bench`/`--bench-lm`/`--bench-tr` always target CUDA specifically (the tf32 arm is a
-tensor-core question) and reject `--backend vulkan` rather than silently ignoring it.
+CPU fallback. `--prec tf32` and `--prec bf16` stay CUDA-only; Vulkan and Metal run f32 at the
+same 1e-4 tolerance as CPU. The timing and check modes (`--bench`, `--bench-lm`, `--bench-tr`,
+`--bench-yue2`, `--dsw-check`, `--saved-check`) target CUDA (the tf32 arm is a tensor-core
+question), or Metal with `--backend metal` for the Metal FA-train checks, and reject any other
+`--backend` rather than silently ignoring it.
 
 `vst-host --monitor` first asks WASAPI's shared mode to take the track's own rate. If the
 device refuses, it renders at the device rate through a linear resampler
@@ -80,9 +94,31 @@ lifecycle lines go to `logs/<session>/vst_host.log`.
 not compiled. The shipped `ace-server` is built from `hot-step-server.cpp`.
 
 The Node server starts `ace-server` with `--models`, `--host` and `--port`, and adds
-`--adapters`, `--keep-loaded` and `--noise-profile` when they are configured
-(`server/src/services/aceEngineProcess.ts`). The app's default port is
+`--adapters`, `--keep-loaded`, `--noise-profile`, `--draft-lm`, `--vae-chunk` and
+`--vae-overlap` when they are configured, plus `--user-plugins` when the app runs with a
+data folder (`server/src/services/aceEngineProcess.ts`). The app's default port is
 8085; the binary's own default is 8080.
+
+### ace-midi speculative decoding
+
+`ace-midi --draft-model <dir> [--speculative-k 1-4]` ports upstream MuScriptor PR #95.
+The draft (small) proposes k tokens one step at a time; the target checks `[current,
+p1..pk]` in one block and keeps the proposals up to the first disagreement, plus its own
+token there. Rejected K/V rows are not undone: `n_past` moves back and the next write
+overwrites them. The block runs through `ggml_soft_max_ext` with an explicit causal mask,
+because `ggml_diag_mask_inf` is wrong on CUDA when `n_past > 0`. Models of different card
+sizes pair fine (small 1393, large 1395); only the 1393 emittable tokens are compared.
+
+Measured on a 4-minute track, RTX 5090: large 121.6 s scalar, 90.1 s at k=2, 79.4 s at
+k=4; medium 60.9 / 66.1 / 59.6 s. The MIDI was byte-identical to scalar decoding in every
+run, CPU included. Decode is launch-bound (about 0.21 ms per layer per token at any width,
+so a 14-layer small step costs 2.9 ms against 10 ms for 48-layer large), which is why only
+large gains. The app passes `--draft-model small --speculative-k 4` for large only
+(`speculativeArgs` in `server/src/services/muscriptor.ts`).
+
+Upstream PR #94 (preallocated KV cache without a NaN fill, native reshapes instead of
+einops, one cache write per step) has no GGML counterpart to port: the cache is allocated
+uninitialised already, and graph build plus allocation is about 6% of a decode step.
 
 ### ace-midi tempo, meter and bars
 
@@ -117,14 +153,14 @@ it onto a FIFO queue and return `{"id":"..."}` straight away. Clients poll
 YuE2 jobs share that queue, so they never run on the GPU at the same time. The job
 table keeps 32 entries and evicts the oldest finished ones first.
 
-`POST /sa3-refine`, `/pp-vae-reencode` and `/yue2/align` answer in the same request,
-but `on_worker()` in `hot-step-server.cpp` runs their body on the worker thread while
-the HTTP thread waits. Every module shares one GGML backend, and two threads
+`POST /sa3-synth`, `/sa3-refine`, `/pp-vae-reencode` and `/yue2/align` answer in the
+same request, but `on_worker()` in `hot-step-server.cpp` runs their body on the worker
+thread while the HTTP thread waits. Every module shares one GGML backend, and two threads
 computing on it at once abort the Metal driver or corrupt the model store (GH #226).
 These routes therefore queue behind whatever job is running: a call made during a
 long YuE2 batch waits for the whole batch, so a direct engine client needs a timeout
-long enough to cover that wait. The MM3 bring-up endpoints and `POST /yue2/imatrix`
-are not wrapped yet and still compute on their HTTP thread.
+long enough to cover that wait. The MM3 bring-up endpoints, `POST /mm3/imatrix` and
+`POST /yue2/imatrix` are not wrapped yet and still compute on their HTTP thread.
 
 `POST /sa3-synth` and `/sa3-refine` cancel by connection: when the client closes it,
 both SA3 sampling loops stop before the next step, and a full-loop Lua solver sees
@@ -137,7 +173,7 @@ Models are discovered by scanning `--models` at startup. ACE-Step files are
 classified by their GGUF `general.architecture` into LM, text encoder, DiT and VAE
 buckets (`model-registry.h`). MM3 looks in `<models>/mm3/` and then `<models>/`;
 YuE2 looks in `<models>/yue2/` and then `<models>/`. The server still boots when only
-MM3 or YuE2 weights are present (`hot-step-families.h`); the ACE-Step endpoints then
+MM3, YuE2 or SA3 weights are present (`hot-step-families.h`); the ACE-Step endpoints then
 answer 501.
 
 GPU residency is owned by `model-store.h`. The default policy keeps at most one
@@ -218,7 +254,8 @@ style + lyrics (+ optional ABC) -> tokenizer and prompt assembly (yue2-tokenizer
   -> NAR stage: mixture-of-transformers flow matching with a midpoint ODE solver
      (yue2-nar-graph.h), optionally chunked (nar_chunk_frames)
   -> Oobleck VAE decode, "standard", "legacy" or local "dec2x" variant (yue2-vae-graph.h)
-  -> stitch and clamp -> 16-bit WAV (yue2-pipeline.h, yue2-job.h)
+  -> stitch; a track that peaks past full scale is scaled to -0.3 dBFS (yue2_peak_scale)
+  -> 16-bit WAV (yue2-pipeline.h, yue2-job.h)
 ```
 
 `codec_ids` on a `/yue2/synth` request supplies the composer's codec stream (raw ids,
@@ -235,7 +272,9 @@ Matching prompts share the prefix prefill by copying KV rows and logits, includi
 the negative CFG rows; scheduled lyrics replay the prefix as a batch. Every row's
 output must begin with the exact prefix, or the whole job fails. Reproduction by
 seed requires the same batch width.
-A lyric schedule still needs `cfg_scale` 1. The stage fails if the output does not begin with the exact
+A lyric schedule also runs under guidance: the negative prompt hides the same score lines
+at the same times (`yue2-lyric-schedule.h`), though the server's Lyric Timing still skips
+itself at a CFG other than 1. The stage fails if the output does not begin with the exact
 prefix. The NAR and VAE then render the whole stream again, prefix included, unless
 `render_from_frame` starts them later. Prefix noise is the same for the same
 `noise_seed`, but the NAR attends both ways across its chunk, so the prefix audio is
@@ -256,10 +295,11 @@ them as `<song>.yue2-request.json`, so a later request can resume the stream. Ad
 `yue2-probe --continue-check <request.json>` checks prefix identity, cancellation and
 the context cap on any backend.
 
-NAR plugins and plan conditioning. `nar_solver` accepts `md_wasserstein_yue2`,
-`md_ancestral_yue2`, and the full-loop solvers `md_latent_eq_yue2` and `md_tlie_yue2`;
-`nar_scheduler` accepts `md_ht_scheduler V3`, `md_plan_aware_yue2`,
-`md_plan_loose_yue2` and `md_plan_overdrive_yue2`. Any other name fails the request.
+NAR plugins and plan conditioning. On a `/yue2/synth` request, `infer_method` (the NAR
+solver) accepts `md_wasserstein_yue2`, `md_ancestral_yue2`, and the full-loop solvers
+`md_latent_eq_yue2` and `md_tlie_yue2`; `scheduler` accepts `md_ht_scheduler V3`,
+`md_plan_aware_yue2`, `md_plan_loose_yue2` and `md_plan_overdrive_yue2`. Any other name
+fails the request.
 Full-loop solvers run through `yue2_nar_run_loop_solver` (`engine/src/yue2/yue2-nar-loop.h`),
 which turns a model error, a cancel or non-finite latents into a failed chunk;
 `engine/tests/test-yue2-nar-loop.cpp` checks it. The Lua host has no instruction or
@@ -357,6 +397,20 @@ identity as `yue2Cover`; the engine composes from the score rather than
 conditioning its audio renderer on the recording. Without `--melody-only`,
 `yue2-sheet` retains its full-score training default.
 
+Source guidance is the optional second path from the recording to the render.
+`ace-train yue2-guide` runs MERT and the tokenizer head over the source with
+TF32 off, which ace-server cannot promise, and keeps the head's top-K codes per
+frame instead of its argmax. The head's argmax matches the code YuE2 itself drew
+on only 27.6% of frames when re-reading one of its own renders; top-20 holds it
+on 78.4% and top-64 on 91.4%. So the semantic stage mixes the LM's distribution
+with the tokenizer's over those candidates (`guide_scale`) and can forbid
+everything else (`guide_outside`), at the same seam as `end_bias`, before the
+reference sampler chain. On a 20 s cot=off test the share of drawn codes inside
+the top-64 went from 1.4% unguided to 37%, 83%, 96% and 100% at scales 0.25,
+0.5, 0.75 and 1.0. The idea comes from comfyui_acetricks'
+TokenizerGuideLogitsProcessor; its log-space blend was replaced by the mixture
+because the log-space version barely moved at 0.5.
+
 The post-render cover drift check matches sung lyric blocks to like-labelled
 score sections in order, skipping instrumental tags and listing unmatched sung
 blocks. A section is unscored when its opening or full-block median MMS_FA word
@@ -384,7 +438,7 @@ cache key; older results are recomputed when requested.
 ## HOT-Step hook files
 
 Upstream files are kept as close to acestep.cpp as possible so syncs stay a copy.
-Three upstream files carry HOT-Step `#include` hooks, and losing them is the main
+Four upstream files carry HOT-Step `#include` hooks, and losing them is the main
 risk of a sync:
 
 | Upstream file | Hook | If a sync overwrites it |
@@ -392,6 +446,7 @@ risk of a sync:
 | `pipeline-synth-ops.cpp` | `#include "hot-step-sampler.h"` in place of `dit-sampler.h` | Compiles, but every solver, scheduler, guidance mode, DCW and custom schedule goes dead. The link then fails on `hotstep_sampler_linked_`, a sentinel `hot-step-server.cpp` references on purpose |
 | `model-store.h` | `hot-step-params.h` | Compile error |
 | `dit.h` | `adapter-merge.h` and `adapter-runtime.h` | Compile error |
+| `fsq-detok.h` (with `fsq-tok.h`) | `fsq-quant.h` in place of upstream's own FSQ quantizer copies | Silent if both FSQ headers are overwritten: upstream's quantizer comes back and matches only about 40% of the reference indices. Overwriting one of them is a compile error |
 
 The HOT-Step files these hooks bring in:
 
@@ -404,15 +459,21 @@ The HOT-Step files these hooks bring in:
   solvers, schedulers and guidance from the Lua registry, and adds APG, DCW,
   custom timesteps, step caching, CFG cutoff, repaint injection and LRC alignment.
   `hot-step-sampler-trt.h` is the same loop over a TensorRT forward pass.
-- `hot-step-families.h` lets the server boot when only MM3 or YuE2 weights exist.
+- `fsq-quant.h` holds the FSQ levels and index encode and decode, following the
+  vector_quantize_pytorch ResidualFSQ reference (soft clamp, then hard clamp).
+- `hot-step-families.h` lets the server boot when only MM3, YuE2 or SA3 weights exist.
+  SA3's probe lives in `sa3-families.h`.
 - `hot-step-build-flags.h` carries `HOT_STEP_DISABLE_FA` for the Volta build.
 
 `hot-step-server.cpp` wires the model families in with one include and one
 registration call each: `minimax/mm3-server.h` plus `minimax/mm3-job.h`
 (`mm3_register_routes`, `mm3_register_job_routes`) and `yue2/yue2-server.h`
-(`yue2_register_routes`).
+(`yue2_register_routes`). SA3 has no subtree hook; its routes are written in
+`hot-step-server.cpp` itself.
 
-`engine/verify-hooks.ps1` checks all of these, the sentinel, and the HOT-ggml changes.
+`engine/verify-hooks.ps1` checks the four hooks, the sentinel, `hot-step-server.cpp`'s own
+`hot-step-params.h` include, the family includes and registration calls, both boot gates'
+`hot_step_any_family_weights_present()` calls, and the HOT-ggml changes (Hooks 7 to 18).
 `build.cmd` runs it before every compile. Run it after any upstream sync; the
 procedure is in `.claude/skills/upstream-sync/SKILL.md`, and `engine/UPSTREAM_SYNC`
 records the last upstream commit synced.
@@ -430,8 +491,8 @@ pointer itself is never reachable. `math.random` is a port of Lua 5.4's
 xoshiro256** generator, so seeded plugins draw the same numbers as before. `PluginRegistry::init` (`lua-plugin-registry.h`) scans
 `engine/plugins/{solvers,schedulers,guidance,postprocess}/` and then the same four
 folders under the project root `plugins/`, once at startup. `ace-server` then
-scans the root given by `--user-plugins`, which the release app sets to
-`<data folder>/plugins`. A user plugin replaces a shipped plugin of the same name
+scans the root given by `--user-plugins`, which the app sets to
+`<data folder>/plugins` whenever it runs with a data folder (a release always does). A user plugin replaces a shipped plugin of the same name
 (the shipped Lua state is closed and the log names both files); any other duplicate
 keeps the first one loaded. `ace-server` and `ace-synth` both call it. `lua-plugin.h` runs each file in its own sandboxed VM,
 passes float arrays without copying, reads each plugin's metadata and parameter
@@ -451,11 +512,27 @@ to guidance plugins.
   as given; they no longer rebuild it. Rescale keeps truncate's step count (#124).
 - An unknown solver falls back to `euler` and an unknown guidance mode to `apg`,
   with an error line in the log.
-- MM3's flow stage (`mm3-plugins.h`), YuE2's NAR stage and `/sa3-refine` use the same
-  registry.
+- MM3's flow stage (`mm3-plugins.h`), YuE2's NAR stage, `/sa3-refine` and `/sa3-synth`
+  use the same registry.
 
 New plugins need no C++ rebuild. Writing one is covered in
 [plugins-authoring.md](plugins-authoring.md).
+
+## Stable Audio 3 training
+
+`ace-train sa3-train` trains Medium DoRA-rows adapters against the separate
+Medium base checkpoint. SAME and T5Gemma pre-encode the prepared instrumental
+snapshot. The base stays frozen, segmented backward graphs train the adapters,
+and AdamW updates their F32 host masters. CUDA and CPU are supported by the
+server runner; operation support is checked before graph execution.
+
+Raw adapters and optimizer state stay in the run directory. Inference exports
+contain row scales computed against the installed inference DiT and are
+validated before entering `models/sa3-adapters`. `sa3-train-check` replays the
+official-reference fixtures. See [training internals](training-internals.md#stable-audio-3-medium-training)
+for the API, preparation and integrated checker, and the
+[CLI reference](../../engine/docs/ARCHITECTURE.md#stable-audio-3-training-cli)
+for standalone arguments.
 
 ## Stable Audio 3 sampling
 
@@ -465,6 +542,27 @@ adapter path as StableStep. The Node backend defaults to 8 steps and the
 `pingpong` or `euler` selects a native loop; an opted-in solver plugin takes
 precedence over the default Lua solver.
 
+The optional `synth_model` query field picks the generation DiT by bare
+filename, such as `sa3-dit-Q8_0.gguf`. A missing, empty, non-`sa3-dit-*.gguf` or
+uninstalled name falls back to `sa3-dit-BF16.gguf`. The training base
+`sa3-dit-base-*` (any case) and path-like names return 400. The `X-SA3-DiT`
+response header names the DiT that ran. `/sa3-refine` always uses BF16. Full
+contract: [ARCHITECTURE](../../engine/docs/ARCHITECTURE.md).
+
+Checkpoint previews add `snapshot_run=<dataset>/<adapter>/<stamp>`,
+`snapshot_step=N` and optional `snapshot_scale` (default 1, a finite number or
+400). `sa3-preview-resolver.h` loads the run's `snapshots/step-N.gguf` as an extra
+adapter stacked after any named ones. It is an internal path beside the public
+adapter names: `models/sa3-adapters` parsing and the `/sa3/props` catalogue are
+unchanged, and snapshots never appear there. The resolver checks the run and step
+charsets (no separators beyond the two slashes), keeps the canonical file under
+the training runs root, reads the step file once, hashes those bytes and loads an
+immutable content-addressed copy from `sa3-medium/.preview-cache` (newest 16
+kept), and requires a `dora-rows-v1` export whose inference base matches the DiT
+the request loads. The content hash is part of the model key, so a rewritten step
+file loads fresh. Failures are 400. `tools/sa3-preview-proof.mjs` checks the render
+effect, the rejections and cache freshness.
+
 Seed breeding is limited to noise-only synthesis. `seed_b` selects a second
 noise stream and `seed_blend` mixes it into the initial latent and each pingpong
 re-noise draw. Node resolves an omitted or blank blend to 0.5 when seed B is set;
@@ -472,7 +570,8 @@ explicit 0 disables breeding and 1 selects seed B's noise. The native loop
 advances both streams together. The Lua solver uses `math.randomstream(seed_b)`
 for an independent host-backed 64-bit stream, selected through the shared
 `SolverState.seed_b` and `seed_blend` globals. Other
-solver callers retain disabled defaults of -1 and 0, including ACE-Step.
+solver callers, ACE-Step included, leave those globals at -1 and 0; ACE-Step's own
+`seed_b` breeding mixes only its initial noise (`pipeline-synth-ops.cpp`).
 StableStep refinement does not enable breeding.
 
 `engine/tests/test-sa3-seed-blend.cpp` exercises the real LuaJIT bridge without
@@ -502,24 +601,35 @@ steering vectors in `concepts` (`concept-steer.h`) are also sideband fields. The
 long cold-start delta precompute can be cancelled through `adapter-cancel.h`, and
 its progress shows as `adapter_progress` in `GET /job`.
 
+DoRA magnitudes (PEFT `lora_magnitude_vector`, LyCORIS `dora_scale`) are folded in by
+merge mode. The runtime modes skip them with a warning unless the request sets
+`adapter_runtime_dora`; the stack is then merged into private copies of the weights and
+kept as merge-equivalent full deltas, in `runtime_lowrank` too.
+
 Other adapter paths:
 
-- The ACE-Step planner LM takes a runtime LoRA (`lm_adapter`, from `<adapters>/lm/`
-  or a path) through `lm-adapter.h`, with artist tokens, trained KV prefixes and
-  shared PiSSA residuals in `artist-token-runtime.h`, `lm-prefix-runtime.h` and
-  `pissa-residual.h`.
-- MM3 LM adapters are runtime or merge (`mm3-lm-adapter.h`, `mm3-lm-merge.h`,
-  `mm3-lm-dora.h`); MM3 DiT LoRAs merge at load (`mm3-adapter.h`).
-- YuE2 NAR LoRAs merge at load (`yue2-adapter.h`), chosen with
+- The ACE-Step planner LM takes a runtime LoRA or DoRA (`lm_adapter`, from
+  `<adapters>/lm/` or a path) through `lm-adapter.h`, with artist tokens, trained KV
+  prefixes and shared PiSSA residuals in `artist-token-runtime.h`,
+  `lm-prefix-runtime.h` and `pissa-residual.h`. A DoRA's column norms are computed
+  once after load.
+- MM3 LM adapters are runtime or merge (`mm3-lm-adapter.h`, `mm3-lm-merge.h`). A
+  runtime DoRA gets a one-time norm pass (`mm3-lm-dora.h`), and `adapter_runtime_dora`
+  re-normalises it for the request's scale dials. MM3 DiT LoRAs and DoRAs merge at
+  load (`mm3-adapter.h`).
+- YuE2 adapters merge at load (`yue2-adapter.h`): AR (composer) and NAR files in
+  LoRA, LoKr or DoRA form (`yue2-{ar,nar}-{lora,lokr,dora}-v1`), chosen with
   `POST /yue2/select-model`. On a ConvRot INT8 base the LoRA factors are applied at
   runtime instead (`yue2-convrot-adapter.h`).
+- SA3 `dora-rows-v1` adapters from `models/sa3-adapters` merge at load
+  (`sa3-dit-ggml.h`).
 
 The `adapter-system` skill in `.claude/skills/` covers failure modes.
 
 ## TensorRT paths
 
-Native TensorRT is the only non-GGML runtime; it has no switch of its own, the model
-path picks it.
+Native TensorRT is the only non-GGML runtime. For ACE-Step the model path picks it; for
+MM3 the request's `dit_backend` does.
 
 - Native TensorRT (raw NvInfer) for the ACE-Step DiT and LM, and for the MM3 DiT. It
   was chosen over ONNX Runtime's TensorRT provider because adapter switching needs
@@ -533,6 +643,7 @@ path picks it.
   - MM3 DiT: `"dit_backend": "tensorrt"` on `/mm3/synth` uses `mm3-dit-trt.h`, which
     builds a base engine per GPU under `<models>/mm3/mm3-trt-cache/` and refits it
     per DiT GGUF and adapter stack.
+
 ONNX Runtime is gone from the engine: no build links it, and there is no CMake option
 for it. What used to run on it:
 
@@ -557,16 +668,18 @@ are in `.claude/skills/engine-performance/SKILL.md`.
 
 ## Training subcommands
 
-`ace-train` links no `acestep-core`; every trainer is header-only under
-`engine/src/train/`. It writes machine-readable JSONL on stdout with `--jsonl` and
+`ace-train` links no `acestep-core`. The trainers are headers under `engine/src/train/`;
+the one compiled piece is `yue2-aitk-kernels` (`train/aitk-runtime.cmake`), the YuE2
+joint trainer's runtime, which on a CUDA build adds the 8-bit AdamW, fused head-loss and
+gradient-clip kernels. It writes machine-readable JSONL on stdout with `--jsonl` and
 human logs on stderr, and exits 0 on success, 1 on a runtime failure and 2 on bad
 usage. `ace-train --help` prints the full option list.
 
 | Subcommand | Purpose |
 |---|---|
 | `preprocess` | Build per-song tensor caches from an ACE-Step dataset |
-| `train-lm` | Train an ACE-Step planner-LM LoRA |
-| `train-dit` | Train an ACE-Step DiT LoRA or LoKr |
+| `train-lm` | Train an ACE-Step planner-LM adapter: LoRA or LoKr, with DoRA, HRA, HiRA, LoHa and PiSSA as options |
+| `train-dit` | Train an ACE-Step DiT adapter: LoRA or LoKr, with DoRA, HRA, HiRA, LoHa and PiSSA as options |
 | `detok-table` | Dump the FSQ detokenizer output for every code |
 | `mm3-encode` | MM3 DAV encode: raw audio to flow latents |
 | `mm3-codes` | MM3 dataset to RVQ codes (LM training input) |
@@ -578,15 +691,19 @@ usage. `ace-train --help` prints the full option list.
 | `mm3-condition` | MM3 AR rollout to a flow-DiT conditioning cache |
 | `mm3-train-dit` | Train an MM3 flow-DiT LoRA, or DoRA with `--dora`; CLI-only |
 | `rec7-selftest` | Parity gate for the rec7 state encoder |
+| `sa3-train` | Train a Stable Audio 3 Medium DoRA-rows adapter on CUDA or CPU (see [Stable Audio 3 training](#stable-audio-3-training)) |
+| `sa3-train-check` | Replay the official SA3 trainer capture; exits 77 when the fixtures or the base DiT are absent |
 | `yue2-preprocess` | Audio folder to cached YuE2 VAE latents and a manifest. Skips `*.engine.wav` (old server conversion-cache leftovers, duplicates of real tracks), as the dataset scanner does |
 | `yue2-tokenize` | Fill a YuE2 manifest's codec ids. `--dump-mert` also writes `codes/<stem>.mert.f16`, the tokenizer head's exact instance-normed `[T25, 1024]` MERT input, for head-training experiments |
 | `yue2-align` | Fill word timings for the AR lyric-cursor loss |
+| `yue2-guide` | One audio file to a source guide (`--audio`, `--out`, `--topk 64`, `--lufs -14`): the real-audio tokenizer's top-K codes per 25 Hz frame, read by the YuE2 semantic stage through `guide_path` (`yue2/yue2-guide.h`) |
 | `yue2-sheet` | Fill the ABC lead sheet with SheetSage2; `--melody-only` serves cover inference, while training keeps full score by default |
 | `yue2-nar-train` | Train a YuE2 NAR LoRA. `--manifest` may repeat (all caches train as one set); `--companion` merges `nar_lora_joint_v9` under the NAR first, as the server does at render time, and the export records it in `companion` metadata. `--audio-loss <w>` adds an audio-domain term on low-noise steps, the clean-latent estimate decoded through the frozen VAE and scored against the source recording ([training internals](training-internals.md#yue2-nar-audio-domain-loss)) |
 | `yue2-ar-train` | Train a YuE2 AR (composer) LoRA |
 | `yue2-prepare-aitk`, `yue2-import-aitk-cache` | Build or import caches for joint training |
 | `yue2-joint-train` | YuE2 AR and NAR joint training. `--eval-base-loss` trains nothing: it prints the base planner CE and decoder flow MSE per song (the Optimise phase). `--eval-adapted --resume <record> [--eval-dataset <held-out dataset.json>]` also trains nothing: it restores the checkpoint's adapters and prints base vs adapted planner CE and decoder MSE per song ([training internals](training-internals.md)). `--resume` restores optimizer state exactly; older 8-bit records load with a note ([training internals](training-internals.md)) |
 | `yue2-optim-check` | Optimizer self-check |
+| `yue2-batch-check` | CPU self-check of the AR sequence layouts the joint trainer builds, no model needed |
 | `spike` | Phase-0 evidence runs |
 
 `yue2-prepare-aitk --caption-dropout-trigger <text>` sets the exact style text
@@ -613,18 +730,23 @@ build leave `engine/ggml` clean and nothing is applied at configure time.
 | CPU fused snake | One CPU kernel for the mul → sin → sqr → mul → add snake chain |
 | `alloc-free-blocks` | Raises ggml-alloc's per-chunk free-block table from 256 to 1024 entries |
 | `bf16-out-prod` | CUDA `out_prod` accepts a BF16 `src0` |
+| `bf16-mul-mat-grad` | A BF16 `MUL_MAT` weight operand may carry a gradient, which the YuE2 trainer's BF16 GEMMs need |
 | `cudagraph-log` | Env-gated trace of CUDA graph decisions |
 | `f16-f32-accumulate` | CUDA F16 GEMMs accumulate and write in F32 on every architecture |
 | `flash-attn-train` | Adds `GGML_OP_FLASH_ATTN_TRAIN` and `_BACK`, with `ggml-cuda/fattn-train.{cu,cuh}` |
+| CUDA BF16 flash-attn-train | BF16 Q/K/V kernels for the fused training attention on sm_80+, for an explicit `GGML_PREC_BF16` request |
 | `metal-acc-set-cpy` | Metal non-inplace `ACC`/`SET` copy every column |
 | `metal-bin-threads` | Raises the Metal binary-op threadgroup cap |
 | `metal-im2col-ic` | Adds a separate Metal im2col kernel for the VAE's 1D convolutions |
+| Metal training ops | Metal kernels for the ops YuE2 joint training runs (fused training attention, `CONVROT8`, `BF16_ROUND`, `RMS_NORM_BACK`, `REPEAT_BACK`, `OUT_PROD`, `SILU_BACK`), CPU `CONVROT8` kernels, and optional hints on the fused attention op |
+| `metal-kquant-cpy` | Metal copies K-quants to F32 and F16, so a YuE2 LoRA trains on a K-quant base |
 | `mm-backward` | Env-gated dtype-agnostic `MUL_MAT` backward (`GGML_BACKWARD_MM=1`) |
 | `quant-cpy-kquant` | CUDA `CPY` reaches ggml's generic quant-to-F32 converter, so K-quants can be cast |
 | `sched-unplaced-log` | Logs the node no backend accepts before the scheduler's `cur_backend_id != -1` assert |
-| `zz-yue2-convrot8` | Adds the CUDA-only `GGML_OP_CONVROT8` and `_BACK` ops for YuE2 ConvRot training, with `ggml-cuda/convrot8.{cu,cuh}` |
+| `zz-yue2-convrot8` | Adds the `GGML_OP_CONVROT8` and `_BACK` ops for YuE2 ConvRot training, with `ggml-cuda/convrot8.{cu,cuh}`; the Metal training ops add CPU and Metal kernels |
 | `zzz-yue2-bf16-round` | Adds the `GGML_UNARY_OP_BF16_ROUND` unary op |
-| `zzzz-vulkan-train-ops` | Vulkan `BF16_ROUND` and `FLASH_ATTN_TRAIN`/`_BACK`, with `vulkan-shaders/fa_train_*`; what the YuE2 joint trainer needs off CUDA |
+| `zzzz-vulkan-train-ops` | Vulkan `BF16_ROUND` and `FLASH_ATTN_TRAIN`/`_BACK`, with `vulkan-shaders/fa_train_*`; what the YuE2 joint trainer needs on Vulkan |
+| BF16 training speed-ups | CUDA (`cuda-bf16-round-fuse`, `cuda-bf16-round-defer`, `cuda-bf16-storage`, `cuda-gemm-bf16-store`, `cuda-bf16-producer-store`, `bf16-round-elide`, `bf16-round-inplace`, `fa-train-cuda-hints`) and Metal (`metal-out-prod-smem`, `metal-cpy-transpose`, `metal-bf16-round-producer`, `metal-mul-mm-half-prepass`) work for the YuE2 trainer. Most are bit-identical, and most have an environment switch that turns them off |
 | RPC patch-level check | The RPC client refuses a server without the fork's ops |
 
 The quant-to-F32 copy launch fix that used to be `cpy-q-occupancy` is upstream now.
@@ -642,13 +764,12 @@ Two rules that bite:
 
 ## HOT-Step endpoints
 
-Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`,
-`/job`, `/health`, `/props`, `/logs` and `/`. Request and response details are in
-[the endpoint reference](../../engine/docs/ARCHITECTURE.md#endpoints).
+Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`, `/vae`
+(VAE encode or decode), `/job`, `/health`, `/props`, `/logs` and `/`. Request and
+response details are in [the endpoint reference](../../engine/docs/ARCHITECTURE.md#endpoints).
 
 | Route | Purpose |
 |---|---|
-| `POST /vae` | VAE encode (audio in, latents out) or decode (latents in, audio out) |
 | `POST /codes-decode` | Render LM audio codes to audio (training audition) |
 | `POST /warm` | Preload a DiT, VAE and adapter |
 | `GET /jobs` | List every job in the table |
@@ -659,6 +780,8 @@ Routes `ace-server` adds on top of upstream's `/lm`, `/synth`, `/understand`,
 | `POST /models/restore-policy` | Undo a `?keep_loaded=1` switch |
 | `POST /pp-vae-reencode` | Round-trip audio through the post-processing VAE |
 | `POST /sa3-refine` | Stable Audio 3 SDEdit refine of a finished track |
+| `POST /sa3-synth` | Stable Audio 3 generation from noise (see [Stable Audio 3 sampling](#stable-audio-3-sampling)) |
+| `GET /sa3/props` | SA3 readiness, sample rate, prompt token limit and adapter catalogue |
 | `GET /worker-drain` | Answers once the worker queue ahead of it has finished |
 | `POST /supersep/separate`, `GET /supersep/progress`, `GET /supersep/result`, `GET /supersep/serve`, `POST /supersep/release`, `POST /supersep/recombine` | Stem separation jobs |
 | `POST /spectral-lifter` | Spectral Lifter clean-up (CPU) |
@@ -678,14 +801,16 @@ exits 1 unless both pass, each WAV is fresh and exactly frames x 1920 samples lo
 the engine log yields per-stage times. No app, server or UI is
 involved. It resolves the models folder through `server/scripts/data-paths.ts`
 (override with `--models <dir>`), uses `acestep-v15-turbo-BF16.gguf` (override with
-`--dit <file>`), and writes requests, WAVs and logs to `logs/engine-smoke/`.
+`--dit <file>`), and writes requests, WAVs and logs to a per-run folder under
+`logs/engine-smoke/`, pruning run folders older than a day.
 `--self-test` renders six tracks, corrupts five inside ace-synth (NaN, subnormal,
 silence, DC, clip), forces a write failure, and passes only if every fault is caught.
 The block-based monitor chain has its own test, `engine/tests/test-monitor-chain.cpp`
 (odd block sizes, decaying tail, subnormal count); how to run it is in the
 engine-dev-loop skill. The checks and thresholds are in
 [engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md#ace-synth-reference).
-Engine hand-offs carry its `[Check Batch0]`, `stages:` and `wav:` lines as the render receipt.
+Engine hand-offs carry its `[Check Batch0]`, `stages:` and `wav:` lines and the
+`ENGINE SMOKE:` verdict as the render receipt.
 
 ## Related
 

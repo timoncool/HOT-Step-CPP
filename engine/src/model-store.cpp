@@ -684,8 +684,12 @@ Sa3GgmlRefine * store_require_sa3_ggml(ModelStore * s, const ModelKey & k) {
         }
     }
     Sa3GgmlRefine * m = new Sa3GgmlRefine();
-    // k.path = models root with the 4 sa3-*.gguf
-    if (!sa3_ggml_load(m, k.path.c_str(), specs.empty() ? nullptr : &specs)) {
+    // k.path = "<models root>/<generation DiT file>"; the other 3 sa3-*.gguf
+    // sit beside it. Keying on the DiT path gives each quant its own entry.
+    const size_t      slash = k.path.find_last_of("/\\");
+    const std::string dir   = slash == std::string::npos ? std::string(".") : k.path.substr(0, slash);
+    const std::string dit   = slash == std::string::npos ? k.path : k.path.substr(slash + 1);
+    if (!sa3_ggml_load(m, dir.c_str(), dit.c_str(), specs.empty() ? nullptr : &specs)) {
         sa3_ggml_free(m);
         delete m;
         return nullptr;

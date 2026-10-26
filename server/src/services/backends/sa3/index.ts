@@ -9,7 +9,7 @@
 // Shape mirrors backends/minimax/index.ts: same EngineBackend contract, same
 // lifecycle story (no process of its own — a model family inside ace-server),
 // same capabilities → generic-dropdown rendering. Deliberately smaller: SA3
-// has no planner LM, no quant ladder, no LRC, no streaming, no multi-take.
+// has no planner LM, no LRC, no streaming, no multi-take.
 //
 // Engine side: hot-step-server.cpp /sa3/props + /sa3-synth, which is
 // /sa3-refine minus the input (sa3-refine.h sa3_refine_run_backend with
@@ -23,6 +23,7 @@ import { isEngineSuspended } from '../../aceEngineProcess.js';
 import { aceClient } from '../../aceClient.js';
 import type { Sa3Props } from '../../aceClient.js';
 import { runSa3Generation } from './generate.js';
+import { sa3ModelCatalogue, sa3SelectedDit, selectSa3Model } from './models.js';
 import type {
   EngineBackend,
   BackendCapabilities,
@@ -106,7 +107,8 @@ const SA3_EXTENSIONS: BackendExtensionParam[] = [
     label: 'Sampler Plugins',
     hint: 'Drive the SA3 denoise with the shared Lua solver/scheduler/guidance '
         + 'plugins instead of the native pingpong loop. Full-loop (owns_loop) '
-        + 'solvers are fine here — SA3 renders in one pass, no window seams. '
+        + 'solvers are not offered: SA3 is distilled for pingpong sampling and '
+        + 'they skip the per-step re-noise it needs. '
         + 'Guidance is mostly decorative: SA3 has no CFG uncond branch, so '
         + 'APG-family modes pass through unchanged.',
     default: false,
@@ -173,8 +175,7 @@ async function capabilities(): Promise<BackendCapabilities> {
       modelsMissing,
     },
     features: {
-      // Single model set (onnx or gguf, engine picks); no ladder to show.
-      models: false,
+      models: true,
       lm: false,
       plugins: false,
       // The SA3 sampler loop runs the same Lua solvers/schedulers/guidance as
@@ -222,9 +223,8 @@ async function capabilities(): Promise<BackendCapabilities> {
 async function models(): Promise<BackendModels> {
   const { props } = await sa3PropsCached();
   return {
-    buckets: {},
+    ...sa3ModelCatalogue(),
     adapters: props?.adapters ?? [],
-    defaults: {},
   };
 }
 
@@ -262,9 +262,8 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
   return {
     operation: 'text2music',
     common,
-    // No quant ladder, no persisted selection — single model set, engine
-    // picks onnx/gguf by presence (see selectModel note below).
-    models: {},
+    models: { dit: typeof submission.sa3DitModel === 'string'
+      ? submission.sa3DitModel : sa3SelectedDit() },
     options,
     policy: { retry: { maxAttempts: 2, reseedOnRetry: true } },
   };
@@ -305,7 +304,7 @@ export const sa3Backend: EngineBackend = {
   },
   capabilities,
   models,
-  // No selectModel: single model set, engine picks onnx/gguf by presence.
+  selectModel: selectSa3Model,
   operations: SA3_OPERATIONS,
   resolveRequest,
   /** /sa3-synth is one synchronous call — no engine job id to poll, so

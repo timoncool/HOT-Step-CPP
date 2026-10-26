@@ -16,6 +16,16 @@ export interface Yue2LyricScheduleWire {
   lead_sec?: number;
   behind?: number;
   sections: Yue2LyricScheduleSection[];
+  blind?: Yue2BlindWindow[];
+}
+
+/** An improvised stretch: while the composer writes [from_sec, to_sec) these
+ *  lyric and score spans are hidden whatever the sections say. */
+export interface Yue2BlindWindow {
+  from_sec: number;
+  to_sec: number;
+  lyric?: Array<[number, number]>;
+  abc?: Array<[number, number]>;
 }
 
 export interface Yue2LyricScheduleOptions {
@@ -43,23 +53,7 @@ export function buildYue2LyricSchedule(abc: string, lyrics: string, options: Yue
   const onsets = scoreVocalNoteOnsets(abc, bars);
   const sections = scoreSections(abc);
   if (!sections.length) throw new Error('lyric schedule needs a score with labelled sections');
-  // Per score section, the codepoint spans of its own lines: the "% label"
-  // line and its music, never a field line (M:, Q:, K:, V: ...), which stays
-  // in force past the section and so must stay visible.
-  const abcEnd = codepoints(abc);
-  const abcSpans: Array<Array<[number, number]>> = [];
-  let at = 0;
-  for (const line of abc.split('\n')) {
-    const trimmed = line.trim();
-    const next = Math.min(at + codepoints(line) + 1, abcEnd);
-    if (trimmed.startsWith('%') && trimmed.slice(1).trim()) abcSpans.push([]);
-    const spans = abcSpans.at(-1);
-    if (spans && trimmed && !/^[A-Za-z+]:/.test(trimmed)) {
-      const last = spans.at(-1);
-      if (last && last[1] === at) last[1] = next; else spans.push([at, next]);
-    }
-    at = next;
-  }
+  const abcSpans = sectionLineSpans(abc);
   if (abcSpans.length !== sections.length) throw new Error('lyric schedule could not locate the score section lines');
   const lyricChars = Array.from(lyrics);
   const tags = lyricBlocks(lyrics);
@@ -96,5 +90,45 @@ export function buildYue2LyricSchedule(abc: string, lyrics: string, options: Yue
       sections: wire,
     },
     untimed,
+  };
+}
+
+/** Per score section, the codepoint spans of its own lines: the "% label"
+ *  line and its music, never a field line (M:, Q:, K:, V: ...), which stays
+ *  in force past the section and so must stay visible. */
+function sectionLineSpans(abc: string): Array<Array<[number, number]>> {
+  const abcEnd = codepoints(abc);
+  const abcSpans: Array<Array<[number, number]>> = [];
+  let at = 0;
+  for (const line of abc.split('\n')) {
+    const trimmed = line.trim();
+    const next = Math.min(at + codepoints(line) + 1, abcEnd);
+    if (trimmed.startsWith('%') && trimmed.slice(1).trim()) abcSpans.push([]);
+    const spans = abcSpans.at(-1);
+    if (spans && trimmed && !/^[A-Za-z+]:/.test(trimmed)) {
+      const last = spans.at(-1);
+      if (last && last[1] === at) last[1] = next; else spans.push([at, next]);
+    }
+    at = next;
+  }
+  return abcSpans;
+}
+
+/**
+ * A schedule that hides every lyric and every score section line while the
+ * composer writes each window (seconds on the score clock), and nothing
+ * outside them: the take improvises there from the style and what it already
+ * played. Header fields stay visible, so key, meter and tempo hold.
+ */
+export function blindYue2Schedule(abc: string, lyrics: string, windows: Array<[number, number]>): Yue2LyricScheduleWire {
+  const lines = sectionLineSpans(abc).flat();
+  const sung = codepoints(lyrics.trimEnd());
+  return {
+    mode: 'mask', sections: [],
+    blind: windows.map(([from, to]) => ({
+      from_sec: Math.round(from * 1000) / 1000, to_sec: Math.round(to * 1000) / 1000,
+      ...(sung ? { lyric: [[0, sung] as [number, number]] } : {}),
+      ...(lines.length ? { abc: lines } : {}),
+    })),
   };
 }

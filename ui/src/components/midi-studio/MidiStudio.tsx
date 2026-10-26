@@ -29,6 +29,7 @@ import {
 import { MidiPlayer } from './MidiPlayer';
 import { MidiExportPanel } from './MidiExportPanel';
 import { ParamLabel } from '../shared/ParamLabel';
+import { Toggle } from '../shared/Toggle';
 import { useUpload } from '../../queries/writes';
 
 const MODEL_INFO: Array<{ id: MuscriptorModel; params: string }> = [
@@ -68,6 +69,7 @@ export const MidiStudio: React.FC = () => {
   const [sourceSongId, setSourceSongId] = useState<string | undefined>(undefined);
   const [model, setModel] = useState<MuscriptorModel>(() =>
     (localStorage.getItem('hs-midi-model') as MuscriptorModel) || 'small');
+  const [speculative, setSpeculative] = useState(() => localStorage.getItem('hs-midi-speculative') !== '0');
 
   // ── Jobs ──
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
@@ -118,12 +120,16 @@ export const MidiStudio: React.FC = () => {
     setModel(m);
     try { localStorage.setItem('hs-midi-model', m); } catch { /* ignore */ }
   };
+  const handleSpeculativeChange = (v: boolean) => {
+    setSpeculative(v);
+    try { localStorage.setItem('hs-midi-speculative', v ? '1' : '0'); } catch { /* ignore */ }
+  };
 
   const handleTranscribe = async () => {
     if (!sourceAudioUrl) return;
     setSubmitError('');
     try {
-      await submitTranscription({ sourceAudioUrl, sourceFileName: sourceName, songId: sourceSongId, model });
+      await submitTranscription({ sourceAudioUrl, sourceFileName: sourceName, songId: sourceSongId, model, speculative });
       refreshJobs();
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : String(err));
@@ -284,7 +290,7 @@ export const MidiStudio: React.FC = () => {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".wav,.mp3,audio/wav,audio/mpeg"
+              accept=".wav,.mp3,.flac,audio/wav,audio/mpeg,audio/flac"
               className="hidden"
               onChange={e => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ''; }}
             />
@@ -417,6 +423,17 @@ export const MidiStudio: React.FC = () => {
                 <span className="text-[11px] text-red-500 dark:text-red-400">{beatState.error.slice(0, 120)}</span>
               )}
             </div>
+
+            {/* Speculative decoding: only the large model gains from it */}
+            {model === 'large' && (
+              <div className="mt-3 flex items-center gap-2 flex-wrap text-xs">
+                <Toggle size="sm" accent="purple" checked={speculative} onChange={handleSpeculativeChange}
+                  label={t('midiStudio.speculative')} info={t('midiStudio.speculativeInfo')} />
+                {speculative && !status?.models?.small?.downloaded && (
+                  <span className="text-[11px] text-zinc-400 dark:text-zinc-500">{t('midiStudio.speculativeNeedsSmall')}</span>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Primary action morphs with the selected model's state:

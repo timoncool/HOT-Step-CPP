@@ -20,6 +20,7 @@ import type {
   GuiResponse, MonitorStartResponse, MonitorStopResponse, MonitorSwitchResponse,
   MonitorStatusResponse, MonitorSeekResponse,
 } from '../../../server/src/contracts/vst';
+import type { ReportLogsResponse } from '../../../server/src/contracts/reportLogs';
 import type { EnvResponse, EnvUpdateResponse, GpusResponse } from '../../../server/src/contracts/settings';
 import type {
   ProfileFile, ListProfilesResponse, SaveProfileResponse, RenameProfileResponse, DeleteProfileResponse,
@@ -426,6 +427,10 @@ export const settingsApi = {
    *  CUDA_VISIBLE_DEVICES — the index is display-only, because nvidia-smi and
    *  CUDA number GPUs differently (issue #153). */
   getGpus: (opts?: ReadOptions) => get<GpusResponse>('/settings/gpus', opts),
+};
+
+export const reportLogsApi = {
+  snapshot: (opts?: ReadOptions) => get<ReportLogsResponse>('/logs/snapshot', opts),
 };
 
 // ── Parameter Profiles ──────────────────────────────────────

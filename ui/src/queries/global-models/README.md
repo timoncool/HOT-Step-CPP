@@ -22,10 +22,11 @@ and request URL. Reads consume Query's AbortSignal and throw on HTTP failures.
 | `BackendModelsDropdown.tsx`, `Yue2LmAdapterDropdown.tsx` | Backend-scoped `global-models/backend-models`; model selection/import remain explicit commands |
 | `Mm3LmAdapterDropdown.tsx` | `global-models/mm3-adapters` |
 | `PostProcessingDropdown.tsx` | Shared plugins plus `global-models/pp-vae`, `stablestep`, `sa3-adapters` |
+| `training-studio/Sa3TrainCard.tsx` | The same `global-models/sa3-adapters` list for its audition picker, read only while training targets this PC |
 | `GenerationDropdown.tsx`, `MasteringDropdown.tsx`, `PostProcessingDropdown.tsx` | One `global-models/references` snapshot; upload/delete invalidates all consumers |
 | `CoverArtDropdown.tsx` | `global-models/cover-art`; download/cancel are explicit commands |
 | `AdaptersDropdown.tsx` | Folder-filtered `global-models/lm-adapters` and shared `adapter-scan`; scan is a read-only POST owned by Query, fresh per click and shared with shell-queue |
-| `ProfilesModal.tsx` | `global-models/profiles`; save/rename/delete/import invalidates it |
+| `ProfilesModal.tsx` | `global-models/profiles`, one list per backend (`backend` filter); save/rename/delete/import invalidates it |
 | `SeedManagerDrawer.tsx` | `global-models/seeds`; save/delete/favorite invalidates it; random GET remains an explicit selection command |
 | `MonitorBar.tsx`, `vstChainStore.ts`, `VstChainDropdown.tsx` | `global-models/monitor`, `vst-chain`, `vst-scan`; exact-key projections preserve existing store selectors |
 | `vstChainStore.ts` preset collection | Family-filtered `global-models/vst-presets` supplies authoritative reads through the existing injectable API; the collection retains unsaved edits, migration decisions and revision conflicts |
@@ -50,7 +51,7 @@ No app run belongs to this slice.
 | --- | --- |
 | `GET /api/plugins` | One shared read on first use; reload invalidates all subscribers |
 | `GET /api/capabilities?backend=<id>` | One shared read per backend; 10 seconds while absent/down, stops when up |
-| `GET /api/logs/vram` | Shared 1500 ms poll while observed, including Terminal and top bar together |
+| `GET /api/logs/vram` | Shared 1500 ms poll while observed; the only reader is the Terminal box's VRAM badge (`shared/VramIndicator.tsx`) |
 | `GET /api/logs/models-loaded` | 2000 ms only while unload dropdown is open |
 | `GET /api/model-manager/registry` | First use/stale remount; download completion, reconnect or deletion invalidates |
 | `GET /api/model-manager/downloads` | One shared SSE connection; no polling |
@@ -58,7 +59,7 @@ No app run belongs to this slice.
 | `GET /api/models` | Shared read; 3000 ms while the DiT list is empty/unavailable, stops once populated |
 | `GET /api/backends`, `/api/backends/models?backend=<id>` | First use/stale remount; backend switch/model selection invalidates captured target |
 | `GET /api/models/pp-vae`, `/api/models/stablestep`, `/api/models/stablestep/adapters`, `/api/mm3/lm-adapters` | First use/stale remount; model installation/deletion invalidates |
-| `GET /api/mastering/references`, `/api/profiles`, `/api/seeds`, `/api/adapters/lm?folder=...` | First use/stale remount; own writes or manual refresh invalidate |
+| `GET /api/mastering/references`, `/api/profiles?backend=<id>`, `/api/seeds`, `/api/adapters/lm?folder=...` | First use/stale remount; own writes or manual refresh invalidate |
 | `POST /api/adapters/scan` | Read-only scan on explicit request, deduplicated by folder |
 | `GET /api/cover-art/status` | First use; 1500 ms while downloading, stops on terminal phase |
 | `GET /api/vst/monitor/status` | 300 ms while running; 2000 ms while idle to discover an already-running monitor |
@@ -75,9 +76,9 @@ only to network/5xx failures; submit commands never retry automatically.
 1. Open global generation/sampler/postprocessing consumers together. Count one
    plugin read and one capability read per backend key. Invalidate/reload plugins
    and check every subscriber sees the replacement registry.
-2. Open Terminal alongside the top bar. Both VRAM displays must share the
-   1500 ms request stream. Hover the unload dropdown and confirm its separate
-   2000 ms list stops when closed. Unload once and verify VRAM/list refresh.
+2. Open the Terminal box. Its VRAM badge polls at 1500 ms. Hover the unload
+   dropdown and confirm its separate 2000 ms list stops when closed. Unload
+   once and verify VRAM/list refresh.
 3. Capture an initial down capability response, then restore the engine. Verify
    the 10-second probe recovers and stops. Repeat after an up manifest was seen:
    the previous controls stay available while the raw down response is polled.

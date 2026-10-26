@@ -4,10 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { abcSidecarPath, readAbcSidecar, writeAbcSidecar } from './abcSidecar.js';
-import { seedAbcManifestFromSidecars, saveAbcManifestSidecars, buildYue2SheetArgs } from './yue2Sheet.js';
+import { seedAbcManifestFromSidecars, saveAbcManifestSidecars, buildYue2SheetArgs, readYue2CoverAbc } from './yue2Sheet.js';
 import { runYue2CoverSheetJob, runYue2SheetJob } from './yue2ArTrainRunner.js';
 import { createJob } from './labelingQueue.js';
 import { runYue2AceTrain } from './yue2TrainRunner.js';
+import { writeWav } from '../generation/audioLevel.js';
 
 test('lead sheets survive manifest reset and seed the next stage by source name', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'abc-sidecar-'));
@@ -73,6 +74,22 @@ test('cover transcription fails for all-rest Vocal bars and accepts a sounding b
     const sounding = createJob('yue2-sheet', 'fixture', [], {});
     assert.equal(await runYue2CoverSheetJob(sounding, audio, dir, deps), abc);
     assert.equal(sounding.status, 'done');
+
+    // Rap: no sung melody, but the vocal stem gives the rhythm. Bar 2 holds a
+    // syllable on its first two 16ths at 120 BPM.
+    abc = 'X:1\nM:4/4\nL:1/16\nQ:1/4=120\nV: Vocal\nV: Ins\nK:Am\n% verse\nV: Vocal\nZ|"Am"z16|\nV: Ins\nE16|E16|';
+    const stem = path.join(dir, 'vocals.wav');
+    const samples = new Float32Array(4 * 8000);
+    for (let i = 16000; i < 18000; i++) samples[i] = 0.5 * Math.sin(i);
+    writeWav(stem, { channels: [samples], sampleRate: 8000, numChannels: 1, sourceFormat: 's16' }, 's16');
+    const rapped = createJob('yue2-sheet', 'fixture', [], {});
+    const filled = await runYue2CoverSheetJob(rapped, audio, dir, { ...deps, vocalStem: async () => stem });
+    assert.ok(filled.endsWith('V: Vocal\nz16|"Am"A2z12z2|\nV: Ins\nE16|E16|'), filled);
+    assert.equal(rapped.status, 'done');
+    assert.equal(readYue2CoverAbc(path.join(dir, 'cover-sheet.json'), 'track.wav'), filled);
+    const noStem = createJob('yue2-sheet', 'fixture', [], {});
+    await assert.rejects(runYue2CoverSheetJob(noStem, audio, dir, { ...deps, vocalStem: async () => { throw new Error('separation found no vocals'); } }),
+      /heard no melody in this source, and its vocal rhythm could not be read: separation found no vocals/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

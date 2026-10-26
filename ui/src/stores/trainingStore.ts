@@ -376,6 +376,7 @@ interface TrainingState {
   deletePreprocessVariant(variantKey: string): Promise<void>;
   loadTrainLmStatus(q?: { variantKey?: string; adapterName?: string; lmSize?: LmSize }): Promise<void>;
   startTrainLm(opts: TrainLmOptions): Promise<void>;
+  startSa3Train(opts: trainingApi.StartSa3TrainingRequest): Promise<void>;
   /** MiniMax-Music3: audio -> RVQ codes. */
   startMm3Codes(opts?: { launder?: boolean }): Promise<void>;
   /** MiniMax-Music3: codes + captions -> an LM LoRA. */
@@ -853,6 +854,12 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     }
   },
 
+  startSa3Train: async (opts) => {
+    await startJob(set, get, (id, target) => trainingApi.startSa3Training(id, opts, target), () => ({
+      ...blankTrainSeries(), trainMaxEpochs: 0, trainTargetLoss: 0,
+    }));
+  },
+
   startMm3Codes: async (opts?: { launder?: boolean }) => {
     await startJob(set, get, (id, t) => trainingApi.startMm3Codes(id, opts?.launder ? { launder: true } : {}, t));
   },
@@ -1205,7 +1212,7 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
         // yue2-ar-train's relay parses a different log line into the same
         // vocabulary (services/training/yue2ArTrainRunner.ts), so it too draws
         // on the shared chart.
-        if (chartKind === 'train-lm' || chartKind === 'train-dit' || chartKind === 'mm3-train-lm'
+        if (chartKind === 'train-lm' || chartKind === 'train-dit' || chartKind === 'sa3-train' || chartKind === 'mm3-train-lm'
           || chartKind === 'yue2-nar-train' || chartKind === 'yue2-ar-train') {
           if (ev.metric === 'data' && typeof ev.stepsPerEpoch === 'number' && ev.stepsPerEpoch > 0) {
             set({ trainStepsPerEpoch: ev.stepsPerEpoch });
@@ -1578,6 +1585,9 @@ function refreshAfterJob(get: GetState, jobId: string): void {
   // run usually leaves one on disk, so this refresh matters on every terminal
   // status, not just 'done'.
   if (get().activeJob?.kind === 'train-dit') void get().loadTrainDitStatus();
+  if (get().activeJob?.kind === 'sa3-train' && get().trainingWorker === null) {
+    void queryManager.keys(queryClient, resourceKey('global-models/sa3-adapters'));
+  }
   // A finished audition wrote data/training/previews/<id>/ — the card renders
   // its players from the list, so re-read it. Placed here rather than inline in
   // applyStreamEvent's `status` case so a cancelled job refreshes too (§6.6).

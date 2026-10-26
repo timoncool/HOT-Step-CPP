@@ -302,7 +302,7 @@ export const AdaptersAccordion: React.FC<AdaptersAccordionProps> = ({
                     </div>
                     <p className="text-[10px] text-zinc-600 mt-1">
                       {adapterMode === 'runtime_lowrank'
-                        ? 'Applies raw adapter factors per-step — lowest VRAM (LoRA & LoKr; DoRA needs Merge).'
+                        ? 'Applies raw adapter factors per step, lowest VRAM for LoRA & LoKr. DoRA magnitudes are skipped unless Runtime DoRA magnitudes is on, which builds full-size deltas.'
                         : adapterMode === 'runtime'
                         ? 'Keeps base weights intact, applies adapter per-step. Same quality, slower inference, saves VRAM.'
                         : 'Merges adapter at F32 precision. Best quality, fast inference, but uses more VRAM during synthesis.'}
@@ -462,7 +462,7 @@ export const AdaptersAccordion: React.FC<AdaptersAccordionProps> = ({
                     </div>
                     <p className="text-[10px] text-zinc-600 mt-1">
                       {adapterMode === 'runtime_lowrank'
-                        ? 'Applies raw adapter factors per-step — lowest VRAM (LoRA & LoKr; DoRA needs Merge).'
+                        ? 'Applies raw adapter factors per step, lowest VRAM for LoRA & LoKr. DoRA magnitudes are skipped unless Runtime DoRA magnitudes is on, which builds full-size deltas.'
                         : adapterMode === 'runtime'
                         ? 'Keeps base weights intact, applies adapter per-step. Same quality, slower inference, saves VRAM.'
                         : 'Merges adapter at F32 precision. Best quality, fast inference, but uses more VRAM during synthesis.'}

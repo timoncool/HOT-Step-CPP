@@ -3,17 +3,23 @@
 Two local MCP servers let an agent such as Claude Code or Codex act on the
 running app on your behalf, instead of (or alongside) you using the UI.
 
-- **`lyricstudio`** drives Lyric Studio: artists, albums, profiles, lyric
-  generation and refinement. It reads the database directly. See
+- **`lyricstudio`** drives Lyric Studio: artists, lyrics sets, profiles, lyric
+  generation and refinement, and the MiniMax-Music3 and YuE2 captions for a
+  song. It reads and writes the app's database file directly instead of going
+  through the app's server. The same MCP server also hosts the discussion
+  rooms and work channels agents use to coordinate. See
   [tools/mcp-lyricstudio/README.md](../../tools/mcp-lyricstudio/README.md).
-- **`hotstep`** drives generation and training across all three backends:
-  submitting and polling songs, switching backends, and the dataset/training
-  pipeline (datasets, labeling, prepare, start, runs). It talks to the running
-  server over its HTTP API, the same one the browser UI uses. See
+- **`hotstep`** drives generation and training on ACE-Step 1.5,
+  MiniMax-Music3 and YuE2: submitting and polling songs, switching backends,
+  and the dataset/training pipeline (datasets, labeling, prepare, start,
+  runs). It talks to the running server over its HTTP API, the same one the
+  browser UI uses. Stable Audio 3, the fourth backend, is not covered. See
   [tools/mcp-hotstep/README.md](../../tools/mcp-hotstep/README.md) for the
   full tool and field reference; this page is a shorter tour.
 
 ## Setup
+
+This section sets up `hotstep`. The `lyricstudio` setup is in its README.
 
 The app's server has to be running first; an MCP server with nothing to talk
 to can't do anything. The MCP package also needs its own dependencies
@@ -65,28 +71,37 @@ keeps its old tool list until you reconnect it, the same rule as the
 
 ## Security posture
 
-The app's HTTP API has no real login. Asking it for a token (which both MCP
-servers do automatically) succeeds for anyone who can reach it, no password
-involved. That is the app's existing single-user, local-machine design, not
-something either MCP server weakens further. Anyone who can reach the
-server's URL can submit generations and start jobs that occupy the GPU, some
-for a long time. Keep it pointed at your own machine (`127.0.0.1`) unless
-you have deliberately put something else, such as a firewall or an
-authenticated tunnel, in front of it.
+The app's HTTP API has no real login. Asking it for a token (which the
+`hotstep` server does automatically) succeeds for anyone who can reach it, no
+password involved. That is the app's existing single-user, local-machine
+design, not something the MCP server weakens further. Anyone who can reach
+the server's URL can submit generations and start jobs that occupy the GPU,
+some for a long time. Keep `HOTSTEP_URL` pointed at your own machine
+(`127.0.0.1`) unless you have deliberately put something else, such as a
+firewall or an authenticated tunnel, in front of it. The server listens on
+every network interface by default (`SERVER_HOST`, default `0.0.0.0`), so the
+same applies to anyone on your network, with or without an MCP server.
+
+`lyricstudio` makes no HTTP calls to the app; it opens the database file
+directly. Its optional LAN endpoint for discussions is separate and needs a
+token; its README covers it.
 
 ## Generation tour
 
 Five tools cover generation, in the order you'd typically call them:
 
-- `gen_backends` lists the three backends, which one is active, and what it
-  supports.
+- `gen_backends` lists the registered backends (all four, Stable Audio 3
+  included), which one is active, and what it supports.
 - `gen_configure` switches the active backend, or picks a model on a backend
   whose model choice is server-side state (MiniMax-Music3, YuE2). Switching
-  releases the outgoing backend's VRAM.
+  releases the outgoing backend's VRAM. It cannot switch to Stable Audio 3.
 - `gen_submit` starts a generation: a backend, a caption, optionally lyrics
   and the rest of the usual knobs. It names the backend it expects to be
   active; if someone switched backends since you last checked, the server
-  answers 409 rather than running on the wrong one.
+  answers 409 rather than running on the wrong one. While Stable Audio 3 is
+  the active backend a plain submit gets that 409, so switch first with
+  `gen_configure`, or send a one-job `backendOverride` as the README
+  describes.
 - `gen_wait` polls a submitted job until it finishes or a time budget runs
   out, whichever comes first.
 - `gen_song` looks up a finished song's metadata and audio location once you
@@ -126,9 +141,11 @@ under way does not refund the minutes already spent.
   and reports what is still missing before training can start.
 - `train_fields` looks up the exact fields a given backend and stage accepts,
   each with its type, whether it's required and its default: the same
-  information the README's field tables hold, but generated from the same
-  validation the server runs, so it can't drift from it. Reach for this
-  before guessing a field name.
+  information the README's field tables hold, generated from the schemas the
+  tool checks your call against before sending it. Reach for this before
+  guessing a field name. Those schemas copy the server's routes by hand, so a
+  field or value a route gained later can be missing; the README lists the
+  known gaps.
 
 One example per backend family, as which tool to call in which order (see
 the README's field tables for what each one actually takes). Every step
@@ -144,7 +161,8 @@ moving to the next step. On `outcome: "budget"`, call `train_wait` again.
   `train_prepare` `backend: "ace"` (encode tensors) → wait → `train_start`
   with `backend: "ace-lm"` or `backend: "ace-dit"` → wait.
 - **MiniMax-Music3**: `train_dataset_label` `stage: "label"` → wait →
-  `stage: "caption"` for its own caption format → wait → `stage: "build"`
+  `stage: "caption"` for its own caption format (`options.provider` `moss` or
+  `gemini`; the other providers do not write it) → wait → `stage: "build"`
   (its code export also refuses an unbuilt dataset) → wait → `train_prepare`
   `backend: "mm3"` (encode RVQ codes) → wait → `train_start` with
   `backend: "mm3-lm"` → wait.
@@ -156,9 +174,12 @@ moving to the next step. On `outcome: "budget"`, call `train_wait` again.
 
 ## Limits
 
-- Pipelines and batches, checkpoint previews and audition, ladder rung
-  scoring, and MiniMax-Music3 streaming and STORM are not exposed yet. Use
-  the UI for those.
+- Stable Audio 3 generation and training, pipelines and batches, rendering
+  previews from existing checkpoints, audition, ladder rung scoring, and
+  MiniMax-Music3 streaming and STORM are not exposed yet. Use the UI for
+  those. A MiniMax-Music3 or YuE2 training run can still be started with
+  mid-run previews switched on, through the `preview` field of its
+  `train_start` call.
 - A wait tool (`gen_wait`, `train_wait`) always returns once its time budget
   is up, whether or not the job has finished; the job itself keeps running
   on the server either way. Poll again, or raise the budget (and your MCP

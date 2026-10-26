@@ -24,9 +24,6 @@ const STUDIO_NEEDS: Record<string, (caps: BackendCapabilities, backendId: string
   // Section regeneration is repaint outpainting.
   'song-builder': caps => caps.features.repaint,
   'storm': caps => caps.features.streaming,
-  // Training has ACE-Step, MiniMax-Music3 and YuE2 paths; the manifest's
-  // `training` flag predates the YuE2 trainer, so go by engine.
-  'training-studio': (_caps, backendId) => backendId !== 'sa3',
 };
 
 /** Which views the active engine supports. */

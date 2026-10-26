@@ -18,7 +18,7 @@ A client never sends a file path. The file goes up as a multipart upload, which 
    - Each entry has either `song`, the new library row, or `error`. One bad item does not stop the others, so check every entry.
    - An asset the caller does not own, or whose file is gone, fails its item only.
    - Unknown fields, a non-uuid `assetId` or more than 50 items answer `400 { error: 'Invalid import request', issues }`.
-   - The import converts the audio to the library's WAV shape (stereo 16-bit). The uploaded file is left in the references folder: there is no delete route, and the server does not clean it up.
+   - The import converts the audio to the library's WAV shape (stereo 16-bit, kept at 44.1 or 48 kHz, any other rate resampled to 44.1 kHz). The uploaded file is left in the references folder: there is no delete route, and the server does not clean it up.
 
 ## Exporting audio
 
@@ -42,7 +42,8 @@ There is no export job to poll. A client resolves what to download, then downloa
    - `format`: `wav`, `flac` (the default), `mp3` or `opus`.
    - `bitrate`: kbps, 32 to 512, used for MP3 and Opus.
    - `downloadVersion`: `original`, `mastered` (the default) or `both`. It applies to items without an explicit `variant`. `mastered` falls back to the original when a song has no master; `both` gives two entries when it has one.
-   - `includeLatent`: adds the latent file as a separate entry.
+   - `variant` on an item: `original`, `mastered`, `noadapter` or `latent`. An item's `mastered` also falls back to the original when there is no master.
+   - `includeLatent`: adds the latent file as a separate entry, for items without an explicit `variant`.
    - `audioUrl` or `srcUrl` on an item lets a render that exists only in the queue (not yet a library row) be found by its audio file.
 2. The response is `200 { items }` ([`ResolvedExport`](../../server/src/contracts/exportImport.ts)). An input item can produce several entries, all carrying its `index`.
    - A resolved entry has `variant`, `filename` and a relative `url`.
@@ -53,7 +54,11 @@ There is no export job to poll. A client resolves what to download, then downloa
    - `Content-Disposition: attachment; filename="…"`. The name follows the same rule the resolve response's `filename` shows.
    - `Content-Length`.
 
-   Errors come back as JSON instead: 400 for a bad format, 404 for a missing song or file. A non-WAV format, or a WAV with tags to embed, is transcoded into a temporary file. The server deletes that file once it has been read to the end. A download abandoned midway can leave it in the server's `download_temp` folder.
+   Errors come back as JSON instead: 400 for a bad format, 404 for a missing song or file, 500 when conversion fails (for example no ffmpeg for a non-WAV format). A non-WAV format, or a WAV with tags to embed, is transcoded into a temporary file. The server deletes that file once it has been read to the end. A download abandoned midway can leave it in the server's `download_temp` folder.
+4. **Save on the server** (optional): `POST` the same `url` with `/save` after the id (`/api/download/:id/save?…`, no token) to write the file into the folder the `DOWNLOAD_DIR` setting names instead of streaming it.
+   - Success: `200 { path, filename }`. A name already taken there gets ` (2)`, ` (3)` and so on before the extension.
+   - With no folder set: `409 { error: 'No download folder is set' }`. The bundled UI then falls back to the browser download.
+   - A save that fails: `500 { error }`. The other errors match the download's.
 
 ## Importing a profile file
 
@@ -61,7 +66,7 @@ There is no export job to poll. A client resolves what to download, then downloa
 
 - The server accepts either a saved profile wrapper (`{ name, saved_at, data }` whose `data._format` is `hot-step-preset`) or bare preset JSON.
 - It names the profile after the file, without `.json` and with characters a filename cannot hold replaced by `_`.
-- It answers `200 { name, data }` ([`ProfileImportResult`](../../server/src/contracts/exportImport.ts)). Save `data` under `name` with the profile routes.
+- It answers `200 { name, data }` ([`ProfileImportResult`](../../server/src/contracts/exportImport.ts)). Save `data` under `name` with the profile routes, passing `backend` for an engine other than ACE-Step: profiles are kept per engine ([Profiles](api-contracts.md#shared-contracts-for-legacy-routes)).
 - An empty profile, a non-object or unknown top-level fields answer `400 { error: 'Invalid profile', details }`.
 - Validation writes nothing.
 
@@ -78,7 +83,7 @@ The response is `Content-Type: audio/wav`, and the stream's Node session is name
 
 **STORM.**
 
-- Start: the body is any Create generation parameters plus `streamId` (default `'default'`, one per DJ deck), `seed`, `coResident` and `pluginParams`. Before any audio, the route answers `503` while the engine is not ready and `409` while generation jobs are active.
+- Start: the body is any Create generation parameters plus `streamId` (default `'default'`, one per DJ deck), `seed`, `coResident`, `pluginParams` and an optional `drift` (a `Partial<DriftPressure>`, as for control below) that starts the stream with Directed Drift. Before any audio, the route answers `503` while the engine is not ready and `409` while generation jobs are active.
 - Live changes: `POST /api/generate/storm/control` with [`StormControl`](../../server/src/contracts/streaming.ts) and the same `streamId` applies them from the next slot. It returns `{ ok: true, streamId }`.
   - `next_*`, `seed`, `prompt` and `lyrics` apply to one slot.
   - `stick_prompt` and `stick_lyrics` persist until set to `null`.
@@ -91,10 +96,10 @@ The response is `Content-Type: audio/wav`, and the stream's Node session is name
 
 **MM3.**
 
-- Submit a generation that streams. Poll `GET /api/generate/status/:id` until `mm3_streaming` is true ([`Mm3StreamStatus`](../../server/src/contracts/streaming.ts)), then open one stream per take, `take` from 0 to `mm3_takes - 1`.
+- Submit a MiniMax-Music3 generation with `mm3Stream: true`, the Play While Rendering extension. Poll `GET /api/generate/status/:id` until `mm3_streaming` is true ([`Mm3StreamStatus`](../../server/src/contracts/streaming.ts)), then open one stream per take, `take` from 0 to `mm3_takes - 1`.
 - `mm3_duration` gives the full length before any audio arrives.
 - Errors:
-  - 404: the job is unknown.
+  - 404: the job is unknown or no longer held in memory (after a restart, or once a finished job is pruned an hour after it was created).
   - 409: the job has not reached the engine yet (poll and reopen), is not streaming, or the engine refused. The engine refuses when the take has finished or already has a reader; it allows one reader per take.
   - 502: the engine stream failed.
 - Closing the connection drops the engine connection too. The render itself carries on as a normal job: cancel it the same way as any other generation, `POST /api/generate/cancel/:id` ([Jobs](api-contracts.md#jobs)), which also ends any stream still reading it.

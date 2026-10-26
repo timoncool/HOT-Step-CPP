@@ -57,8 +57,17 @@ export interface SourceSection {
 }
 
 /** `lyrics`, when set, is this occurrence's own sung text (the block's lines,
- *  without its tag), so a repeated chorus can sing other words than the first. */
-export interface Occurrence { id: string; section: string; lyrics?: string }
+ *  without its tag), so a repeated chorus can sing other words than the first.
+ *  An improv occurrence has section IMPROV and its own bar count instead of a
+ *  source section: the score gets that many bars of rests, labelled Improv,
+ *  and its take composes them without the score (yue2Takes' blind window). */
+export interface Occurrence { id: string; section: string; lyrics?: string; bars?: number }
+
+export const IMPROV = 'improv';
+export const IMPROV_BARS = [2, 4, 8, 16];
+
+/** A plan entry for composeArrangement: a source section index, or improv bars. */
+export type PlanEntry = number | { improv: number };
 
 export interface Arrangement {
   sections: SourceSection[];
@@ -151,13 +160,20 @@ export interface Composed {
  *  (lyrics gain a final newline if they lack one). `sing[k]`, when set, is
  *  sung by occurrence k in place of its block's lines; an unsung section has
  *  none to replace. */
-export function composeArrangement(abc: string, lyrics: string, plan: number[], sing: Array<string | undefined> = []): Composed {
+export function composeArrangement(abc: string, lyrics: string, plan: PlanEntry[], sing: Array<string | undefined> = []): Composed {
   abc = abc.replace(/\r\n?/g, '\n');
   lyrics = lyrics.replace(/\r\n?/g, '\n');
   const lines = abc.split('\n');
   const starts = lines.flatMap((line, i) => (label(line.trim()) ? [i] : []));
   if (!starts.length) throw new Error('The score has no section labels.');
-  if (plan.some(s => !Number.isInteger(s) || s < 0 || s >= starts.length)) throw new Error('No such section in the plan.');
+  if (plan.some(s => (typeof s === 'number' ? !Number.isInteger(s) || s < 0 || s >= starts.length : !IMPROV_BARS.includes(s.improv)))) {
+    throw new Error('No such section in the plan.');
+  }
+  // Every voice the score uses, for an improv's rest bars.
+  const voiceIds = [...new Set(lines.flatMap(line => {
+    const f = FIELD.exec(line.trim());
+    return f?.[1] === 'V' ? [line.trim().slice(2).trim().split(/\s+/)[0] ?? ''] : [];
+  }))].filter(Boolean);
   // The header ends at its K: line; music between it and the first label
   // travels with the first section.
   const k = lines.slice(0, starts[0]).findIndex(line => /^K:/.test(line.trim()));
@@ -215,6 +231,15 @@ export function composeArrangement(abc: string, lyrics: string, plan: number[], 
   let state = header, bar = 1, lyricAt = 0;
   const sections = sourceSections(abc, lyrics);
   for (const [k, s] of plan.entries()) {
+    if (typeof s !== 'number') {
+      const rests = `${restBar(state.fields)}|`.repeat(s.improv);
+      const chunk = ['% Improv', ...(voiceIds.length ? voiceIds.flatMap(v => [`V: ${v}`, rests]) : [rests])];
+      occurrences.push({ section: -1, startBar: bar, bars: s.improv, abcStart: Array.from(out.join('\n')).length + (out.length ? 1 : 0), lyric: null });
+      out.push(...chunk);
+      state = walk(state, chunk);
+      bar += s.improv;
+      continue;
+    }
     const want = entry[s];
     // ponytail: restates changed fields in every voice the section uses, which
     // is how the transcriber writes meter changes; a voice absent from the
@@ -274,9 +299,32 @@ export function composeArrangement(abc: string, lyrics: string, plan: number[], 
   };
 }
 
-/** The plan's source section indexes, for composeArrangement. */
-export function planSections(arrangement: Arrangement): number[] {
-  return arrangement.plan.map(o => arrangement.sections.findIndex(s => s.id === o.section));
+/** One bar of rest in the meter in force (M:, L:; ABC's defaults when absent). */
+function restBar(fields: Record<string, string>): string {
+  const ratio = (text: string | undefined, fallback: [number, number]): [number, number] => {
+    const m = /(\d+)\s*\/\s*(\d+)/.exec(text ?? '');
+    return m ? [Number(m[1]), Number(m[2])] : fallback;
+  };
+  const m = fields.M?.slice(2).trim();
+  const meter = m === 'C' ? [4, 4] : m === 'C|' ? [2, 2] : ratio(m, [4, 4]);
+  const unit = ratio(fields.L?.slice(2), meter[0] / meter[1] < 0.75 ? [1, 16] : [1, 8]);
+  let num = meter[0] * unit[1], den = meter[1] * unit[0];
+  const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
+  const g = gcd(num, den);
+  num /= g; den /= g;
+  return den === 1 ? (num === 1 ? 'z' : `z${num}`) : `z${num}/${den}`;
+}
+
+/** The plan's entries for composeArrangement: source section indexes and improvs. */
+export function planSections(arrangement: Arrangement): PlanEntry[] {
+  return arrangement.plan.map(o => (o.section === IMPROV ? { improv: o.bars ?? 0 }
+    : arrangement.sections.findIndex(s => s.id === o.section)));
+}
+
+/** Occurrence i's name: its source section's label, or Improv. */
+export function occurrenceLabel(arrangement: Arrangement, i: number): string | undefined {
+  const o = arrangement.plan[i];
+  return o?.section === IMPROV ? 'Improv' : arrangement.sections.find(s => s.id === o?.section)?.label;
 }
 
 /** The plan's own lyrics per occurrence, for composeArrangement. */
@@ -289,7 +337,8 @@ export const planLyrics = (arrangement: Arrangement): Array<string | undefined> 
  *  section (that take composes an ending) or once the plan is finished. */
 export function lookaheadSection(arrangement: Arrangement): number | null {
   if (arrangement.finished || !arrangement.plan.length) return null;
-  const last = planSections(arrangement).at(-1)!;
+  // After an improv, the source runs on from the last source section before it.
+  const last = planSections(arrangement).filter((s): s is number => typeof s === 'number').at(-1) ?? -1;
   return last + 1 < arrangement.sections.length ? last + 1 : null;
 }
 
@@ -343,6 +392,12 @@ export function editPlan(session: ArrangedSession, upcoming: string[], finished:
   const plan = kept.concat(upcoming.map(id => {
     const existing = spare.get(id);
     if (existing) { spare.delete(id); return existing; }
+    const improv = /^improv:(\d+)$/.exec(id);
+    if (improv) {
+      const bars = Number(improv[1]);
+      if (!IMPROV_BARS.includes(bars)) throw new Error(`An improv is ${IMPROV_BARS.join(', ')} bars long.`);
+      return { id: `o${counter++}`, section: IMPROV, bars };
+    }
     if (!arrangement.sections.some(s => s.id === id)) throw new Error(`No such section or upcoming occurrence: ${id}`);
     return { id: `o${counter++}`, section: id };
   }));

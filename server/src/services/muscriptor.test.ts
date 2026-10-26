@@ -1,7 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { partialMidiFromEvents, readGrid, alignToAudio, exportArgs } from './muscriptor.js';
+import { partialMidiFromEvents, readGrid, alignToAudio, exportArgs, speculativeArgs, modelDir } from './muscriptor.js';
 import { parseMidiFile } from './midiParser.js';
+
+test('speculativeArgs drafts with small only for large, when on and small is downloaded', () => {
+  assert.deepEqual(speculativeArgs('large', true, true), ['--draft-model', modelDir('small'), '--speculative-k', '4']);
+  assert.deepEqual(speculativeArgs('large', false, true), []);
+  assert.deepEqual(speculativeArgs('large', true, false), []);
+  assert.deepEqual(speculativeArgs('medium', true, true), []);
+  assert.deepEqual(speculativeArgs('small', true, true), []);
+});
 
 test('partialMidiFromEvents keeps completed notes and drops the open one', () => {
   const mid = partialMidiFromEvents([

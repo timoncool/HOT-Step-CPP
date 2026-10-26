@@ -21,9 +21,8 @@ laddered by ear across 20 checkpoints. Working log: `docs/plans/
 
 ## THE CURRENT BEST RECIPE
 
-Keep this block up to date — it is the thing the in-app trainer should
-eventually be dialled to, and `docs/plans/` is gitignored so nothing there
-survives a fresh clone.
+Keep this block up to date: it mirrors what the in-app trainer runs, and
+`docs/plans/` is gitignored so nothing there survives a fresh clone.
 
 **WHOLE-SONG since 2026-09-11.** The crop-750 / history-2048 recipe below
 this block's history taught adapters that lost the song's arc: one sung
@@ -46,9 +45,9 @@ writing; the ledger `docs/plans/mm3-endings-checklist.md` has the tables.
 --pissa-frozen-f16 --pissa-cache-dir <adapters>/mm3-lm-adapters/_pissa-init-cache
 --optimizer adamw --lr 8e-5 --lr-end-frac 0.005 --warmup 25    # AdamW tied Prodigy by ear, 2.3 GB lighter (2x LR broke vocals)
 --attn flash                                                   # no --prefix-frames: under the whole-song window the track is its own history
---max-frames 9000 --drop-over-frames 9000                      # WHOLE SONG (2026-09-11, Rob): every track as one sequence; tracks over 360 s left out
+--max-frames 9000 --drop-over-frames 9000                      # WHOLE SONG (2026-09-11): every track as one sequence; tracks over 360 s left out
 --crop-mode structured --crop-start-frac 0.2 --crop-end-frac 0.15   # only matters for a track longer than the window (none, with the drop)
---crop-start-tiles 3 --crop-anchor song
+--crop-start-tiles 1 --crop-anchor song
 --rank-dropout 0.1                                             # the mask IS the method under --hot-pizza; never 0
 --steps 600 --save-every 100                                   # Balanced = 600, Fast = 300, Thorough = 900 (2026-09-11); stop on STEPS
 --depth-loss-weight 1.0 --depth-loss-frames 128
@@ -56,14 +55,22 @@ writing; the ledger `docs/plans/mm3-endings-checklist.md` has the tables.
 # the shared caption killed endings (0/6 vs 4/6) and was removed on 2026-09-09.
 # NO --reg-* prior by default (it was a workaround for the shared caption; costs likeness)
 --trigger "<artist>" --trigger-prepend
---holdout 0.15 --eval-every 250 --eval-crop 500
+--holdout 0.15 --eval-every 250 --eval-crop 750
 ```
 
-Previews: every 50 steps (= every checkpoint), 40 s, control + baseline off,
-rendered on q8_0 at MLP 1.0 — the same dials generation uses.
+The block mirrors `MM3_LM_DEFAULTS` with the Balanced preset laid over it
+(`server/src/services/training/mm3Train.ts`); the server also passes
+`--depth mm3-depth-f16.gguf`, `--grad-accum 1`, `--seed 42` and `--weights
+f32-window` (bf16 only for a bf16 base).
 
-**Rob, 2026-09-06, on the stacked HOT-PiZZA recipe above (blind-hotpissa-recipe
-letter F): "sounds fantastic, this should be the default in-app."** Cost on
+Previews: every 100 steps (= every checkpoint), 40 s, seed 424242, control +
+baseline off, rendered on q8_0 at MLP 1.0 — the same dials generation uses.
+<!-- TODO(verify): each preview pause restarts the trainer with --resume while still passing --hot-pizza, and cmd_mm3_lm_train in engine/tools/ace-train.cpp refuses --pissa with --resume (exit 2). Statically, a default run with previews would stop at its first preview; not run. -->
+
+
+**The maintainer, 2026-09-06, on the stacked HOT-PiZZA recipe above
+(blind-hotpissa-recipe letter F): "sounds fantastic, this should be the default
+in-app."** Cost on
 albumA: 4.7 s/step, 39 min for 500 steps, peak 25.9 GB — against the
 2026-09-05 LoKr/Prodigy/exact/4096 line's 5.9 s, 49 min, 30.4 GB. Every
 lever was first tied individually in a blind set, then stacked and heard.
@@ -75,21 +82,22 @@ prefix 1024 (69 of 90) and crop 500 (67.5) tie the reference (68), while the
 prefill chunk 256 → 1024 cuts 17% off the step with an identical step-1 loss.
 Combined and heard blind (`blind-confirm/RESULTS.md`): safe stack 67 vs the
 crop-750 recipe 70.5, inside the ~6 noise floor, at 3.1 s/step and 26 min per
-500 steps (was 4.5 s, 37 min). That is the recipe block above. What did NOT
+500 steps (was 4.5 s, 37 min). That was the recipe until the 2026-09-11
+whole-song change. What did NOT
 survive: doubling the LR (every 2x arm 3-4 under, and a 2x-LR/300-step stack
 produced a vocal-free plan on 1 of 6 songs across two seeds) and turning the
 acoustic loss off (lowest score). Held-out loss every 50 has the same shape in
 every arm — it follows the seed's crop order, not the adapter — so it is not a
 stopping signal.
 
-**Presets (Rob, 2026-09-07, `MM3_LM_PRESETS` in mm3Train.ts, a Recipe row in
+**Presets (2026-09-07, `MM3_LM_PRESETS` in mm3Train.ts, a Recipe row in
 the Training Studio card; the route lays `preset` under the request's own
 fields, so `{preset:'thorough'}` alone trains Thorough):**
 
 | preset | steps | lr | window | history | min/album (5090) | record |
 |---|---|---|---|---|---|---|
 | Fast | 300 | 8e-5 | whole song (9000) | none | 30-60 | the 2026-09-10 overnight arm: album B 7/12, album S 7/12, album P 3/12 at 300 s and 6/12 at 360 s |
-| **Balanced** (default) | 600 | 8e-5 | whole song (9000) | none | 60-120 | Fast at twice the depth; Rob's pick for the default (2026-09-11), not yet heard |
+| **Balanced** (default) | 600 | 8e-5 | whole song (9000) | none | 60-120 | Fast at twice the depth; the maintainer's pick for the default (2026-09-11), not yet heard |
 | Thorough | 900 | 8e-5 | whole song (9000) | none | 90-180 | three times Fast's depth; not yet heard |
 
 (Superseded 2026-09-11: Fast 300 / Balanced 500 / Thorough 1000 at crop 750
@@ -101,8 +109,8 @@ acoustic loss; tracks longer than the window are left out (`longTracks:
 Balanced values, so an empty API body trains Balanced. Prior preservation is
 OFF unless the request names a corpus (since 2026-09-09).
 
-**Rob, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever gotten to
-artist replication."** Crop 750 = 30 s = ~3 s/step; he set it by ear after
+**The maintainer, 2026-08-25, on the LoKr configuration this replaced: "the closest we've ever
+gotten to artist replication."** Crop 750 = 30 s = ~3 s/step, set by ear after
 finding 15 s steps at crop 4272 unworkable and the shorter crop *better*, not
 merely faster.
 
@@ -136,7 +144,9 @@ ace-train mm3-codes --jsonl --dataset <dataset.json> \
 
 ## Steps: 750–2000, and the loss will NOT tell you which
 
-The single most important finding. Held-out cross-entropy bottoms out very
+From the 2026-08-23/24 sweep (plain LoRA, rank 64, short crops); the current
+recipe is HOT-PiZZA on whole songs and its presets stop at 300, 600 or 900
+steps. The single most important finding. Held-out cross-entropy bottoms out very
 early and then rises for the rest of the run — but the checkpoint that actually
 *sounds* right is **1–8x later than that minimum**:
 
@@ -206,9 +216,11 @@ Muon classifies all 504 LoRA tensors into 34 buckets at every rank tested — a
 run that classifies ZERO tensors onto Muon is silently training as AdamW, so
 check the `{"type":"optimizer",...}` line reports `"muon":504`.
 
-Rank 64 is the validated default. Higher rank is **untested for quality** — more
-capacity should memorise faster, so expect the sweet spot to move EARLIER, and
-keep 250-granularity checkpoints rather than assuming 2500 transfers.
+Rank 64 was this sweep's validated default. The rank sweep that closed it picked
+rank 128 (rank 64 garbles lyrics; see [`reference/method-and-knobs.md`](reference/method-and-knobs.md)),
+and the current HOT-PiZZA recipe trains rank 128. More capacity should memorise faster, so
+expect the sweet spot to move EARLIER, and keep checkpoints rather than assuming
+2500 transfers.
 
 ## Album-specific behaviour — do not apply a blanket rule
 
@@ -252,7 +264,7 @@ loss curve, no Prodigy `d` and no warning left to read. Check these FIRST.
 ## Verify a run started correctly
 
 ```
-grep -E "songs \(|evaluation:|caption begins|VRAM after" <train.log>
+grep -E "songs \(|evaluation:|caption begins|VRAM after" "<run dir>/train-console.log"
 ```
 
 Expect: sensible train/holdout split, a non-zero eval crop count, the caption

@@ -21,6 +21,8 @@ import songRoutes from './routes/songs.js';
 import generateRoutes from './routes/generate.js';
 import modelRoutes from './routes/models.js';
 import healthRoutes from './routes/health.js';
+import updatesRoutes from './routes/updates.js';
+import { startUpdateCheck } from './services/updates/index.js';
 import shutdownRoutes from './routes/shutdown.js';
 import masteringRoutes from './routes/mastering.js';
 import downloadRoutes from './routes/download.js';
@@ -32,6 +34,8 @@ import analyzeRoutes from './routes/analyze.js';
 import uploadRoutes from './routes/upload.js';
 import supersepRoutes from './routes/supersep.js';
 import settingsRoutes from './routes/settings.js';
+import settingsBackupRoutes from './routes/settingsBackup.js';
+import { backupBodyParser } from './routes/settingsBackup.js';
 import modelManagerRoutes from './routes/modelManager.js';
 import stemStudioRoutes from './routes/stemStudio.js';
 import assistantRoutes from './routes/assistant.js';
@@ -96,6 +100,8 @@ app.use(cors());
 app.use('/api', workerTokenGate);
 app.use('/api', workerUpdateGate);
 app.use('/api/workers', workerRoutes);
+// Backups can exceed 50 MB; this parser runs first and the global one then skips the parsed body.
+app.use('/api/settings/backup', backupBodyParser);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -105,6 +111,7 @@ app.use('/api/songs', songRoutes);
 app.use('/api/generate', generateRoutes);
 app.use('/api/models', modelRoutes);
 app.use('/api/health', healthRoutes);
+app.use('/api/updates', updatesRoutes);
 app.use('/api/shutdown', shutdownRoutes);
 app.use('/api/mastering', masteringRoutes);
 app.use('/api/download', downloadRoutes);
@@ -116,6 +123,7 @@ app.use('/api/analyze', analyzeRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/supersep', supersepRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/settings/backup', settingsBackupRoutes);
 app.use('/api/model-manager', modelManagerRoutes);
 app.use('/api/stem-studio', stemStudioRoutes);
 app.use('/api/assistant', assistantRoutes);
@@ -478,6 +486,7 @@ const server = app.listen(config.server.port, config.server.host, () => {
   // Workflow jobs: mark jobs a previous process left running as interrupted,
   // then start pending ones.
   startWorkflowJobs();
+  startUpdateCheck();
 });
 
 // Graceful shutdown

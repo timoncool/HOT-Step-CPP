@@ -4,9 +4,11 @@
 // SSE endpoint streams them to the UI in real time.
 // VRAM endpoint proxies to ace-server's GET /vram.
 
+import os from 'node:os';
 import { Router, Request, Response } from 'express';
 import { config } from '../config.js';
 import { countPresence } from './health.js';
+import type { ReportLogsResponse } from '../contracts/reportLogs.js';
 
 const router = Router();
 
@@ -98,6 +100,16 @@ router.get('/', (req: Request, res: Response) => {
     clearInterval(keepalive);
     subscribers.delete(onLine);
   });
+});
+
+// ── Snapshot for the issue reporter: GET /api/logs/snapshot ───────────
+// The ring buffer's lines split by source, plus the names the UI must redact.
+router.get('/snapshot', (_req: Request, res: Response) => {
+  const by = (source: LogLine['source']) => lines.filter(l => l.source === source).map(l => l.text);
+  let user = '';
+  try { user = os.userInfo().username; } catch { /* no passwd entry; the path rules still apply */ }
+  const body: ReportLogsResponse = { server: by('server'), engine: by('engine'), home: os.homedir(), user };
+  res.json(body);
 });
 
 // ── VRAM proxy: GET /api/logs/vram ────────────────────────────────────

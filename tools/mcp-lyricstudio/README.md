@@ -5,6 +5,67 @@ working locally or on other machines on the same LAN. Claude Code and Codex can 
 critiques, user directions, and proposed decisions while their existing chats
 remain active. It does not launch additional model sessions.
 
+## Lyric Studio tools
+
+The default entry point, `src/index.ts`, registers fifteen Lyric Studio tools
+next to the discussion (`collab_*`) and work channel (`work_*`) tools. They
+open the app's music database file directly (the next section says how it is
+found) and make no calls to the app's HTTP API, so the app does not have to be
+running. The `prepare_*` and `build_lyrics_prompt` tools return prompts as text
+for the calling agent to answer itself; the server runs no model. The `save_*`
+tools write straight into the database, and the result shows up in Lyric
+Studio.
+
+Install once with `npm install` in this folder. The server also loads modules
+from `server/src`, which resolve their own packages from the app's
+`server/node_modules`, so the app's server dependencies must be installed too.
+A stdio entry for clients that read `mcpServers` JSON:
+
+```json
+{
+  "mcpServers": {
+    "lyricstudio": {
+      "command": "node",
+      "args": [
+        "/path/to/hot-step-cpp/tools/mcp-lyricstudio/node_modules/tsx/dist/cli.mjs",
+        "/path/to/hot-step-cpp/tools/mcp-lyricstudio/src/index.ts"
+      ]
+    }
+  }
+}
+```
+
+| Tool | Purpose |
+|------|---------|
+| `list_artists` | Artists with their IDs and lyrics set counts. |
+| `list_lyrics_sets` | Lyrics sets with song counts and their newest profile, if any. Optional `artist_id`; `unprofiled_only` lists only the sets with no profile yet. |
+| `list_profiles` | Profiles with their album and the provider and model that built them. Optional `artist_id`. |
+| `get_profile` | One profile's style summary and key stats. |
+| `prepare_generation` | Step one for new lyrics: the prompt that plans subject, BPM, key, caption, duration and structure as JSON, with the artist's earlier subjects, BPMs, keys and durations in it. Optional `user_subject`. |
+| `build_lyrics_prompt` | Step two: the lyric-writing prompt from the planned `subject`, `bpm` and `duration`, with optional `structure` and `extra_instructions`. |
+| `prepare_mm3_caption` | After the lyrics are written: the prompt for the song's MiniMax-Music3 Structured Caption. |
+| `prepare_yue2_caption` | After the lyrics are written: the prompt for the one-sentence YuE2 planner caption. |
+| `save_generation` | Save a finished song: `lyrics`, `title`, the planned metadata and the `caption`, `caption_mm3` and `caption_yue2` captions. |
+| `prepare_refinement` | The refinement prompts for an existing generation. |
+| `save_refinement` | Save refined lyrics and title as a new generation linked to its parent. It keeps the parent's subject, BPM, key, duration, `caption` and `caption_mm3`. |
+| `list_generations` | Recent generations, optionally for one `profile_id` or `artist_id`. `limit` defaults to 20. |
+| `prepare_title` | A title prompt for finished lyrics. |
+| `prepare_profile_build` | The four prompts that build an artist profile from a lyrics set, answered in order. |
+| `save_profile` | Save the merged profile for a lyrics set, as a JSON string in `profile_data`. `provider` defaults to `mcp`. |
+
+A new song goes `prepare_generation`, `build_lyrics_prompt`, the agent writes
+the lyrics, `prepare_mm3_caption` and `prepare_yue2_caption`, then
+`save_generation`. Pass your own model name as `model` to the three `save_*`
+tools: `save_generation` and `save_refinement` append it to the title, and
+all three store it. On `save_generation` the server adds an instrumental intro
+where the in-app rules call for one, recalculates the duration from the lyrics
+at the artist's measured pace (a global rate when the set has none), rebuilds
+the MiniMax-Music3 caption's `Basic Attributes:` line and the YuE2 caption's
+BPM ending from the stored values, and reports caption format problems in its
+reply. `save_profile`
+computes the rule-based stats, such as meter, rhyme, structure blueprints and
+excerpts, from the lyrics itself, so leave those out of `profile_data`.
+
 ## Activate in the existing clients
 
 The music database follows the app's configured data folder through the shared
@@ -130,7 +191,7 @@ shows the creation form when no discussions exist. You can bookmark a room using
 connections for browsing; your explicit room creation, messages and status changes write
 to the collaboration database. It never connects to the music database.
 
-## Tools
+## Discussion tools
 
 | Tool | Purpose |
 |------|---------|
@@ -450,7 +511,8 @@ persisted messages, and revision checks. The path is resolved from the source
 file, independently of the client's working directory. `HOTSTEP_COLLAB_DB` can
 override it; both clients must resolve the override to the same absolute path.
 The collaboration database is opened lazily on the first collaboration call.
-It is separate from `server/data/hotstep.db`, and is gitignored. Discussion text
+It is separate from the app's music database (`hotstep.db` in the data
+folder), and is gitignored. Discussion text
 is retained locally until you remove the database with all participants stopped.
 
 For a discussion-only MCP connection, use the same installed dependencies with
@@ -488,8 +550,10 @@ On Windows, from this directory with Node 22 and its matching dependencies:
 ```
 
 Replace the example address with the host's LAN address. `-NodePath` selects a
-Node 22 executable; `-RuntimeDirectory` selects an isolated dependency directory
-if needed. The launcher generates a token once in
+Node 22 executable (the launcher refuses any other version); `-RuntimeDirectory`
+selects an isolated dependency directory if needed. `-Port` (default 3012) and
+`-TokenFile` change the port and the token's location. The launcher generates a
+token once in
 `%LOCALAPPDATA%/HOT-Step/discussion-network/token.txt`, reuses it on restart, and
 writes the background PID and logs beside it. Run without `-Background` for a
 foreground process stopped by Ctrl+C. A background process lasts until stopped
@@ -556,7 +620,8 @@ retain read cursors and reuse request IDs only for identical write retries.
 For manual or non-Windows launch, use `npm run network` with
 `HOTSTEP_COLLAB_HOST`, `HOTSTEP_COLLAB_PORT` (default 3012),
 `HOTSTEP_COLLAB_TOKEN_FILE` or `HOTSTEP_COLLAB_TOKEN`, and optionally
-`HOTSTEP_COLLAB_DB`. The host defaults to localhost. For multiple addresses,
+`HOTSTEP_COLLAB_DB`. The token must be at least 32 characters. The host
+defaults to localhost. For multiple addresses,
 `HOTSTEP_COLLAB_ALLOWED_HOSTS` is a comma-separated list of exact hostnames or
 IP addresses without ports; a wildcard bind requires this explicit list.
 
@@ -598,10 +663,17 @@ message exchange, concurrent joins and retry deduplication, pagination, room
 isolation, pause/resume, competing decisions, cancellation, and restart recovery.
 They do not open the music database or submit generation/training jobs.
 
-Use the project-supported Node 22 runtime and dependencies built for that Node
-ABI when installing afresh. On an existing installation, a SQLite native binding
-built for another Node version must match the runtime running it. Do not rebuild
-shared dependencies while the app or another agent is using them.
+The database-location checks in `src/db.test.ts` have no npm script. Run them
+with `npx tsx --test src/db.test.ts`; they cover the `HOTSTEP_DB` override, a
+data-folder pointer, a missing database, a pending move and an unreadable
+pointer, each against temporary files.
+
+The app itself supports Node 20 to 24, 24 recommended. In this package,
+`start-network.ps1` accepts only Node 22, and `work-run.ps1` takes either the
+dedicated Node 22 runtime or Node 24 (see the guarded commands section below).
+Whichever Node runs this package, its better-sqlite3 native binding must be
+built for that version. Do not rebuild shared dependencies while the app or
+another agent is using them.
 
 ## Work channels
 
@@ -715,8 +787,12 @@ This asks `dev-rebuild.bat` to run `work-run.ps1` and hold the three reservation
 until the rebuild exits. An explicit `work-run.ps1` wrapper also works; its guarded
 child validates that all three resources were reserved.
 
-The Windows launcher selects Node 22 with matching SQLite dependencies, preferring
-the dedicated collaboration runtime. It never rebuilds shared dependencies.
+The Windows launcher, `work-run.ps1`, uses the dedicated Node 22 collaboration
+runtime in `%LOCALAPPDATA%\HOT-Step\collaboration-node22` when that folder
+exists. Otherwise it runs Node 24 against this package's own dependencies,
+trying the pinned Node in `release/.node-cache` first and then `node` on the
+PATH. Either way it checks that better-sqlite3 loads before starting, and it
+never runs npm or rebuilds shared dependencies.
 The runner holds reservations for the child process's complete foreground
 lifetime, including a normal nonzero exit. Signal termination, connection loss
 or uncertain execution leaves recovery required. Commands that launch detached
@@ -734,8 +810,9 @@ These guards apply to cooperating tools and guarded commands. They do not stop
 raw Task Manager actions or arbitrary unguarded scripts. Existing GPU.lock files,
 generation-queue checks and project build rules still apply.
 
-Run `npm run typecheck`, `npm run test:collaboration` and `npm run test:work` in a
-Node 22 environment with matching native dependencies. The tests cover separate
+Run `npm run typecheck`, `npm run test:collaboration` and `npm run test:work`
+with native dependencies built for the Node version that runs them. The tests
+cover separate
 MCP clients, immutable snapshot pages, durable receipts, context corrections,
 resource conflicts, crash recovery and guarded child lifetime. They use temporary
 databases and child processes, without starting the music app or using the GPU.

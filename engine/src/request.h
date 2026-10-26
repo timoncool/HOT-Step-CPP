@@ -62,6 +62,10 @@ struct AceRequest {
     float       lm_cfg_scale;        // 2.0
     float       lm_cfg_cutoff_ratio; // 1.0 (1.0 = full CFG, 0.5 = CFG for first 50% of tokens)
     float       lm_top_p;            // 0.9
+    float       lm_min_p;            // 0 = off. Code phase: drop codes under min_p x the top one
+    float       lm_cfg_min_p;        // 0 = off. CFG plausibility mask (lm-cfg-extras.h)
+    bool        lm_cfg_logprob;      // false. Blend CFG in log-prob space
+    float       lm_cfg_rescale;      // 0 = off. Pull the CFG row's spread back toward cond
     int         lm_top_k;            // 0 = disabled (matches Python None)
     float       lm_rep_penalty;      // 1.0 = off. Windowed repetition penalty
                                      // over recently emitted audio codes; breaks

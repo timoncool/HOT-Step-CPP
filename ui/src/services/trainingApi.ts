@@ -23,6 +23,7 @@
 // is that worker. Mutations take no signal: aborting a read is fine, but a
 // cancelled request must never be mistaken for cancelling a server job.
 import { apiClient, type ReadOptions } from './httpClient';
+import type { Sa3DatasetAssets } from '../../../server/src/contracts/training';
 
 export interface TrainingTarget { worker?: string | null }
 export interface TrainingReadOptions extends TrainingTarget, ReadOptions {}
@@ -45,6 +46,41 @@ export function setTrainingWorker(name: string | null): void {
 // ── Core enums ────────────────────────────────────────────────────────────
 export type TagPosition = 'prepend' | 'append' | 'replace';
 
+/** SA3 Medium DoRA-rows. Resume preserves the saved recipe and snapshot. */
+export interface StartSa3TrainingRequest {
+  adapterName?: string;
+  steps?: number;
+  rank?: number;
+  alpha?: number;
+  learningRate?: number;
+  duration?: number;
+  seed?: number;
+  checkpointEvery?: number;
+  exportEvery?: number;
+  resumeRun?: string;
+}
+
+export type Sa3Recipe = Required<Omit<StartSa3TrainingRequest, 'adapterName' | 'resumeRun'>>;
+export interface Sa3TrainingStatus {
+  available: boolean;
+  backend: string;
+  missing: string[];
+  defaults: Sa3Recipe;
+  activeJob: TrainingJobSummary | null;
+  runs: Array<{
+    run: string; adapterName: string; recipe: Sa3Recipe; resumable: boolean;
+    published: string | null; baseSha256?: string; inferenceSha256?: string;
+  }>;
+}
+
+export function getSa3TrainingStatus(id: string, opts?: TrainingReadOptions): Promise<Sa3TrainingStatus> {
+  return request(`/datasets/${encodeURIComponent(id)}/sa3-train`, undefined, opts);
+}
+
+export function startSa3Training(id: string, opts: StartSa3TrainingRequest, target?: TrainingTarget): Promise<{ jobId: string }> {
+  return request(`/datasets/${encodeURIComponent(id)}/sa3-train`, { method: 'POST', ...jsonBody(opts) }, target);
+}
+
 export type MergePolicy =
   | 'fill_missing'        // default: only write fields currently empty
   | 'overwrite_caption'
@@ -53,7 +89,7 @@ export type MergePolicy =
 
 export type TrainingJobKind =
   | 'label' | 'enhance-genius' | 'enhance-caption' | 'enhance-yue2-caption' | 'build'
-  | 'preprocess' | 'train-lm' | 'train-dit'
+  | 'preprocess' | 'train-lm' | 'train-dit' | 'sa3-train'
   | 'audition' | 'lm-calibrate' | 'dit-calibrate'
   // MiniMax-Music3. Both GPU-lane and engine-stopping — an MM3 training step
   // peaks at 31.7 GB of a 32 GB card.
@@ -1412,6 +1448,8 @@ export interface TrainingAdapterHit {
  *  the server computes them unconditionally — so DatasetAssetChips.tsx picks
  *  which block to render off the active backend. */
 export interface DatasetAssets {
+  /** Verified SA3 preparation, cache, snapshots and publication. */
+  sa3?: Sa3DatasetAssets;
   labeled: boolean;           // at least one caption — shared across backends
   built: boolean;             // dataset.json written — shared across backends
   tensorVariants: number;     // preprocessed variant dirs
@@ -2642,6 +2680,14 @@ export async function getYue2CleanupPlan(id: string, run: string, step: number, 
 }
 export async function runYue2Cleanup(id: string, body: { run: string; step: number; blind?: boolean; blindLabel?: string } & Yue2CleanupChoice): Promise<{ freedBytes: number; done: string[]; finishError?: string }> {
   return localRequest(`/datasets/${encodeURIComponent(id)}/yue2-cleanup`, { method: 'POST', ...jsonBody(body) });
+}
+
+/** PATCH /datasets/:id/yue2-joint-runs/:jobId/params — the checkpoint and
+ *  preview interval of the run training now, on the machine training it. */
+export async function updateYue2JointIntervals(
+  id: string, jobId: string, body: { saveEvery?: number; previewEvery?: number }, reqOpts?: TrainingTarget,
+): Promise<{ saveEvery: number; previewEvery?: number }> {
+  return request(`/datasets/${encodeURIComponent(id)}/yue2-joint-runs/${encodeURIComponent(jobId)}/params`, { method: 'PATCH', ...jsonBody(body) }, reqOpts);
 }
 
 /** DELETE /datasets/:id/yue2-joint-runs/:jobId — a finished run and its checkpoints. */

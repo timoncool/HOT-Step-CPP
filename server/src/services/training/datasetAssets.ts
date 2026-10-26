@@ -18,9 +18,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'node:crypto';
+import { config } from '../../config.js';
+import type { Sa3DatasetAssets } from '../../contracts/training.js';
 import * as audioMeta from './audioMeta.js';
-import { latestRunDir, lmSizeFromSlug } from './adapterLayout.js';
-import { scanAudioFiles } from './datasetScan.js';
+import { latestRunDir, lmSizeFromSlug, sa3RunsRoot, validateSa3Export } from './adapterLayout.js';
+import { SA3_AUDIO } from './sa3Stems.js';
+import type { Sa3DatasetManifest } from './sa3Dataset.js';
+import { dedupeBySidecar, scanAudioFiles } from './datasetScan.js';
 import * as repo from './datasetsRepo.js';
 import { readAllLabels } from './labelStore.js';
 import { findMm3LmAdapter, findMm3LmAdaptersFor } from './mm3Runs.js';
@@ -154,10 +159,131 @@ function safeYue2ArAdapter(ds: TrainingDatasetRow): TrainingAdapterHit | null {
 
 // ── Assets ───────────────────────────────────────────────────────────────
 
+/** Resolve only existing descendants, including through junctions/symlinks. */
+function assetFile(root: string, relative: string): string {
+  if (!relative || path.isAbsolute(relative)) throw new Error('Invalid asset path');
+  const file = fs.realpathSync(path.resolve(root, relative));
+  const rel = path.relative(fs.realpathSync(root), file);
+  if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)
+    || !fs.statSync(file).isFile()) throw new Error('Asset outside its root');
+  return file;
+}
+
+function assetHash(file: string): string {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const hash = createHash('sha256'), chunk = Buffer.alloc(65536);
+    let n: number;
+    while ((n = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, n));
+    return hash.digest('hex');
+  } finally { fs.closeSync(fd); }
+}
+
+// Re-stat every request, but rehash only after replacement or modification.
+// Weights are shared across datasets; clips are shared across resumed runs.
+const assetHashes = new Map<string, { identity: string; hash: string }>();
+function assetIdentity(file: string): string {
+  const st = fs.statSync(file, { bigint: true });
+  return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+}
+function currentAssetHash(file: string): string {
+  const identity = assetIdentity(file);
+  const cached = assetHashes.get(file);
+  if (cached?.identity === identity) return cached.hash;
+  const hash = assetHash(file);
+  if (assetHashes.size >= 4096) assetHashes.clear();
+  assetHashes.set(file, { identity, hash });
+  return hash;
+}
+
+const validExports = new Map<string, string>();
+function verifySa3Export(file: string, expectedBase?: string): void {
+  const identity = `${assetIdentity(file)}:${expectedBase ?? ''}`;
+  if (validExports.get(file) === identity) return;
+  validateSa3Export(file, expectedBase);
+  if (validExports.size >= 4096) validExports.clear();
+  validExports.set(file, identity);
+}
+
+/** SA3 facts come from receipts and their files, never job completion. Paths
+ * supplied in run records are ignored in favour of the current managed roots.
+ * The trainer's cache key also hashes base-padding tensor bytes. Until a server
+ * validator can reproduce that key, cache presence is deliberately unready. */
+export function readSa3DatasetAssets(
+  ds: Pick<TrainingDatasetRow, 'id' | 'slug' | 'sourceDir' | 'recursive'>,
+  roots = { runs: sa3RunsRoot(ds.slug), models: config.aceServer.models },
+): Sa3DatasetAssets {
+  const assets: Sa3DatasetAssets = { audioPrepared: false, preparedClips: 0,
+    encodingCacheValid: false, encodedClips: 0, snapshots: 0, adapter: null };
+  try {
+    if (!fs.existsSync(roots.runs)) return assets;
+    const sourceFiles = new Set(dedupeBySidecar(scanAudioFiles(ds.sourceDir, ds.recursive)).map(f => fs.realpathSync(f.absPath)));
+    const excluded = new Set([...readAllLabels(ds.slug).values()].filter(l => l.excluded)
+      .map(l => path.resolve(ds.sourceDir, l.relPath)));
+    const included = new Set([...sourceFiles].filter(f => !excluded.has(f)));
+    for (const name of fs.readdirSync(roots.runs, { withFileTypes: true })) {
+      if (!name.isDirectory()) continue;
+      for (const stamp of fs.readdirSync(path.join(roots.runs, name.name), { withFileTypes: true })) {
+        if (!stamp.isDirectory()) continue;
+        const runId = `${name.name}/${stamp.name}`, dir = path.join(roots.runs, name.name, stamp.name);
+        try {
+          const run = JSON.parse(fs.readFileSync(assetFile(roots.runs, `${runId}/run.json`), 'utf8'));
+          if (run.datasetId !== ds.id) continue;
+          try {
+            const preparedDir = path.join(dir, 'dataset');
+            const manifest: Sa3DatasetManifest = JSON.parse(fs.readFileSync(assetFile(roots.runs, `${runId}/dataset/manifest.json`), 'utf8'));
+            const sources = new Set<string>();
+            if (manifest.version !== 1 || manifest.sample_rate !== SA3_AUDIO.sampleRate
+              || manifest.channels !== SA3_AUDIO.channels || manifest.separation_level !== SA3_AUDIO.level
+              || !Array.isArray(manifest.samples) || !manifest.samples.length) throw new Error('Invalid preparation receipt');
+            for (const sample of manifest.samples) {
+              const source = fs.realpathSync(sample.source_path);
+              if (!included.has(source) || sources.has(source) || currentAssetHash(source) !== sample.source_sha256
+                || currentAssetHash(assetFile(preparedDir, sample.audio_path)) !== sample.audio_sha256
+                || fs.readFileSync(assetFile(preparedDir, sample.caption_path), 'utf8').trim() !== sample.prompt
+                || !Number.isFinite(sample.seconds_total) || sample.seconds_total <= 0
+                || sample.seconds_total > SA3_AUDIO.maxSeconds) throw new Error('Stale prepared audio');
+              const modelHashes = ['bs_leap_xe_voc-F32.gguf', 'bs_leap_xe_inst-F32.gguf']
+                .map(f => currentAssetHash(assetFile(roots.models, `supersep/${f}`)));
+              const fingerprint = createHash('sha256').update(JSON.stringify({ sourceHash: sample.source_sha256,
+                modelHashes, settings: SA3_AUDIO })).digest('hex');
+              if (JSON.stringify(modelHashes) !== JSON.stringify(sample.model_sha256)
+                || fingerprint !== sample.cache_fingerprint) throw new Error('Stale preparation fingerprint');
+              sources.add(source);
+            }
+            if (sources.size !== included.size) throw new Error('Dataset selection changed');
+            assets.preparedClips = Math.max(assets.preparedClips, sources.size);
+            assets.audioPrepared = true;
+          } catch { /* Missing, partial or stale preparation is not ready. */ }
+
+          const expectedBase = typeof run.inferenceSha256 === 'string' && /^[a-f0-9]{64}$/.test(run.inferenceSha256)
+            ? `stabilityai/stable-audio-3-medium sha256:${run.inferenceSha256}` : undefined;
+          try {
+            for (const file of fs.readdirSync(path.join(dir, 'snapshots'))) {
+              if (!/^step-[1-9][0-9]*\.gguf$/.test(file)) continue;
+              try { verifySa3Export(assetFile(roots.runs, `${runId}/snapshots/${file}`), expectedBase); assets.snapshots++; }
+              catch { /* Incomplete exports are not inference snapshots. */ }
+            }
+          } catch { /* No snapshots yet. */ }
+          if (typeof run.published === 'string' && /^[a-z0-9][a-z0-9_-]{0,180}$/i.test(run.published)) {
+            try {
+              const file = assetFile(path.join(roots.models, 'sa3-adapters'), `${run.published}.gguf`);
+              verifySa3Export(file, expectedBase);
+              const trainedAt = fs.statSync(file).mtime.toISOString();
+              if (!assets.adapter || trainedAt > assets.adapter.trainedAt) assets.adapter = { name: run.published, trainedAt, run: runId };
+            } catch { /* Deleted or invalid publication. */ }
+          }
+        } catch { /* One corrupt run does not hide the others. */ }
+      }
+    }
+  } catch { /* Missing roots degrade to empty facts. */ }
+  return assets;
+}
+
 /**
- * Every pipeline artefact this dataset has on disk. Cheap enough for the list
- * endpoint: one readdir of the tensors root, one of the newest variant, a
- * couple of stats per adapter candidate, and one small JSON parse.
+ * Every pipeline artefact this dataset has on disk. SA3 verifies receipts,
+ * source bytes and exports on the first read; subsequent reads reuse verified
+ * hashes/exports while file identity, size and modification/change times match.
  *
  * `labeled` comes off the row's cached counter, not a fresh scan — the list
  * already shows that counter, and re-scanning N source folders to confirm it
@@ -176,8 +302,8 @@ export function readDatasetAssets(
     yue2ArAdapter: TrainingAdapterHit | null;
     yue2Joint?: { dir: string; trainedAt: string } | null;
   },
-): DatasetAssets {
-  const assets: DatasetAssets = {
+): DatasetAssets & { sa3: Sa3DatasetAssets } {
+  const assets: DatasetAssets & { sa3: Sa3DatasetAssets } = {
     labeled: ds.labeledCount > 0,
     built: ds.status === 'built' || !!ds.builtAt,
     tensorVariants: 0,
@@ -188,6 +314,7 @@ export function readDatasetAssets(
     dit: null,
     mm3: { codesReady: false, codesCount: 0, lmAdapter: null },
     yue2: { latentsReady: false, clips: 0, codesReady: false, cursorReady: false, narAdapter: null, arAdapter: null },
+    sa3: readSa3DatasetAssets(ds),
   };
 
   // A row that says 'built' but whose dataset.json has since been deleted is

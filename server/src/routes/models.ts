@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { aceClient } from '../services/aceClient.js';
 import { config } from '../config.js';
+import { listSa3Adapters } from '../services/training/adapterLayout.js';
 
 const router = Router();
 
@@ -116,18 +117,7 @@ router.get('/stablestep', (_req, res) => {
 // refine time with per-adapter strength; GGUF backend only.
 router.get('/stablestep/adapters', (_req, res) => {
   try {
-    const dir = path.join(config.aceServer.models, 'sa3-adapters');
-    let adapters: Array<{ name: string; sizeMb: number }> = [];
-    if (fs.existsSync(dir)) {
-      adapters = fs.readdirSync(dir)
-        .filter(f => f.endsWith('.gguf') && !f.endsWith('.part'))
-        .map(f => ({
-          name: f.slice(0, -'.gguf'.length),
-          sizeMb: Math.round(fs.statSync(path.join(dir, f)).size / 1e6),
-        }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-    }
-    res.json({ adapters });
+    res.json({ adapters: listSa3Adapters() });
   } catch (err: any) {
     res.json({ adapters: [], error: err.message });
   }

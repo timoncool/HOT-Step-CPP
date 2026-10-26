@@ -226,10 +226,12 @@ interface Props {
   disabled?: boolean;
   starting?: boolean;
   onStart: () => void;
+  /** Place the controls inside a folding stage while keeping its validated action visible. */
+  renderLayout?: (controls: React.ReactNode, action: React.ReactNode) => React.ReactNode;
 }
 
 export const TrainDitForm: React.FC<Props> = ({
-  value, onChange, ditModel, sampleCount, disabled, starting, onStart,
+  value, onChange, ditModel, sampleCount, disabled, starting, onStart, renderLayout,
 }) => {
   const { t } = useTranslation();
 
@@ -391,7 +393,7 @@ export const TrainDitForm: React.FC<Props> = ({
   const lrOk = value.learningRate > 0 && value.learningRate <= 1;
   const seedOk = value.seed >= 0 && value.seed <= 2147483647;
 
-  return (
+  const controls = (
     <div className="flex flex-col gap-4">
       {/* ── Adapter type / method (K1: LoKR is the default) ──────────────
           One row for everything the trainer can build. LoKR is its own type;
@@ -770,7 +772,7 @@ export const TrainDitForm: React.FC<Props> = ({
           </span>
 
           <label className="flex flex-col gap-1.5">
-            {P('learningRate', value.optimizer === 'prodigy' ? 'Ignored under Prodigy (auto step size)' : isLokr ? 'LoKR default 0.01' : 'LoRA default 5e-4', { onReset: onReset('learningRate') })}
+            {P('learningRate', value.optimizer === 'prodigy' ? 'Ignored under Prodigy (auto step size)' : isLokr ? 'LoKR default 2e-3' : 'LoRA default 5e-4', { onReset: onReset('learningRate') })}
             <input
               type="number" min={0.00001} max={1} step={0.00001}
               value={value.learningRate} disabled={lock}
@@ -1178,20 +1180,22 @@ export const TrainDitForm: React.FC<Props> = ({
           />
         </div>
       </details>
-
+    </div>
+  );
+  const action = (
       <button
         onClick={onStart}
         disabled={
           lock || !adapterNameOk || !cropRangeOk || !tWindowOk || !cropOk || !lrOk || !seedOk ||
           !lokrFactorOk || value.stages.length === 0
         }
-        className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
       >
         {starting ? <Loader2 size={15} className="animate-spin" /> : <Waves size={15} />}
         {t('trainingStudio.train.dit.start')}
       </button>
-    </div>
   );
+  return <>{renderLayout ? renderLayout(controls, action) : <div className="flex flex-col gap-4">{controls}{action}</div>}</>;
 };
 
 export default TrainDitForm;
