@@ -1,7 +1,7 @@
 import { queryClient } from '../queries/client';
-import { serverKey } from '../queries/keys';
+import { separationProgressOptions, separationResultOptions } from '../queries/studios/resources';
 import { ACTIVE_POLL_MS } from '../queries/contract';
-import { waitForSnapshot } from '../queries/studios/wait';
+import { waitForQuery } from '../queries/wait';
 import { apiClient, type ReadOptions } from './httpClient';
 // supersepApi.ts — API client for SuperSep stem separation
 //
@@ -63,12 +63,14 @@ const API_BASE = '/api/supersep';
 /** Path prefix for apiClient calls (the client already adds `/api`). */
 const P = '/supersep';
 
-/** Start a separation job. Returns the job ID. */
+/** Start a separation job. Returns the job ID. Silent: CoverStudio's
+ *  handleSeparate toasts the failure itself (its "Separation failed" line is
+ *  the sole notifier). */
 export async function startSeparation(
   audioUrl: string,
   level: SeparationLevel = 0,
 ): Promise<string> {
-  const data = await apiClient.post<{ id: string }>(`${P}/separate?level=${level}`, { audioUrl });
+  const data = await apiClient.post<{ id: string }>(`${P}/separate?level=${level}`, { audioUrl }, { silent: true });
   return data.id;
 }
 
@@ -114,10 +116,8 @@ export async function waitForCompletion(
   onProgress?: (progress: number, message: string) => void,
   pollIntervalMs = ACTIVE_POLL_MS,
 ): Promise<StemListResult> {
-  const p = await waitForSnapshot(serverKey('studios/separation-progress', { id: jobId }),
-    signal => getProgress(jobId, { signal }), p => p.status === 'running',
-    p => onProgress?.(p.progress, p.message), { pollMs: pollIntervalMs });
+  const p = await waitForQuery<ProgressResult>(separationProgressOptions(jobId),
+    p => p.status === 'running', p => onProgress?.(p.progress, p.message), { pollMs: pollIntervalMs });
   if (p.status !== 'done') throw new Error(p.error || `Separation ${p.status}`);
-  return queryClient.query({ queryKey: serverKey('studios/separation-result', { id: jobId }),
-    queryFn: ({ signal }) => getStemList(jobId, { signal }) });
+  return queryClient.query(separationResultOptions(jobId));
 }

@@ -16,6 +16,7 @@ import {
   getMidiStreamUrl, channelLabel,
 } from '../../services/midiStudioApi';
 import { MidiSynth, type PlayNote } from './midiSynth';
+import { QueryError } from '../shared/QueryError';
 
 const PPS = 40;          // px per second
 const ROLL_H = 230;
@@ -122,8 +123,8 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
             setChunks({ done: ev.completed, total: ev.total });
             setFrontier(ev.completed * 5.0);
           } else if (ev.type === 'status') {
-            void queryManager.keys(client, midiJobsOptions().queryKey);
-            void queryManager.keys(client, midiNotesOptions(jobId).queryKey);
+            void queryManager.invalidate(client, midiJobsOptions().queryKey);
+            void queryManager.invalidate(client, midiNotesOptions(jobId).queryKey);
             flush();
             setLiveDone(true);
             setFrontier(null);
@@ -131,8 +132,8 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
           }
         } catch { /* ignore malformed */ }
       };
-      es.onopen = () => { void queryManager.keys(client, midiJobsOptions().queryKey); };
-      es.onerror = () => { void queryManager.keys(client, midiJobsOptions().queryKey); };
+      es.onopen = () => { void queryManager.invalidate(client, midiJobsOptions().queryKey); };
+      es.onerror = () => { void queryManager.invalidate(client, midiJobsOptions().queryKey); };
       return () => { window.clearInterval(flushTimer); es.close(); };
     }
     return undefined;
@@ -297,6 +298,9 @@ export const MidiPlayer: React.FC<Props> = ({ jobId, sourceAudioUrl, live }) => 
 
   return (
     <div className="mt-3">
+      {notesQuery.isError && (
+        <QueryError error={notesQuery.error} onRetry={() => void notesQuery.refetch()} className="mb-2" />
+      )}
       {sourceAudioUrl && <audio ref={audioRef} src={sourceAudioUrl} preload="metadata" />}
 
       {/* transport */}

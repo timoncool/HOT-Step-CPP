@@ -1,5 +1,6 @@
 // Durable Lyric Studio batches. The submit route captures every source and option.
 import { z } from 'zod/v4';
+import './scratchLyrics.js';
 import * as db from '../../db/lireekDb.js';
 import * as genius from './geniusService.js';
 import * as llm from './llmService.js';

@@ -1,6 +1,6 @@
 import { serverKey } from '../queries/keys';
 import { waitForSnapshot } from '../queries/studios/wait';
-import { apiClient, type ReadOptions } from './httpClient';
+import { apiClient, type ClientOptions, type ReadOptions } from './httpClient';
 import { getAuthToken, SLOW_ROUTE_TIMEOUT_MS } from './axiosClient';
 // inspireApi.ts — Frontend API client for the inspire endpoint
 //
@@ -112,8 +112,9 @@ export interface InspireProvider {
 /** Generate lyrics via an external LLM provider (synchronous call) */
 export async function runLlmInspire(
   params: LlmInspireParams,
+  opts?: ClientOptions,
 ): Promise<LlmInspireResult> {
-  return apiClient.post<LlmInspireResult>('/inspire/llm', params, { timeout: SLOW_ROUTE_TIMEOUT_MS });
+  return apiClient.post<LlmInspireResult>('/inspire/llm', params, { timeout: SLOW_ROUTE_TIMEOUT_MS, ...opts });
 }
 
 /** Fetch available LLM providers for the Insta-Gen provider dropdown */
@@ -124,8 +125,9 @@ export async function fetchInspireProviders(opts?: ReadOptions): Promise<Inspire
 /** Ask the LLM to generate a random song subject for the given genres */
 export async function generateRandomSubject(
   params: { provider: string; model?: string; genres?: string[] },
+  opts?: ClientOptions,
 ): Promise<string> {
-  const data = await apiClient.post<{ subject?: string }>('/inspire/llm/subject', params, { timeout: SLOW_ROUTE_TIMEOUT_MS });
+  const data = await apiClient.post<{ subject?: string }>('/inspire/llm/subject', params, { timeout: SLOW_ROUTE_TIMEOUT_MS, ...opts });
   return data.subject || '';
 }
 
@@ -164,13 +166,16 @@ export interface InstaWorkflowInput {
   expectedBackend: string; coResident: boolean; cacheLmCodes: boolean;
 }
 
+// The Insta-Gen panel displays every one of these failures itself (its inline
+// error line covers the submit leg and the SSE job follow alike), so the JSON
+// legs stay silent — one notifier per failure.
 export const instaWorkflowApi = {
   preview: (input: InstaWorkflowInput, key = crypto.randomUUID()) =>
-    workflowApi.submit('insta-preview', key, input as unknown as Record<string, unknown>),
+    workflowApi.submit('insta-preview', key, input as unknown as Record<string, unknown>, { silent: true }),
   direct: (input: InstaWorkflowInput, key = crypto.randomUUID()) =>
-    workflowApi.submit('insta-direct', key, input as unknown as Record<string, unknown>),
+    workflowApi.submit('insta-direct', key, input as unknown as Record<string, unknown>, { silent: true }),
   approve: (documentId: string, revision: number, key = `approve:${documentId}:${revision}`) =>
-    workflowApi.submit('insta-approve', key, { documentId, revision }),
+    workflowApi.submit('insta-approve', key, { documentId, revision }, { silent: true }),
   get: workflowApi.get,
   list: workflowApi.list,
   cancel: workflowApi.cancel,

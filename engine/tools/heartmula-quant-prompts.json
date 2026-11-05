@@ -1,0 +1,230 @@
+{
+ "calib": [
+  {
+   "id": "c01",
+   "tags": "pop,upbeat,female vocal,synth,summer",
+   "lyrics": "[verse]\nSun on the pavement, windows rolled down\nEvery light is green on the way out of town\n[chorus]\nTake me higher, take me home\nNever want to be alone",
+   "seconds": 20,
+   "seed": 100
+  },
+  {
+   "id": "c02",
+   "tags": "rock,electric guitar,male vocal,energetic,drums",
+   "lyrics": "[verse]\nRain on the tin roof, thunder in my chest\nI've been running all night, I can't find rest\n[chorus]\nLight it up, burn it down\nWe don't need this town",
+   "seconds": 20,
+   "seed": 101
+  },
+  {
+   "id": "c03",
+   "tags": "hip hop,boom bap,male rapper,vinyl crackle,laid back",
+   "lyrics": "[verse]\nMorning coffee, city noise, pen and a notebook\nEvery line a brick I lay, every bar a hook\n[hook]\nKeep it moving, keep it true",
+   "seconds": 20,
+   "seed": 102
+  },
+  {
+   "id": "c04",
+   "tags": "jazz,piano trio,smooth,late night,brush drums",
+   "lyrics": "[instrumental]",
+   "seconds": 24,
+   "seed": 103
+  },
+  {
+   "id": "c05",
+   "tags": "electronic,house,four on the floor,club,female vocal",
+   "lyrics": "[verse]\nLose yourself in the neon glow\nFeel the bass and let it go\n[drop]\nHands up, hands up",
+   "seconds": 20,
+   "seed": 104
+  },
+  {
+   "id": "c06",
+   "tags": "folk,acoustic guitar,warm,male vocal,storytelling",
+   "lyrics": "[verse]\nMy grandfather's boat sat low in the bay\nHe taught me the stars and he taught me to pray\n[chorus]\nOh the sea remembers",
+   "seconds": 20,
+   "seed": 105
+  },
+  {
+   "id": "c07",
+   "tags": "classical,orchestral,strings,cinematic,emotional",
+   "lyrics": "[instrumental]",
+   "seconds": 24,
+   "seed": 106
+  },
+  {
+   "id": "c08",
+   "tags": "metal,heavy,double bass,growl,aggressive",
+   "lyrics": "[verse]\nIron sky, the horizon bleeds\nMarching forward on broken knees\n[chorus]\nRise, rise, never fall",
+   "seconds": 16,
+   "seed": 107
+  },
+  {
+   "id": "c09",
+   "tags": "reggae,offbeat guitar,relaxed,male vocal,sunny",
+   "lyrics": "[verse]\nSlow down, slow down, the day is long\nSing it with me, sing a little song\n[chorus]\nOne love on the island breeze",
+   "seconds": 20,
+   "seed": 108
+  },
+  {
+   "id": "c10",
+   "tags": "country,pedal steel,female vocal,heartbreak,ballad",
+   "lyrics": "[verse]\nYour truck's still in the driveway but your heart is long gone\nI kept the porch light burning till the break of dawn\n[chorus]\nGoodbye was never easy",
+   "seconds": 20,
+   "seed": 109
+  },
+  {
+   "id": "c11",
+   "tags": "ambient,pads,slow,atmospheric,no drums",
+   "lyrics": "[instrumental]",
+   "seconds": 24,
+   "seed": 110
+  },
+  {
+   "id": "c12",
+   "tags": "r&b,soul,female vocal,smooth,electric piano",
+   "lyrics": "[verse]\nCome a little closer, let me see your eyes\nEvery word you whisper feels like a surprise\n[chorus]\nStay with me tonight",
+   "seconds": 20,
+   "seed": 111
+  },
+  {
+   "id": "c13",
+   "tags": "pop,spanish,latin,female vocal,guitar,dance",
+   "lyrics": "[verse]\nBailamos bajo la luna, el mundo se detiene\nTu mirada me lo dice, mi corazon te tiene\n[chorus]\nDime que si, dime que si",
+   "seconds": 20,
+   "seed": 112
+  },
+  {
+   "id": "c14",
+   "tags": "pop,japanese,city pop,retro synth,female vocal",
+   "lyrics": "[verse]\n夜の街に光が揺れて\n君の声が聞こえる気がした\n[chorus]\nもう一度、あの夏へ",
+   "seconds": 20,
+   "seed": 113
+  },
+  {
+   "id": "c15",
+   "tags": "rock,french,male vocal,indie,jangly guitar",
+   "lyrics": "[verse]\nLe matin se leve sur la ville endormie\nJe marche sans but dans la pluie\n[chorus]\nEncore une fois, encore une nuit",
+   "seconds": 20,
+   "seed": 114
+  },
+  {
+   "id": "c16",
+   "tags": "dance,german,eurodance,female vocal,synth,fast",
+   "lyrics": "[verse]\nDie Nacht ist jung und wir sind wach\nDie Musik laeuft, die Stadt ist nah\n[chorus]\nTanz mit mir bis morgen frueh",
+   "seconds": 20,
+   "seed": 115
+  },
+  {
+   "id": "c17",
+   "tags": "k-pop,korean,bright,group vocal,electronic",
+   "lyrics": "[verse]\n별빛 아래 우리 둘이\n손을 잡고 걸어가\n[chorus]\n끝없이 빛나는 이 밤",
+   "seconds": 20,
+   "seed": 116
+  },
+  {
+   "id": "c18",
+   "tags": "blues,slide guitar,gravelly male vocal,slow,shuffle",
+   "lyrics": "[verse]\nWoke up this morning with the weight of the world\nGot nothing but a guitar and a dusty old girl\n[chorus]\nOh the blues don't ever sleep",
+   "seconds": 20,
+   "seed": 117
+  },
+  {
+   "id": "c19",
+   "tags": "punk,fast,raw,shouted vocals,power chords",
+   "lyrics": "[verse]\nNo future, no plans, nothing to lose\nTurn it up loud and sing the blues\n[chorus]\nHey, hey, we won't go",
+   "seconds": 14,
+   "seed": 118
+  },
+  {
+   "id": "c20",
+   "tags": "funk,slap bass,horns,groovy,male vocal",
+   "lyrics": "[verse]\nPut your hands together, feel the groove\nEverybody's gonna find a move\n[chorus]\nGet down, get down tonight",
+   "seconds": 20,
+   "seed": 119
+  },
+  {
+   "id": "c21",
+   "tags": "lo-fi,chillhop,mellow,vinyl,piano,rain",
+   "lyrics": "[instrumental]",
+   "seconds": 24,
+   "seed": 120
+  },
+  {
+   "id": "c22",
+   "tags": "musical theatre,piano,dramatic,female vocal,ballad",
+   "lyrics": "[verse]\nI have walked these streets alone\nBuilt a life from stone on stone\n[chorus]\nBut tonight I'll find my voice",
+   "seconds": 20,
+   "seed": 121
+  },
+  {
+   "id": "c23",
+   "tags": "world,celtic,fiddle,whistle,uplifting,dance",
+   "lyrics": "[instrumental]",
+   "seconds": 20,
+   "seed": 122
+  },
+  {
+   "id": "c24",
+   "tags": "pop punk,portuguese,male vocal,guitars,anthemic",
+   "lyrics": "[verse]\nA estrada e longa mas eu nao vou parar\nCada passo que eu dou me leva pra lar\n[chorus]\nGrita comigo, grita mais alto",
+   "seconds": 20,
+   "seed": 123
+  }
+ ],
+ "heldout": [
+  {
+   "id": "h01",
+   "tags": "pop,dreamy,female vocal,synth,reverb",
+   "lyrics": "[verse]\nPaper lanterns drifting up above the water\nEvery wish we made is a little bit brighter\n[chorus]\nHold on to the light",
+   "seconds": 16,
+   "seed": 900
+  },
+  {
+   "id": "h02",
+   "tags": "rock,grunge,male vocal,distorted guitar,mid tempo",
+   "lyrics": "[verse]\nBasement walls and a broken amp\nEverything I loved is in this lamp\n[chorus]\nTurn it down and let it ring",
+   "seconds": 16,
+   "seed": 901
+  },
+  {
+   "id": "h03",
+   "tags": "jazz,saxophone,quartet,swing,upbeat",
+   "lyrics": "[instrumental]",
+   "seconds": 16,
+   "seed": 902
+  },
+  {
+   "id": "h04",
+   "tags": "electronic,techno,dark,driving,minimal",
+   "lyrics": "[instrumental]",
+   "seconds": 16,
+   "seed": 903
+  },
+  {
+   "id": "h05",
+   "tags": "pop,italian,male vocal,acoustic,romantic",
+   "lyrics": "[verse]\nSotto il cielo di una sera d'estate\nTi ho cercata per strade bagnate\n[chorus]\nResta qui con me",
+   "seconds": 16,
+   "seed": 904
+  },
+  {
+   "id": "h06",
+   "tags": "hip hop,trap,female rapper,808,dark",
+   "lyrics": "[verse]\nMidnight energy, I never switch my lane\nEvery step I take is a hundred in the rain\n[hook]\nCount it, count it up",
+   "seconds": 16,
+   "seed": 905
+  },
+  {
+   "id": "h07",
+   "tags": "folk,chinese,guzheng,female vocal,gentle",
+   "lyrics": "[verse]\n春风吹过小河边\n花开满山又一年\n[chorus]\n等你回来看花开",
+   "seconds": 16,
+   "seed": 906
+  },
+  {
+   "id": "h08",
+   "tags": "orchestral,epic,trailer,choir,brass",
+   "lyrics": "[instrumental]",
+   "seconds": 16,
+   "seed": 907
+  }
+ ]
+}

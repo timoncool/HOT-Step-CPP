@@ -78,6 +78,17 @@ test('caption staleness refreshes copies and replaced hardlinks without changing
   }
 });
 
+test('caption refresh replaces copied sidecars whose names hold non-ASCII characters', t => {
+  const f = fixture(t, true);
+  f.write('Song — Café.wav');
+  f.write('Song — Café.txt', 'old lyrics');
+  const dir = f.stage(['Song — Café.wav']);
+  f.manifest(dir);
+  f.write('Song — Café.txt', 'new lyrics');
+  yue2CaptionsStale(f.manifestPath);
+  assert.equal(fs.readFileSync(path.join(dir, 'Song — Café.txt'), 'utf8'), 'new lyrics');
+});
+
 test('separation reads nested and renamed staged sources with the exact aligner stem names', t => {
   const f = fixture(t);
   for (const name of ['one/track.wav', 'two/track.wav', 'unique.wav']) f.write(name);

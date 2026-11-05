@@ -2,12 +2,16 @@
 
 An MCP server exposing HOT-Step CPP's **generation** and **training dataset/job**
 APIs. Generation: submit, poll, cancel, inspect the queue, switch backends,
-look up a saved song — all three backends (ACE-Step 1.5, MiniMax-Music3, YuE2)
-go through the same eight tools, none of them backend-specific. Training:
-list/create/rescan datasets, run the labeling pipeline's three stages, list
-and control jobs, then prepare, start and inspect adapter training for ACE
-(LM and DiT), MiniMax-Music3 (LM) and YuE2 (joint): the thirteen `train_*` tools
-below, all wrappers over `server/src/routes/training.ts`.
+look up a saved song. ACE-Step 1.5, MiniMax-Music3 and YuE2 go through the
+same eight tools, none of them backend-specific. The app's fourth backend,
+Stable Audio 3 (`sa3`), is not covered: `gen_backends` lists it, but
+`gen_configure` and `gen_submit` do not accept it, and there is no SA3
+training tool. Training: list/create/rescan datasets, run the labeling
+pipeline's three stages, list and control jobs, then prepare, start and
+inspect adapter training for ACE (LM and DiT), MiniMax-Music3 (LM) and YuE2
+(joint): the thirteen `train_*` tools below. Twelve of them wrap routes in
+`server/src/routes/training.ts`; `train_fields` answers from this package's
+own schemas without a call.
 
 Everything here talks to the running app over its HTTP API
 (`server/src/routes/`) — nothing reads the database or engine state directly.
@@ -32,7 +36,10 @@ cd tools/mcp-hotstep
 npm install
 ```
 
-Registered in the repo root's `.mcp.json` as `hotstep`. Env:
+Register it with your MCP client as `hotstep`.
+[docs/user/mcp.md](../../docs/user/mcp.md#setup) has the Claude Code
+(`.mcp.json`) and Codex (`config.toml`) entries. The repo root's `.mcp.json` is
+gitignored, so each checkout keeps its own. Env:
 
 | Var | Default | Meaning |
 |---|---|---|
@@ -50,23 +57,28 @@ reconnected. (That reconnect is also required after editing this package's sourc
 npm run typecheck   # tsc -p tsconfig.check.json — src/ and test/
 npm test            # tsx --test test/*.test.ts
 npm start           # run the server directly (stdio) — normally the client does this
+npm run dev         # tsx watch src/index.ts
 ```
 
 ## Tools
 
 ### `gen_backends`
-Lists the registered backends (`ace`, `minimax-m3`, `yue2`), which one is
-active, the active backend's capability manifest (`GET /api/capabilities`),
+Lists the registered backends (`ace`, `minimax-m3`, `yue2`, `sa3`), which one
+is active, the active backend's capability manifest (`GET /api/capabilities`),
 and its model catalogue (`GET /api/backends/models`). Call this before
-`gen_submit` if you're not sure what's active or what it supports.
+`gen_submit` if you're not sure what's active or what it supports. `sa3` shows
+up here, but the other generation tools take only the first three ids.
 
 ### `gen_configure`
 `{ backend?, model? }` — switch the active backend and/or select its models.
 Switching releases the **outgoing** backend's VRAM before anything new loads
 (fire-and-forget; the switch itself answers immediately). Model selection is
 engine *state* for MiniMax-Music3 (per-role quants: `lm`, `depth`, `cond`,
-`dit`, `voc`) and YuE2 (`lm`, `vae_variant`) — this is where you set it. ACE
-has no engine-state model selection at all: its model names travel on every
+`dit`, `voc`; a role left out keeps its current pick). For YuE2 it is the
+server's default for jobs submitted afterwards, while queued jobs keep their
+own: `lm`, `vae` (the VAE variant) and the adapter slots (`lmAdapterAr`,
+`lmAdapterNar`). This is where you set either. ACE has no engine-state model
+selection at all: its model names travel on every
 `gen_submit` call instead (its `ditModel`/`lmModel` args), so this route
 answers `501` for ACE, which the tool reports as the reason rather than an
 error to retry.
@@ -80,34 +92,46 @@ batchSize?, title?, ditModel?, lmModel?, options? }` → `POST /api/generate`. R
   new `expectedBackend`. If the active backend has moved on since you last
   checked `gen_backends` (someone else switched it), the submit is refused
   with `409` instead of silently running on the wrong backend.
+- `options.backendOverride`, set to the same id as `backend`, runs this one
+  job on that backend without switching the active one; `expectedBackend` is
+  then checked against the override instead. It is not a reserved name, so it
+  travels through `options`. That is also the way to submit while Stable
+  Audio 3 is active.
 - `operation` becomes `taskType`, defaulting to `text2music`. Checked against
   a per-backend allow-list before any HTTP call — ACE additionally supports
   `cover`, `repaint`, `lego`, `extract`, `complete`, `cover-nofsq`; the other
   two backends support `text2music` only.
 - **Duration behaviour differs per backend** and the API gives no error for
   getting this wrong, so it's worth knowing: ACE (max 600s) treats `duration`
-  as a *target* the LM aims for. MiniMax-Music3 (max 300s) treats it as a
-  *ceiling only* — the model's own stop token usually ends it sooner. YuE2
-  ignores `duration` entirely; it is always model-ended.
+  as a *target* the LM aims for. MiniMax-Music3 ignores `duration`: every render
+  runs to the model's own stop token under the 300s ceiling, and the generation
+  log notes that a requested length was ignored. YuE2 (max 360s) ends on its
+  own too, but treats a `duration` above 0 as a *ceiling*: the server trims a
+  longer render to it with a short fade-out.
 - `ditModel`/`lmModel` are ACE-only and independent — ACE has separate DiT
   and LM catalogues, and a name from one is not valid in the other
   (`translateParams.ts` maps them to `synth_model`/`lm_model`, and the engine
   rejects an LM name it can't find in the LM bucket). Neither does anything
   for MiniMax-Music3 or YuE2 — use `gen_configure` for those.
 - `options` is a bag of backend-specific knobs sent as **top-level** HTTP
-  fields, not nested. MiniMax-Music3 only reads fields prefixed `mm3` (e.g.
-  `mm3Steps`); YuE2 only reads fields prefixed `yue2`; anything else is
-  silently ignored by those two. ACE reads plain unprefixed names (e.g.
-  `guidanceScale`, `inferenceSteps`, `negativePrompt`). An `options` key that
-  collides with one of this tool's own typed args (`caption`, `lyrics`,
+  fields, not nested; each value is a string, number or boolean.
+  MiniMax-Music3's own knobs are prefixed `mm3` (e.g. `mm3Steps`) and YuE2's
+  `yue2`. Both also read a few shared unprefixed fields, such as `scheduler`
+  on MiniMax-Music3 and `bpm` and `keyScale` on YuE2. ACE reads plain
+  unprefixed names as the UI sends them (e.g. `guidanceScale`,
+  `inferenceSteps`, `negative_prompt`). A field the job's backend does not
+  read is ignored without an error. An `options` key that collides with one
+  of this tool's own typed args (`caption`, `lyrics`, `instrumental`,
   `duration`, `seed`, `batchSize`, `title`, `backend`, `expectedBackend`,
-  `taskType`, `ditModel`, `lmModel` — and ACE's caption aliases `prompt`,
-  `songDescription`, `style`) is **rejected before any HTTP call**, since it
-  would otherwise silently override what the typed arg asked for.
-- **Never retried on a 401.** Every other tool retries once automatically
-  after a fresh login; submit does not, because silently resending a
-  generation body after a relogin risks training/rendering twice on the
-  GPU. A submit that 401s returns the failure; the *next* call (a manual
+  `taskType`, `ditModel`, `lmModel`, plus `randomSeed` and the caption aliases
+  every backend reads, `prompt`, `songDescription` and `style`) is **rejected
+  before any HTTP call**, since it would otherwise silently override what the
+  typed arg asked for.
+- **Never retried on a 401.** The other tools retry once automatically
+  after a fresh login, apart from `train_prepare` and `train_start`; submit
+  does not, because silently resending a generation body after a relogin
+  risks training/rendering twice on the GPU. A submit that 401s returns the
+  failure; the *next* call (a manual
   retry of `gen_submit`, or any other tool) logs in fresh.
 
 ### `gen_status`, `gen_cancel`, `gen_queue`
@@ -142,10 +166,13 @@ behalf. Use `gen_cancel` for that.
 audio bytes. Also includes `audioFilePath` — a real filesystem path — but
 **only** when `HOTSTEP_URL` resolves to loopback (127.0.0.1/localhost), since
 otherwise the path wouldn't resolve on the machine asking for it. That path
-is reconstructed from this repo's own `DATA_DIR` resolution (mirrored in
-`src/tools.ts` — see the design note below, `server/src/config.ts` is never
-imported), so it is only correct if this MCP process sees the same
-`DATA_DIR` the running server does — true for the default, unmodified setup.
+is reconstructed from a mirror of the server's audio-folder resolution in
+`src/tools.ts` (see the design note below; `server/src/config.ts` is never
+imported). The mirror resolves `server/<DATA_DIR or ./data>/audio` in this
+checkout, which is where a checkout with no data folder keeps its audio. It
+does not follow a data folder (every release has one, and a checkout gets one
+from Settings), where the server keeps audio under the data folder's library,
+so there the path does not match.
 
 ### `train_capabilities`
 `GET /api/training/capabilities`, returned whole: engine readiness, and
@@ -162,24 +189,26 @@ settings only the UI needs. Use `train_dataset` for one dataset in full.
 `{ id }` → `GET /api/training/datasets/:id`, returned whole.
 
 ### `train_dataset_create`
-Mirrors `CreateDatasetInput` (`server/src/services/training/types.ts:600`):
+Mirrors `CreateDatasetInput` (`server/src/services/training/types.ts`):
 `{ name, sourceDir, recursive?, customTag?, tagPosition?, genreRatio?,
 defaultArtist?, defaultAlbum?, defaultGenre?, defaultLanguage? }` →
 `POST /api/training/datasets`. Returns `201` with the created dataset.
 
 ### `train_dataset_rescan`
 `{ id }` → `POST /api/training/datasets/:id/rescan`. Refuses with `409`
-("A job is already running for this dataset") while a job is active for
+("A job is running for this dataset") while a job is active for
 this dataset.
 
 ### `train_dataset_label`
 One tool, three stages, all async (answer `202` with a `jobId` — poll with
 `train_wait` or `train_job`): `{ datasetId, stage, options? }`.
-- `stage: "label"` posts `options` as `LabelOptions` (`types.ts:644`) to
+- `stage: "label"` posts `options` as `LabelOptions` (`types.ts`) to
   `/datasets/:id/label` — Essentia BPM/key, Genius lyrics, LLM caption; which
   steps run is in `options`.
-- `stage: "caption"` posts `options` as `CaptionOptions` (`types.ts:672`) to
-  `/datasets/:id/enhance/caption` — re-caption with a specific provider.
+- `stage: "caption"` posts `options` as `CaptionOptions` (`types.ts`) to
+  `/datasets/:id/enhance/caption` — re-caption with a specific provider. With
+  `moss` or `gemini` it also writes the per-track `.mm3.txt` captions
+  MiniMax-Music3 training reads; the other providers do not.
 - `stage: "build"` posts `options` as `{ outputPath? }` to
   `/datasets/:id/build` — write `dataset.json`.
 
@@ -203,7 +232,7 @@ when `cancel: true`.
 Same contract as `gen_wait` (see above), against
 `GET /api/training/jobs/:jobId`: `{ jobId, maxSeconds? }` →
 `{ jobId, outcome, status }`. Terminal statuses are `TrainingJobStatus`'s
-(`types.ts:50`) `done`/`failed`/`cancelled` — note `done`, not `succeeded`
+(`types.ts`) `done`/`failed`/`cancelled` — note `done`, not `succeeded`
 (that's generation's vocabulary, not training's). Shares its polling loop
 (`waitForJob` in `src/tools.ts`) with `gen_wait` rather than duplicating it.
 
@@ -239,7 +268,8 @@ The defaults below are what each route resolves an absent field to, read from
 the handler in `server/src/routes/training.ts`, not from the comments in
 `types.ts` (several of those have drifted). Where a route clamps silently
 instead of answering `400` (`yue2-preprocess`, `mm3-train-lm`), an
-out-of-range value becomes the default without an error.
+out-of-range value becomes the default without an error. The exception is
+`mm3-train-lm`'s `maxFrames`, which answers `400` outside 64..9000.
 
 #### `ace`
 
@@ -278,7 +308,7 @@ out-of-range value becomes the default without an error.
 | `defaultCaption` | string | The caption for every clip under captionMode 'default'. Default ''. |
 | `acknowledgeSidecarFormat` | boolean | Required true for captionMode 'txt': that mode feeds the whole ACE .txt sidecar in as the style prompt. |
 | `decode` | `auto` \| `ffmpeg` | Default 'auto'. 'ffmpeg' is a 400 without an ffmpeg binary. |
-| `loudnessLufs` | number | Default: absent = the engine's -14 LUFS. 0 = off; else -40..0 (400 outside). Part of the cache key: a change re-encodes. |
+| `loudnessLufs` | number | Default -14 LUFS, for every training method. 0 = off; else -40..0 (400 outside). Part of the cache key: a change re-encodes. |
 | `clipSeconds` | number | Default 10; 1..60. |
 | `tileFrames` | number | Default 750; 1..100000. |
 | `haloFrames` | number | Default 20; 12..4096. |
@@ -344,7 +374,7 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 | `epochs` | number | Hard cap per leg. Default 150; 1..200. |
 | `targetLoss` | number | Final target. Default 4.0; 0..20; 0 = no auto-stop. |
 | `targetLossStages` | number[] | Explicit target chain, strictly descending (0 only last), one ace-train leg each. Default: the 2.0 and 1.5 rungs above targetLoss, then targetLoss — so [4.0], one leg, at the default targetLoss. |
-| `initAdapter` | string | Resume source: a run dir or 'latest'. Default: scratch when the chain has more than one leg; with ONE leg (the default chain) 'latest' — the newest non-calibrated run of this adapter name, or scratch if none. '' counts as absent (training.ts:5592), so it does NOT force scratch on a one-leg chain: use a new adapterName or a multi-leg targetLossStages. A resume collapses the chain to [targetLoss] unless targetLossStages is sent. |
+| `initAdapter` | string | Resume source: a run dir or 'latest'. Default: scratch when the chain has more than one leg; with ONE leg (the default chain) 'latest' — the newest non-calibrated run of this adapter name, or scratch if none. '' counts as absent, so it does NOT force scratch on a one-leg chain: use a new adapterName or a multi-leg targetLossStages. A resume collapses the chain to [targetLoss] unless targetLossStages is sent. |
 | `adapterType` | `lora` \| `lokr` | Default 'lora'. On any resume (including the default 'latest' one) adapterType, rank, alpha, the lokr* fields, weights and pissa/hotPizza are ignored: the engine adopts them from the source run. |
 | `rank` | number | Default 16; 1..256. |
 | `alpha` | number | Default 32; 1..1024. |
@@ -481,7 +511,7 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 | `warmup` | number | Default 25; 0..100000. |
 | `gradAccum` | number | Default 1; 1..64. |
 | `seed` | number | Default 42. |
-| `maxFrames` | number | Default 9000; 64..9000. |
+| `maxFrames` | number | Default 9000; 64..9000; outside that range is a 400. |
 | `longTracks` | `exclude` \| `crop` \| `excise` | Default 'exclude'. 400 if exclude would drop more than half the tracks. |
 | `cropMode` | `random` \| `beginning` \| `structured` | Default 'structured'. |
 | `cropStartFrac` | number | Default 0.2; 0..1. |
@@ -518,7 +548,7 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 | `hotPizza` | boolean | Default true. Implies pissa. |
 | `pissaCache` | boolean | Default true. |
 | `pissaFrozenF16` | boolean | Default true. |
-| `hra` | boolean | Default false. hra + rslora is a 400. hra: true ALONE is dropped silently and the run trains HOT-PiZZA, because pissa defaults on and wins (mm3Train.ts:1333): send pissa: false with it. dora/hira/loha alone are fine. |
+| `hra` | boolean | Default false. hra + rslora is a 400. hra: true ALONE is dropped silently and the run trains HOT-PiZZA, because pissa defaults on and wins (buildMm3TrainLmArgs in mm3Train.ts): send pissa: false with it. dora/hira/loha alone are fine. |
 | `loraPlusRatio` | number | Default 1; 1..64. |
 | `artistToken` | string | Default '' (off). |
 | `artistTokenK` | number | Default 32; 1..256. |
@@ -543,7 +573,7 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 |---|---|---|
 | `steps` (required) | integer | Total steps. Required (400 without it). On a resume it must exceed resumeStep. |
 | `saveEvery` | integer | Checkpoint cadence, 1..steps. Required on a fresh run (400 without it); on a resume it is inherited from the run, except that refine may set it and refinePlanner forces it to steps. |
-| `resumeRunId` | string | Resume a run listed by train_runs (yue2-joint). Must be sent with resumeStep. Base, seed, optimizer, adapter shape, dataset, lyricTiming and cursorWeight come from that run; only the stop target, preview and refine fields can change. A base-matched run re-applies its recipe on resume, which clears refine/refinePlanner/freezePlannerNow and the loss/KL targets (read from the code, not exercised). |
+| `resumeRunId` | string | Resume a run listed by train_runs (yue2-joint). Must be sent with resumeStep. Base, seed, optimizer, adapter shape, dataset, lyricTiming and cursorWeight come from that run; only steps, the stop target, stopEngine, planCheck, the spike/recon guards, preview and the refine fields can change. A base-matched run re-applies its recipe on resume, which clears refine/refinePlanner/freezePlannerNow and the loss/KL targets (read from the code, not exercised). |
 | `resumeStep` | integer | Checkpoint step of resumeRunId that has an optimizer state. Must be sent with resumeRunId. |
 | `autoPrepare` | boolean | Default false. true (fresh runs only) makes the job run joint preparation first with the readiness defaults, so `dataset` is not needed. Without it a fresh run needs `dataset`. A resume never auto-prepares. |
 | `preparation` | object | Overrides for autoPrepare. Ignored without it. Keys: `models`, `legacyManifest`, `tokenizer`. |
@@ -553,7 +583,7 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 | `output` | string | Default: a new dir under the adapters root named after the trigger. Must not exist (or be empty with previews on). |
 | `resume` | string | Low-level: an optimizer checkpoint file. Prefer resumeRunId/resumeStep, which fill this in. |
 | `seed` | integer | Default 42; uint32. |
-| `device` | string | ggml device, e.g. CUDA0, Vulkan0, MTL0, CPU. Default: from the engine build (CUDA0 on CUDA). |
+| `device` | string | ggml device, e.g. CUDA0, Vulkan0, MTL0, CPU. Default: from the engine build (CUDA0 on CUDA). Ignored when `gpuUuid` (see below) picks a card: the run then uses CUDA0 on that card. |
 | `method` | `tuned` \| `base-matched` | Default 'tuned'. 'base-matched' forces: stopMode steps (targetLoss/targetKl/targetKlMode cleared, narExtraSteps 0), lrSchedule cosine-floor with lrFloor 0.1, arTargets base, klWeight 0, captionDropout 0, plannerLrScale 1, narLrScale 1, cursorWeight 0 (lyric timing off whatever lyricTiming says), the spike/recon guards off, planCheck/refine/refinePlanner/freezePlannerNow cleared, autoRefine false. It fills blanks with optimizer adamw-lm, lr 1e-4, weightDecay 0.1, beta1 0.9, beta2 0.95, abcDropout 0.5, narCropFrames 1500, arLossWeight 0.25, gradAccum 4, text/lyric/bothDropout 0.1, warmup 3% of steps. An explicit optimizer 'adamw' with it is a 400 (cosine-floor needs another optimizer). |
 | `calibrated` | boolean | Base-matched fresh runs only: scale steps and saveEvery to the album length. Default false. |
 | `optimizer` | `adamw` \| `adamw-lm` \| `prodigy` \| `muon` | Default 'adamw'. |
@@ -612,10 +642,30 @@ HOT-PiZZA, because `pissa` defaults on and takes precedence. Send
 | `freezePlannerNow` | boolean | Resume only: freeze the planner. |
 | `refine` | boolean | Resume only: decoder refinement. |
 | `refinePlanner` | boolean | Resume only: planner refinement to targetKl in KL rungs. |
-| `klCheckpointEvery` | number | refinePlanner: 0.01..1, default 0.1. |
+| `klCheckpointEvery` | number | refinePlanner: 0.01..1, default 0.1. Without refinePlanner, under method tuned and stopMode kl, a value above 0 (clamped to 0.01..1) also saves a checkpoint at each step of that size in planner KL below the target. |
 | `refineLrScale` | number | refinePlanner: 0.05..1, default 0.3. |
 | `autoRefine` | boolean | Fresh runs only: chain a planner refinement after the run. |
 | `preview` | object | Checkpoint previews. Default off. Keys: `enabled`, `everySteps`, `seconds`, `takes`, `odeSteps`, `narCacheRatio`, `seed`, `previewMaxFrames`, `baseline`, `control`, `parallel`, `sharedSheet`, `caption`, `lyrics`, `lyricsSource`, `previewSongId`. |
+
+#### Route fields the schemas do not cover
+
+Some routes have gained fields since `src/trainSchemas.ts` was written. A new
+top-level field still reaches its route through `options`:
+
+- `yue2-joint`: `gpuUuid`, a GPU UUID from Settings, runs the job on that card
+  (400 for one the server does not know).
+- `mm3-lm`: `updateLinkedPresets`, default true, repoints the linked Lyric
+  Studio album presets at the final checkpoint when the run ends. Send false
+  for a test run.
+- `yue2` `joint-prepare`: `captionGrammar: "fixed-recipe"` prepares a dataset
+  for the fixed recipe, with lyric timing off and the base taken from `base`
+  (default `bf16`).
+
+A new value for a typed field, or a new key inside a typed nested object,
+cannot be sent at all: the field object's strict schema rejects it, and
+`options` refuses the field's name. Until the schemas catch up, use the
+Training Studio for `yue2Joint.method: "fixed-recipe"`, `yue2Joint.adapterType:
+"dora"`, and the preview keys `arScale` (default 0.6) and `sampler`.
 
 ### `train_runs`
 `{ datasetId, backend }`, with `backend` as for `train_start`. Returns
@@ -638,47 +688,56 @@ backend (`stage` for `yue2` prepare only). Returns `{ argument, route,
 fields }`: the name of the field object to send, the route it posts to, and
 one row per field with `name`, `type`, `required`, `default` and `notes`.
 Nested objects are flattened as `parent.child`. The rows come from the same
-zod schemas that validate the call, so they can't drift from it. `default` is
-lifted from the description's "Default ..." clause and is `null` where the
-route forwards nothing (the engine's default applies) or the description
+zod schemas that validate the call, so they can't drift from the tool's own
+checks; they can lag the routes, as listed above. `default` is the text of
+the description's "Default ..." clause: `"engine"` where the route forwards
+nothing and the engine's own default applies, `null` where the description
 states none.
 
 ## Design notes for maintainers
 
-- `src/trainSchemas.ts` is a **client-side mirror** of what the six training
+- `src/trainSchemas.ts` is a **client-side mirror** of what the eight training
   start/prepare routes read from the body and what they default an absent
-  field to. Its descriptions are the documentation: `train_fields` serves
-  them, and the tables above were generated from them. When a route gains a
-  field or changes a fallback, update the schema and regenerate the table.
-  Until then the new field still works through `options`.
+  field to. Its descriptions are what `train_fields` serves, and the tables
+  above started as a copy of them. Where a route has since moved on, the
+  tables follow the route and the gap is listed under "Route fields the
+  schemas do not cover". When a route gains a field or changes a fallback,
+  update the schema and the table together. Until then a new top-level field
+  still works through `options`; a new value for a typed field, or a new key
+  inside a typed nested object, is refused.
 - The tool list is capped at 16 KB by a test in `test/client.test.ts`,
   because every MCP client loads the whole list into context each session.
   Keep tool descriptions to a clause or two and put the detail here.
 
 - `src/http.ts` is the one place every tool's HTTP call goes through:
   auto-login on first use, one retry on a `401` after a fresh login (opt-out
-  per call — `gen_submit` opts out), a 10s timeout per fetch, and the
-  server's raw response text is always available on failure rather than a
-  paraphrase.
+  per call: `gen_submit`, `train_prepare` and `train_start` opt out), a 10s
+  timeout per call covering the login, the request, its retry and reading the
+  body (a wait's poll uses its remaining budget instead), and the server's raw
+  response text is always available on failure rather than a paraphrase.
 - `src/tools.ts` holds the actual tool logic, deliberately separate from
   `src/server.ts`'s `server.tool(...)` registrations, so a test can call
   `genSubmit(...)` etc. directly against a loopback HTTP fixture without any
   MCP protocol machinery in the way (see `test/http.test.ts`).
   `test/client.test.ts` covers the one thing `tools.ts`-level tests can't: that
   `server.ts` actually wires everything up correctly end to end, over the
-  SDK's in-memory transport.
+  SDK's in-memory transport. `test/stdio.test.ts` starts the real stdio
+  entry point and lists all 21 tools, which fails if anything writes stray
+  bytes to stdout during the handshake.
 - `BACKEND_OPERATIONS` in `src/tools.ts` is a **client-side mirror** of
   `ACE_OPERATIONS`/`MM3_OPERATIONS`/`YUE2_OPERATIONS` in
   `server/src/services/backends/{ace,minimax,yue2}/index.ts`. Nothing in the
   HTTP API exposes a backend's supported operations (the capabilities
   manifest has no such field), and this slice keeps generation strictly
   HTTP-only — so if a backend gains or loses an operation, update the mirror
-  here too.
+  here too. It has no entry for Stable Audio 3 (`SA3_OPERATIONS` in
+  `backends/sa3/index.ts`), since the tools do not accept `sa3`.
 - `src/tools.ts` never imports `server/src/config.ts`, even though that would
   be the obvious way to get `audioDir`. That module bootstraps the app on
   import (creates `.env` from `.env.example` on first launch, logs to
   stdout), and this process's stdout *is* its MCP JSON-RPC wire once
   `index.ts` connects the stdio transport — a stray non-JSON line there
   corrupts the stream for the client. `AUDIO_DIR` is instead a small,
-  deliberately duplicated mirror of `config.ts`'s `DATA_DIR` resolution; see
-  the comment above its definition.
+  deliberately duplicated mirror of how `config.ts` resolves `DATA_DIR` for a
+  checkout with no data folder; see the comment above its definition. It
+  predates the data folder (`server/src/dataroot/`) and does not follow one.

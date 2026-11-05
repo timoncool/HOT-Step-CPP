@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   yue2ResolvePick, yue2PickFromModels, yue2CoverFromSubmission, yue2CoverPickBase,
-  yue2PlanStackFrom, yue2PlanScaleDiffers,
+  yue2PlanStackFrom, yue2PlanScaleDiffers, yue2LmVariant, yue2AdapterHome,
   type Yue2PersistedSelection,
 } from './index.js';
 import { yue2CoalesceKey } from './generate.js';
@@ -87,6 +87,20 @@ test('planner strength: travels with the pick, plans at its own strength, and cl
   assert.equal(cleared.adapters.nar.scales.plan, undefined);
   assert.equal(yue2PlanScaleDiffers(defaults.adapters), false);
   assert.equal(yue2PlanStackFrom(defaults.adapters)[0].scales.global, 0.8);
+});
+
+test('basin re-base: the variant rule, an adapter\'s home, and beta travelling with the pick', () => {
+  assert.equal(yue2LmVariant('q8_0'), '');
+  assert.equal(yue2LmVariant('IQ2_XS-imat'), '');
+  assert.equal(yue2LmVariant('rs-4.0x0.7-Q6_K'), 'rs-4.0x0.7');
+  assert.equal(yue2LmVariant('convrot'), '');
+  assert.equal(yue2AdapterHome(undefined), '');
+  assert.equal(yue2AdapterHome('N:\\models\\yue2\\yue2-lm-rs-4.0x0.7-q8_0.gguf'), 'rs-4.0x0.7');
+  assert.equal(yue2AdapterHome('/m/yue2/yue2-lm-bf16.gguf'), '');
+  const pick = yue2ResolvePick({ yue2Pick: { lmAdapterNarRebase: 1.7 } }, defaults);
+  assert.equal(pick.adapters.nar.scales.rebase, 1);  // clamped to the engine's 0..1
+  assert.equal(yue2PickFromModels({ lm_adapter_nar: fileA, lm_adapter_nar_rebase: '0.4' }).adapters.nar.scales.rebase, 0.4);
+  assert.equal(yue2ResolvePick({}, defaults).adapters.nar.scales.rebase, undefined);  // absent = engine default
 });
 
 test('only jobs with the same pick coalesce', () => {
@@ -231,10 +245,19 @@ test('a cover submission with a blank ABC is rejected at submit', async () => {
   );
 });
 
-test('a cover submission rejects a silent Vocal score', async () => {
+test('a silent Vocal score is rejected for a vocal cover and accepted for an instrumental one', async () => {
   const { yue2Backend } = await import('./index.js');
-  assert.throws(() => yue2Backend.resolveRequest({ caption: 'c',
-    yue2Cover: { sourceId: 's' }, yue2Abc: 'X:1\nV: Vocal\nZ4|z4|\nV: Ins\nC4|' }),
+  const yue2Abc = 'X:1\nV: Vocal\nZ4|z4|\nV: Ins\nC4|';
+  assert.throws(() => yue2Backend.resolveRequest({ caption: 'c', lyrics: 'la la',
+    yue2Cover: { sourceId: 's' }, yue2Abc }),
+  /The transcriber heard no melody in this source/);
+  for (const extra of [{ instrumental: true, lyrics: 'la la' }, {}]) {
+    // Past the score check the resolver needs a database; only the score verdict matters here.
+    try { yue2Backend.resolveRequest({ caption: 'c', ...extra, yue2Cover: { sourceId: 's' }, yue2Abc }); }
+    catch (err) { assert.doesNotMatch((err as Error).message, /heard no melody/); }
+  }
+  assert.throws(() => yue2Backend.resolveRequest({ caption: 'c', instrumental: true,
+    yue2Cover: { sourceId: 's' }, yue2Abc: 'X:1\nV: Vocal\nZ4|z4|\nV: Ins\nz4|' }),
   /The transcriber heard no melody in this source/);
 });
 

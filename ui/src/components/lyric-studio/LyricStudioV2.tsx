@@ -6,13 +6,13 @@
  *   2. Album Grid for selected artist
  *   3. Album Detail with tabbed content (Source Lyrics, Profiles, Written Songs)
  *
- * State management: All data is loaded via lireekApi, with URL-based routing
- * and popstate support for browser back/forward.
+ * State management: Query owns server snapshots; URL restore consumes the
+ * artists observer once, with popstate support for browser back/forward.
  *
  * Ported from hot-step-9000 with import path + API adaptations for the C++ engine.
  */
 
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import type { AlbumPreset } from '../../services/lireekApi';
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
@@ -36,6 +36,7 @@ import type { TabId } from './ContentTabs';
 import { SourceLyricsTab } from './SourceLyricsTab';
 import { ProfilesTab } from './ProfilesTab';
 import { WrittenSongsTab } from './WrittenSongsTab';
+import { WriteLyricsTab } from './WriteLyricsTab';
 import { RecordingsTab } from './RecordingsTab';
 import { RenderAcrossModal } from './RenderAcrossModal';
 import type { RenderTarget } from './RenderAcrossModal';
@@ -77,7 +78,7 @@ function buildUrl(artistId?: number, albumId?: number, tab?: TabId): string {
 }
 
 function parseUrl(path: string): { artistId?: number; albumId?: number; tab?: TabId } {
-  const m = path.match(/\/lyric-studio\/artist\/(\d+)(?:\/album\/(\d+)(?:\/(source-lyrics|profiles|written-songs|recordings))?)?/);
+  const m = path.match(/\/lyric-studio\/artist\/(\d+)(?:\/album\/(\d+)(?:\/(source-lyrics|profiles|write-lyrics|written-songs|recordings))?)?/);
   if (!m) return {};
   return {
     artistId: Number(m[1]),
@@ -160,8 +161,8 @@ export const LyricStudioV2: React.FC = () => {
   const [curatedModalOpen, setCuratedModalOpen] = useState(false);
 
   // ── Fetch lyrics progress ──
-  const [fetchingLyrics, setFetchingLyrics] = useState(false);
-  const [fetchingLabel, setFetchingLabel] = useState('');
+  // Derived from the mutation: the label comes from the variables that were
+  // actually submitted, so a second request cannot show the first one's name.
 
   // ── Bulk queue data ──
   const allSetsQuery = useQuery({ ...snapshotOptions<LyricsSet[]>('lireek', '/lireek/lyrics-sets'), enabled: queueOpen });
@@ -188,28 +189,31 @@ export const LyricStudioV2: React.FC = () => {
     setTimeout(() => setToast(null), 3500);
   }, []);
 
-  // ── Load artists ──
-  const loadArtists = useCallback(async (): Promise<Artist[]> => {
-    const { artists } = await lireekApi.listArtists();
-    void fillMissingArtwork(artists, 'artist');
-    return artists;
-  }, []);
-
-  // ── Initial load: artists + URL restore ──
+  // ── Initial artwork + URL restore from the artists observer ──
+  const initialLoad = useRef({ path: window.location.pathname, artworkStarted: false, restored: false });
   useEffect(() => {
+    const artistsList = artistsQuery.data;
+    if (!artistsList || initialLoad.current.restored) return;
+    if (!initialLoad.current.artworkStarted) {
+      initialLoad.current.artworkStarted = true;
+      void fillMissingArtwork(artistsList, 'artist');
+    }
     let live = true;
-    const initialPath = window.location.pathname;
+    const initialPath = initialLoad.current.path;
     const init = async () => {
-      const artistsList = await loadArtists();
       if (!live || initialPath !== window.location.pathname) return;
-      const parsed = parseUrl(window.location.pathname);
+      const parsed = parseUrl(initialPath);
       if (parsed.artistId) {
         isRestoringUrl.current = true;
         try {
           const artist = artistsList.find(a => a.id === parsed.artistId);
-          if (!artist) return;
+          if (!artist) {
+            initialLoad.current.restored = true;
+            return;
+          }
           const albumRes = await lireekApi.listLyricsSets(artist.id);
           if (!live || initialPath !== window.location.pathname) return;
+          initialLoad.current.restored = true;
 
           if (parsed.albumId) {
             const album = albumRes.lyrics_sets.find(a => a.id === parsed.albumId);
@@ -225,11 +229,13 @@ export const LyricStudioV2: React.FC = () => {
         } finally {
           isRestoringUrl.current = false;
         }
+      } else {
+        initialLoad.current.restored = true;
       }
     };
     void init().catch(console.error);
     return () => { live = false; };
-  }, [loadArtists]);
+  }, [artistsQuery.data]);
 
   // ── Load albums ──
   const loadAlbums = useCallback(async (artistId: number) => {
@@ -278,9 +284,8 @@ export const LyricStudioV2: React.FC = () => {
   const handleBackToArtists = useCallback(() => {
     setNav({ level: 'artists', selectedArtist: null, selectedAlbum: null });
     setSongCount(0);
-    loadArtists();
     pushUrl();
-  }, [loadArtists, pushUrl]);
+  }, [pushUrl]);
 
   const handleBackToAlbums = useCallback(() => {
     setNav(prev => ({ ...prev, level: 'albums', selectedAlbum: null }));
@@ -321,88 +326,120 @@ export const LyricStudioV2: React.FC = () => {
   }, [artists, albums, loadAlbums]);
 
   // ── Actions ──
-  const handleDeleteArtist = useCallback(async (artist: Artist) => {
-    if (!confirm(`Delete ${artist.name} and ALL their albums, profiles, and generations?`)) return;
-    try {
-      await lireekApi.deleteArtist(artist.id);
+  // Every command below is a `useMutation`: pending state and double-click
+  // guards come from `isPending`, and failures keep the transport as their one
+  // notifier (lireekApi invalidates the affected reads on write).
+  const deleteArtistMut = useMutation({
+    mutationFn: (artist: Artist) => lireekApi.deleteArtist(artist.id),
+    onSuccess: (_res, artist) => {
       showToast(`Deleted ${artist.name}`);
-      loadArtists();
-    } catch (err: any) { showToast(`Failed to delete: ${err.message}`); }
-  }, [loadArtists, showToast]);
+    },
+  });
 
-  const handleRefreshImage = useCallback(async (artist: Artist) => {
-    try {
-      showToast(`Refreshing image for ${artist.name}...`);
-      await lireekApi.refreshArtistImage(artist.id);
-      showToast(`Updated image for ${artist.name}`);
-    } catch (err: any) { showToast(`Couldn't find image: ${err.message}`); }
-  }, [showToast]);
+  const refreshArtistImageMut = useMutation({
+    mutationFn: (artist: Artist) => lireekApi.refreshArtistImage(artist.id),
+    onSuccess: (_res, artist) => showToast(`Updated image for ${artist.name}`),
+  });
 
-  const handleSetImage = useCallback(async (artist: Artist, url: string) => {
-    try {
-      await lireekApi.setArtistImage(artist.id, url);
-      showToast(`Image updated for ${artist.name}`);
-    } catch (err: any) { showToast(`Failed: ${err.message}`); }
-  }, [showToast]);
+  const setArtistImageMut = useMutation({
+    mutationFn: ({ artist, url }: { artist: Artist; url: string }) => lireekApi.setArtistImage(artist.id, url),
+    onSuccess: (_res, { artist }) => showToast(`Image updated for ${artist.name}`),
+  });
 
-  const handleDeleteAlbum = useCallback(async (album: LyricsSet) => {
-    if (!confirm(`Delete album "${album.album || 'Top Songs'}" and all associated data?`)) return;
-    try {
-      await lireekApi.deleteLyricsSet(album.id);
+  const deleteAlbumMut = useMutation({
+    mutationFn: (album: LyricsSet) => lireekApi.deleteLyricsSet(album.id),
+    onSuccess: () => {
       showToast('Album deleted');
-      if (nav.selectedArtist) loadAlbums(nav.selectedArtist.id);
-    } catch (err: any) { showToast(`Failed to delete: ${err.message}`); }
-  }, [nav.selectedArtist, loadAlbums, showToast]);
+      if (nav.selectedArtist) void loadAlbums(nav.selectedArtist.id);
+    },
+  });
 
-  const handleRefreshAlbumImage = useCallback(async (album: LyricsSet) => {
-    try {
-      await lireekApi.refreshAlbumImage(album.id);
-      showToast('Album image updated');
-    } catch { showToast('Could not find album image on Genius'); }
-  }, [showToast]);
+  const refreshAlbumImageMut = useMutation({
+    mutationFn: (album: LyricsSet) => lireekApi.refreshAlbumImage(album.id),
+    onSuccess: () => showToast('Album image updated'),
+  });
 
-  const handleSetAlbumImage = useCallback(async (album: LyricsSet, url: string) => {
-    try {
-      await lireekApi.setAlbumImage(album.id, url);
-      showToast('Album image set');
-    } catch (err: any) { showToast(`Failed: ${err.message}`); }
-  }, [showToast]);
+  const setAlbumImageMut = useMutation({
+    mutationFn: ({ album, url }: { album: LyricsSet; url: string }) => lireekApi.setAlbumImage(album.id, url),
+    onSuccess: () => showToast('Album image set'),
+  });
 
-  const handleDeleteSong = useCallback(async (index: number) => {
-    if (!nav.selectedAlbum) return;
-    try {
-      await lireekApi.removeSong(nav.selectedAlbum.id, index);
+  const deleteSongMut = useMutation({
+    mutationFn: ({ albumId, index }: { albumId: number; index: number }) => lireekApi.removeSong(albumId, index),
+    onSuccess: async (_res, { albumId }) => {
       showToast('Song removed');
-      const updated = await lireekApi.getLyricsSet(nav.selectedAlbum.id);
+      const updated = await lireekApi.getLyricsSet(albumId);
       setNav(prev => ({ ...prev, selectedAlbum: updated }));
-    } catch (err: any) { showToast(`Failed: ${err.message}`); }
-  }, [nav.selectedAlbum, showToast]);
+    },
+  });
 
-  const handleEditSong = useCallback(async (index: number, lyrics: string) => {
-    if (!nav.selectedAlbum) return;
-    try {
-      const updated = await lireekApi.editSong(nav.selectedAlbum.id, index, lyrics);
+  const editSongMut = useMutation({
+    mutationFn: ({ albumId, index, lyrics }: { albumId: number; index: number; lyrics: string }) =>
+      lireekApi.editSong(albumId, index, lyrics),
+    onSuccess: (updated) => {
       setNav(prev => ({ ...prev, selectedAlbum: updated }));
       showToast('Lyrics updated');
-    } catch (err: any) { showToast(`Failed: ${err.message}`); }
-  }, [nav.selectedAlbum, showToast]);
+    },
+  });
 
-  const handleFetchLyrics = useCallback(async (artist: string, album: string, maxSongs: number) => {
-    const label = `${artist}${album ? ` — ${album}` : ''}`;
-    setFetchingLyrics(true);
-    setFetchingLabel(label);
-    showToast(`Fetching lyrics for ${label}…`);
-    try {
-      const res = await lireekApi.fetchLyrics({ artist, album: album || undefined, max_songs: maxSongs });
+  const fetchLyricsMut = useMutation({
+    mutationFn: ({ artist, album, maxSongs }: { artist: string; album: string; maxSongs: number }) =>
+      lireekApi.fetchLyrics({ artist, album: album || undefined, max_songs: maxSongs }),
+    onSuccess: async (res) => {
       showToast(`Fetched ${res.songs_fetched} songs`);
-      await loadArtists();
       if (nav.selectedArtist && res.artist.id === nav.selectedArtist.id) {
         await loadAlbums(nav.selectedArtist.id);
       }
       if (nav.level === 'artists') handleSelectArtist(res.artist);
-    } catch (err: any) { showToast(`Fetch failed: ${err.message}`); }
-    finally { setFetchingLyrics(false); setFetchingLabel(''); }
-  }, [loadArtists, loadAlbums, nav.selectedArtist, nav.level, handleSelectArtist, showToast]);
+    },
+  });
+
+  const fetchingLyrics = fetchLyricsMut.isPending;
+  const fetchingLabel = fetchLyricsMut.variables
+    ? `${fetchLyricsMut.variables.artist}${fetchLyricsMut.variables.album ? ` — ${fetchLyricsMut.variables.album}` : ''}`
+    : '';
+
+  const handleDeleteArtist = useCallback((artist: Artist) => {
+    if (!confirm(`Delete ${artist.name} and ALL their albums, profiles, and generations?`)) return;
+    deleteArtistMut.mutate(artist);
+  }, [deleteArtistMut]);
+
+  const handleRefreshImage = useCallback((artist: Artist) => {
+    showToast(`Refreshing image for ${artist.name}...`);
+    refreshArtistImageMut.mutate(artist);
+  }, [refreshArtistImageMut, showToast]);
+
+  const handleSetImage = useCallback((artist: Artist, url: string) => {
+    setArtistImageMut.mutate({ artist, url });
+  }, [setArtistImageMut]);
+
+  const handleDeleteAlbum = useCallback((album: LyricsSet) => {
+    if (!confirm(`Delete album "${album.album || 'Top Songs'}" and all associated data?`)) return;
+    deleteAlbumMut.mutate(album);
+  }, [deleteAlbumMut]);
+
+  const handleRefreshAlbumImage = useCallback((album: LyricsSet) => {
+    refreshAlbumImageMut.mutate(album);
+  }, [refreshAlbumImageMut]);
+
+  const handleSetAlbumImage = useCallback((album: LyricsSet, url: string) => {
+    setAlbumImageMut.mutate({ album, url });
+  }, [setAlbumImageMut]);
+
+  const handleDeleteSong = useCallback((index: number) => {
+    if (!nav.selectedAlbum) return;
+    deleteSongMut.mutate({ albumId: nav.selectedAlbum.id, index });
+  }, [nav.selectedAlbum, deleteSongMut]);
+
+  const handleEditSong = useCallback((index: number, lyrics: string) => {
+    if (!nav.selectedAlbum) return;
+    editSongMut.mutate({ albumId: nav.selectedAlbum.id, index, lyrics });
+  }, [nav.selectedAlbum, editSongMut]);
+
+  const handleFetchLyrics = useCallback(async (artist: string, album: string, maxSongs: number) => {
+    showToast(`Fetching lyrics for ${artist}${album ? ` — ${album}` : ''}…`);
+    try { await fetchLyricsMut.mutateAsync({ artist, album, maxSongs }); } catch { /* interceptor notified */ }
+  }, [fetchLyricsMut, showToast]);
 
   const refreshAlbumData = useCallback(() => {
     if (nav.selectedAlbum) loadAlbumData(nav.selectedAlbum.id);
@@ -473,33 +510,49 @@ export const LyricStudioV2: React.FC = () => {
   }, []);
 
   // ── Manual add handlers ──
-  const handleAddArtistManual = useCallback(async (name: string, imageUrl?: string) => {
-    try {
-      const res = await lireekApi.createArtist({ name, image_url: imageUrl });
+  // The modals await these, so each handler returns a Promise; `mutateAsync`
+  // keeps that contract while the mutation owns pending/error state.
+  const addArtistMut = useMutation({
+    mutationFn: ({ name, imageUrl }: { name: string; imageUrl?: string }) =>
+      lireekApi.createArtist({ name, image_url: imageUrl }),
+    onSuccess: (res) => {
       showToast(`Added ${res.artist.name}`);
-      await loadArtists();
       handleSelectArtist(res.artist);
-    } catch (err: any) { showToast(`Failed to add artist: ${err.message}`); }
-  }, [loadArtists, handleSelectArtist, showToast]);
+    },
+  });
+
+  const addAlbumMut = useMutation({
+    mutationFn: ({ albumName, imageUrl }: { albumName?: string; imageUrl?: string }) =>
+      lireekApi.createLyricsSet({ artist_id: nav.selectedArtist!.id, album: albumName, image_url: imageUrl }),
+    onSuccess: async (res, { albumName }) => {
+      showToast(`Created ${albumName || 'lyrics collection'}`);
+      if (nav.selectedArtist) await loadAlbums(nav.selectedArtist.id);
+      handleSelectAlbum(res.lyrics_set);
+    },
+  });
+
+  const addSongMut = useMutation({
+    mutationFn: ({ albumId, title, lyrics }: { albumId: number; title: string; lyrics: string }) =>
+      lireekApi.addSongToSet(albumId, { title, lyrics }),
+    onSuccess: (updated, { title }) => {
+      showToast(`Added "${title}"`);
+      setNav(prev => ({ ...prev, selectedAlbum: updated }));
+    },
+  });
+
+  const handleAddArtistManual = useCallback(async (name: string, imageUrl?: string) => {
+    try { await addArtistMut.mutateAsync({ name, imageUrl }); } catch { /* interceptor notified */ }
+  }, [addArtistMut]);
 
   const handleAddAlbumManual = useCallback(async (albumName: string | undefined, imageUrl?: string) => {
     if (!nav.selectedArtist) return;
-    try {
-      const res = await lireekApi.createLyricsSet({ artist_id: nav.selectedArtist.id, album: albumName, image_url: imageUrl });
-      showToast(`Created ${albumName || 'lyrics collection'}`);
-      await loadAlbums(nav.selectedArtist.id);
-      handleSelectAlbum(res.lyrics_set);
-    } catch (err: any) { showToast(`Failed to create album: ${err.message}`); }
-  }, [nav.selectedArtist, loadAlbums, handleSelectAlbum, showToast]);
+    try { await addAlbumMut.mutateAsync({ albumName, imageUrl }); } catch { /* interceptor notified */ }
+  }, [nav.selectedArtist, addAlbumMut]);
 
   const handleAddSong = useCallback(async (title: string, lyrics: string) => {
     if (!nav.selectedAlbum) return;
-    try {
-      const updated = await lireekApi.addSongToSet(nav.selectedAlbum.id, { title, lyrics });
-      showToast(`Added "${title}"`);
-      setNav(prev => ({ ...prev, selectedAlbum: updated }));
-    } catch (err: any) { showToast(`Failed to add song: ${err.message}`); }
-  }, [nav.selectedAlbum, showToast]);
+    try { await addSongMut.mutateAsync({ albumId: nav.selectedAlbum.id, title, lyrics }); } catch { /* interceptor notified */ }
+  }, [nav.selectedAlbum, addSongMut]);
 
   const handleCuratedComplete = useCallback(async (lyricsSet: any) => {
     if (nav.selectedArtist) await loadAlbums(nav.selectedArtist.id);
@@ -709,6 +762,10 @@ export const LyricStudioV2: React.FC = () => {
                         onRefresh={refreshAlbumData} showToast={showToast}
                         profilingModel={modelSelections.profiling} />
                     )}
+                    {activeTab === 'write-lyrics' && (
+                      <WriteLyricsTab key={nav.selectedAlbum.id} lyricsSetId={nav.selectedAlbum.id}
+                        onRefresh={refreshAlbumData} onViewLyrics={() => handleTabChange('written-songs')} />
+                    )}
                     {activeTab === 'written-songs' && (
                       <WrittenSongsTab generations={generations} profiles={profiles}
                         lyricsSetId={nav.selectedAlbum.id}
@@ -777,7 +834,6 @@ export const LyricStudioV2: React.FC = () => {
         profilingModel={modelSelections.profiling} generationModel={modelSelections.generation}
         refinementModel={modelSelections.refinement} showToast={showToast}
         onFetchComplete={async () => {
-          await loadArtists();
           if (nav.selectedArtist) loadAlbums(nav.selectedArtist.id);
           try {
             await Promise.all([lireekApi.listLyricsSets(), lireekApi.listProfiles()]);

@@ -3,8 +3,8 @@
 // POST /api/shutdown — stops ace-server, Vite (dev only) and the Node process tree
 // POST /api/restart  — stops and relaunches (writes marker for the loop wrapper)
 //
-// SAFETY: we only kill processes we own — the ace-server child (via
-// stopAceServer), the dev Vite server on :3000 (only when dev.bat set
+// SAFETY: we only kill processes we own — the ace-server children (via
+// stopAllEngines), the dev Vite server on :3000 (only when dev.bat set
 // HOT_STEP_DEV), and our own parent on Windows (tsx / tsx watch).
 
 import { Router } from 'express';
@@ -16,7 +16,7 @@ import { closeDb } from '../db/database.js';
 import { getDataLocation, getBusyBlockers } from '../dataroot/pointer.js';
 import { closeLogger } from '../services/logger.js';
 import { killActiveChildren } from '../services/training/labelingQueue.js';
-import { stopAceServer } from '../services/aceEngineProcess.js';
+import { stopAllEngines } from '../services/aceEngineProcess.js';
 import type { ShutdownResponse, RestartResponse } from '../contracts/shutdown.js';
 
 const router = Router();
@@ -123,7 +123,8 @@ function killSelf(): void {
     try {
       spawn('taskkill', ['/PID', String(parentPid), '/T', '/F'], {
         detached: true, stdio: 'ignore', windowsHide: true,
-      }).unref();
+      }).on('error', err => console.error(`[Shutdown] taskkill of ${parentPid} failed: ${err.message}`))
+        .on('exit', (code, signal) => console.log(`[Shutdown] taskkill of ${parentPid} exited: code=${code}, signal=${signal}`)).unref();
     } catch { /* fallback: process.exit below still runs */ }
   }, 500);
 }
@@ -136,15 +137,16 @@ async function stopEverything(restart: boolean): Promise<void> {
   killTrainingChildren();
   // Through the owning module so the exit handler knows this was deliberate —
   // the old port-based taskkill made it log "crash 1/3, restarting in 3 s".
-  await stopAceServer(restart ? 'Server restarting' : 'Server shutting down', 15_000, { suspend: false });
+  await stopAllEngines(restart ? 'Server restarting' : 'Server shutting down', 15_000, { suspend: false });
   closeDb();
-  closeLogger();
   if (!restart) killVite();
   // Portable restart: HOT-Step.bat runs node directly, so our parent IS the
   // restart loop — exiting is enough there. Every other case needs the tree kill.
   if (!restart || !PORTABLE_MODE) killSelf();
   setTimeout(() => {
     console.log(restart ? '[Server] Exiting for restart.' : '[Server] Exiting.');
+    // Keep the log open for the delayed taskkill callbacks until final exit.
+    closeLogger();
     process.exit(0);
   }, 1000);
 }

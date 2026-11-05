@@ -10,6 +10,7 @@ import { create } from 'zustand';
 import type { GenerationParams, LmRepMode, StableStepBackend, StableStepBlendMode } from '../types';
 import { DEFAULT_SETTINGS, type AppSettings } from '../components/settings/SettingsPanel';
 import { useBackendStore } from './backendStore';
+import { apiClient } from '../services/httpClient';
 
 // -- Types --
 
@@ -118,6 +119,10 @@ export const GLOBAL_PARAM_DEFAULTS = {
   lmTopK: 0,
   lmTopP: 0.92,
   lmRepPenalty: 1.1,
+  lmMinP: 0,
+  lmCfgMinP: 0,
+  lmCfgLogprob: false,
+  lmCfgRescale: 0,
   lmRepWindow: 64,
   lmRepMode: 'presence' as LmRepMode,
   lmDryBase: 1.75,
@@ -298,11 +303,11 @@ function hydrateBackendScoped(backendId: string = activeBackendId()): Record<str
  */
 function mirrorActiveModels(patch: Record<string, string>): void {
   try {
-    void fetch('/api/training/active-models', {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(patch),
-    }).catch(() => { /* offline / server down — retried on the next change and at boot */ });
+    // silent: this is a best-effort mirror with no UI of its own — failures are
+    // retried on the next change and at boot, so the global toast would only
+    // be noise.
+    void apiClient.put('/training/active-models', patch, { silent: true })
+      .catch(() => { /* offline / server down — retried on the next change and at boot */ });
   } catch { /* never let a model change throw */ }
 }
 
@@ -416,6 +421,10 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   lmTopK: readKey("hs-lmTopK", GLOBAL_PARAM_DEFAULTS.lmTopK),
   lmTopP: readKey("hs-lmTopP", GLOBAL_PARAM_DEFAULTS.lmTopP),
   lmRepPenalty: readKey("hs-lmRepPenalty", GLOBAL_PARAM_DEFAULTS.lmRepPenalty),
+  lmMinP: readKey("hs-lmMinP", GLOBAL_PARAM_DEFAULTS.lmMinP),
+  lmCfgMinP: readKey("hs-lmCfgMinP", GLOBAL_PARAM_DEFAULTS.lmCfgMinP),
+  lmCfgLogprob: readKey("hs-lmCfgLogprob", GLOBAL_PARAM_DEFAULTS.lmCfgLogprob),
+  lmCfgRescale: readKey("hs-lmCfgRescale", GLOBAL_PARAM_DEFAULTS.lmCfgRescale),
   lmRepWindow: readKey("hs-lmRepWindow", GLOBAL_PARAM_DEFAULTS.lmRepWindow),
   lmRepMode: readKey<LmRepMode>("hs-lmRepMode", GLOBAL_PARAM_DEFAULTS.lmRepMode),
   lmDryBase: readKey("hs-lmDryBase", GLOBAL_PARAM_DEFAULTS.lmDryBase),
@@ -626,6 +635,10 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   setLmTopK: (v: any) => { set({ lmTopK: v }); writeKey("hs-lmTopK", v); },
   setLmTopP: (v: any) => { set({ lmTopP: v }); writeKey("hs-lmTopP", v); },
   setLmRepPenalty: (v: any) => { set({ lmRepPenalty: v }); writeKey("hs-lmRepPenalty", v); },
+  setLmMinP: (v: any) => { set({ lmMinP: v }); writeKey("hs-lmMinP", v); },
+  setLmCfgMinP: (v: any) => { set({ lmCfgMinP: v }); writeKey("hs-lmCfgMinP", v); },
+  setLmCfgLogprob: (v: any) => { set({ lmCfgLogprob: v }); writeKey("hs-lmCfgLogprob", v); },
+  setLmCfgRescale: (v: any) => { set({ lmCfgRescale: v }); writeKey("hs-lmCfgRescale", v); },
   setLmRepMode: (v: any) => { set({ lmRepMode: v }); writeKey("hs-lmRepMode", v); },
   setLmDryBase: (v: any) => { set({ lmDryBase: v }); writeKey("hs-lmDryBase", v); },
   setLmDryMinLen: (v: any) => { set({ lmDryMinLen: v }); writeKey("hs-lmDryMinLen", v); },
@@ -729,6 +742,9 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   getGlobalParams: (overrides?: Record<string, any>): Partial<GenerationParams> => {
     const s = overrides ? { ...get(), ...overrides } : get();
     const settings: AppSettings = readKey('ace-settings', DEFAULT_SETTINGS);
+    const backendState = useBackendStore.getState();
+    const heartmulaModels = backendState.activeBackendId === 'heartmula'
+      ? backendState.models.heartmula?.defaults : undefined;
 
     // Effective adapter stack: the multi-adapter list when in Advanced mode,
     // otherwise the single `adapter` folded into a one-element stack. `primary`
@@ -799,6 +815,17 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       // object literal, so a backend can never shadow a core field by picking a
       // colliding key.
       ...(s.backendParams || {}),
+      ...(backendState.activeBackendId === 'heartmula' ? { backendOverride: 'heartmula' } : {}),
+      // Freeze component choices with queued requests, including an explicit
+      // empty adapter so a later selection cannot change a base-model job.
+      ...(heartmulaModels ? {
+        heartmulaVariant: String(heartmulaModels.variant ?? ''),
+        heartmulaGlobalModel: String(heartmulaModels.global ?? ''),
+        heartmulaLocalModel: String(heartmulaModels.local ?? ''),
+        heartmulaFlowModel: String(heartmulaModels.flow ?? ''),
+        heartmulaScalarDecoderModel: String(heartmulaModels.scalar_decoder ?? ''),
+        heartmulaAdapter: String(heartmulaModels.lmAdapter ?? ''),
+      } : {}),
       // Multi-backend: which engine backend this request targets. Read directly
       // from backendStore (not a globalParamsStore field) so it's always the
       // live active id; defaults to 'ace' for installs with no second backend
@@ -858,7 +885,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       inferMethod: s.inferMethod, scheduler: s.scheduler, guidanceMode: s.guidanceMode,
       seed: s.seed, randomSeed: s.randomSeed,
       lmSeed: s.lmSeed, lmSeedFollowsDit: s.lmSeedFollowsDit,
-      batchSize: s.batchSize,
+      batchSize: Math.min(s.batchSize, backendState.capabilities[backendState.activeBackendId]?.core.batch.max ?? s.batchSize),
       storkSubsteps: (s.inferMethod === 'stork2' || s.inferMethod === 'stork4') ? s.storkSubsteps : undefined,
       beatStability: s.inferMethod === 'jkass_fast' ? s.beatStability : undefined,
       frequencyDamping: s.inferMethod === 'jkass_fast' ? s.frequencyDamping : undefined,
@@ -870,6 +897,10 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       lmTemperature: s.lmTemperature, lmCfgScale: s.lmCfgScale,
       lmTopK: s.lmTopK, lmTopP: s.lmTopP, lmNegativePrompt: s.lmNegativePrompt,
       lmRepPenalty: s.lmRepPenalty > 1.0 ? s.lmRepPenalty : undefined,
+      lmMinP: s.lmMinP > 0 ? s.lmMinP : undefined,
+      lmCfgMinP: s.lmCfgMinP > 0 ? s.lmCfgMinP : undefined,
+      lmCfgLogprob: s.lmCfgLogprob || undefined,
+      lmCfgRescale: s.lmCfgRescale > 0 ? s.lmCfgRescale : undefined,
       lmRepWindow: s.lmRepPenalty > 1.0 ? s.lmRepWindow : undefined,
       lmRepMode: s.lmRepPenalty > 1.0 ? s.lmRepMode : undefined,
       lmDryBase: (s.lmRepPenalty > 1.0 && s.lmRepMode === 'dry') ? s.lmDryBase : undefined,

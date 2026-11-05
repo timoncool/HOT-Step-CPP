@@ -176,6 +176,8 @@ interface Props {
   disabled?: boolean;
   starting?: boolean;
   onStart: () => void;
+  /** Place the controls inside a folding stage while keeping its validated action visible. */
+  renderLayout?: (controls: React.ReactNode, action: React.ReactNode) => React.ReactNode;
   /** The one `vram` metric event of the live/last run (4B plan §1.3). null
    *  before the engine has reported, in which case the static per-size hint
    *  stands on its own. */
@@ -186,7 +188,7 @@ interface Props {
 }
 
 export const TrainLmForm: React.FC<Props> = ({
-  capabilities, value, onChange, disabled, starting, onStart, vram,
+  capabilities, value, onChange, disabled, starting, onStart, vram, renderLayout,
 }) => {
   const { t } = useTranslation();
 
@@ -267,7 +269,7 @@ export const TrainLmForm: React.FC<Props> = ({
     />
   );
 
-  return (
+  const controls = (
     <div className="flex flex-col gap-4">
       {/* ── Base size ─────────────────────────────────────────────────── */}
       <div className="flex flex-col gap-1.5">
@@ -490,7 +492,7 @@ export const TrainLmForm: React.FC<Props> = ({
           onChange={(v) => onChange({ regEvery: v ? 3 : 0 })}
           label={t('trainingStudio.train.priorPreservation')}
           info={t('trainingStudio.train.priorPreservationInfo')}
-          meta="Default on · every 3rd step"
+          meta="Default off · every 3rd step when on"
           className="mt-1"
           defaultValue={D.regEvery > 0}
         />
@@ -578,7 +580,7 @@ export const TrainLmForm: React.FC<Props> = ({
           </div>
 
           <div className="flex flex-col gap-1.5">
-            {P('lm.optimizer', 'Default Prodigy (auto step size) · Muon and AdamW supported', { onReset: onReset('optimizer') })}
+            {P('lm.optimizer', 'Default AdamW · Prodigy (auto step size) and Muon supported', { onReset: onReset('optimizer') })}
             <StyledSelect
               accent="amber"
               value={value.optimizer}
@@ -939,17 +941,19 @@ export const TrainLmForm: React.FC<Props> = ({
           {t('trainingStudio.preprocess.engineDownForModels')}
         </div>
       )}
-
+    </div>
+  );
+  const action = (
       <button
         onClick={onStart}
         disabled={lock || noLmForSize || !adapterNameOk || value.stages.length === 0}
-        className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
       >
         {starting ? <Loader2 size={15} className="animate-spin" /> : <Cpu size={15} />}
         {t('trainingStudio.train.start')}
       </button>
-    </div>
   );
+  return <>{renderLayout ? renderLayout(controls, action) : <div className="flex flex-col gap-4">{controls}{action}</div>}</>;
 };
 
 export default TrainLmForm;

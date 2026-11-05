@@ -5,6 +5,7 @@
 
 import type { Song } from '../types';
 import { resolveExports } from '../services/exportImportApi';
+import { HttpStatus } from '../services/httpClient';
 
 type AudioFormat = 'wav' | 'flac' | 'opus' | 'mp3';
 type DownloadVersion = 'original' | 'mastered' | 'both';
@@ -69,7 +70,7 @@ async function triggerDownload(url: string): Promise<void> {
     triggerBrowserDownload(url);
     return;
   }
-  if (res.status === 409) { triggerBrowserDownload(url); return; }
+  if (res.status === HttpStatus.conflict) { triggerBrowserDownload(url); return; }
   const body = await res.json().catch(() => null);
   window.dispatchEvent(new CustomEvent('hotstep:download-saved', {
     detail: res.ok ? { path: body?.path } : { error: body?.error || `HTTP ${res.status}` },

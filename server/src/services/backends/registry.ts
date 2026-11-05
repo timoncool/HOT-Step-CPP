@@ -12,6 +12,7 @@ import { aceBackend } from './ace/index.js';
 import { minimaxBackend } from './minimax/index.js';
 import { yue2Backend } from './yue2/index.js';
 import { sa3Backend } from './sa3/index.js';
+import { heartmulaBackend } from './heartmula/index.js';
 
 const SETTING_KEY = 'active_backend_id';
 const DEFAULT_BACKEND_ID = 'ace';
@@ -26,6 +27,7 @@ const backends: Record<string, EngineBackend> = {
   // HOT-Step: Stable Audio 3 as a primary backend (backends/sa3/). Last in
   // the toggle, after the two it does not change.
   sa3: sa3Backend,
+  heartmula: heartmulaBackend,
 };
 
 /** Look up a backend by id, or undefined if unregistered. */

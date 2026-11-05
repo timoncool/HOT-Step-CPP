@@ -27,8 +27,8 @@ test('Repaint and player variants share the LRC request and sidecar invalidation
     const results = await Promise.all([client.query(studio), client.query(player)]);
     assert.deepEqual(results, ['[00:01] Words', '[00:01] Words']);
     assert.equal(calls, 1);
-    const { invalidateSidecars } = await import('../keys');
-    await invalidateSidecars(client);
+    const { queryManager } = await import('../invalidation');
+    await queryManager.sidecars.all(client);
     assert.equal(client.getQueryState(studio.queryKey)?.isInvalidated, true);
   } finally { globalThis.fetch = original; client.clear(); }
 });
@@ -115,6 +115,27 @@ test('lyrics follow the selected source and distinguish missing sidecars from er
     globalThis.fetch = async () => json({}, 403);
     await assert.rejects(client.query(lyricsOptions('/audio/forbidden.wav')), /403/);
   } finally { globalThis.fetch = original; client.clear(); }
+});
+
+test('repeated identical snapshots reach onData only with deliverRepeats', async () => {
+  queryClient.clear();
+  const key = serverKey('studios/test-repeats', { id: 'repeat-job' });
+  let value = { status: 'running' };
+  let deliveries = 0;
+  const read = async () => value;
+  const active = (snapshot: { status: string }) => snapshot.status === 'running';
+  try {
+    const done = waitForSnapshot(key, read, active, () => { deliveries++; }, { deliverRepeats: true });
+    await tick();
+    await queryClient.refetchQueries({ queryKey: key });
+    await tick();
+    // The second poll returned the same object; a cancellation-checking
+    // caller still needs its onData tick.
+    assert.equal(deliveries, 2);
+    value = { status: 'done' };
+    await queryClient.refetchQueries({ queryKey: key });
+    assert.deepEqual(await done, { status: 'done' });
+  } finally { queryClient.clear(); }
 });
 
 test('imperative workflow wait uses one shared query and detaches observers at terminal status', async () => {

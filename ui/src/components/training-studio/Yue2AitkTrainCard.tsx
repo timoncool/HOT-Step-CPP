@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { yue2SamplerSnapshot } from '../../stores/globalParamsStore';
 import { AlertTriangle, Download, Loader2, Play, RotateCcw, Save, Upload, X } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -6,10 +6,10 @@ import { useTranslation } from 'react-i18next';
 import { YUE2_JOINT_BASE_MATCHED_DEFAULTS, YUE2_JOINT_BASE_MATCHED_VALUES, YUE2_JOINT_FIXED_RECIPE_DROPOUTS, YUE2_JOINT_FORM_DEFAULTS, YUE2_JOINT_LADDER_PREVIEW, YUE2_JOINT_LEGACY_VALUES, YUE2_JOINT_LOKR_STOP, YUE2_JOINT_LORA_STOP, YUE2_JOINT_PRESETS, YUE2_JOINT_TUNED_KEYS } from '../../../../server/src/contracts/trainingRecipes';
 import { pollWhile } from '../../queries/contract';
 import { trainingQueries } from '../../queries/training-data/queries';
-import { useJobSelection, useReload, useScopedId } from '../../queries/training-runs/hooks';
-import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { useJobSelection, useReload, useRunEvents, useScopedId } from '../../queries/training-runs/hooks';
+import { activeJob as isActiveJob, runQueries, trainingWritePlan } from '../../queries/training-runs/queries';
+import { waitForQuery } from '../../queries/wait';
 
-import { usePersistedState } from '../../hooks/usePersistedState';
 import { preferencesApi } from '../../services/preferencesApi';
 import { subscribeEventSource } from '../../services/sharedEventSource';
 import {
@@ -19,6 +19,7 @@ import {
   jobStreamUrl,
   pickLadderRun,
   startYue2AitkPrepare,
+  updateYue2JointIntervals,
   type TrainingJobSummary,
   type TrainingMetricEvent,
   type TrainingStreamEvent,
@@ -34,12 +35,15 @@ import { formatMB, yue2AdapterHalfBytes } from '../../utils/yue2AdapterSize';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
+import { PreviewField, TrainingPreviewSettings, TrainingCheckpointLadder, TrainingRunPicker, TrainingPresetChoice } from './TrainingPreviewPanel';
+import { TrainingRunPanel } from './Yue2StageCard';
 import { Yue2LadderReview } from './Yue2LadderReview';
 import { Yue2OptimizerFields } from './Yue2OptimizerFields';
 import { Yue2SplitChart } from './Yue2SplitChart';
 import { reduceYue2Metric, type Yue2Point } from './yue2ChartData';
-import { captureJointOverrides, submitJointStart } from './yue2JointCommand';
+import { attachHoldout, captureJointOverrides, submitJointStart } from './yue2JointCommand';
 import { YUE2_JOINT_PRESETS_KEY, type Yue2JointPreset } from './yue2JointPresets';
+import { useActiveTrainingJob } from '../../queries/training-runs/hooks';
 
 const JOB_KEY = 'hs-yue2-aitk-job:';
 export const FORM_KEY = 'hs-yue2-aitk-form:';
@@ -47,15 +51,8 @@ export const PREP_KEY = 'hs-yue2-aitk-prepare:';
 // These dataset-scoped keys are local editing drafts; the accepted operation
 // carries its own captured form and source revisions.
 const METRIC_CAP = 2000;
-// Chart caches (~120 KB a run) were never deleted and filled the 5 MB storage
-// quota, after which every unguarded write on the Train page threw and blanked
-// it. Clear them once per page load, before any other write; a live job's
-// stream replays its history, and the card below keeps only the job on screen.
-try {
-  if (typeof window !== 'undefined') for (const key of Object.keys(window.localStorage)) {
-    if (key.startsWith(JOB_KEY) && key.includes(':metrics:')) window.localStorage.removeItem(key);
-  }
-} catch { /* storage unavailable */ }
+// The card prunes other jobs' chart caches when selecting a job. Preserve
+// the displayed job across page loads so terminal history needs no replay.
 // `loss` is absent once the planner is frozen: the trainer then reports only
 // the decoder's terms and the composite has no AR part. Those steps still
 // count for progress, pace and the gradient norm.
@@ -119,6 +116,12 @@ function jointEta(points: JointStepPoint[], form: Yue2JointTrainRequest): string
 const PRESET_EXCLUDED_KEYS: ReadonlySet<keyof Yue2JointTrainRequest> = new Set([
   'trainingMethod', 'autoPrepare', 'preparation', 'checkpoint', 'dataset', 'output', 'resume', 'alignmentEnabled', 'gpuUuid',
 ]);
+/** The recipe default for the chosen adapter type: picking LoRA/DoRA fills
+ *  alpha and the KL stop, which are that type's defaults, not edits (#318).
+ *  The adapter type itself still shows as changed. */
+export function baselineFor(f: Pick<Yue2JointTrainRequest, 'adapterType' | 'rank'>): Record<string, unknown> {
+  return { ...DEFAULT_FORM, ...((f.adapterType ?? 'lora') === 'lokr' ? LOKR_STOP : { alpha: f.rank ?? 64, ...LORA_STOP }) } as unknown as Record<string, unknown>;
+}
 function snapshotPresetSettings(form: Yue2JointTrainRequest, lyricTiming: boolean): Partial<Yue2JointTrainRequest> {
   const settings: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(form)) {
@@ -408,9 +411,52 @@ export function createPresetLoadGate() {
   };
 }
 
+/** GH #307: change the checkpoint and preview interval of the run training
+ *  now. Blank fields stay as they are; the trainer takes the rest up between
+ *  steps. Preview every shows only on a run that pauses for previews. */
+const LiveIntervals: React.FC<{ datasetId: string; jobId: string; worker?: string | null; options?: Record<string, unknown> }> = ({ datasetId, jobId, worker, options }) => {
+  const { t } = useTranslation();
+  const preview = options?.preview as Yue2JointPreviewOptions | undefined;
+  const [saveEvery, setSaveEvery] = useState('');
+  const [previewEvery, setPreviewEvery] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState('');
+  const current = { saveEvery: typeof options?.saveEvery === 'number' ? options.saveEvery : undefined, previewEvery: preview?.enabled && preview.everySteps > 0 ? preview.everySteps : undefined };
+  const apply = async () => {
+    setBusy(true); setNote('');
+    try {
+      const done = await updateYue2JointIntervals(datasetId, jobId, {
+        ...(saveEvery ? { saveEvery: Number(saveEvery) } : {}), ...(previewEvery ? { previewEvery: Number(previewEvery) } : {}) }, { worker });
+      setSaveEvery(''); setPreviewEvery('');
+      setNote(t('trainingStudio.yue2.method.intervalsApplied', 'Now: checkpoint every {{save}}', { save: done.saveEvery })
+        + (done.previewEvery ? t('trainingStudio.yue2.method.intervalsAppliedPreview', ', preview every {{preview}}', { preview: done.previewEvery }) : ''));
+    } catch (err) { setNote(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  };
+  const field = 'w-24 px-2 py-1 rounded-lg text-xs bg-white/70 dark:bg-black/20 border border-zinc-300/70 dark:border-white/10 text-zinc-800 dark:text-zinc-100';
+  return (
+    <div className="mt-2 flex items-end gap-3 flex-wrap">
+      <label className="flex flex-col gap-1">
+        <ParamLabel label={t('trainingStudio.yue2.method.liveSaveEvery', 'Checkpoint every')} className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider"
+          info={t('trainingStudio.yue2.method.liveSaveEveryInfo', 'Change how often this run saves a checkpoint, without stopping it. Counted from step 0: 50 saves at 50, 100, 150 and so on. Takes effect after the step in progress.')} />
+        <input className={field} type="number" min={1} value={saveEvery} placeholder={current.saveEvery === undefined ? '' : String(current.saveEvery)} onChange={e => setSaveEvery(e.target.value)} />
+      </label>
+      {current.previewEvery !== undefined && <label className="flex flex-col gap-1">
+        <ParamLabel label={t('trainingStudio.yue2.method.livePreviewEvery', 'Preview every')} className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider"
+          info={t('trainingStudio.yue2.method.livePreviewEveryInfo', 'Change how many steps this run trains between preview pauses, counted from the last pause. If the new pause is already behind the current step, the run pauses for a preview after the step in progress.')} />
+        <input className={field} type="number" min={1} value={previewEvery} placeholder={String(current.previewEvery)} onChange={e => setPreviewEvery(e.target.value)} />
+      </label>}
+      <button type="button" onClick={() => void apply()} disabled={busy || (!saveEvery && !previewEvery)}
+        className="px-3 py-1 rounded-lg text-xs font-semibold bg-amber-500/80 text-black hover:bg-amber-400 disabled:opacity-40">
+        {t('trainingStudio.yue2.method.liveApply', 'Apply to this run')}
+      </button>
+      {note && <span className="text-[11px] text-zinc-600 dark:text-zinc-400">{note}</span>}
+    </div>
+  );
+};
+
 export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: string; cursorReady?: boolean; lyricTiming: boolean; onLyricTimingChange: (value: boolean) => void; onTimingLockedChange?: (locked: boolean) => void; exposeStart?: (fn: () => Promise<Record<string, unknown>>) => void }> = ({ datasetId, legacyManifest, cursorReady = false, lyricTiming, onLyricTimingChange, onTimingLockedChange, exposeStart }) => {
   const { t } = useTranslation();
-  const [blindRungs] = usePersistedState('hs-yue2-blind-rungs', true);
   const [form, setForm] = useState<Yue2JointTrainRequest>(() => readStoredForm(datasetId));
   const latestForm = useRef(form);
   latestForm.current = form;
@@ -418,7 +464,22 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
   latestLyricTiming.current = lyricTiming;
   const presetLoadRequest = useRef(0);
   const trainingWorker = useTrainingStore(s => s.trainingWorker);
-  const [job, setJob] = useJobSelection(trainingWorker, datasetId);
+  const client = useQueryClient();
+  // Keep the canonical Query owner, with the persisted terminal chart also
+  // gating the bridge if the HTTP snapshot briefly lags completion.
+  const [jobId, selectJob] = useScopedId(trainingWorker, datasetId);
+  const jobQuery = useQuery({ ...trainingQueries.job(trainingWorker, jobId), enabled: !!jobId,
+    refetchInterval: pollWhile<TrainingJobSummary>(isActiveJob) });
+  const job = jobQuery.data ?? null;
+  const cachedTerminal = useMemo(() => {
+    const saved = readStored<{ status?: TrainingJobSummary['status'] }>(`${JOB_KEY}${datasetId}:metrics:${jobId}`, {});
+    return !!saved.status && !isActiveJob({ status: saved.status });
+  }, [datasetId, trainingWorker, jobId]);
+  useRunEvents(job && isActiveJob(job) && !cachedTerminal ? job.id : null, trainingWorker);
+  const setJob = (selected: TrainingJobSummary | null) => {
+    if (selected) client.setQueryData(trainingQueries.job(trainingWorker, selected.id).queryKey, selected);
+    selectJob(selected?.id ?? '');
+  };
   const [jointPipelineId, setJointPipelineId] = useScopedId(trainingWorker, datasetId);
   // Tracks with no .yue2.txt are re-captioned from the audio before training
   // (on by default): otherwise they train on the long ACE caption. Gemini's
@@ -432,23 +493,38 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
     ? savedCaption.provider : captionDefault;
   const autoCaption = form.autoCaption === false || !captionProvider ? null
     : { provider: captionProvider, ...(captionProvider === 'gemini' && savedCaption?.model ? { model: savedCaption.model } : {}) };
-  const [captioning, setCaptioning] = useState<TrainingJobSummary | null>(null);
-  const captionMissing = async () => {
-    if (!autoCaption) return;
-    const started = await runCommand(client, trainingWorker, () => captionMissingYue2(datasetId, autoCaption, { worker: trainingWorker }));
-    if (!started.jobId) return;
-    let j = await client.query(trainingQueries.job(trainingWorker, started.jobId));
-    setCaptioning(j);
-    while (j.status === 'queued' || j.status === 'running') {
-      await new Promise(r => setTimeout(r, 1500));
-      j = await client.query(trainingQueries.job(trainingWorker, started.jobId));
-      setCaptioning(j);
-    }
-    setCaptioning(null);
-    if (j.status !== 'done') throw new Error(`Captioning failed: ${j.error || j.status}`);
-    const left = (await captionMissingYue2(datasetId, { checkOnly: true }, { worker: trainingWorker })).missing ?? 0;
-    if (left) throw new Error(`${left} track(s) still have no YuE2 caption after captioning; see the Label log on the Dataset page. Not training on the ACE captions.`);
-  };
+  const [captionJobId, setCaptionJobId] = useState<string | null>(null);
+  // The progress line renders the one job cache entry. The waiter below polls
+  // that same entry, so this observer only reads it — a second cadence here
+  // would fetch the job twice.
+  const captionQuery = useQuery({
+    ...trainingQueries.job(trainingWorker, captionJobId ?? ''),
+    enabled: !!captionJobId,
+    refetchInterval: false,
+  });
+  const captioning = captionJobId ? captionQuery.data ?? null : null;
+  // No onError: the caller's catch (run, or the run-all orchestrator) sets the
+  // error line, as before; the service is silent so that line is sole notifier.
+  const captionStartMut = useMutation({
+    mutationFn: async (cap: { provider: 'gemini' | 'moss'; model?: string }) => {
+      const started = await captionMissingYue2(datasetId, cap, { worker: trainingWorker });
+      // The stages list shows the captioning job as soon as it starts.
+      await trainingWritePlan(client, trainingWorker);
+      if (!started.jobId) return;
+      setCaptionJobId(started.jobId);
+      // The one non-React waiter owns the cadence (1.5 s active, backing off
+      // while failing) instead of a hand-rolled loop with its own timer.
+      const j = await waitForQuery<TrainingJobSummary>(
+        trainingQueries.job(trainingWorker, started.jobId),
+        job => isActiveJob(job),
+      );
+      setCaptionJobId(null);
+      if (j.status !== 'done') throw new Error(`Captioning failed: ${j.error || j.status}`);
+      const left = (await captionMissingYue2(datasetId, { checkOnly: true }, { worker: trainingWorker })).missing ?? 0;
+      if (left) throw new Error(`${left} track(s) still have no YuE2 caption after captioning; see the Label log on the Dataset page. Not training on the ACE captions.`);
+    },
+  });
+  const captionMissing = () => { if (!autoCaption) return; return captionStartMut.mutateAsync(autoCaption); };
   const [commandError, setError] = useState('');
   const [starting, setStarting] = useState(false);
   // Saved presets keep their names and settings; only the leftover tuned-era
@@ -516,6 +592,16 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
   // A batch draft turns this card into the recipe editor for N datasets: the
   // form is the same, Start sends it to the server-side batch instead of one
   // run, and the per-dataset paths are resolved per item by the runner.
+  // The batch write targets runOn, so its invalidation plans for runOn too —
+  // planning the local trainingWorker left the worker's queues stale. No
+  // onError: runBatch's catch sets the error line (sole notifier).
+  const dispatchMut = useMutation({
+    mutationFn: async ({ worker, ...input }: { worker: string } & Parameters<typeof dispatchYue2Batch>[1]) => {
+      await dispatchYue2Batch(worker, input);
+      return worker;
+    },
+    onSuccess: worker => { void trainingWritePlan(client, worker); },
+  });
   const runBatch = async () => {
     if (!batchDraft?.length || presetLoadGate.current.pending) return;
     setBatchStarting(true); setError('');
@@ -529,7 +615,7 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
         ...(form.preview ? { preview: { ...defaultPreview(form.saveEvery), ...form.preview, sampler: yue2SamplerSnapshot(),
           everySteps: form.preview.parallel ? 0 : form.saveEvery, previewMaxFrames: Math.max(8, Math.min(360, form.preview.seconds || 300)) * 25 } } : {}) };
       if (runOn) {
-        await runCommand(client, trainingWorker, () => dispatchYue2Batch(runOn, { datasetIds: batchDraft, lyricTiming: batchTiming, clearCache: batchClearCache, recipe }));
+        await dispatchMut.mutateAsync({ worker: runOn, datasetIds: batchDraft, lyricTiming: batchTiming, clearCache: batchClearCache, recipe });
         setBatchDraft(null);
         await setTrainingWorker(runOn);
         return;
@@ -540,19 +626,26 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
       setError(err instanceof Error ? err.message : String(err));
     } finally { setBatchStarting(false); }
   };
-  const client = useQueryClient();
   const runsQuery = useQuery({ ...runQueries.jointRuns(datasetId),
     refetchInterval: pollWhile<Awaited<ReturnType<typeof import('../../services/trainingApi').listYue2AitkRuns>>>(data =>
       !data || data.runs.some(run => run.live) || job?.status === 'queued' || job?.status === 'running', 5000) });
   const aitkRuns = runsQuery.data?.runs ?? [];
   const [resumeChoice, setResumeChoice] = useState('');
   const [liveMetric, setLiveMetric] = useState<TrainingMetricEvent | null>(null);
+  const [gateReading, setGateReading] = useState<TrainingMetricEvent['plannerGate']>();
+  const gate = form.plannerGate;
+  // On a resume the run's own gate and split apply; the preview is for new runs.
+  const gateResuming = !!resumeChoice || !!form.resume?.trim();
+  const holdoutQuery = useQuery({ ...runQueries.holdout(trainingWorker, datasetId, gate?.evalSeed ?? 42), enabled: !!gate && !gateResuming });
+  // What Decoder steps held before the gate raised it, so switching the gate off puts it back.
+  const narBeforeGate = useRef<number | undefined>(undefined);
   const [chartVram, setChartVram] = useState<number>();
   // AITK's joint runner emits step metrics without an epoch stream. Keep the
   // history here in the same step-domain shape used by the legacy YuE2 chart.
   // The job SSE endpoint replays its buffer, so this also reconstructs the
   // curve after a reload or EventSource reconnect.
   const [stepHistory, setStepHistory] = useState<JointStepPoint[]>([]);
+  const [historyUnavailable, setHistoryUnavailable] = useState(false);
   // The KL stop reading at every step, for the chart: the same computation the
   // engine makes, so the line crosses the target where the run stops.
   // The planner freezes at its KL target: from then on steps carry no loss.
@@ -609,23 +702,48 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
 
   useEffect(() => {
     setLiveMetric(null);
+    setGateReading(undefined);
     setChartVram(undefined);
     setStepHistory([]);
+    setHistoryUnavailable(false);
     setMilestones([]);
     setJobLogs([]);
     setShowJobLogs(false);
     if (!job?.id) return;
     const metricKey = `${JOB_KEY}${datasetId}:metrics:${job.id}`;
-    // Only the job on screen keeps a cached chart (see the load-time sweep).
+    // Only the job on screen keeps a cached chart.
     try {
       for (const key of Object.keys(window.localStorage)) {
         if (key.startsWith(JOB_KEY) && key.includes(':metrics:') && !key.startsWith(metricKey)) window.localStorage.removeItem(key);
       }
     } catch { /* storage unavailable */ }
-    const saved = readStored<{ steps?: JointStepPoint[]; milestones?: JointMilestone[] }>(metricKey, {});
+    const saved = readStored<{ steps?: JointStepPoint[]; milestones?: JointMilestone[]; status?: TrainingJobSummary['status']; historyUnavailable?: boolean }>(metricKey, {});
     if (saved.steps?.length) setStepHistory(saved.steps);
     const savedMilestones = readStored<JointMilestone[]>(`${metricKey}:milestones`, saved.milestones ?? []);
     if (savedMilestones.length) setMilestones(savedMilestones);
+    // An uncached finished job needs one replay. Legacy series lack status,
+    // so retain their history when the job itself is known terminal.
+    const complete = !saved.historyUnavailable && (saved.status ? !isActiveJob({ status: saved.status })
+      : !!saved.steps?.length && !isActiveJob(job));
+    if (complete) return;
+    let steps = saved.steps ?? [];
+    let points = savedMilestones;
+    let status: TrainingJobSummary['status'] = 'running';
+    let unavailable = false;
+    let dirty = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const persist = () => {
+      clearTimeout(timer);
+      timer = undefined;
+      if (!dirty || unavailable) return;
+      writeStored(metricKey, { steps, status });
+      writeStored(`${metricKey}:milestones`, points);
+      dirty = false;
+    };
+    const schedulePersist = () => {
+      dirty = true;
+      timer ??= setTimeout(persist, 1000);
+    };
     const stop = subscribeEventSource(jobStreamUrl(job.id, { worker: trainingWorker }), { message: data => {
       try {
         const item = JSON.parse(data) as TrainingStreamEvent;
@@ -634,33 +752,53 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
         } else if (item.type === 'metric' && item.metric === 'step') {
           setLiveMetric(item);
           if (typeof item.step === 'number' && Number.isFinite(item.step)) {
-            setStepHistory(previous => {
-              const next = reduceYue2Metric(previous, { ...item,
-                // Older trainers lack cumulative time; retain the job-clock fallback.
-                trainMs: item.trainMs ?? (typeof job.startedAt === 'number' && typeof item.ts === 'number'
-                  ? Math.max(0, item.ts - job.startedAt) : undefined),
-              }, METRIC_CAP);
-              writeStored(metricKey, { steps: next });
-              return next;
-            });
+            steps = reduceYue2Metric(steps, { ...item,
+              // Older trainers lack cumulative time; retain the job-clock fallback.
+              trainMs: item.trainMs ?? (typeof job.startedAt === 'number' && typeof item.ts === 'number'
+                ? Math.max(0, item.ts - job.startedAt) : undefined),
+            }, METRIC_CAP);
+            setStepHistory(steps);
+            schedulePersist();
           }
+        } else if (item.type === 'metric' && item.metric === 'eval' && item.plannerGate) {
+          setGateReading(item.plannerGate);
         } else if (item.type === 'metric' && item.metric === 'milestone'
           && typeof item.step === 'number' && typeof item.path === 'string') {
-          setMilestones(previous => {
-            const next = [...previous.filter(point => point.path !== item.path), { epoch: item.step!, loss: item.loss ?? 0, path: item.path! }];
-            writeStored(`${metricKey}:milestones`, next);
-            return next;
-          });
+          points = [...points.filter(point => point.path !== item.path), { epoch: item.step, loss: item.loss ?? 0, path: item.path }];
+          setMilestones(points);
+          schedulePersist();
         } else if (item.type === 'log') {
           const stamp = new Date(item.ts).toLocaleTimeString();
           setJobLogs(previous => [...previous, `${stamp} ${item.level}: ${item.message}`].slice(-100));
         } else if (item.type === 'status' && !['queued', 'running'].includes(item.status)) {
+          status = item.status;
+          dirty = true;
+          persist();
           stop();
         }
       } catch { /* Ignore malformed replay frames; polling remains authoritative. */ }
+    }, error: () => {
+      // A failed terminal replay is final, and cannot complete a chart cache.
+      if (!isActiveJob(job)) {
+        stop();
+        unavailable = true;
+        dirty = false;
+        clearTimeout(timer);
+        try {
+          window.localStorage.removeItem(metricKey);
+          window.localStorage.removeItem(`${metricKey}:milestones`);
+        } catch { /* storage unavailable */ }
+        setHistoryUnavailable(true);
+      }
+      persist();
+    } }, { replayOnly: !isActiveJob(job), isTerminal: data => {
+      try {
+        const item = JSON.parse(data) as TrainingStreamEvent;
+        return item.type === 'status' && !['queued', 'running'].includes(item.status);
+      } catch { return false; }
     } });
-    return stop;
-  }, [trainingWorker, job?.id, job?.startedAt]);
+    return () => { stop(); persist(); };
+  }, [datasetId, trainingWorker, job?.id, job?.startedAt]);
 
   useEffect(() => {
     setForm(readStoredForm(datasetId));
@@ -735,7 +873,7 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
   // "Perform all stages" runs in the store and can outlive this card: after a
   // page remount it starts training through the old instance, so the job never
   // reaches this one. Adopt any joint job the store reports for this dataset.
-  const storeJob = useTrainingStore(s => s.activeJob);
+  const storeJob = useActiveTrainingJob();
   useEffect(() => {
     if (!storeJob || !isJointJob(storeJob, datasetId) || storeJob.id === job?.id) return;
     setJob(storeJob);
@@ -746,7 +884,7 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
 
   const pipelineQuery = useQuery({ ...runQueries.preparation(jointPipelineId), enabled: !!jointPipelineId });
   const pipelineJobQuery = useQuery({ ...runQueries.preparationJob(jointPipelineId), enabled: !!jointPipelineId,
-    refetchInterval: pollWhile(() => !!jointPipelineId) });
+    refetchInterval: pollWhile<TrainingJobSummary | null>(data => !!jointPipelineId && isActiveJob(data)) });
   useEffect(() => {
     const current = pipelineJobQuery.data;
     if (current && isJointJob(current, datasetId)) {
@@ -819,10 +957,10 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
   // Settings that differ from the recipe defaults, per-run paths excluded
   // (#200). Each one can be reset on its own, or all at once.
   const changedSettings = Object.entries(snapshotPresetSettings(form, lyricTiming))
-    .filter(([key, value]) => JSON.stringify(value) !== JSON.stringify((DEFAULT_FORM as unknown as Record<string, unknown>)[key]));
+    .filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(baselineFor(form)[key]));
   const resetSetting = (key: string) => {
     if (key === 'lyricTiming') { onLyricTimingChange(false); return; }
-    setForm(previous => ({ ...previous, [key]: (DEFAULT_FORM as unknown as Record<string, unknown>)[key] }));
+    setForm(previous => ({ ...previous, [key]: baselineFor(previous)[key] }));
   };
   const resetAllSettings = () => {
     setForm(previous => {
@@ -876,9 +1014,22 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
   const captureJointRequest = async (): Promise<Record<string, unknown>> => {
     const request = presetLoadGate.current.capture(() =>
       captureJointOverrides(form, prepare, lyricTiming, defaultDevice, resumeChoice));
+    // The songs shown on the card are the songs held out: the ids go with the request.
+    if (request.plannerGate && !request.resume && !resumeChoice) {
+      const seed = form.plannerGate?.evalSeed ?? 42;
+      const pick = await client.fetchQuery({ ...runQueries.holdout(trainingWorker, datasetId, seed), staleTime: 0 });
+      if (pick.error) throw new Error(pick.error);
+      attachHoldout(request, pick.holdoutIds);
+    }
     if (!resumeChoice && !form.resume?.trim()) await captionMissing();
     return request;
   };
+  // No onError: a failed start rejects into run's catch, which sets the
+  // error line (sole notifier), as before.
+  const prepareStartMut = useMutation({
+    mutationFn: (snapshot: Parameters<typeof preparationApi.startYue2Preparation>[0]) => preparationApi.startYue2Preparation(snapshot),
+    onSuccess: () => trainingWritePlan(client, trainingWorker),
+  });
   const run = async (): Promise<string | null> => {
     if (presetLoadGate.current.pending) return null;
     const worker = currentWorkerRef();
@@ -887,7 +1038,7 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
       const request = await captureJointRequest();
       const pipeline = await submitJointStart(datasetId, request, {
         getContext: preparationApi.getYue2PreparationContext,
-        start: snapshot => runCommand(client, trainingWorker, () => preparationApi.startYue2Preparation(snapshot)),
+        start: snapshot => prepareStartMut.mutateAsync(snapshot),
       }, undefined, worker);
       // A new run takes the ladder over from whatever was picked before.
       setPickedLadderRun('');
@@ -904,43 +1055,46 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
     startRef.current = captureJointRequest;
     if (exposeStart) exposeStart(() => startRef.current ? startRef.current() : Promise.reject(new Error('Joint form is unavailable')));
   });
-  const prepareDataset = async () => {
-    if (presetLoadGate.current.pending) return;
-    setStarting(true); setError('');
-    try {
-      const result = await runCommand(client, trainingWorker, () => startYue2AitkPrepare(datasetId, { ...prepare,
+  const prepareMut = useMutation({
+    mutationFn: async () => {
+      const result = await startYue2AitkPrepare(datasetId, { ...prepare,
         lyricTiming: form.method === 'fixed-recipe' ? false : lyricTiming,
-        ...(form.method === 'fixed-recipe' ? { captionGrammar: 'fixed-recipe' as const, base: form.base } : {}) }, { worker: trainingWorker }));
-      setPrepareManifest(result.manifest);
-      setAppliedPrepareJobId('');
-      setPrepareJob(await client.query(trainingQueries.job(trainingWorker, result.jobId)));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally { setStarting(false); }
+        ...(form.method === 'fixed-recipe' ? { captionGrammar: 'fixed-recipe' as const, base: form.base } : {}) }, { worker: trainingWorker });
+      return { result, job: await client.query(trainingQueries.job(trainingWorker, result.jobId)) };
+    },
+    onSuccess: r => { setPrepareManifest(r.result.manifest); setAppliedPrepareJobId(''); setPrepareJob(r.job); void trainingWritePlan(client, trainingWorker); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const prepareDataset = () => {
+    if (presetLoadGate.current.pending) return;
+    setError('');
+    void prepareMut.mutateAsync().catch(() => null);
   };
-  const stop = async () => {
+  const pipelineCancelMut = useMutation({
+    mutationFn: (pipelineId: string) => preparationApi.commandYue2Preparation(pipelineId, 'cancel'),
+    onSuccess: () => { void trainingWritePlan(client, trainingWorker); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  // Shared by Stop (train job) and the prepare Stop: silent is threaded through
+  // the target because this card's stop error line is the sole notifier.
+  const cancelMut = useMutation({
+    mutationFn: async (v: { jobId: string; worker: string | null }) => {
+      await cancelJob(v.jobId, { worker: v.worker, silent: true });
+      return client.query(trainingQueries.job(v.worker, v.jobId));
+    },
+    onSuccess: (_measured, v) => { void trainingWritePlan(client, v.worker); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const stop = () => {
     if (!job && !jointPipelineId) return;
     setError('');
-    try {
-      if (jointPipelineId) {
-        await runCommand(client, trainingWorker, () => preparationApi.commandYue2Preparation(jointPipelineId, 'cancel'));
-      } else if (job) {
-        await runCommand(client, trainingWorker, () => cancelJob(job.id, { worker: trainingWorker }));
-        setJob(await client.query(trainingQueries.job(trainingWorker, job.id)));
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    if (jointPipelineId) void pipelineCancelMut.mutateAsync(jointPipelineId).catch(() => null);
+    else if (job) void cancelMut.mutateAsync({ jobId: job.id, worker: trainingWorker }).then(measured => setJob(measured)).catch(() => null);
   };
-  const stopPrepare = async () => {
+  const stopPrepare = () => {
     if (!prepareJob) return;
     setError('');
-    try {
-      await runCommand(client, trainingWorker, () => cancelJob(prepareJob.id, { worker: trainingWorker }));
-      setPrepareJob(await client.query(trainingQueries.job(trainingWorker, prepareJob.id)));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+    void cancelMut.mutateAsync({ jobId: prepareJob.id, worker: trainingWorker }).then(measured => setPrepareJob(measured)).catch(() => null);
   };
   const error = commandError || prepareQuery.error?.message || runsQuery.error?.message || previewsQuery.error?.message || pipelineQuery.error?.message || pipelineJobQuery.error?.message || '';
   const selectResume = (value: string) => {
@@ -970,26 +1124,20 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
     (!!resumeChoice && ['seed', 'device', 'rank', 'alpha', 'adapterType', 'lokrDim', 'lokrFactor', 'saveEvery', 'cursorWeight'].includes(key))
     || active || starting || preparing || yue2RunAllActive;
   const field = (label: string, key: string, type = 'text', source: unknown = form, update?: (value: string) => void, info?: string, meta?: string, onReset?: () => void) => (
-    <label className="flex flex-col gap-1">
-      <ParamLabel label={label} info={info} meta={meta} className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider" onReset={onReset} />
+    <PreviewField label={label} info={info} meta={meta} onReset={onReset}>
       <input className={input} type={type} step={key === 'arScale' ? 0.1 : undefined} min={key === 'arScale' ? 0 : undefined} value={String((source as Record<string, unknown>)[key] ?? '')} disabled={fieldLocked(key)}
         onChange={event => update ? update(event.target.value) : set(key as keyof Yue2JointTrainRequest, type === 'number' ? Number(event.target.value) : event.target.value as never)} />
-    </label>
+    </PreviewField>
   );
   // The lyric timing toggle lives in its own card on the stages page; it is
   // locked while this card is resuming, preparing or training.
-  const busy = active || preparing || starting || yue2RunAllActive;
+  const busy = active || preparing || starting || prepareMut.isPending || yue2RunAllActive;
   const timingLocked = !!resumeChoice || active || preparing || starting;
   useEffect(() => { onTimingLockedChange?.(timingLocked); }, [timingLocked, onTimingLockedChange]);
   const progress = job && job.total > 0 ? ` · ${job.done}/${job.total}` : '';
   return (
-    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-5">
-      <h3 className="text-sm font-semibold text-amber-700 dark:text-amber-300">
-        {t('trainingStudio.yue2.method.aitkTitle', 'Joint Training')}
-      </h3>
-      <p className="text-xs text-zinc-600 dark:text-zinc-400 mt-2 leading-relaxed">
-        {t('trainingStudio.yue2.method.autoTrainHint', 'Start training prepares the dataset automatically, then trains the planner (AR) and decoder (NAR) adapters together with the YuE2 report recipe. Unchanged prepared data is reused.')}
-      </p>
+    <TrainingRunPanel title={t('trainingStudio.yue2.method.aitkTitle', 'Joint Training')}
+      description={t('trainingStudio.yue2.method.autoTrainHint', 'Start training prepares the dataset automatically, then trains the planner (AR) and decoder (NAR) adapters together with the YuE2 report recipe. Unchanged prepared data is reused.')}>
       <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
         <div>
           <label className="flex flex-col gap-1">
@@ -1116,12 +1264,12 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
           {form.resume?.trim() && field(t('trainingStudio.yue2.method.resumeDataset', 'Prepared manifest for resume'), 'dataset', 'text', form, undefined,
             t('trainingStudio.yue2.method.resumeDatasetInfo', 'The prepared dataset manifest that matches the run being resumed by record below. Filled in automatically when a resume record is set; only needed if you are pointing at a different prepared copy.'))}
         </div>
-        <button type="button" onClick={() => void prepareDataset()} disabled={presetLoading || preparing || active || starting || yue2RunAllActive || !prepare.legacyManifest || !prepare.checkpoint || !prepare.tokenizer || !prepare.output || !prepare.models.vae || !prepare.models.semantic || !prepare.models.sheetsage}
+        <button type="button" onClick={prepareDataset} disabled={presetLoading || preparing || active || starting || prepareMut.isPending || yue2RunAllActive || !prepare.legacyManifest || !prepare.checkpoint || !prepare.tokenizer || !prepare.output || !prepare.models.vae || !prepare.models.semantic || !prepare.models.sheetsage}
           className="mt-3 px-3 py-1.5 rounded-lg text-xs font-semibold border border-amber-500/50 text-amber-700 dark:text-amber-300 hover:bg-amber-500/10 disabled:opacity-40">
           {preparing ? t('trainingStudio.yue2.method.preparing', 'Preparing dataset…') : t('trainingStudio.yue2.method.prepare', 'Prepare native dataset')}
         </button>
         {prepareJob && <span className="ml-3 text-[11px] text-zinc-600 dark:text-zinc-400">{prepareJob.status} · {prepareJob.phase || 'waiting'}</span>}
-        {preparing && <button type="button" onClick={() => void stopPrepare()} className="ml-3 text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.yue2.method.cancel', 'Stop')}</button>}
+        {preparing && <button type="button" disabled={cancelMut.isPending} onClick={stopPrepare} className="ml-3 text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.yue2.method.cancel', 'Stop')}</button>}
         {prepareJob?.error && <div className="mt-2 text-xs text-red-600 dark:text-red-400">{prepareJob.error}</div>}
       </details>
       <div className="mt-4">
@@ -1132,7 +1280,7 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
           {form.method !== 'fixed-recipe' && !activePreset(form) && !presets.some(userPresetActive) && <span className="text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.presetCustom', 'custom')}</span>}
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
-          <button type="button" disabled={busy || presetLoading} onClick={() => { onLyricTimingChange(false); setForm(previous => ({ ...previous,
+          <TrainingPresetChoice selected={form.method === 'fixed-recipe'} disabled={busy || presetLoading} onClick={() => { onLyricTimingChange(false); setForm(previous => ({ ...previous,
             method: 'fixed-recipe', base: 'bf16', checkpoint: '', adapterType: 'lora', rank: 64, alpha: 64,
             steps: 1500, saveEvery: 200, seed: 42,
             optimizer: 'adamw-lm', cautious: false, lr: 1e-4, weightDecay: 0.01,
@@ -1141,21 +1289,16 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
             gradAccum: 1, arCropFrames: 0, narCropFrames: 1500,
             ...YUE2_JOINT_FIXED_RECIPE_DROPOUTS,
             lyricTiming: false, cursorWeight: 0, calibrated: false, autoRefine: false,
-          })); }} className={`flex flex-col items-center gap-1 px-4 py-3 rounded-xl border-2 transition-colors disabled:opacity-40 ${form.method === 'fixed-recipe'
-            ? 'border-blue-500 bg-blue-500/15 text-blue-700 dark:text-blue-300'
-            : 'border-zinc-300 dark:border-white/15 text-zinc-800 dark:text-zinc-100 hover:border-blue-500/50 hover:bg-blue-500/5'}`}>
+          })); }}>
             <span className="text-base font-bold">{t('trainingStudio.yue2.method.preset_fixed-recipe', 'HOT-Approved')}</span>
             <span className="text-xs text-zinc-500">1500 × 1 {t('trainingStudio.yue2.method.presetFixedSong', 'song')}</span>
-          </button>
-          {PRESETS.map(p => <button key={p.key} type="button" disabled={active || starting || preparing || yue2RunAllActive}
+          </TrainingPresetChoice>
+          {PRESETS.map(p => <TrainingPresetChoice key={p.key} selected={activePreset(form) === p.key} disabled={active || starting || preparing || yue2RunAllActive}
             onClick={() => setForm(previous => ({ ...previous,
-              ...(previous.method === 'fixed-recipe' ? DEFAULT_FORM : {}), ...presetValues(p) }))}
-            className={`flex flex-col items-center gap-1 px-4 py-3 rounded-xl border-2 transition-colors disabled:opacity-40 ${activePreset(form) === p.key
-              ? 'border-blue-500 bg-blue-500/15 text-blue-700 dark:text-blue-300'
-              : 'border-zinc-300 dark:border-white/15 text-zinc-800 dark:text-zinc-100 hover:border-blue-500/50 hover:bg-blue-500/5'}`}>
+              ...(previous.method === 'fixed-recipe' ? DEFAULT_FORM : {}), ...presetValues(p) }))}>
             <span className="text-base font-bold">{t(`trainingStudio.yue2.method.preset_${p.key}`, p.label)}</span>
             <span className="text-xs text-zinc-500">{p.key === 'legacy' ? t('trainingStudio.yue2.method.presetLegacySteps', 'up to {{steps}} × 1 song', { steps: p.steps }) : `${p.steps} × ${p.gradAccum} songs`} · {p.key === 'balanced' ? t('trainingStudio.yue2.method.presetBaseline', '1× time (baseline)') : t('trainingStudio.yue2.method.presetRelative', '{{ratio}} the time', { ratio: presetTime(p) })}</span>
-          </button>)}
+          </TrainingPresetChoice>)}
         </div>
         {form.method === 'fixed-recipe' && <p className="mt-2 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.fixedRecipeNote', 'The server fixes the adapter, optimizer, loss, crop and timing settings for this method. The base defaults to bf16 and can be changed below.')}</p>}
         {form.method === 'fixed-recipe' && (form.base || 'bf16') !== 'bf16' && <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">{t('trainingStudio.yue2.method.fixedRecipeBaseNote', 'Not ear-tested on this base: HOT-Approved was tuned and scored on bf16. A quantized base uses less VRAM.')}</p>}
@@ -1520,43 +1663,101 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
             </div>}
           </div>;
         })()}
+        {(() => {
+          const label = 'text-[10px] font-medium text-zinc-500 uppercase tracking-wider';
+          const locked = busy || gateResuming;
+          const gateNum = (key: 'every' | 'minEpochs' | 'patience' | 'epsilon' | 'evalSeed', name: string, info: string, meta: string) => (
+            <label key={key} className="flex flex-col gap-1">
+              <ParamLabel label={name} info={info} meta={meta} className={label} />
+              <input className={input} type="number" step="any" placeholder={meta.replace('default ', '')} value={String(gate?.[key] ?? '')} disabled={locked}
+                onChange={event => setForm(previous => ({ ...previous, plannerGate: { ...previous.plannerGate, [key]: event.target.value === '' ? undefined : Number(event.target.value) } }))} />
+            </label>
+          );
+          const pick = holdoutQuery.data;
+          return <div className="mt-4 pt-3 border-t border-zinc-300/70 dark:border-white/10">
+            <span className={label}>{t('trainingStudio.yue2.method.gateTitle', 'Held-out planner gate')}</span>
+            <Toggle
+              accent="amber"
+              className="mt-2"
+              checked={!!gate}
+              disabled={locked}
+              onChange={checked => {
+                if (checked) {
+                  narBeforeGate.current = form.narExtraSteps;
+                  setForm(previous => ({ ...previous, plannerGate: {}, narExtraSteps: (previous.narExtraSteps ?? 0) > 0 ? previous.narExtraSteps : 250 }));
+                } else setForm(previous => ({ ...previous, plannerGate: undefined, narExtraSteps: narBeforeGate.current }));
+              }}
+              label={t('trainingStudio.yue2.method.gateEnable', 'Freeze the planner when held-out loss stops improving')}
+              info={t('trainingStudio.yue2.method.gateEnableInfo', 'Holds a few songs out of training and scores the planner on them every few updates. Once the minimum epochs have passed, a run of readings that do not beat the best by the epsilon freezes the planner where it is (no rollback); the decoder then trains on for its own budget. Off by default.')}
+            />
+            {gate && <>
+              <p className="mt-1 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.gateStarting', 'These are starting settings, not validated ones.')} {t('trainingStudio.yue2.method.gateCost', 'Each reading takes about 4 s for 5 held-out songs; checking every 10 updates adds about 25% to the joint phase.')}</p>
+              <div className="grid grid-cols-3 md:grid-cols-6 gap-3 mt-2">
+                {gateNum('every', t('trainingStudio.yue2.method.gateEvery', 'Check every'),
+                  t('trainingStudio.yue2.method.gateEveryInfo', 'Optimiser updates between held-out readings. Lower reacts sooner and costs more time.'), 'default 10')}
+                {gateNum('minEpochs', t('trainingStudio.yue2.method.gateMinEpochs', 'Min epochs'),
+                  t('trainingStudio.yue2.method.gateMinEpochsInfo', 'The planner cannot freeze before this many passes over the training songs (the held-out ones do not count).'), 'default 5')}
+                {gateNum('patience', t('trainingStudio.yue2.method.gatePatience', 'Patience'),
+                  t('trainingStudio.yue2.method.gatePatienceInfo', 'How many readings in a row may fail to beat the best before the planner freezes.'), 'default 3')}
+                {gateNum('epsilon', t('trainingStudio.yue2.method.gateEpsilon', 'Epsilon'),
+                  t('trainingStudio.yue2.method.gateEpsilonInfo', 'A reading counts as better only if it is below the best by more than this, in absolute cross-entropy.'), 'default 0.001')}
+                {gateNum('evalSeed', t('trainingStudio.yue2.method.gateSeed', 'Eval seed'),
+                  t('trainingStudio.yue2.method.gateSeedInfo', 'Seeds both the choice of held-out songs and the readings, so every reading scores the same draws.'), 'default 42')}
+                <label className="flex flex-col gap-1">
+                  <ParamLabel label={t('trainingStudio.yue2.method.gateNarSteps', 'Decoder steps after freeze')} className={label}
+                    info={t('trainingStudio.yue2.method.gateNarStepsInfo', 'The most steps the decoder trains alone after the planner freezes. Must be above 0. Updates caps the run as well.')} meta="default 250" />
+                  <input className={input} type="number" step="1" value={String(form.narExtraSteps ?? '')} disabled={locked}
+                    onChange={event => set('narExtraSteps', event.target.value === '' ? undefined : Number(event.target.value))} />
+                </label>
+              </div>
+              {gateResuming
+                ? <p className="mt-2 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.gateResume', "Resuming keeps the run's own gate settings, held-out songs and decoder budget; no new songs are held out.")}</p>
+                : holdoutQuery.isError ? <p className="mt-2 text-[11px] text-red-600 dark:text-red-400">{holdoutQuery.error instanceof Error ? holdoutQuery.error.message : String(holdoutQuery.error)}</p>
+                : pick?.error ? <p className="mt-2 text-[11px] text-red-600 dark:text-red-400">{pick.error}</p>
+                : pick ? <p className="mt-2 text-[11px] text-zinc-600 dark:text-zinc-400">
+                  {t('trainingStudio.yue2.method.gateHoldout', 'Holding out {{count}} of {{songs}} songs ({{training}} left to train on): {{ids}}',
+                    { count: pick.holdoutIds.length, songs: pick.songs, training: pick.training, ids: pick.holdoutIds.join(', ') })}</p>
+                : <p className="mt-2 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.gateLoading', 'Choosing held-out songs…')}</p>}
+              {(form.narExtraSteps ?? 0) <= 0 && <p className="mt-1 text-[11px] text-red-600 dark:text-red-400">{t('trainingStudio.yue2.method.gateNeedsNar', "Set Decoder steps after freeze above 0: the gate needs the decoder's budget.")}</p>}
+            </>}
+          </div>;
+        })()}
       </details>
-      <details className="mt-3 rounded-lg border border-zinc-300/70 dark:border-white/10 bg-white/30 dark:bg-black/10 p-3">
-        <summary className="cursor-pointer text-[11px] font-semibold text-zinc-700 dark:text-zinc-300">
-          {t('trainingStudio.yue2.method.previewTitle', 'Checkpoint previews (optional)')}
-        </summary>
-        <Toggle
-          accent="amber"
-          className="mt-2"
-          checked={form.stopEngine !== false}
-          disabled={active || preparing || starting || yue2RunAllActive}
-          onChange={checked => setForm(previous => ({ ...previous, stopEngine: checked }))}
-          label={t('trainingStudio.yue2.method.stopEngine', 'Stop the engine during training')}
-          info={t('trainingStudio.yue2.method.stopEngineHelp', 'Off by default since the ladder previews render while training runs and need the engine up (about 14 GB for the trainer plus 10-12 GB for the engine and a render). On: the trainer gets the whole GPU, generation is unavailable, and no previews render until the run ends; use it on a smaller card and render the ladder afterwards.')}
-        />
-        <Toggle
-          accent="amber"
-          className="mt-2"
-          checked={form.preview?.enabled ?? false}
-          disabled={active || preparing || starting || yue2RunAllActive}
-          onChange={checked => setForm(previous => ({ ...previous, preview: { ...(previous.preview ?? defaultPreview(form.saveEvery)), enabled: checked } }))}
-          label={t('trainingStudio.yue2.method.previewEnable', 'Render a preview at every saved checkpoint')}
-          info={t('trainingStudio.yue2.method.previewManual', 'On by default: each checkpoint gets one draft take (12 decoder steps, 300 s) rendered while training continues, so the ladder is ready to score when the run ends. Off: render rungs by hand from the ladder below.')}
-          defaultValue={LADDER_PREVIEW.enabled}
-        />
-        {form.preview?.enabled && form.stopEngine === false && <Toggle
-          accent="amber"
-          size="sm"
-          className="mt-2"
-          checked={form.preview.parallel !== false}
-          disabled={active || preparing || starting || yue2RunAllActive}
-          onChange={checked => setForm(previous => ({ ...previous, preview: { ...defaultPreview(previous.saveEvery), ...previous.preview, parallel: checked }, ...(checked ? { stopEngine: false } : {}) }))}
-          label={t('trainingStudio.yue2.method.previewParallel', 'In parallel with training')}
-          info={t('trainingStudio.yue2.method.previewParallelInfo', 'Render each checkpoint\'s preview while training continues; needs the engine up (this also turns "Stop the engine during training" off). Off: training pauses at each checkpoint, renders, and resumes, which fits a smaller card but takes longer.')}
-          defaultValue={LADDER_PREVIEW.parallel}
-        />}
-        {form.preview?.enabled && form.stopEngine !== false && <p className="mt-2 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.previewEngineStopped', 'The engine is stopped during training, so only the final checkpoint gets a preview automatically; render the other rungs from the ladder after the run.')}</p>}
-        {form.preview?.enabled && <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+      <TrainingPreviewSettings
+        title={t('trainingStudio.yue2.method.previewTitle', 'Checkpoint previews (optional)')}
+        enabled={form.preview?.enabled ?? false}
+        disabled={active || preparing || starting || yue2RunAllActive}
+        onEnabledChange={checked => setForm(previous => ({ ...previous, preview: { ...(previous.preview ?? defaultPreview(form.saveEvery)), enabled: checked } }))}
+        enableLabel={t('trainingStudio.yue2.method.previewEnable', 'Render a preview at every saved checkpoint')}
+        enableInfo={t('trainingStudio.yue2.method.previewManual', 'On by default: each checkpoint gets one draft take (12 decoder steps, 300 s) rendered while training continues, so the ladder is ready to score when the run ends. Off: render rungs by hand from the ladder below.')}
+        enableDefault={LADDER_PREVIEW.enabled}
+        lead={
+          <Toggle
+            accent="amber"
+            className="mt-2"
+            checked={form.stopEngine !== false}
+            disabled={active || preparing || starting || yue2RunAllActive}
+            onChange={checked => setForm(previous => ({ ...previous, stopEngine: checked }))}
+            label={t('trainingStudio.yue2.method.stopEngine', 'Stop the engine during training')}
+            info={t('trainingStudio.yue2.method.stopEngineHelp', 'Off by default since the ladder previews render while training runs and need the engine up (about 14 GB for the trainer plus 10-12 GB for the engine and a render). On: the trainer gets the whole GPU, generation is unavailable, and no previews render until the run ends; use it on a smaller card and render the ladder afterwards.')}
+          />
+        }
+        afterToggle={<>
+          {form.preview?.enabled && form.stopEngine === false && <Toggle
+            accent="amber"
+            size="sm"
+            className="mt-2"
+            checked={form.preview.parallel !== false}
+            disabled={active || preparing || starting || yue2RunAllActive}
+            onChange={checked => setForm(previous => ({ ...previous, preview: { ...defaultPreview(previous.saveEvery), ...previous.preview, parallel: checked }, ...(checked ? { stopEngine: false } : {}) }))}
+            label={t('trainingStudio.yue2.method.previewParallel', 'In parallel with training')}
+            info={t('trainingStudio.yue2.method.previewParallelInfo', 'Render each checkpoint\'s preview while training continues; needs the engine up (this also turns "Stop the engine during training" off). Off: training pauses at each checkpoint, renders, and resumes, which fits a smaller card but takes longer.')}
+            defaultValue={LADDER_PREVIEW.parallel}
+          />}
+          {form.preview?.enabled && form.stopEngine !== false && <p className="mt-2 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.previewEngineStopped', 'The engine is stopped during training, so only the final checkpoint gets a preview automatically; render the other rungs from the ladder after the run.')}</p>}
+        </>}
+      >
+        {form.preview?.enabled && <>
           {field(t('trainingStudio.yue2.method.previewSeconds', 'Preview seconds'), 'seconds', 'number', form.preview, value => setForm(previous => {
             const seconds = Math.max(8, Math.min(360, Number(value) || 300));
             return { ...previous, preview: { ...defaultPreview(previous.saveEvery), ...previous.preview, seconds, previewMaxFrames: seconds * 25 } };
@@ -1641,8 +1842,8 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
             />
             <textarea className={`${input} min-h-20 resize-y`} value={form.preview.lyrics ?? ''} disabled={active || preparing || starting || yue2RunAllActive} onChange={event => setForm(previous => ({ ...previous, preview: { ...defaultPreview(previous.saveEvery), ...previous.preview, lyrics: event.target.value } }))} />
           </label>
-        </div>}
-      </details>
+        </>}
+      </TrainingPreviewSettings>
       <p className="text-[11px] text-zinc-500 mt-2">{t('trainingStudio.yue2.method.autoOutput', 'Adapters are saved in your global adapters folder under yue2-joint-adapters/triggerword_date_time.')}</p>
       {error && <div className="mt-3 flex items-start gap-2 text-xs text-red-600 dark:text-red-400"><AlertTriangle size={14} className="mt-0.5 shrink-0" />{error}</div>}
       {job?.error && <div className="mt-2 text-xs text-red-600 dark:text-red-400">{job.error}</div>}
@@ -1695,12 +1896,19 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
           {starting ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
           {jointPipelineId && !job ? t('trainingStudio.yue2.method.admitting', 'Starting joint training…') : active ? (job?.phase === 'preparing' ? t('trainingStudio.yue2.method.preparing', 'Preparing dataset…') : t('trainingStudio.yue2.method.running', 'Joint training is running')) : t('trainingStudio.yue2.method.start', 'Start joint training')}
         </button>
-        {active && <button type="button" onClick={() => void stop()} className="text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.yue2.method.cancel', 'Stop')}</button>}
-        {job && <span className="text-[11px] text-zinc-600 dark:text-zinc-400">{job.status} · {job.phase || 'waiting'}{!(ladderRunRec && blindRungs) && progress}
-          {!(ladderRunRec && blindRungs) && liveMetric?.step !== undefined && ` · step ${liveMetric.step}${liveMetric.loss !== undefined ? ` · loss ${liveMetric.loss.toFixed(4)}` : ''}`}
+        {active && <button type="button" disabled={cancelMut.isPending || pipelineCancelMut.isPending} onClick={stop} className="text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.yue2.method.cancel', 'Stop')}</button>}
+        {job && <span className="text-[11px] text-zinc-600 dark:text-zinc-400">{job.status} · {job.phase || 'waiting'}{progress}
+          {liveMetric?.step !== undefined && ` · step ${liveMetric.step}${liveMetric.loss !== undefined ? ` · loss ${liveMetric.loss.toFixed(4)}` : ''}`}
+        </span>}
+        {job && gateReading && <span className="text-[11px] text-zinc-600 dark:text-zinc-400">
+          {t('trainingStudio.yue2.method.gateReading', 'held-out CE {{ce}} · best {{best}} (step {{bestStep}}) · stale {{stale}}/{{patience}}{{armed}}',
+            { ce: gateReading.ce.toFixed(4), best: gateReading.best.toFixed(4), bestStep: gateReading.bestStep, stale: gateReading.stale, patience: gateReading.patience,
+              armed: gateReading.armed ? '' : ' · not armed yet' })}
         </span>}
       </div>
-      {!(ladderRunRec && blindRungs) && stepHistory.length > 0 && (
+      {job?.status === 'running' && isJointJob(job, datasetId) && <LiveIntervals key={job.id} datasetId={datasetId} jobId={job.id} worker={trainingWorker}
+        options={aitkRuns.find(r => r.jobId === job.id)?.options} />}
+      {stepHistory.length > 0 && (
         <div className="mt-3">
           <Yue2SplitChart points={stepHistory} milestones={milestones} totalSteps={job?.total ?? 0} vramMb={chartVram}
             options={aitkRuns.find(r => r.jobId === job?.id)?.options} />
@@ -1714,6 +1922,9 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
           </div>
         </div>
       )}
+      {historyUnavailable && <p className="mt-3 text-xs text-zinc-500">
+        {t('trainingStudio.yue2.method.historyUnavailable', 'Training history for this run is no longer available.')}
+      </p>}
       {jobLogs.length > 0 && <details className="mt-2" open={showJobLogs} onToggle={event => setShowJobLogs(event.currentTarget.open)}>
         <summary className="cursor-pointer text-[11px] text-zinc-600 dark:text-zinc-400">{t('trainingStudio.yue2.method.showLogs', 'Show training log (last 100 lines)')}</summary>
         <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-zinc-950 p-2 text-[10px] leading-4 text-zinc-300 whitespace-pre-wrap">{jobLogs.join('\n')}</pre>
@@ -1721,23 +1932,22 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
       {awaitingMirror && <div className="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
         <p className="text-xs text-zinc-700 dark:text-zinc-300">{t('trainingStudio.yue2.method.awaitingMirror', 'Waiting for the first sync from {{worker}}', { worker: trainingWorker })}</p>
       </div>}
-      {ladderRunRec && <div className="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/5 p-3">
+      {ladderRunRec && <TrainingCheckpointLadder>
         <p className="text-xs font-semibold text-zinc-700 dark:text-zinc-300 flex items-center gap-1.5">{t('trainingStudio.yue2.method.ladderTitle', 'Checkpoint ladder')} · {new Date(ladderRunRec.createdAt).toLocaleString()}{ladderRunRec.live ? ` · ${t('trainingStudio.yue2.method.ladderLive', 'training')}` : ''}
           {ladderRunRec.origin && <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-500/15 text-violet-700 dark:text-violet-300"
             title={t('trainingStudio.review.originInfo', 'Trained on this worker and mirrored here; previews and scoring run here.') as string}>{ladderRunRec.origin.worker}</span>}</p>
         {aitkRuns.length > 1 && <div className="mt-2 flex flex-col gap-1 max-w-md">
-          <ParamLabel label={t('trainingStudio.yue2.method.ladderRun', 'Run')}
-            className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider"
-            info={t('trainingStudio.yue2.method.ladderRunInfo', 'This dataset has more than one joint run. Pick which run\'s ladder to listen to and score. Each run keeps its own scores.')} />
-          <StyledSelect accent="amber" className="w-full" value={ladderRunRec.jobId} onChange={setPickedLadderRun}
+          <TrainingRunPicker label={t('trainingStudio.yue2.method.ladderRun', 'Run')}
+            info={t('trainingStudio.yue2.method.ladderRunInfo', 'This dataset has more than one joint run. Pick which run\'s ladder to listen to and score. Each run keeps its own scores.')}
+            value={ladderRunRec.jobId} onChange={setPickedLadderRun}
             options={[...aitkRuns].sort((a, b) => b.createdAt - a.createdAt).map(r => ({ value: r.jobId,
               label: `${new Date(r.createdAt).toLocaleString()} · ${r.live ? t('trainingStudio.yue2.method.ladderLive', 'training') : r.status} · ${r.checkpoints.filter(c => c.arPath && c.narPath).length} ${t('trainingStudio.yue2.method.ladderRungs', 'rungs')}${r.origin ? ` · ${r.origin.worker}` : ''}` }))} />
         </div>}
-        <p className="mt-1 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.ladderHint', 'Every saved checkpoint is a rung. Previews render while the run trains: two 300 s draft takes of the dataset\'s first sung track per rung. Take 1 uses the same seed on every rung, so the rungs sing roughly the same song and what changes between them is the training; compare rungs on it. Take 2 uses a new random seed each time, so it is a song no other rung made; it shows how the checkpoint does on a fresh draw, and catches failures the fixed seed happens to miss. A rung with no previews yet says so, and Render adds takes. Score likeness and corruption 1-5, then press Use this rung on your pick: it becomes the dataset\'s adapter and you can clean up the rest. Scores also feed the Review page and "Finish scored" for batches.')}</p>
+        <p className="mt-1 text-[11px] text-zinc-500">{t('trainingStudio.yue2.method.ladderHint', 'Every saved checkpoint is a rung. Previews render while the run trains: by default one 300 s draft take of the dataset\'s first sung track per rung, on the same seed every rung, so the rungs sing roughly the same song and what changes between them is the training; compare rungs on it. Takes per checkpoint adds more, each on a new random seed: a song no other rung made, which shows how the checkpoint does on a fresh draw and catches failures the fixed seed happens to miss. A rung with no previews yet says so, and Render adds takes. Score likeness and corruption 1-5, then press Use this rung on your pick: it becomes the dataset\'s adapter and you can clean up the rest. Scores also feed the Review page and "Finish scored" for batches.')}</p>
         <Yue2LadderReview datasetId={datasetId} datasetName={datasets.find(d => d.id === datasetId)?.name} run={ladderRunRec} previews={jointPreviews}
           renderOpts={{ seconds: form.preview?.seconds ?? 300, takes: form.preview?.takes ?? 1, arScale: form.preview?.arScale ?? LADDER_PREVIEW.arScale, draft: (form.preview?.odeSteps ?? 12) > 0 && (form.preview?.odeSteps ?? 12) < 32 }}
           onError={setError} idPrefix="train-rung" />
-      </div>}
-    </div>
+      </TrainingCheckpointLadder>}
+    </TrainingRunPanel>
   );
 };

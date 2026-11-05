@@ -6,9 +6,12 @@
 // it. This ledger keeps one row per job in the app database: written when the
 // job is queued and again when it ends. The first use in a process marks every
 // row still open as interrupted, because its job died with the old process.
-// Nothing is ever resubmitted from here.
+// Nothing is ever resubmitted from here. A row opened by another live process
+// (the other copy of the app on the same database, services/instance.ts) is
+// that process's job and stays open.
 import type Database from 'better-sqlite3';
 import type { GenerationJob } from './jobTypes.js';
+import { instanceAlive, instanceId } from '../instance.js';
 
 /** Kept for a week; long enough for any client still polling. */
 const KEEP_MS = 7 * 24 * 60 * 60 * 1000;
@@ -24,11 +27,15 @@ export interface LedgerEntry {
   result: GenerationJob['result'] | null;
   createdAt: number;
   finishedAt: number | null;
+  ownerInstance: string | null;
+  /** Engine worker the job ran on (multi-GPU); null until a worker took it. */
+  workerId: string | null;
 }
 
 interface Row {
   id: string; user_id: string; status: LedgerEntry['status']; error: string | null;
-  result_json: string | null; created_at: number; finished_at: number | null;
+  result_json: string | null; created_at: number; finished_at: number | null; owner_instance: string | null;
+  worker_id: string | null;
 }
 
 export class GenerationJobLedger {
@@ -43,17 +50,29 @@ export class GenerationJobLedger {
         created_at  INTEGER NOT NULL,
         finished_at INTEGER
       )`);
+    for (const column of ['owner_instance', 'worker_id']) {
+      const has = (db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('generation_jobs') WHERE name = ?`).get(column) as { c: number }).c;
+      if (!has) db.exec(`ALTER TABLE generation_jobs ADD COLUMN ${column} TEXT`);
+    }
     const at = this.now();
-    // Every open row belongs to a process that has gone: this runs once, before
-    // this process queues anything.
-    db.prepare(`UPDATE generation_jobs SET status = 'interrupted', error = ?, finished_at = ? WHERE status = 'open'`)
-      .run(INTERRUPTED_ERROR, at);
+    // An open row whose process has gone died with it: this runs once, before
+    // this process queues anything. Rows another live process opened are its own.
+    const open = db.prepare(`SELECT id, owner_instance FROM generation_jobs WHERE status = 'open'`).all() as Array<{ id: string; owner_instance: string | null }>;
+    const dead = open.filter(r => r.owner_instance === instanceId() || !instanceAlive(r.owner_instance)).map(r => r.id);
+    db.prepare(`UPDATE generation_jobs SET status = 'interrupted', error = ?, finished_at = ? WHERE status = 'open' AND id IN (SELECT value FROM json_each(?))`)
+      .run(INTERRUPTED_ERROR, at, JSON.stringify(dead));
     db.prepare('DELETE FROM generation_jobs WHERE created_at < ?').run(at - KEEP_MS);
   }
 
   opened(job: Pick<GenerationJob, 'id' | 'userId' | 'createdAt'>): void {
-    this.db.prepare(`INSERT OR REPLACE INTO generation_jobs (id, user_id, status, created_at) VALUES (?, ?, 'open', ?)`)
-      .run(job.id, job.userId ?? '', job.createdAt);
+    this.db.prepare(`INSERT OR REPLACE INTO generation_jobs (id, user_id, status, created_at, owner_instance) VALUES (?, ?, 'open', ?, ?)`)
+      .run(job.id, job.userId ?? '', job.createdAt, instanceId());
+  }
+
+  /** Record the engine worker a job was dispatched to, so an interrupted row
+   *  still says which card it died on. */
+  assigned(job: Pick<GenerationJob, 'id' | 'workerId'>): void {
+    this.db.prepare('UPDATE generation_jobs SET worker_id = ? WHERE id = ?').run(job.workerId ?? null, job.id);
   }
 
   /** Record a job's terminal state; a job still active is left open. */
@@ -70,7 +89,8 @@ export class GenerationJobLedger {
     return {
       id: row.id, userId: row.user_id, status: row.status, error: row.error,
       result: row.result_json ? JSON.parse(row.result_json) : null,
-      createdAt: row.created_at, finishedAt: row.finished_at,
+      createdAt: row.created_at, finishedAt: row.finished_at, ownerInstance: row.owner_instance ?? null,
+      workerId: row.worker_id ?? null,
     };
   }
 }
@@ -80,16 +100,19 @@ export class GenerationJobLedger {
  *  treats `failed` as terminal and shows its error. The error text contains
  *  "failed" on purpose: the browser queue only stops polling on such messages. */
 export function ledgerStatusBody(entry: LedgerEntry): Record<string, unknown> {
-  const interrupted = entry.status === 'interrupted' || entry.status === 'open';
-  const status = interrupted ? 'failed' : entry.status;
+  // Open in another live process (the other copy of the app): still running there.
+  const elsewhere = entry.status === 'open' && entry.ownerInstance !== instanceId() && instanceAlive(entry.ownerInstance);
+  const interrupted = !elsewhere && (entry.status === 'interrupted' || entry.status === 'open');
+  const status = elsewhere ? 'running' : interrupted ? 'failed' : entry.status;
   return {
     jobId: entry.id,
     status,
-    stage: interrupted ? 'Interrupted' : status === 'succeeded' ? 'Complete' : status === 'cancelled' ? 'Cancelled' : 'Failed',
+    stage: elsewhere ? 'Running in another HOT-Step copy' : interrupted ? 'Interrupted' : status === 'succeeded' ? 'Complete' : status === 'cancelled' ? 'Cancelled' : 'Failed',
     progress: status === 'succeeded' ? 100 : 0,
     result: entry.result ?? undefined,
     error: interrupted ? (entry.error ?? INTERRUPTED_ERROR) : entry.error ?? undefined,
     interrupted,
+    workerId: entry.workerId,
     attempts: [],
     ace_job_id: null,
     ace_phase: null,

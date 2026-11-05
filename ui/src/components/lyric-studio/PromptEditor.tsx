@@ -1,9 +1,10 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, Save, RotateCcw, Code2, Loader2 } from 'lucide-react';
 import { lireekApi } from '../../services/lireekApi';
+import { QueryError } from '../shared/QueryError';
 
 interface PromptData {
   name: string;
@@ -32,9 +33,8 @@ export const PromptEditor: React.FC<Props> = ({ open, onClose }) => {
   const [selected, setSelected] = useState<string | null>(null);
   const [editContent, setEditContent] = useState('');
   const loading = snapshot.isPending;
-  const [saving, setSaving] = useState(false);
-  const [dirty, setDirty] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     if (!open || !snapshot.data || selected) return;
@@ -51,37 +51,43 @@ export const PromptEditor: React.FC<Props> = ({ open, onClose }) => {
     }
   };
 
-  const handleSave = async () => {
-    if (!selected) return;
-    setSaving(true);
-    try {
-      await lireekApi.savePrompt(selected, editContent);
-      setDirty(false);
-      setToast('Saved');
-      setTimeout(() => setToast(null), 2000);
-      await snapshot.refetch();
-    } catch (err) {
-      setToast(`Save failed: ${(err as Error).message}`);
-      setTimeout(() => setToast(null), 3000);
-    } finally {
-      setSaving(false);
-    }
+  const flash = (msg: string, ms = 2000) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), ms);
   };
 
-  const handleReset = async () => {
-    if (!selected) return;
-    if (!confirm('Reset this prompt to its default? Your customizations will be lost.')) return;
-    try {
-      await lireekApi.resetPrompt(selected);
-      setToast('Reset to default');
-      setTimeout(() => setToast(null), 2000);
-      const updated = (await snapshot.refetch()).data?.prompts.find(p => p.name === selected);
+  // The transport is silent for both commands: this sheet's toast is the sole
+  // notifier, so a failed save/reset shows exactly one message.
+  const saveMut = useMutation({
+    mutationFn: ({ name, value }: { name: string; value: string }) => lireekApi.savePrompt(name, value),
+    onSuccess: () => {
+      setDirty(false);
+      flash('Saved');
+      void snapshot.refetch();
+    },
+    onError: err => flash(`Save failed: ${(err as Error).message}`, 3000),
+  });
+
+  const resetMut = useMutation({
+    mutationFn: (name: string) => lireekApi.resetPrompt(name),
+    onSuccess: async (_res, name) => {
+      flash('Reset to default');
+      const updated = (await snapshot.refetch()).data?.prompts.find(p => p.name === name);
       if (updated) setEditContent(updated.custom ?? updated.default_content ?? '');
       setDirty(false);
-    } catch (err) {
-      setToast(`Reset failed: ${(err as Error).message}`);
-      setTimeout(() => setToast(null), 3000);
-    }
+    },
+    onError: err => flash(`Reset failed: ${(err as Error).message}`, 3000),
+  });
+
+  const handleSave = () => {
+    if (!selected) return;
+    saveMut.mutate({ name: selected, value: editContent });
+  };
+
+  const handleReset = () => {
+    if (!selected) return;
+    if (!confirm('Reset this prompt to its default? Your customizations will be lost.')) return;
+    resetMut.mutate(selected);
   };
 
   if (!open) return null;
@@ -108,7 +114,11 @@ export const PromptEditor: React.FC<Props> = ({ open, onClose }) => {
         <div className="flex flex-1 min-h-0">
           {/* Sidebar */}
           <div className="w-56 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-y-auto py-2">
-            {loading ? (
+            {snapshot.isError && !snapshot.data ? (
+              <div className="p-3">
+                <QueryError error={snapshot.error} onRetry={() => void snapshot.refetch()} />
+              </div>
+            ) : loading ? (
               <div className="flex items-center justify-center py-8">
                 <Loader2 className="w-5 h-5 animate-spin text-zinc-500" />
               </div>
@@ -155,10 +165,10 @@ export const PromptEditor: React.FC<Props> = ({ open, onClose }) => {
                         <RotateCcw className="w-3 h-3" /> {t('lyric.reset')}
                       </button>
                     )}
-                    <button onClick={handleSave} disabled={!dirty || saving}
+                    <button onClick={handleSave} disabled={!dirty || saveMut.isPending}
                       className="flex items-center gap-1 px-3 py-1 rounded-lg text-xs font-medium bg-cyan-500 text-black hover:bg-cyan-400 disabled:opacity-30 transition-all"
                     >
-                      {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+                      {saveMut.isPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
                       {t('common.save')}
                     </button>
                   </div>

@@ -10,7 +10,6 @@ const root = path.resolve(__dirname, '../..');
 const binary = path.join(__dirname, 'node_modules', '@colbymchenry', 'codegraph', 'npm-shim.js');
 const graphDir = path.join(root, '.codegraph');
 const marker = path.join(graphDir, 'wrapper-sync.json');
-const lock = path.join(graphDir, 'codegraph.lock');
 const environment = {
   ...process.env,
   DO_NOT_TRACK: '1',
@@ -87,17 +86,13 @@ function pause(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function waitForLock() {
-  for (let attempt = 0; fs.existsSync(lock); attempt++) {
-    if (attempt >= 20) throw new Error('index busy, use grep (codegraph lock did not clear)');
-    pause(250);
-  }
-}
-
+// codegraph owns its write lock file in .codegraph: its sync clears a lock left by a
+// dead PID and reports a live holder as LockUnavailableError, retried below.
+// Do not check or remove the lock file here; an existence check blocked every
+// reader forever on a dead writer's lock, and outside cleanup races live writers.
 function sync() {
   let lastError;
   for (let attempt = 0; attempt < 5; attempt++) {
-    waitForLock();
     const freshness = fingerprint();
     if (synced(freshness) && fs.existsSync(path.join(graphDir, 'codegraph.db'))) return;
     const result = run(process.execPath, [binary, 'sync', root]);

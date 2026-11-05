@@ -5,7 +5,7 @@
 // GET  /api/model-manager/downloads        — SSE stream of download progress
 // POST /api/model-manager/download/:id/cancel  — cancel download
 // POST /api/model-manager/download/:id/resume  — resume download
-// DELETE /api/model-manager/files/:filename    — delete installed model
+// DELETE /api/model-manager/files/:key         — delete installed model (key = filename, or the entry id for MuScriptor models)
 
 import { Router } from 'express';
 import { modelDownloadService } from '../services/modelDownloadService.js';

@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { NextFunction, Request, Response } from 'express';
@@ -13,14 +14,44 @@ import { listJobs } from './labelingQueue.js';
 import { listBatches } from './yue2BatchRunner.js';
 import { listPipelines } from './pipelineRunner.js';
 import { requestWorkerRestart } from '../../routes/shutdown.js';
-import { stopAceServer } from '../aceEngineProcess.js';
+import { stopAllEngines } from '../aceEngineProcess.js';
 import { gpuLaneBusy, gpuLaneDepth } from '../generation/gpuLane.js';
 
 const git = (args: string[], cwd = PROJECT_ROOT) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000, windowsHide: true }).trim();
 export const startupCommit = (() => { try { return git(['rev-parse', 'HEAD']); } catch { return ''; } })();
 export const currentCommit = () => git(['rev-parse', 'HEAD']);
-export const dirtyCheckout = () => { try { return !!git(['status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=none']); } catch { return false; } };
+const dirtyArgs = ['status', '--porcelain', '--untracked-files=normal', '--ignore-submodules=none'];
+/** Updater blockers require a fresh synchronous check before allowing updates. */
+export function dirtyCheckout(): boolean {
+  try { return !!git(dirtyArgs); } catch { return false; }
+}
+
+/** Check at startup, then on demand 30 seconds after completion. Readers never wait. */
+export function createDirtyCheckout(read: () => Promise<boolean>, now = Date.now): () => boolean {
+  let cached = false;
+  let refreshAt = 0;
+  let refreshing = false;
+  const refresh = async () => {
+    refreshing = true;
+    try { cached = await read(); } catch { /* Keep the last known display value. */ }
+    finally { refreshAt = now() + 30_000; refreshing = false; }
+  };
+  void refresh();
+  return () => {
+    if (!refreshing && now() >= refreshAt) void refresh();
+    return cached;
+  };
+}
+
+const execFileAsync = promisify(execFile);
+// Health and Workers display tolerate stale state without blocking requests.
+export const cachedDirtyCheckout = createDirtyCheckout(async () => {
+  const { stdout } = await execFileAsync('git', dirtyArgs, {
+    cwd: PROJECT_ROOT, encoding: 'utf8', timeout: 15000, windowsHide: true,
+  });
+  return !!stdout.trim();
+});
 
 export function activeTraining() {
   if (gpuLaneBusy() || gpuLaneDepth() > 0) return { kind: 'generation', dataset: '', done: 0, total: 0, status: 'running' };
@@ -182,8 +213,8 @@ export async function receiveUpdate(body: NodeJS.ReadableStream, base: string, t
       uiBuild: async () => { log('Building UI', 'ui-build'); await npm(['run', 'build'], path.join(PROJECT_ROOT, 'ui'), line => log(line)); },
       engineBuild: async () => {
         log('Stopping engine for rebuild', 'engine-build');
-        // ace-server holds the ggml DLLs open; the linker cannot replace them while it runs.
-        if (!await stopAceServer('Worker engine rebuild')) throw new Error('ace-server did not stop before the engine build');
+        // Every ace-server holds the ggml DLLs open; the linker cannot replace them while one runs.
+        if (!await stopAllEngines('Worker engine rebuild')) throw new Error('ace-server did not stop before the engine build');
         log('Building engine', 'engine-build');
         await command(cmds.engineBuild[0], [...cmds.engineBuild[1]], path.join(PROJECT_ROOT, 'engine'), line => log(line)); },
       restart: () => { log('Build complete; requesting restart', 'restarting'); fs.unlinkSync(bundle); bundlePresent = false; requestWorkerRestart(); },

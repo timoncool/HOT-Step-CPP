@@ -1,43 +1,20 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { localOptions } from '../../queries/global-models/options';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { coverArtStatusOptions, type CoverArtStatus } from '../../queries/shell-queue/queue';
 import { pollWhile } from '../../queries/contract';
-import { keysPlan, writeAndInvalidate } from '../../queries/writes';
+import { queryManager } from '../../queries/invalidation';
 import { apiClient } from '../../services/httpClient';
 // CoverArtDropdown.tsx — AI cover art toggle + download status
 //
 // Renders as an accordion section inside PostProcessingDropdown.
 // Shows: toggle, installation status, download progress, model info.
 
-import React, { useCallback } from 'react';
+import React from 'react';
 import { Image, Download, X, Check, Loader2 } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
-import { useAuth } from '../../context/AuthContext';
 import { ToggleSwitch } from './BarSection';
+import { QueryError } from '../shared/QueryError';
 import { ParamLabel } from '../shared/ParamLabel';
 import { GLOBAL_PARAM_DEFAULTS } from '../../stores/globalParamsStore';
-
-// ── Types ────────────────────────────────────────────────────────
-
-interface FileProgress {
-  filename: string;
-  description: string;
-  status: string;
-  bytesDownloaded: number;
-  totalBytes: number;
-  speed: number;
-}
-
-interface CoverArtStatusResponse {
-  installed: boolean;
-  missingFiles: string[];
-  download: {
-    phase: string;
-    files: FileProgress[];
-    totalBytes: number;
-    downloadedBytes: number;
-    overallProgress: number;
-  };
-}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -57,33 +34,29 @@ const formatSpeed = (bytesPerSec: number): string => {
 
 export const CoverArtContent: React.FC = () => {
   const gp = useGlobalParams();
-  const { token } = useAuth();
   const client = useQueryClient();
-  const options = localOptions<CoverArtStatusResponse>('cover-art', '/cover-art/status');
-  const { data: status } = useQuery({ ...options,
-    refetchInterval: pollWhile<CoverArtStatusResponse>(data => data?.download.phase === 'downloading'),
+  const options = coverArtStatusOptions();
+  const { data: status, isError, error, refetch } = useQuery({ ...options,
+    refetchInterval: pollWhile<CoverArtStatus>(data => data?.download.phase === 'downloading'),
   });
   // Start download (the write dirties the status it polls)
-  const handleDownload = useCallback(async () => {
-    if (!token) return;
-    try {
-      await writeAndInvalidate(client, () => apiClient.post('/cover-art/download'), keysPlan(options.queryKey));
-    } catch { /* transport failure already toasted by the global handler */ }
-  }, [token, client, options.queryKey]);
+  const downloadMut = useMutation({
+    mutationFn: () => apiClient.post('/cover-art/download'),
+    onSuccess: () => { void queryManager.invalidate(client, options.queryKey); },
+  });
 
   // Cancel download
-  const handleCancel = useCallback(async () => {
-    if (!token) return;
-    try {
-      await writeAndInvalidate(client, () => apiClient.post('/cover-art/download/cancel'), keysPlan(options.queryKey));
-    } catch { /* transport failure already toasted by the global handler */ }
-  }, [token, client, options.queryKey]);
+  const cancelMut = useMutation({
+    mutationFn: () => apiClient.post('/cover-art/download/cancel'),
+    onSuccess: () => { void queryManager.invalidate(client, options.queryKey); },
+  });
 
   const isDownloading = status?.download?.phase === 'downloading';
   const isInstalled = status?.installed ?? false;
 
   return (
     <div className="space-y-3 mt-2">
+      {isError && <QueryError error={error} onRetry={() => void refetch()} compact />}
       {/* Auto-generate toggle */}
       <div className="flex items-center justify-between">
         <ParamLabel label="Auto-generate after creation"
@@ -118,7 +91,7 @@ export const CoverArtContent: React.FC = () => {
               </span>
             </div>
             <button
-              onClick={handleCancel}
+              onClick={() => cancelMut.mutate()} disabled={cancelMut.isPending}
               className="p-1 rounded hover:bg-red-500/10 text-zinc-500 hover:text-red-400 transition-colors"
               title="Cancel download"
             >
@@ -171,7 +144,7 @@ export const CoverArtContent: React.FC = () => {
           </div>
 
         <button
-            onClick={handleDownload}
+            onClick={() => downloadMut.mutate()} disabled={downloadMut.isPending}
             className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold rounded-xl
                        bg-gradient-to-r from-pink-500/10 to-purple-500/10
                        border border-pink-500/20 text-pink-400

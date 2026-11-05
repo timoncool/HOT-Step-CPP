@@ -82,6 +82,39 @@ export function engineSupportsFlashAttnTraining(): boolean {
   return backend !== 'vulkan' && backend !== 'metal';
 }
 
+export interface Sa3Recipe {
+  steps: number; rank: number; alpha: number; learningRate: number;
+  duration: number; seed: number; checkpointEvery: number; exportEvery: number;
+}
+
+export function resolveSa3Recipe(input: Record<string, unknown>): Sa3Recipe {
+  const number = (key: string, fallback: number, min: number, max: number, integer = false): number => {
+    const value = input[key] === undefined ? fallback : input[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max
+      || (integer && !Number.isSafeInteger(value))) throw new Error(`Invalid SA3 ${key}`);
+    return value;
+  };
+  return {
+    steps: number('steps', 1000, 1, 1_000_000, true),
+    rank: number('rank', 16, 1, 256, true), alpha: number('alpha', 16, 0.001, 1024),
+    learningRate: number('learningRate', 1e-4, 1e-8, 0.1), duration: number('duration', 380, 1, 384),
+    seed: number('seed', 42, 0, 0x7fffffff, true),
+    checkpointEvery: number('checkpointEvery', 100, 1, 1_000_000, true),
+    exportEvery: number('exportEvery', 0, 0, 1_000_000, true),
+  };
+}
+
+export function buildSa3TrainArgs(o: Sa3Recipe & {
+  modelsDir: string; baseDit: string; inferenceDit: string; manifest: string; runDir: string; resume: boolean;
+}): string[] {
+  return ['sa3-train', '--models', o.modelsDir, '--base-dit', o.baseDit,
+    '--inference-dit', o.inferenceDit, '--manifest', o.manifest, '--out', o.runDir,
+    '--steps', String(o.steps), '--rank', String(o.rank), '--alpha', String(o.alpha),
+    '--lr', String(o.learningRate), '--duration', String(o.duration), '--seed', String(o.seed),
+    '--checkpoint-every', String(o.checkpointEvery), '--export-every', String(o.exportEvery),
+    '--bwd', 'mm', ...(o.resume ? ['--resume'] : []), '--jsonl'];
+}
+
 /** DiT model name → filesystem-safe variant key (extension stripped). */
 export function variantKeyFor(ditModel: string): string {
   const raw = String(ditModel ?? '').replace(/\\/g, '/');

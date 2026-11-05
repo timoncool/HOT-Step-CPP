@@ -14,6 +14,20 @@ import { config } from '../config.js';
 
 let db: Database.Database;
 
+/** How long a write waits for the other copy's write lock before SQLITE_BUSY.
+ *  better-sqlite3 already defaults to 5000 ms; it is set here so it stays
+ *  true whatever the driver default becomes. Dev and prod can share one
+ *  database (services/instance.ts). */
+export const BUSY_TIMEOUT_MS = 5000;
+
+/** The pragmas every connection to hotstep.db opens with. */
+export function applyConnectionPragmas(conn: Database.Database): void {
+  conn.pragma('journal_mode = WAL');
+  conn.pragma('synchronous = NORMAL');
+  conn.pragma('foreign_keys = ON');
+  conn.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+}
+
 export function getDb(): Database.Database {
   if (!db) {
     throw new Error('Database not initialized. Call initDb() first.');
@@ -28,10 +42,7 @@ export function initDb(): void {
 
   db = new Database(config.data.dbPath);
 
-  // Performance pragmas
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
+  applyConnectionPragmas(db);
 
   // ── Core HOT-Step tables ──────────────────────────────────────────────────
   db.exec(`
@@ -316,6 +327,14 @@ export function initDb(): void {
   `);
 
   // ── Migrations — add columns that may not exist in older databases ────────
+  // Two copies of the app (dev and prod) can run on this database at once, and
+  // the newer one migrates it under the older one. So every change while both
+  // run must be backward compatible in schema AND writes: add tables, add
+  // nullable or defaulted columns, never drop, rename or retype a column,
+  // never add a constraint or trigger the older code's writes would break,
+  // never change what an existing value means. A change that cannot meet this
+  // needs both copies stopped first, a backup (db/backup.ts), and both copies
+  // updated before either starts again.
   // Training datasets migrations
   const trainingMigrations: Array<{ check: string; alter: string }> = [
     {

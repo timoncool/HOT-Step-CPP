@@ -2,7 +2,7 @@
 //
 // Used by: LyricsBar, SectionMarkers, RepaintStudio (RegionLyricsEditor)
 
-import { ApiError } from '../services/httpClient';
+import { ApiError, HttpStatus } from '../services/httpClient';
 import { sidecarUrl } from './wordLrcUtils';
 
 /** A single timestamped lyric line from an LRC file. */
@@ -220,7 +220,7 @@ export function lrcToPlainLyrics(allLines: RegionLrcLine[]): string {
 export async function fetchLrc(audioUrl: string, opts: { signal?: AbortSignal } = {}): Promise<string | null> {
   if (!audioUrl) return null;
   const res = await fetch(sidecarUrl(audioUrl, '.lrc'), { signal: opts.signal });
-  if (res.status === 404) return null;
+  if (res.status === HttpStatus.notFound) return null;
   if (!res.ok) throw new ApiError(res.status, `Lyrics fetch failed (${res.status})`, null);
   const text = await res.text();
   return text.includes('[') ? text : null;

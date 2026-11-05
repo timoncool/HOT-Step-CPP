@@ -4,8 +4,8 @@
 // Supports both file-selection and folder-selection modes.
 // Remembers last-visited directory per filter type in localStorage.
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import React, { useState, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { createPortal } from 'react-dom';
 import { Folder, FileText, ChevronUp, X, Loader2 } from 'lucide-react';
 import { browseOptions } from '../../queries/shell-queue/settings';
@@ -52,61 +52,62 @@ function saveLastDir(dir: string, filter?: string): void {
 export const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
   open, onClose, onSelect, mode, startPath, filter, title,
 }) => {
-  const [currentDir, setCurrentDir] = useState('');
-  const [entries, setEntries] = useState<BrowseEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // The directory being browsed; changing it drives the query. Query handles
+  // cancellation of stale navigations and loading/error state automatically.
+  // null until the open effect picks the start dir; '' then means the server's
+  // default folder.
+  const [currentDir, setCurrentDir] = useState<string | null>(null);
   const [pathInput, setPathInput] = useState('');
-  const queryClient = useQueryClient();
-  // Only the newest navigation may land: a slow listing of a folder the user
-  // already left must not replace the one they are looking at.
-  const latest = useRef(0);
 
-  const loadDir = useCallback(async (dir: string) => {
-    const request = ++latest.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await queryClient.query(browseOptions(dir, filter));
-      if (request !== latest.current) return;
-      setCurrentDir(result.current);
-      setPathInput(result.current);
-      setEntries(result.entries);
-      saveLastDir(result.current, filter);
-    } catch (err: any) {
-      if (request === latest.current) setError(err?.message || 'Failed to list directory');
-    } finally {
-      if (request === latest.current) setLoading(false);
+  const browseQuery = useQuery({
+    ...browseOptions(currentDir ?? '', filter),
+    enabled: open && currentDir !== null,
+  });
+
+  // Sync the displayed path and persist it when a listing lands.
+  useEffect(() => {
+    if (browseQuery.data) {
+      setPathInput(browseQuery.data.current);
+      saveLastDir(browseQuery.data.current, filter);
     }
-  }, [filter, queryClient]);
+  }, [browseQuery.data, filter]);
 
   // Load initial directory when modal opens
   useEffect(() => {
     if (open) {
-      loadDir(startPath || getLastDir(filter) || '');
+      const dir = startPath || getLastDir(filter) || '';
+      setCurrentDir(dir);
+      setPathInput(dir);
     }
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, startPath, filter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!open) return null;
 
+  const entries = browseQuery.data?.entries ?? [];
+  const loading = browseQuery.isPending;
+  const error = browseQuery.error?.message ?? null;
+  const displayDir = browseQuery.data?.current ?? currentDir ?? '';
+
+  const navigateTo = (dir: string) => { setCurrentDir(dir); setPathInput(dir); };
+
   const handleEntryClick = (entry: BrowseEntry) => {
     if (entry.type === 'dir') {
-      loadDir(entry.path);
+      navigateTo(entry.path);
     } else if (mode === 'file') {
       onSelect(entry.path);
     }
   };
 
   const handleSelectFolder = () => {
-    if (mode === 'folder' && currentDir) {
-      onSelect(currentDir);
+    if (mode === 'folder' && displayDir) {
+      onSelect(displayDir);
     }
   };
 
   const handlePathSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (pathInput.trim()) {
-      loadDir(pathInput.trim());
+      navigateTo(pathInput.trim());
     }
   };
 
@@ -241,9 +242,9 @@ export const FileBrowserModal: React.FC<FileBrowserModalProps> = ({
           <span
             className="text-zinc-500 truncate font-mono"
             style={{ fontSize: '10px', maxWidth: '60%' }}
-            title={currentDir}
+            title={displayDir}
           >
-            {currentDir}
+            {displayDir}
           </span>
           <div className="flex gap-2">
             {mode === 'folder' && (

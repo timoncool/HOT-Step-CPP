@@ -14,7 +14,8 @@
 // WeightCtx::PendingCopy sources there costs no extra VRAM and needs no
 // second pass: wctx_alloc then uploads already-adapted weights.
 //
-// Deliberately NOT in scope: basin re-base, runtime (unmerged)
+// Basin re-base, for an adapter trained on another YuE2 variant, is at the end
+// of this file (yue2_rebase_nudge). Deliberately NOT in scope: runtime (unmerged)
 // deltas, and an importer for the upstream ComfyUI-YuE2-Trainer's fused-qkv
 // layout (plan §4 calls that "a nice-to-have, not v1" — see "Fused qkv" below
 // for what this file does when it meets one).
@@ -201,10 +202,13 @@ struct Yue2LmAdapterScales {
     float early  = 1.0f;
     float mid    = 1.0f;
     float late   = 1.0f;
+    // Basin re-base beta, 0 to 1: read only when the adapter was trained on
+    // another YuE2 variant (yue2_rebase_nudge below).
+    float rebase = 0.75f;
 
     bool operator==(const Yue2LmAdapterScales & o) const {
         return global == o.global && attn == o.attn && mlp == o.mlp && early == o.early && mid == o.mid &&
-               late == o.late;
+               late == o.late && rebase == o.rebase;
     }
     bool operator!=(const Yue2LmAdapterScales & o) const { return !(*this == o); }
 };
@@ -239,6 +243,12 @@ static std::string yue2_adapter_key(const std::vector<Yue2AdapterSpec> & specs) 
                  (double) s.scales.attn, (double) s.scales.mlp, (double) s.scales.early, (double) s.scales.mid,
                  (double) s.scales.late);
         out += s.path + "@" + buf;
+        // Only off its default, so every key written before re-base existed is
+        // unchanged and a persisted pick does not read as drift.
+        if (s.scales.rebase != 0.75f) {
+            snprintf(buf, sizeof(buf), ",r%.4f", (double) s.scales.rebase);
+            out += buf;
+        }
     }
     return out;
 }
@@ -533,6 +543,9 @@ struct Yue2AdapterMeta {
     int64_t     rank  = 0;      // 0 => absent (informational only; rank always
                                 //      comes from the tensor shapes)
     int         steps = 0;
+    // "off" = trained on codes from a tokenizer that does not pair with the
+    // v9 companion decoder adapter (WannabeTokenizer): render without it.
+    std::string decoder_companion;
 };
 
 static bool yue2a_meta_str(yyjson_val * meta, const char * key, std::string * out) {
@@ -584,6 +597,7 @@ static Yue2AdapterMeta yue2_adapter_read_meta(const STFile & st) {
         yue2a_meta_str(meta, "base_sha", &md.base_sha);
         yue2a_meta_str(meta, "use_dora", &md.use_dora);
         yue2a_meta_str(meta, "dora_scaling", &md.dora_scaling);
+        yue2a_meta_str(meta, "decoder_companion", &md.decoder_companion);
         double d = 0.0;
         if (yue2a_meta_num(meta, "alpha", &d)) {
             md.alpha = (float) d;
@@ -1551,9 +1565,9 @@ static int yue2_adapter_merge_st(WeightCtx *                 wctx,
 // actually being loaded (doc 30 #5) — a merge against a half that is not
 // staged is fatal by design. Accepts the same path shapes yue2_adapter_merge
 // does (a file, or a directory holding one of the exporters' default names).
-static std::string yue2_adapter_probe_family(const std::string & path) {
+static bool yue2_adapter_probe_open(const std::string & path, STFile * st) {
     HS_STAT_T sb;
-    if (hs_stat(path, &sb) != 0) return "";
+    if (hs_stat(path, &sb) != 0) return false;
     std::string sf_path = path;
     if (S_ISDIR(sb.st_mode)) {
         const char * cands[] = { "/adapter_model.safetensors", "/yue2-nar-lora.safetensors",
@@ -1565,10 +1579,14 @@ static std::string yue2_adapter_probe_family(const std::string & path) {
                 break;
             }
         }
-        if (sf_path.empty()) return "";
+        if (sf_path.empty()) return false;
     }
+    return st_open(st, sf_path.c_str());
+}
+
+static std::string yue2_adapter_probe_family(const std::string & path) {
     STFile st = {};
-    if (!st_open(&st, sf_path.c_str())) return "";
+    if (!yue2_adapter_probe_open(path, &st)) return "";
     std::string fam;
     const Yue2AdapterMeta md = yue2_adapter_read_meta(st);
     if (yue2a_starts(md.format, "yue2-nar-lora") || yue2a_starts(md.format, "yue2-nar-lokr") ||
@@ -1585,6 +1603,16 @@ static std::string yue2_adapter_probe_family(const std::string & path) {
     }
     st_close(&st);
     return fam;
+}
+
+// False when the adapter says it was trained on codes that render without the
+// companion decoder adapter (__metadata__.decoder_companion = "off").
+static bool yue2_adapter_wants_companion(const std::string & path) {
+    STFile st = {};
+    if (!yue2_adapter_probe_open(path, &st)) return true;
+    const bool want = yue2_adapter_read_meta(st).decoder_companion != "off";
+    st_close(&st);
+    return want;
 }
 
 static int yue2_adapter_merge(WeightCtx *                 wctx,
@@ -1672,4 +1700,150 @@ static int yue2_adapter_merge(WeightCtx *                 wctx,
             (double) scales.attn, (double) scales.mlp, (double) scales.early, (double) scales.mid,
             (double) scales.late, t.ms());
     return merged;
+}
+
+// ── Basin re-base ───────────────────────────────────────────────────────────
+//
+// ACE's basin re-base (adapter-merge.h) for an adapter trained on another YuE2
+// variant. Before anything merges, each tensor the adapter targets moves toward
+// the same tensor S of the LM it was trained on, W <- W + beta (S - W), so the
+// adapter lands in the weights it learned against. beta is the spec's `rebase`
+// dial. It runs ahead of the companion as well, so the companion and every
+// adapter stack on the nudged base exactly as ACE's merge does.
+//
+// A variant is an LM file's type minus its quant: yue2-lm-q8_0.gguf is the base
+// model (""), yue2-lm-rs-4.0x0.7-Q6_K.gguf is "rs-4.0x0.7". Nothing inside the
+// converted files tells variants apart (the RS fine-tune's norms are
+// bit-identical to the base's; it changed exactly the 392 block projections).
+// An adapter names its training LM in __metadata__.base_sha, a path written by
+// the NAR and AR trainers. One without it predates the variants (the joint
+// trainer's exports among them, which train on the base ConvRot checkpoint), so
+// its home is the base model.
+// ponytail: identity by filename; add a yue2.variant GGUF key at conversion if a
+// variant ever ships under a name this rule misreads.
+static std::string yue2_lm_variant(std::string type) {
+    if (type.size() > 5 && type.compare(type.size() - 5, 5, "-imat") == 0) {
+        type.resize(type.size() - 5);
+    }
+    const size_t dash = type.rfind('-');
+    return dash == std::string::npos ? "" : type.substr(0, dash);
+}
+
+// "rs-4.0x0.7-q8_0" for .../yue2-lm-rs-4.0x0.7-q8_0.gguf, "" for anything else.
+static std::string yue2_lm_type_of(const std::string & path) {
+    const size_t      slash = path.find_last_of("/\\");
+    const std::string n     = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (n.size() > 13 && n.compare(0, 8, "yue2-lm-") == 0 && n.compare(n.size() - 5, 5, ".gguf") == 0) {
+        return n.substr(8, n.size() - 13);
+    }
+    return "";
+}
+
+// The adapter's home LM type (from base_sha, "" when it records none) and the
+// GGUF tensors it patches at a non-zero strength. The merge's own preflight
+// still decides whether the file is legal; this only reads names.
+static bool yue2_adapter_rebase_targets(const std::string & path, const Yue2LmAdapterScales & sc, int n_blocks,
+                                        std::string * home_type, std::vector<std::string> * names) {
+    std::string sf = path;
+    HS_STAT_T   sb;
+    if (hs_stat(path, &sb) != 0) {
+        return false;
+    }
+    if (S_ISDIR(sb.st_mode)) {
+        sf.clear();
+        for (const char * c : { "/adapter_model.safetensors", "/yue2-nar-lora.safetensors", "/yue2-ar-lora.safetensors" }) {
+            if (sf.empty() && hs_stat(path + c, &sb) == 0) {
+                sf = path + c;
+            }
+        }
+    }
+    STFile st = {};
+    if (sf.empty() || !st_open(&st, sf.c_str())) {
+        return false;
+    }
+    *home_type = yue2_lm_type_of(yue2_adapter_read_meta(st).base_sha);
+    std::set<std::string> seen;
+    for (const STEntry & e : st.entries) {
+        std::string mod;
+        if (!yue2_lora_suffix(e.name, mod) && !yue2_lokr_suffix(e.name, mod) && !yue2_magnitude_suffix(e.name, mod)) {
+            continue;
+        }
+        const Yue2LoraTarget t = yue2_lora_target(mod);
+        if (t.gguf_name.empty() || yue2_adapter_effective(sc, t.group, t.block, n_blocks) == 0.0f) {
+            continue;
+        }
+        if (seen.insert(t.gguf_name).second) {
+            names->push_back(t.gguf_name);
+        }
+    }
+    st_close(&st);
+    return true;
+}
+
+// W <- W + beta (S - W) for each named tensor staged in `wctx`, S read from the
+// GGUF at `home`. Call it before any merge into `wctx`, while the staged source
+// of every name is still gf's own bytes. Names `wctx` does not stage (the other
+// half) are skipped. Returns the number nudged, or -1 with `err` set.
+static int yue2_rebase_nudge(WeightCtx * wctx, const GGUFModel & gf, const std::string & home,
+                             const std::vector<std::string> & names, float beta, ggml_backend_t backend,
+                             std::string * err) {
+    GGUFModel hg = {};
+    if (!gf_load(&hg, home.c_str())) {
+        *err = "cannot open the home model " + home;
+        return -1;
+    }
+    std::unordered_map<const void *, size_t> pending_idx;
+    for (size_t i = 0; i < wctx->pending.size(); i++) {
+        pending_idx[wctx->pending[i].src] = i;
+    }
+    int n = 0;
+    for (const std::string & name : names) {
+        ggml_tensor * mw = ggml_get_tensor(gf.meta, name.c_str());
+        const void *  w  = mw ? gf_get_data(gf, name.c_str()) : nullptr;
+        if (!w || !pending_idx.count(w)) {
+            continue;
+        }
+        ggml_tensor * ms = ggml_get_tensor(hg.meta, name.c_str());
+        if (!ms || !ggml_are_same_shape(ms, mw) || ggml_n_dims(mw) != 2) {
+            *err = home + " has no '" + name + "' shaped like the loaded LM's";
+            gf_close(&hg);
+            return -1;
+        }
+        const void *       s  = gf_get_data(hg, name.c_str());
+        const ggml_type    wt = mw->type, st = ms->type;
+        const int64_t      ne0 = mw->ne[0], ne1 = mw->ne[1];
+        // Types the backend cannot cast to F32 (NVFP4, MXFP4) decode on the host.
+        const bool         wh = !yue2_adapter_can_decode(backend, wt), sh = !yue2_adapter_can_decode(backend, st);
+        std::vector<float> wv, sv;
+        if (wh) {
+            wv.resize((size_t) (ne0 * ne1));
+            ggml_get_type_traits(wt)->to_float(w, wv.data(), ne0 * ne1);
+        }
+        if (sh) {
+            sv.resize((size_t) (ne0 * ne1));
+            ggml_get_type_traits(st)->to_float(s, sv.data(), ne0 * ne1);
+        }
+        // The "delta" is S - W at strength beta: the merge adds beta (S - W) to
+        // W and puts the result back in W's own type.
+        std::function<adapter_delta_build(struct ggml_context *)> build = [&](struct ggml_context * ctx) {
+            ggml_tensor * tw = ggml_new_tensor_2d(ctx, wh ? GGML_TYPE_F32 : wt, ne0, ne1);
+            ggml_tensor * ts = ggml_new_tensor_2d(ctx, sh ? GGML_TYPE_F32 : st, ne0, ne1);
+            adapter_delta_build db;
+            db.tdelta = ggml_sub(ctx, sh ? ts : ggml_cast(ctx, ts, GGML_TYPE_F32), wh ? tw : ggml_cast(ctx, tw, GGML_TYPE_F32));
+            db.upload = [&, tw, ts]() {
+                ggml_backend_tensor_set(tw, wh ? (const void *) wv.data() : w, 0, ggml_nbytes(tw));
+                ggml_backend_tensor_set(ts, sh ? (const void *) sv.data() : s, 0, ggml_nbytes(ts));
+            };
+            return db;
+        };
+        if (!adapter_merge_on_backend(wctx, pending_idx, w, wt, ne0, ne1, /*ds=*/nullptr, beta, backend,
+                                      name.c_str(), build, /*promote_f32=*/false)) {
+            *err = name + ": re-base failed after " + std::to_string(n) + " tensor(s)";
+            gf_close(&hg);
+            return -1;
+        }
+        n++;
+    }
+    gf_close(&hg);
+    return n;
 }

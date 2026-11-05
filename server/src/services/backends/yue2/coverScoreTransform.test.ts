@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import abcjs from 'abcjs';
 import {
-  coverScoreChoices, coverTempo, coverTranspose, coverVocalOnly, remeterTwoFourToFourFour, transformCoverScore,
+  coverScoreChoices, coverTempo, coverTranspose, coverVocalOnly, remeterTwoFourToFourFour, shiftBarLines, transformCoverScore,
 } from './coverScoreTransform.js';
 import { scoreBarClock } from './scoreClock.js';
 import { scoreSections } from './scoreSections.js';
@@ -246,5 +246,43 @@ test('re-meter rejects what it cannot convert exactly, and returns nothing to ap
     ['X:1\nM:2/4\nL:1/16\nK:C\nc8|\nM:3/4\nc12|', false, /paired/],
   ] as const) {
     assert.throws(() => remeterTwoFourToFourFour(abc, pickup), message);
+  }
+});
+
+test('bar-line shift moves every bar line a beat, ties the notes it cuts and writes the odd bars as beats', () => {
+  const abc = 'X:1\nM:4/4\nL:1/8\nK:C\n"C"c2d2e2f2|"G"g8|\n';
+  assert.equal(shiftBarLines(abc, 1).abc,
+    'X:1\nM:4/4\nL:1/8\nK:C\nM:1/4\n"C"c2|\nM:4/4\nd2e2f2"G"g2-|\nM:3/4\ng6|\n');
+  assert.equal(shiftBarLines(abc, -1).abc,
+    'X:1\nM:4/4\nL:1/8\nK:C\nM:3/4\n"C"c2d2e2|\nM:4/4\nf2"G"g6-|\nM:1/4\ng2|\n');
+  // The carried sharp is written out in its new bar; the tie continuation needs no mark.
+  assert.equal(shiftBarLines('X:1\nM:4/4\nL:1/8\nK:C\n^F2F2G2A2|F8|', 1).abc,
+    'X:1\nM:4/4\nL:1/8\nK:C\nM:1/4\n^F2|\nM:4/4\n^F2G2A2=F2-|\nM:3/4\nF6|');
+});
+
+test('bar-line shift moves both voices and every section but the first with the bar lines', () => {
+  const abc = [
+    'X:1', 'M:4/4', 'L:1/8', 'V: Vocal', 'V: Ins', 'K:G', '% intro', 'V: Vocal', 'Z2|', 'V: Ins', 'G8|z6d2|',
+    '% verse', 'V: Vocal', '"G"B2A2G2A2|"D"A8|', 'V: Ins', 'Z2|', '',
+  ].join('\n');
+  const later = shiftBarLines(abc, 1).abc;
+  assert.equal(later, [
+    'X:1', 'M:4/4', 'L:1/8', 'V: Vocal', 'V: Ins', 'K:G', '% intro',
+    'V: Vocal', 'M:1/4', 'z2|', 'V: Ins', 'M:1/4', 'G2-|', 'V: Vocal', 'M:4/4', 'Z|z6"G"B2|', 'V: Ins', 'M:4/4', 'G6z2|z4d2z2|',
+    '% verse', 'V: Vocal', 'A2G2A2"D"A2-|', 'V: Ins', 'Z|', 'V: Vocal', 'M:3/4', 'A6|', 'V: Ins', 'M:3/4', 'z6|', '',
+  ].join('\n'));
+  assert.deepEqual(scoreSections(later).map(s => s.startBar), [1, 4]);
+  // Back again plays the same notes (the shift checks that itself) with the sections where they were.
+  assert.deepEqual(scoreSections(shiftBarLines(later, -1).abc), scoreSections(abc));
+});
+
+test('bar-line shift refuses a zero or whole-bar shift and notation it cannot cut', () => {
+  for (const [abc, beats, message] of [
+    ['X:1\nM:4/4\nL:1/8\nK:C\nc8|', 0, /whole number/],
+    ['X:1\nM:4/4\nL:1/8\nK:C\nc8|', 4, /whole number/],
+    ['X:1\nM:4/4\nL:1/8\nK:C\n(3ccc c6|', 1, /tuplets/],
+    ['X:1\nM:4/4\nL:1/8\nK:C\nc8|]', 1, /double bars/],
+  ] as const) {
+    assert.throws(() => shiftBarLines(abc, beats), message);
   }
 });

@@ -4,6 +4,7 @@
 // status contract are shared by ace-train and the CUDA runner; model loading
 // and the training loop remain in yue2-aitk-runtime.cpp.
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 #include <unordered_set>
 #include <cstdlib>
 #include <cmath>
@@ -25,6 +27,8 @@ struct Config {
     std::int32_t steps = 0;
     std::int32_t save_every = 250;
     std::int32_t pause_at = 0; // absolute step; 0 disables preview pauses
+    std::string params_file;   // JSON re-read between steps when it changes: rev, save_every, pause_at
+    std::int32_t params_rev = 0; // the file revision these arguments already carry
     float cursor_weight = 0.08f;
     bool cursor_weight_explicit = false;
     std::uint64_t seed = 0;
@@ -135,6 +139,27 @@ struct Config {
     // --eval-base-loss recipe). No update, no dropout. Pass the run's --steps.
     bool eval_adapted = false;
     std::string eval_dataset;
+    // Opt-in hold-out inside the training dataset: these items (0-based, dataset
+    // order) are left out of training, and --eval-adapted without --eval-dataset
+    // scores only them (pass the same list when resuming a run that used it).
+    // Empty = unchanged.
+    std::vector<size_t> holdout_items;
+    // --eval-adapted window (frames; 0 = whole song) and seed of its per-item
+    // draws. Defaults: --nar-crop-frames and --seed, as before.
+    std::int32_t eval_nar_window = -1;
+    std::uint64_t eval_seed = 0;
+    bool eval_seed_set = false;
+    // Held-out planner gate (GH #316). Every planner_gate_every updates, the
+    // live planner's token-weighted CE on --holdout-items (the --eval-adapted
+    // recipe, AR only: --eval-seed draws, no dropout, its own sampler). Once
+    // planner_gate_min_epochs training epochs have run, planner_gate_patience
+    // readings in a row that are not below best - planner_gate_epsilon freeze
+    // the planner where it is (no rollback), and the decoder trains
+    // --nar-extra-steps more. 0 = off.
+    std::int32_t planner_gate_every = 0;
+    std::int32_t planner_gate_min_epochs = 5;
+    std::int32_t planner_gate_patience = 3;
+    float planner_gate_epsilon = 0.001f;
     // Spike guard. A step whose pre-clip gradient norm exceeds spike_factor x
     // the median of the last 50 applied steps skips its update (0 = off; it
     // arms once 20 norms are in the window, and the window restarts when the
@@ -295,13 +320,70 @@ inline double lr_schedule_multiplier(const Config & c, int completed, int decayi
     return 0.5 * (1.0 + std::cos(pi * ratio));
 }
 
+// The held-out planner gate's state; every field rides in the resume record,
+// so a resumed run reaches the same verdict at the same step as a continuous
+// one. Readings before the epoch floor still set the best, never the count.
+struct PlannerGate {
+    double best = std::numeric_limits<double>::infinity();
+    std::int32_t best_step = -1;
+    std::int32_t stale = 0;  // readings in a row past the floor without improvement
+    // Training songs drawn so far: grad-accum per update, summed as the run
+    // goes, so a resume that changes --grad-accum keeps the epochs behind it.
+    std::int64_t draws = 0;
+    enum class Verdict { keep, fire, nonfinite };
+    // Training epochs: song draws over training songs (the hold-out excluded).
+    static double epochs(std::int64_t draws, size_t training_items) {
+        return training_items ? double(draws) / double(training_items) : 0.0;
+    }
+    // The decoder window the reading's draws are cropped with; bound on resume.
+    static std::int64_t eval_window(const Config & c) {
+        return c.eval_nar_window >= 0 ? c.eval_nar_window : c.nar_crop_frames;
+    }
+    // Per-song (CE, tokens) to one CE over all held-out tokens: a long song
+    // weighs what its tokens weigh. NaN when there are no tokens.
+    static double token_mean(const std::vector<std::pair<double, size_t>> & songs) {
+        double weighted = 0.0; size_t total = 0;
+        for (const auto & s : songs) { weighted += s.first * double(s.second); total += s.second; }
+        return total ? weighted / double(total) : std::numeric_limits<double>::quiet_NaN();
+    }
+    // A fire verdict the run could not act on (a spike stop ended that step):
+    // the resumed segment freezes at once, where the continuous run would have.
+    bool pending(const Config & c) const { return c.planner_gate_every > 0 && stale >= c.planner_gate_patience; }
+    static bool due(const Config & c, int completed) {
+        return c.planner_gate_every > 0 && completed > 0 && completed % c.planner_gate_every == 0;
+    }
+    Verdict observe(const Config & c, int completed, double epoch, double ce) {
+        if (!std::isfinite(ce)) return Verdict::nonfinite;
+        if (ce < best - double(c.planner_gate_epsilon)) { best = ce; best_step = completed; stale = 0; return Verdict::keep; }
+        if (epoch < double(c.planner_gate_min_epochs)) return Verdict::keep;
+        return ++stale >= c.planner_gate_patience ? Verdict::fire : Verdict::keep;
+    }
+};
+
+// What the gate needs from the rest of the configuration. Checked before any
+// model load; the training loop relies on every rule here.
+inline bool validate_planner_gate(const Config & c, std::string * error) {
+    const auto bad = [&](const char * why) { if (error) *error = why; return false; };
+    if (c.planner_gate_every <= 0) return true;
+    if (c.holdout_items.empty()) return bad("--planner-gate-every needs --holdout-items: the songs it scores, kept out of training");
+    if (!c.eval_dataset.empty()) return bad("--planner-gate-every scores --holdout-items; --eval-dataset is for --eval-adapted");
+    if (c.nar_extra_steps <= 0) return bad("--planner-gate-every needs --nar-extra-steps: the decoder's budget after the planner freezes");
+    if (c.lr_schedule == "wsd") return bad("--planner-gate-every does not support --lr-schedule wsd: its tail would end the run when the planner freezes");
+    if (c.eval_adapted || c.eval_base_loss || c.meter_only || !c.fixture_replay.empty())
+        return bad("--planner-gate-every is for training runs, not --eval-adapted, --eval-base-loss, --meter-only or --fixture-replay");
+    if (c.planner_gate_patience < 1) return bad("--planner-gate-patience must be at least 1");
+    if (c.planner_gate_min_epochs < 0) return bad("--planner-gate-min-epochs must be nonnegative");
+    if (!std::isfinite(c.planner_gate_epsilon) || c.planner_gate_epsilon < 0.0f) return bad("--planner-gate-epsilon must be a finite number >= 0");
+    return true;
+}
+
 enum class ParseResult { ok, help, error };
 
 inline void usage(FILE * out) {
     std::fprintf(out,
         "ace-train yue2-joint-train --checkpoint <ConvRot.safetensors> "
         "--dataset <schema1-manifest.json> --output <new-run-dir> "
-        "--steps N --save-every N --seed N --device CUDA0 [--resume <record>] [--pause-at N] "
+        "--steps N --save-every N --seed N --device CUDA0 [--resume <record>] [--pause-at N] [--params-file <json> [--params-rev N]] "
         "[--cursor-weight 0.08 (0 disables lyric timing)] [--rank N] [--alpha F] "
         "[--adapter-type lora|lokr|dora] [--lokr-dim 32] [--lokr-factor 8] "
         "[--optimizer adamw|adamw-lm|prodigy|muon] [--cautious] [--lr F] [--warmup N] [--weight-decay F] "
@@ -312,6 +394,10 @@ inline void usage(FILE * out) {
         "[--nar-drift (log the decoder's drift from base and its reconstruction error at every checkpoint)] "
         "[--meter-only (with --resume: write the checkpoint's meters.json and exit)] "
         "[--eval-adapted (with --resume: held-out base vs adapted planner CE and decoder MSE to <output>/adapted-loss.jsonl, no training)] [--eval-dataset <dataset.json> (the held-out set for --eval-adapted)] "
+        "[--holdout-items I,J,.. (leave these dataset items out of training; --eval-adapted without --eval-dataset scores only them)] "
+        "[--eval-nar-window N (--eval-adapted window: default --nar-crop-frames, 0 = whole song)] [--eval-seed N (seed of the --eval-adapted draws: default --seed)] "
+        "[--planner-gate-every N (score the planner on --holdout-items every N updates; a plateau freezes it, then --nar-extra-steps; 0 = off)] "
+        "[--planner-gate-min-epochs 5] [--planner-gate-patience 3] [--planner-gate-epsilon 0.001] "
         "[--eval-base-loss (no training: per-item base planner CE and decoder flow MSE to <output>/base-loss.jsonl)] "
         "[--recon-stop F (planner frozen: stop when a line fitted through the last --recon-stop-window 3 reconstruction readings gains under F)] [--recon-reset (with --resume: empty window)] "
         "[--unfreeze-planner (with --resume: train the planner on past its freeze)] [--kl-checkpoint-every 0.1 (a checkpoint at each KL rung)] "
@@ -331,6 +417,52 @@ inline void usage(FILE * out) {
 }
 
 namespace detail {
+// Shared by fresh-run filtering and resume validation. Dataset indices are
+// stable; the split is a set, while the training order retains its shuffle.
+inline bool training_order(size_t item_count, const std::vector<size_t> & holdout,
+                           std::vector<size_t> * order, std::string * error) {
+    std::vector<bool> held(item_count, false);
+    for (size_t k : holdout) {
+        if (k >= item_count || held[k]) {
+            if (error) *error = "--holdout-items must contain distinct in-range indices";
+            return false;
+        }
+        held[k] = true;
+    }
+    if (holdout.size() >= item_count) {
+        if (error) *error = "--holdout-items leaves no training item";
+        return false;
+    }
+    order->clear();
+    for (size_t k = 0; k < item_count; ++k) if (!held[k]) order->push_back(k);
+    return true;
+}
+
+inline bool validate_resume_order(size_t item_count, const std::vector<size_t> & holdout,
+                                  const std::vector<size_t> & saved_holdout,
+                                  const std::vector<size_t> & order, uint64_t cursor,
+                                  std::string * error) {
+    std::vector<size_t> expected, saved_expected;
+    if (!training_order(item_count, holdout, &expected, error) ||
+        !training_order(item_count, saved_holdout, &saved_expected, error)) return false;
+    // Missing metadata is passed as an empty split: legacy runs saw all items.
+    if (expected != saved_expected) {
+        if (error) *error = "resume hold-out split mismatch; start a new run";
+        return false;
+    }
+    auto sorted = order;
+    std::sort(sorted.begin(), sorted.end());
+    if (sorted != expected) {
+        if (error) *error = "resume order must be the nonempty complement of the hold-out split";
+        return false;
+    }
+    if (cursor >= order.size()) {
+        if (error) *error = "resume order cursor is out of range";
+        return false;
+    }
+    return true;
+}
+
 inline bool decimal_u64(const char * text, std::uint64_t * out) {
     if (!text || !*text || !out) return false;
     std::uint64_t value = 0;
@@ -427,6 +559,11 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
                 if(error)*error="--cursor-weight must be finite and within [0,10]"; return ParseResult::error;
             }
             parsed.cursor_weight=weight; parsed.cursor_weight_explicit=true;
+        } else if (!std::strcmp(arg, "--params-file")) {
+            if (!detail::value(arg, argc, argv, &i, &parsed.params_file, error)) return ParseResult::error;
+        } else if (!std::strcmp(arg, "--params-rev")) {
+            std::string value_text; if (!detail::value(arg, argc, argv, &i, &value_text, error) ||
+                !detail::decimal_i32(value_text.c_str(), &parsed.params_rev)) { if (error) *error = "--params-rev must be a nonnegative integer"; return ParseResult::error; }
         } else if (!std::strcmp(arg, "--pause-at")) {
             std::string value_text; if (!detail::value(arg, argc, argv, &i, &value_text, error) ||
                 !detail::decimal_i32(value_text.c_str(), &parsed.pause_at)) { if (error) *error = "--pause-at must be a nonnegative integer"; return ParseResult::error; }
@@ -587,6 +724,36 @@ inline ParseResult parse(int argc, char ** argv, Config * config, std::string * 
             parsed.eval_adapted = true;
         } else if (!std::strcmp(arg, "--eval-dataset")) {
             if (!detail::value(arg, argc, argv, &i, &parsed.eval_dataset, error)) return ParseResult::error;
+        } else if (!std::strcmp(arg, "--holdout-items")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error)) return ParseResult::error;
+            parsed.holdout_items.clear(); size_t pos = 0;
+            while (pos <= text.size()) {
+                size_t comma = text.find(',', pos); if (comma == std::string::npos) comma = text.size();
+                const std::string part = text.substr(pos, comma - pos); std::uint64_t v = 0;
+                if (!detail::decimal_u64(part.c_str(), &v) || std::find(parsed.holdout_items.begin(), parsed.holdout_items.end(), size_t(v)) != parsed.holdout_items.end()) {
+                    if (error) *error = "--holdout-items must be distinct item indices like 0,2"; return ParseResult::error;
+                }
+                parsed.holdout_items.push_back(size_t(v)); pos = comma + 1;
+            }
+        } else if (!std::strcmp(arg, "--eval-nar-window")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_i32(text.c_str(), &parsed.eval_nar_window) || parsed.eval_nar_window < 0) { if (error) *error = "--eval-nar-window must be 0 (whole song) or a positive frame count"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--eval-seed")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_u64(text.c_str(), &parsed.eval_seed)) { if (error) *error = "--eval-seed must be an unsigned decimal integer"; return ParseResult::error; }
+            parsed.eval_seed_set = true;
+        } else if (!std::strcmp(arg, "--planner-gate-every")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_i32(text.c_str(), &parsed.planner_gate_every)) { if (error) *error = "--planner-gate-every must be a nonnegative integer"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--planner-gate-min-epochs")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_i32(text.c_str(), &parsed.planner_gate_min_epochs)) { if (error) *error = "--planner-gate-min-epochs must be a nonnegative integer"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--planner-gate-patience")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::decimal_i32(text.c_str(), &parsed.planner_gate_patience) || parsed.planner_gate_patience < 1) { if (error) *error = "--planner-gate-patience must be a positive integer"; return ParseResult::error; }
+        } else if (!std::strcmp(arg, "--planner-gate-epsilon")) {
+            std::string text; if (!detail::value(arg, argc, argv, &i, &text, error) ||
+                !detail::finite_float(text.c_str(), &parsed.planner_gate_epsilon) || parsed.planner_gate_epsilon < 0.0f) { if (error) *error = "--planner-gate-epsilon must be a finite number >= 0"; return ParseResult::error; }
         } else if (!std::strcmp(arg, "--meter-only")) {
             parsed.meter_only = true; parsed.nar_drift = true;
         } else if (!std::strcmp(arg, "--nar-extra-steps")) {

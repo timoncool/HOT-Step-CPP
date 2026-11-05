@@ -5,14 +5,23 @@ Drop Lua plugin files here to extend the engine without rebuilding. The engine l
 in its dropdown. On a duplicate name the first one loaded wins, so a built-in plugin cannot
 be replaced from here; give yours a new `name`.
 
+In a release build, put your own plugins in the data folder's `plugins/` instead, under the
+same subfolders. The engine scans it last, a plugin there replaces a shipped one of the same
+name, and it is kept when the app is upgraded. See
+[Data folder and upgrades](../docs/user/data-folder.md).
+
 ```
 plugins/
   solvers/        ODE and SDE solvers
   schedulers/     noise schedules
   guidance/       guidance modes
-  postprocess/    post-VAE audio processing
+  postprocess/    VAE decode replacements (tiled decode plus a DSP chain)
   docs/           user manuals for the plugins shipped here
 ```
+
+A file whose name contains `_constants`, `_math` or `_data`, or a `<name>_core.lua` next to
+a `<name>.lua`, is treated as a companion file and is not loaded as a plugin. Plugins
+`require` companion files by name, and `require` only looks in the plugin's own folder.
 
 How to write one: [docs/dev/plugins-authoring.md](../docs/dev/plugins-authoring.md) has the
 API (`solver = {...}` metadata table plus a global `step()`, the `apg()` bridge, `post_step()`,
@@ -24,6 +33,10 @@ and community, is generated into [docs/user/plugins.md](../docs/user/plugins.md)
 For advanced solvers that need to control the entire sampling iteration
 (e.g., adaptive dispatch, velocity caching, SDE restarts), set
 `owns_loop = true` and define a `sample()` function instead of `step()`.
+
+ACE-Step and the YuE2 NAR loop run full-loop solvers. MiniMax-Music3 and Stable Audio 3
+generation leave them out of their pickers, and the StableStep refine runs its native
+ping-pong step in their place.
 
 ### Full-Loop Solver Example
 
@@ -49,7 +62,7 @@ function sample(xt, vt_buf, schedule, n, model_fn)
   -- n:         total element count
   -- model_fn:  function(xt_array, t_val) → writes velocity to vt_buf
   --
-  -- Globals: on_step, num_steps, batch_n, n_per, params
+  -- Globals: on_step, num_steps, batch_n, n_per, seed, params, model_context
   --
   -- Contract:
   --   1. Call model_fn(xt, t) to evaluate the model at any timestep
@@ -97,4 +110,5 @@ available, along with the `FloatArray` API for zero-copy access to the latent bu
 ## Sharing
 
 A plugin is a single `.lua` file. Share it as is; the recipient drops it in the matching
-subfolder here.
+subfolder here. If it loads a companion file with `require` (the `md_*` solvers here share
+`solvers/md_solver_commons.lua`), share that file too and put it in the same subfolder.

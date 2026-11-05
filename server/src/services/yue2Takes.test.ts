@@ -378,6 +378,25 @@ test('cover-local lyrics: validated, revisioned, isolated, and the next take fol
     hold = false;
   });
 
+  await t.test('delete build: refused while rendering and for another user, then removes the folder', async () => {
+    const { deleteBuild } = await import('./yue2Takes.js');
+    hold = true; cancelled = false;
+    const s = start();
+    generateBuildTakes(s.id, 'user', 0, 1, 0);
+    await until(() => getBuildSession(s.id, 'user').pending[0]?.progress === 25);
+    assert.throws(() => deleteBuild(s.id, 'user'), /still rendering/);
+    await cancelBuildTakes(s.id, 'user');
+    await settle(s.id);
+    hold = false;
+    const dir = path.join(config.data.audioDir, 'takes', s.id);
+    assert.throws(() => deleteBuild(s.id, 'other'), /not found/);
+    assert.throws(() => deleteBuild(s.id, 'user', id => id === s.id), /Save song render is queued/);
+    assert.ok(fs.existsSync(dir));
+    deleteBuild(s.id, 'user');
+    assert.ok(!fs.existsSync(dir));
+    assert.throws(() => getBuildSession(s.id, 'user'), /not found/);
+  });
+
   await t.test('candidates made before an edit cannot be kept; mutations on the old revision fail', async () => {
     const s = start();
     generateBuildTakes(s.id, 'user', 0, 1, 0);
@@ -495,6 +514,36 @@ test('arrangements: takes and Save song follow the plan, by occurrence', async t
     assert.equal(requests.at(-1)!.lyric_schedule, undefined, 'Lyric Timing is off for builds');
   });
 
+  await t.test('an Improv section is composed blind: score and lyrics hidden for its bars only', async () => {
+    const improv = score.replace('% chorus', '% Improv\nV: Vocal\nz6|z6|\n% chorus');
+    const s = start(lyrics, improv);
+    const [opening] = await take(s.id, 1, 0);
+    assert.equal(requests.at(-1)!.lyric_schedule, undefined);
+    keepBuildTake(s.id, 'user', opening.id, 0);
+    await take(s.id, 2, 0);
+    const blind = requests.at(-1)!.lyric_schedule!;
+    // Intro and verse 0-12 s, improv 12-18 s; sampling resumes after frame 300.
+    assert.deepEqual([blind.mode, blind.sections, blind.blind!.map(w => [w.from_sec, w.to_sec])], ['mask', [], [[12.04, 18]]]);
+    assert.deepEqual(blind.blind![0].lyric, [[0, Array.from(lyrics.trimEnd()).length]]);
+    assert.ok(blind.blind![0].abc!.some(([a, b]) => Array.from(improv).slice(a, b).join('').includes('E6|F6|')), 'the chorus lines are hidden too');
+    assert.ok(blind.blind![0].abc!.every(([a, b]) => !/^[MLQKV]:/m.test(Array.from(improv).slice(a, b).join(''))), 'field lines stay visible');
+    keepBuildTake(s.id, 'user', getBuildSession(s.id, 'user').takes.at(-1)!.id, 0);
+    await take(s.id, 3, 0);
+    assert.equal(requests.at(-1)!.lyric_schedule, undefined, 'the take after it reads the score again');
+  });
+
+  await t.test('an improv added to the plan writes its rest bars and is composed blind', async () => {
+    const s = start();
+    editBuildPlan(s.id, 'user', 0, ['s0', 's1', 'improv:2', 's2'], false);
+    const [opening] = await take(s.id, 1, 1);
+    keepBuildTake(s.id, 'user', opening.id, 1);
+    const [improv] = await take(s.id, 2, 1);
+    const req = requests.at(-1)!;
+    assert.match(req.abc!, /% Improv\nV: Vocal\nz6\|z6\|\n% chorus/);
+    assert.deepEqual(req.lyric_schedule!.blind!.map(w => [w.from_sec, w.to_sec]), [[12.04, 18]]);
+    assert.equal(improv.occurrences.length, 1);
+  });
+
   await t.test('skip, repeat and continue: each take resumes the kept output under the composed prompt', async () => {
     const s = start();
     const planned = editBuildPlan(s.id, 'user', 0, ['s1', 's2', 's2', 's3'], true);
@@ -553,6 +602,25 @@ test('arrangements: takes and Save song follow the plan, by occurrence', async t
     assert.throws(() => editBuildPlan(s.id, 'user', 2, 'o5', true), /must list/);
     assert.deepEqual(getBuildSession(s.id, 'user').kept, [verse.id]);
     assert.deepEqual(getBuildSession(s.id, 'user').arrangement.plan[0].id, 'o4');
+  });
+
+  await t.test('a crop that keeps the start of the run-on section carries on from the cut', async () => {
+    const { cropBuildTake } = await import('./yue2Takes.js');
+    const s = start();
+    editBuildPlan(s.id, 'user', 0, ['s1', 's2'], false);
+    const [open] = await take(s.id, 1, 1);
+    assert.equal(open.after, 's3', 'the chorus ran on into the outro');
+    keepBuildTake(s.id, 'user', open.id, 1);
+    const cut = open.starts[2]! + 10;
+    const kept = cropBuildTake(s.id, 'user', open.id, 1, cut, 'regenerate');
+    const spine = kept.takes.find(x => x.id === kept.kept.at(-1))!;
+    assert.deepEqual([spine.to, spine.resume], [1, cut]);
+    // Another section next would sing over the kept start of the outro.
+    let rev = editBuildPlan(s.id, 'user', 1, ['s0'], false).revision;
+    assert.throws(() => generateBuildTakes(s.id, 'user', 2, 1, rev), /carries on into outro/i);
+    rev = editBuildPlan(s.id, 'user', rev, ['s3'], true).revision;
+    await take(s.id, 2, rev);
+    assert.equal(requests.at(-1)!.codec_ids!.length, cut, 'the next take resumes at the cut');
   });
 
   await t.test('a plan edit after a take leaves it keepable while its own sections are untouched', async () => {
@@ -806,6 +874,9 @@ test('crop plans: a cut on a frame inside the composed part, by occurrence', asy
   assert.deepEqual(cropPlan(take, 200, 'regenerate'), { to: 0, starts: [0, 150, null, null], resume: 200, prefix: 150 });
   // Past the next section's start: only Save song's tail changes.
   assert.deepEqual(cropPlan(take, 360, undefined), { to: 2, starts: [0, 150, 250, 330], resume: undefined, prefix: 150 });
+  // 'regenerate' there keeps the run-on up to the cut; the next take carries on from it.
+  assert.deepEqual(cropPlan(take, 360, 'regenerate'), { to: 2, starts: [0, 150, 250, 330], resume: 360, prefix: 150 });
+  assert.equal(cropPlan(take, 330, 'regenerate').resume, undefined, 'a cut at its start keeps none of it');
   // The last occurrence: moving on keeps it, cut short.
   assert.deepEqual(cropPlan({ ...take, to: 3 }, 360, 'advance').to, 3);
   assert.deepEqual(cropPlan({ ...take, to: 3 }, 360, 'advance').starts.length, 4);

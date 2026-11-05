@@ -5,6 +5,7 @@
 // keep CPU as fallback. This avoids duplicating init logic across
 // qwen3.h, qwen3-lm.h, cond.h, dit.h, vae.h.
 
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <cstdio>
@@ -41,6 +42,32 @@ struct BackendPair {
 // calls (see GitHub #49).
 inline BackendPair g_backend_cache = {};
 inline int         g_backend_refs  = 0;
+
+// Test-only fault injection (#242). ACE_FAULT_BACKEND_ERROR=<site> marks the
+// shared backend as poisoned right after the named compute (sites: "align"),
+// mimicking a Metal command buffer failure that only surfaces at synchronize.
+// While poisoned, backend_healthy() and backend_compute_ok() report failure,
+// until a fresh backend_init (refs back from 0) clears it. A no-op when unset.
+inline bool g_backend_poisoned = false;
+
+// Compiled in only when ACE_ENABLE_FAULT_INJECTION is defined (the
+// backend-health-test target); release builds get an empty fault point.
+static void backend_fault_point(const char * site) {
+#ifdef ACE_ENABLE_FAULT_INJECTION
+    const char * want = std::getenv("ACE_FAULT_BACKEND_ERROR");
+    if (want && site && strcmp(want, site) == 0 && g_backend_refs > 0) {
+        g_backend_poisoned = true;
+        fprintf(stderr, "[Fault] ACE_FAULT_BACKEND_ERROR=%s: backend marked poisoned%s", site, "\n");
+    }
+#else
+    (void) site;
+#endif
+}
+
+// A compute result, folded with the injected poison flag.
+static bool backend_compute_ok(enum ggml_status st) {
+    return st == GGML_STATUS_SUCCESS && !g_backend_poisoned;
+}
 
 // Physical core count heuristic (logical / 2 for HT/SMT).
 // Used for GGML CPU thread count: GEMM shares SIMD units across hyperthreads,
@@ -395,8 +422,9 @@ static BackendPair backend_init(const char * label) {
 
     fprintf(stderr, "[Load] %s backend: %s (CPU threads: %d)\n", label, ggml_backend_name(bp.backend), n_threads);
 
-    g_backend_cache = bp;
-    g_backend_refs  = 1;
+    g_backend_cache    = bp;
+    g_backend_refs     = 1;
+    g_backend_poisoned = false;  // a fresh backend carries no error state
     return bp;
 }
 
@@ -415,6 +443,65 @@ static void backend_release(ggml_backend_t backend, ggml_backend_t cpu_backend) 
         }
         g_backend_cache = {};
     }
+}
+
+// Health probe for the shared backend (#242). ggml has no public "is in error"
+// query and ggml_backend_synchronize returns void, so synchronize, then run a
+// 1-element graph and check its status: a Metal backend left in error state by
+// an earlier command buffer failure refuses every new compute. No backend
+// cached means nothing to be unhealthy, so that reports healthy.
+static bool backend_healthy() {
+    if (g_backend_refs <= 0 || !g_backend_cache.backend) {
+        return true;
+    }
+    ggml_backend_t be = g_backend_cache.backend;
+    ggml_backend_synchronize(be);
+    if (g_backend_poisoned) {
+        return false;
+    }
+    ggml_init_params ip = { ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(8, false), nullptr, true };
+    ggml_context *   ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * y = ggml_scale(ctx, a, 2.0f);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8, false);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    bool                  ok  = false;
+    if (buf) {
+        const float one = 1.0f;
+        ggml_backend_tensor_set(a, &one, 0, sizeof(one));
+        ok = ggml_backend_graph_compute(be, gf) == GGML_STATUS_SUCCESS;
+        if (ok) {
+            float out = 0.0f;
+            ggml_backend_tensor_get(y, &out, 0, sizeof(out));
+            ok = out == 2.0f;
+        }
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
+// Teardown recovery for a poisoned backend (#242). Every resident buffer lives
+// on the old backend, so an in-place swap is not possible: unload() must drop
+// all of the caller's backend refs, then, if no one else holds one (refs at 0,
+// which frees the backend and clears the poison), reload() builds it fresh.
+// Shared by the YuE2 job path and engine/tools/backend-health-test.cpp.
+enum class BackendRecover { OK, OTHER_HOLDER, RELOAD_FAILED };
+
+template <class Unload, class Reload>
+static BackendRecover backend_teardown_recover(Unload && unload, Reload && reload) {
+    unload();
+    if (g_backend_refs != 0) {
+        return BackendRecover::OTHER_HOLDER;
+    }
+    if (!reload() || !backend_healthy()) {
+        return BackendRecover::RELOAD_FAILED;
+    }
+    return BackendRecover::OK;
 }
 
 // A second backend instance on the same device as the shared one: its own

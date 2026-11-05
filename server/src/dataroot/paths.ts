@@ -120,7 +120,7 @@ export function layoutDefaults(l: DataLayout): Record<string, string> {
     ACESTEPCPP_ADAPTERS: l.adapters,
     TRAINING_DIR: path.join(l.library, 'training'),
     LYRICS_EXPORT_DIR: path.join(l.library, 'lyrics'),
-    MUSCRIPTOR_MODELS_DIR: path.join(l.library, 'models', 'muscriptor'),
+    MUSCRIPTOR_MODELS_DIR: path.join(l.models, 'muscriptor'),
     TENSORRT_LIBS: l.runtimeLibDir,
     WHISPER_EXE: path.join(l.whisperDir, `whisper-cli${BIN_EXT}`),
     WHISPER_MODELS_DIR: path.join(l.models, 'whisper'),

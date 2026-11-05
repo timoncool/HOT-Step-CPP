@@ -1,14 +1,13 @@
-import { useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useStudioSongs } from '../../queries/studios/shared';
-import { sharedKeys } from '../../queries/keys';
-import { queryManager } from '../../queries/invalidation';
+import { removeSongs } from '../../queries/shell-queue/songs';
 // RecentBuilds.tsx — Recent stem builds sidebar section
 //
 // Fetches recent songs generated via Stem Builder (source = 'stem-builder')
 // and displays them in a compact list. Each item can be played or used as
 // a new source for iterative composition.
 
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useMemo } from 'react';
 import { Play, ArrowUp, Trash2 } from 'lucide-react';
 import { songApi } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
@@ -23,7 +22,6 @@ interface RecentBuild {
 }
 
 interface RecentBuildsProps {
-  refreshTrigger: number;
   onPlay: (build: RecentBuild) => void;
   onUseAsSource: (build: RecentBuild) => void;
 }
@@ -36,7 +34,6 @@ const TRACK_EMOJI: Record<string, string> = {
 };
 
 export const RecentBuilds: React.FC<RecentBuildsProps> = ({
-  refreshTrigger,
   onPlay,
   onUseAsSource,
 }) => {
@@ -44,7 +41,6 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
   const client = useQueryClient();
   const songsQuery = useStudioSongs();
   const loading = songsQuery.isPending;
-  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const builds = useMemo(() => {
       const songs = songsQuery.data?.songs ?? [];
@@ -79,32 +75,22 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
         });
       return stemBuilds;
   }, [songsQuery.data]);
-  useEffect(() => {
-    if (refreshTrigger) void queryManager.keys(client, sharedKeys.songs());
-  }, [client, refreshTrigger]);
 
   /** Delete a build. A stem build is an ordinary song row (source
    *  'stem-builder'), so the normal song delete removes the DB row and the
-   *  audio file together. Without this the only routes out were the Library
-   *  tab or deleting WAVs from data/audio by hand (issue #110). */
-  const handleDelete = useCallback(async (build: RecentBuild) => {
+   *  audio file together — one mutation. On success removeSongs drops the row
+   *  from every cached list, removes its detail query, and refetches via the
+   *  manager (no manual cache surgery here). Without this the only routes out
+   *  were the Library tab or deleting WAVs from data/audio by hand (#110). */
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => songApi.delete(id),
+    onSuccess: (_data, id) => { void removeSongs(client, [id]); },
+  });
+  const requestDelete = (build: RecentBuild) => {
     if (!token) return;
     if (!window.confirm(`Delete "${build.title}"? This removes the audio file too.`)) return;
-    setDeletingId(build.id);
-    try {
-      const key = sharedKeys.songs();
-      await client.cancelQueries({ queryKey: key });
-      await songApi.delete(build.id);
-      await client.cancelQueries({ queryKey: key });
-      client.setQueryData<typeof songsQuery.data>(key, data => data && ({ ...data, songs: data.songs.filter(song => song.id !== build.id) }));
-      client.removeQueries({ queryKey: sharedKeys.song(build.id) });
-      await queryManager.keys(client, key);
-    } catch (err) {
-      console.error('[RecentBuilds] Delete failed:', err);
-    } finally {
-      setDeletingId(null);
-    }
-  }, [token, client]);
+    deleteMut.mutate(build.id);
+  };
 
   if (songsQuery.error) return <div role="alert">{songsQuery.error.message}</div>;
   if (loading && builds.length === 0) {
@@ -157,8 +143,8 @@ export const RecentBuilds: React.FC<RecentBuildsProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => handleDelete(build)}
-            disabled={deletingId === build.id}
+            onClick={() => requestDelete(build)}
+            disabled={deleteMut.isPending}
             className="flex-shrink-0 w-6 h-6 rounded-full bg-white/[0.06] flex items-center justify-center hover:bg-red-500/20 transition-colors opacity-0 group-hover:opacity-100 disabled:opacity-30"
             title="Delete build"
           >

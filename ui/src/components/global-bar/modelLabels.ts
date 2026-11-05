@@ -34,7 +34,8 @@ export function formatDitModel(filename: string): string {
     [/^acestep-v15-sft$/, 'SFT'],
   ];
 
-  let label = base;
+  // Unmapped merges keep their name, minus the prefix every DiT shares.
+  let label = base.replace(/^acestep-v15-/, '');
   for (const [pattern, replacement] of labelMap) {
     if (pattern.test(base)) {
       label = base.replace(pattern, replacement);
@@ -181,4 +182,18 @@ export function getVaeModelDescription(filename: string): string {
   if (name.includes('scragvae') || name.includes('scrag')) return 'ScragVAE — custom-trained for reduced artifacts and improved clarity.';
   if (name.startsWith('vae')) return 'Stock ACE-Step VAE. Standard latent-to-audio decoding.';
   return 'Variational autoencoder for latent-to-audio decoding.';
+}
+
+/** Trailing quant token of a model name: BF16, Q8_0, Q4_K_M-imat, NVFP4, ...
+ *  Also matches a bare token ("q8_0"), the shape non-ACE backends report. */
+const QUANT_SUFFIX = /(?:^|-)((?:BF16|F16|F32|MXFP4|NVFP4|I?Q\d\w*)(?:-imat)?)$/i;
+
+/** Split a model name into the variant it belongs to and its quant, so pickers
+ *  can show "which model" and "which quant of it" as two choices. A name with
+ *  no quant suffix (safetensors dir, ONNX file) is its own variant, quant ''. */
+export function splitModel(name: string): { variant: string; quant: string } {
+  const stem = name.replace(/\.gguf$/i, '');
+  const m = stem.match(QUANT_SUFFIX);
+  if (!m) return { variant: name, quant: '' };
+  return { variant: stem.slice(0, m.index), quant: m[1] };
 }

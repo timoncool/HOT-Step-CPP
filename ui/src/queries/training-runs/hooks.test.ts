@@ -5,9 +5,81 @@ import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { createQueryClient } from '../client';
-import { useJobSelection, useReload } from './hooks';
+import { useJobSelection, useReload, useRunEvents } from './hooks';
 import { runQueries } from './queries';
 import type { TrainingJobSummary } from '../../services/trainingApi';
+import { trainingQueries } from '../training-data/queries';
+
+test('a standalone job bridge closes its shared source on a terminal frame without a chart', async () => {
+  const saved = { window: globalThis.window, document: globalThis.document, EventSource: globalThis.EventSource };
+  const { window, document } = parseHTML('<html><body><div id="root"></div></body></html>');
+  Object.assign(globalThis, { window, document, IS_REACT_ACT_ENVIRONMENT: true });
+  class Stream {
+    static made: Stream[] = [];
+    static CLOSED = 2; static OPEN = 1;
+    readyState = 1;
+    onmessage?: (event: { data: string }) => void;
+    constructor() { Stream.made.push(this); }
+    close() { this.readyState = 2; }
+  }
+  globalThis.EventSource = Stream as unknown as typeof EventSource;
+  const client = createQueryClient();
+  function Panel() { useRunEvents('bridge-only', null); return null; }
+  const root = createRoot(document.getElementById('root')!);
+  try {
+    await act(async () => root.render(createElement(QueryClientProvider, { client }, createElement(Panel))));
+    const stream = Stream.made[0];
+    stream.onmessage?.({ data: JSON.stringify({ type: 'metric', metric: 'step', step: 1 }) });
+    assert.equal(stream.readyState, Stream.OPEN);
+    stream.onmessage?.({ data: JSON.stringify({ type: 'status', status: 'done' }) });
+    assert.equal(stream.readyState, Stream.CLOSED);
+  } finally {
+    await act(async () => root.unmount()); client.clear();
+    Object.assign(globalThis, saved);
+  }
+});
+
+test('restored terminal jobs never stream; live jobs release their bridge on completion', async () => {
+  const saved = { window: globalThis.window, document: globalThis.document,
+    EventSource: globalThis.EventSource, fetch: globalThis.fetch };
+  const { window, document } = parseHTML('<html><body><div id="root"></div></body></html>');
+  Object.assign(globalThis, { window, document, IS_REACT_ACT_ENVIRONMENT: true });
+  class Stream {
+    static made: Stream[] = [];
+    static CLOSED = 2; static OPEN = 1;
+    readyState = 1;
+    constructor() { Stream.made.push(this); }
+    close() { this.readyState = 2; }
+  }
+  globalThis.EventSource = Stream as unknown as typeof EventSource;
+  // Keep background revalidation pending so each transition below comes
+  // from the canonical job cache, as it does after a server status refresh.
+  globalThis.fetch = () => new Promise<Response>(() => {});
+  const client = createQueryClient();
+  let current: ReturnType<typeof useJobSelection>;
+  function Panel() { current = useJobSelection(null, 'set'); return null; }
+  const root = createRoot(document.getElementById('root')!);
+  try {
+    await act(async () => root.render(createElement(QueryClientProvider, { client }, createElement(Panel))));
+    for (const status of ['done', 'failed', 'cancelled', 'interrupted'] as const) {
+      await act(async () => current![1]({ id: status, status } as TrainingJobSummary));
+      assert.equal(Stream.made.length, 0, status);
+    }
+    await act(async () => current![1]({ id: 'live', status: 'running' } as TrainingJobSummary));
+    assert.equal(Stream.made.length, 1);
+    await act(async () => {
+      client.setQueryData(trainingQueries.job(null, 'live').queryKey, { id: 'live', status: 'done' });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    });
+    assert.equal(Stream.made[0].readyState, Stream.CLOSED);
+    await act(async () => current![1](null));
+    await act(async () => current![1]({ id: 'live', status: 'done' } as TrainingJobSummary));
+    assert.equal(Stream.made.length, 1, 'revisiting the finished job must not reconnect');
+  } finally {
+    await act(async () => root.unmount()); client.clear();
+    Object.assign(globalThis, saved);
+  }
+});
 
 test('a mounted panel rejects job adoption from a previous worker or dataset', async () => {
   const savedWindow = globalThis.window;
@@ -28,7 +100,12 @@ test('a mounted panel rejects job adoption from a previous worker or dataset', a
     current = useJobSelection(worker, dataset);
     return createElement('span', {}, current[0]?.id ?? 'none');
   }
-  globalThis.fetch = async () => new Response(JSON.stringify({ job: { id: 'B-job', status: 'done' } }), {
+  // The real /jobs/:id returns the summary itself, and the job query has
+  // staleTime 0, so adopting a job immediately starts a refetch. A mock with
+  // the wrong shape would replace the seeded summary with an envelope whose
+  // `id` is undefined, and whether that landed before the assertion was a
+  // timing race — the source of this test's intermittent failure.
+  globalThis.fetch = async () => new Response(JSON.stringify({ id: 'B-job', status: 'done' }), {
     headers: { 'Content-Type': 'application/json' },
   });
   const root = createRoot(document.getElementById('root')!);

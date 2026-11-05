@@ -34,6 +34,7 @@
 // yue2/yue2-tok-head.h in transitively; must follow yue2-preprocess-run.h,
 // whose decode helpers it reuses rather than re-implementing.
 #include "train/yue2-tokenize-run.h"
+#include "train/yue2-guide-run.h"
 // YuE2 native forced aligner (docs/plans/yue2/17-mms-fa-port.md §5): fills the
 // cursor_words slot the AR trainer's lyric-cursor loss reads, replacing
 // engine/tools/yue2-cursor-bridge.py and the torchaudio install behind it.
@@ -63,6 +64,9 @@
 #include "train/lm-train-run.h"    // pulls in every lm-*.h (LM LoRA trainer)
 #include "train/preprocess-run.h"  // pulls in st-write.h + preprocess-io.h
 #include "train/spike-run.h"       // Phase-0 training spike (evidence code)
+#include "train/sa3-train-run.h"   // Stable Audio 3 DoRA-rows trainer
+#include "train/heartmula-prepare.h"  // HeartMuLa: audio + text -> codes + prompt ids
+#include "train/heartmula-train-run.h"  // HeartMuLa backbone LoRA trainer
 
 #include <cstdarg>
 #include <cstdio>
@@ -299,6 +303,20 @@ static void print_usage(void) {
             "                [--lm-adapter-scale 1] [--lm-adapter-scale-attn 1]\n"
             "                [--lm-adapter-scale-mlp 1] [--trigger <word>] prepends\n"
             "                \"<word>, \" to every caption, the shape --trigger-prepend trained.\n"
+            "  sa3-train     Stable Audio 3 medium DoRA-rows adapter training (official\n"
+            "                train_lora.py recipe; CUDA or CPU, Vulkan/Metal lack OUT_PROD).\n"
+            "                --manifest <json> --models <dir> --base-dit <sa3-dit-base-BF16.gguf>\n"
+            "                --out <dir> [--steps 1000] [--rank 16] [--alpha 16] [--lr 1e-4]\n"
+            "                [--duration 380] crop seconds (needs ~11 GB VRAM; 30 s ~4 GB)\n"
+            "                [--seed 42] [--checkpoint-every 100] [--export-every 0]\n"
+            "                [--resume] [--cache <dir>] [--inference-dit <gguf>]\n"
+            "                [--train-seconds] also adapt the seconds_total embedder (upstream\n"
+            "                does; the dora-rows-v1 export cannot carry it, so off by default)\n"
+            "                [--bwd mm|outprod] [--tf32 on|off] [--jsonl]. <out>/STOP stops after\n"
+            "                the current step with state saved; --resume continues bit-for-bit.\n"
+            "  sa3-train-check  Replay the official SA3 trainer capture (tools/sa3-training-\n"
+            "                step-fixture.py): --fixtures <dir> --base-dit <gguf> --models <dir>\n"
+            "                [--bwd mm|outprod]. Exit 77 when fixtures or the base are absent.\n"
             "  mm3-train-dit MiniMax-Music3 flow-DiT LoRA training.\n"
             "                --cache <dir from mm3-condition> --models <dir> --out <dir>\n"
             "                [--dora] learn per-output magnitudes alongside LoRA factors.\n"
@@ -371,6 +389,45 @@ static void print_usage(void) {
             "                [--bwd outprod] restore the slow CPU mul_mat backward (510x slower)\n"
             "                [--tf32 on|off] default off\n"
             "                Writes <out>/mm3_lora.safetensors; load with MM3_ADAPTER=<path>.\n"
+            "  heartmula-prepare  Sample list (audio, tags, lyrics) -> HeartCodec codes and\n"
+            "                prompt ids, the cache the HeartMuLa trainer reads.\n"
+            "                --dataset <json>  [{id, audio, tags, lyrics}] or {samples: [...]}\n"
+            "                --out <dir>       holds codes/ and heartmula_prepare.json\n"
+            "                --models <dir>    tokenizer and RVQ, as inference finds them\n"
+            "                [--encoder <dir>] HeartCodec encoder pack; default <models>/heartmula\n"
+            "                [--ffmpeg <path>] decodes non-WAV audio; default ffmpeg on PATH\n"
+            "                [--force]         re-encode samples whose codes are cached\n"
+            "  roundtrip     One track through a backend's training encode and straight back to\n"
+            "                audio, to hear what an adapter can learn from it.\n"
+            "                --backend ace|sa3|heartmula|mm3|yue2  --audio <file>  --models <dir>\n"
+            "                --out <x.wav>     reconstruction; x.source.wav is the encoder's input\n"
+            "                [--max-duration S] crop as that prep does (ace 600, sa3 384, else none)\n"
+            "                [--ffmpeg <path>] default ffmpeg on PATH\n"
+            "                ace:  --vae <name|path> [--normalize none|peak] [--target-db -1]\n"
+            "                      [--dtype f32|bf16] [--vae-chunk 384] [--vae-overlap 48]\n"
+            "                yue2: [--vae standard|legacy] [--loudness-lufs 0 = off, or a target]\n"
+            "                mm3:  [--enc <mm3-enc-*.gguf>]   heartmula: [--seed 42]\n"
+            "  heartmula-train  HeartMuLa backbone LoRA (global q/k/v/o[, mlp]) on a heartmula-prepare\n"
+            "                cache. Contract: engine/docs/HEARTMULA_TRAINING_CONTRACT.md.\n"
+            "                --data <dir>      the heartmula-prepare --out directory\n"
+            "                --out <dir>       state, adapters/step-N.gguf, control/\n"
+            "                --models <dir> [--variant 3B] [--type F16], or --global/--local <gguf>\n"
+            "                [--steps 480] [--rank 64] [--alpha 64] [--lr 1e-4] [--weight-decay 0.01]\n"
+            "                [--grad-accum 4] [--seed 0] [--max-frames 0] [--max-grad-norm 0]\n"
+            "                [--save-every 100] [--stop-after N] [--resume] [--name <adapter>]\n"
+            "                [--weights f16|bf16] [--local-chunk 0 = auto]\n"
+            "                [--attn auto|flash-bf16|flash|exact] global attention (auto: best the GPU runs)\n"
+            "                [--keep-layers auto|-1|0..28] global blocks trained without recompute\n"
+            "                (auto: most that fit; -1 recomputes every block and the local decoder)\n"
+            "                [--lora-mlp] also train the backbone MLP (w1/w2/w3)\n"
+            "                [--trigger <word>] stored in the adapter for generation to prepend\n"
+            "                [--eos] train the end-of-song frame; [--crop-frames N] start-anchored crops\n"
+            "                [--cb0-weighted] loss factors CB0 2.0, CB1..7 0.7..0.1 (normalised)\n"
+            "                --eval base|<adapter.gguf> (repeatable) [--eval-samples id,id]: forward-only\n"
+            "                held-out CE of --data, no training (stdout: HMTRAIN eval events)\n"
+            "                control/checkpoint-now: checkpoint after this step, exit 3;\n"
+            "                control/cancel: stop now, exit 4. stdout: HMTRAIN {json} events.\n"
+            "                [--selftest <fixture dir>] check contract section 5 against the oracle\n"
             "  yue2-preprocess  Folder of audio -> cached YuE2 VAE latents + the manifest\n"
             "                yue2-nar-train reads. Encodes each source ONCE (posterior mean,\n"
             "                [64, frames] f32 channel-major) and cuts fixed clips out of the\n"
@@ -415,6 +472,10 @@ static void print_usage(void) {
             "                yue2-sheet. 0 = off (the old, unnormalized cache keys).\n"
             "                TF32 is forced off (the encoder is 50x outside its parity gate\n"
             "                on a TF32 cuBLAS handle) and there is no escape hatch.\n"
+            "  yue2-guide     Source guide for YuE2 Cover renders: run the real-audio tokenizer\n"
+            "                over one file and keep its top-K codes per 25 Hz frame.\n"
+            "                --audio <file> --out <file.y2gd> [--topk 64] [--lufs -14|0]\n"
+            "                [--tok <yue2-tok-*.gguf> | --models <dir>] [--ffmpeg <exe>]\n"
             "  yue2-tokenize  Fill the codec_ids slot yue2-preprocess reserves: run the YuE2\n"
             "                real-audio semantic tokenizer (MERT-v2-FullSong block 20 + the\n"
             "                8-layer head) over every source the manifest lists, write the\n"
@@ -463,6 +524,8 @@ static void print_usage(void) {
             "                [--only <substr>]  case-insensitive name filter\n"
             "                [--force]  re-transcribe sources that already have abc/abc_error\n"
             "                [--melody-only]  write melody ABC without decoded harmony\n"
+            "                [--refined]      SheetSage2-Refined (sheetsage2-refined-*.gguf beside the base)\n"
+            "                [--key-mode]     with --refined: keys with modes (dorian, mixolydian, ...)\n"
             "                [--threads <n>]  pin the backend's thread count for this run\n"
             "                [--fast]  skip the encoder's exact-precision load (default: exact,\n"
             "                doc 23's fix for the F16-weight matmul narrowing that otherwise\n"
@@ -4548,6 +4611,69 @@ static int cmd_mm3_train_dit(int argc, char ** argv) {
     return mm3_train_dit_run(a);
 }
 
+// ─── sa3-train / sa3-train-check ────────────────────────────────────────────
+//
+// Same two environment latches as mm3-train-dit, set before any backward is
+// built: GGML_BACKWARD_MM=1 (HOT-ggml mm-backward) unless --bwd outprod, and
+// NVIDIA_TF32_OVERRIDE=0 unless --tf32 on.
+static void sa3_train_latches(bool bwd_mm, bool tf32) {
+#ifdef _WIN32
+    if (bwd_mm) _putenv("GGML_BACKWARD_MM=1");
+    if (!tf32) _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+#else
+    if (bwd_mm) setenv("GGML_BACKWARD_MM", "1", 1);
+    if (!tf32) setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+#endif
+}
+
+static int cmd_sa3_train(int argc, char ** argv) {
+    Sa3TrainArgs a;
+    bool         bwd_mm = true, tf32 = false;
+    std::string  fixtures;
+    const bool   check = !strcmp(argv[0], "sa3-train-check");
+    for (int i = 1; i < argc; i++) {
+        auto next = [&](const char * w) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "ace-train: %s needs a value\n", w); exit(2); }
+            return argv[++i];
+        };
+        if      (!strcmp(argv[i], "--manifest"))         a.manifest      = next("--manifest");
+        else if (!strcmp(argv[i], "--models"))           a.models_dir    = next("--models");
+        else if (!strcmp(argv[i], "--base-dit"))         a.base_dit      = next("--base-dit");
+        else if (!strcmp(argv[i], "--inference-dit"))    a.inference_dit = next("--inference-dit");
+        else if (!strcmp(argv[i], "--out"))              a.out_dir       = next("--out");
+        else if (!strcmp(argv[i], "--cache"))            a.cache_dir     = next("--cache");
+        else if (!strcmp(argv[i], "--fixtures"))         fixtures        = next("--fixtures");
+        else if (!strcmp(argv[i], "--steps"))            a.steps         = atoll(next("--steps"));
+        else if (!strcmp(argv[i], "--rank"))             a.rank          = atoll(next("--rank"));
+        else if (!strcmp(argv[i], "--alpha"))            a.alpha         = (float) atof(next("--alpha"));
+        else if (!strcmp(argv[i], "--lr"))               a.lr            = (float) atof(next("--lr"));
+        else if (!strcmp(argv[i], "--duration"))         a.duration      = atof(next("--duration"));
+        else if (!strcmp(argv[i], "--seed"))             a.seed          = (uint64_t) atoll(next("--seed"));
+        else if (!strcmp(argv[i], "--checkpoint-every")) a.ckpt_every    = atoll(next("--checkpoint-every"));
+        else if (!strcmp(argv[i], "--export-every"))     a.export_every  = atoll(next("--export-every"));
+        else if (!strcmp(argv[i], "--resume"))           a.resume        = true;
+        else if (!strcmp(argv[i], "--train-seconds"))    a.train_seconds = true;
+        else if (!strcmp(argv[i], "--bwd"))              bwd_mm          = strcmp(next("--bwd"), "outprod") != 0;
+        else if (!strcmp(argv[i], "--tf32"))             tf32            = !strcmp(next("--tf32"), "on");
+        else if (!strcmp(argv[i], "--jsonl"))            g_jsonl         = true;
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
+        else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
+    }
+    sa3_train_latches(bwd_mm, tf32);
+    if (check) {
+        if (fixtures.empty() || a.base_dit.empty() || a.models_dir.empty()) {
+            fprintf(stderr, "ace-train sa3-train-check: --fixtures, --base-dit and --models are required\n");
+            return 2;
+        }
+        return sa3_train_check(fixtures, a.base_dit, a.models_dir);
+    }
+    if (a.manifest.empty() || a.models_dir.empty() || a.base_dit.empty() || a.out_dir.empty()) {
+        fprintf(stderr, "ace-train sa3-train: --manifest, --models, --base-dit and --out are required\n");
+        return 2;
+    }
+    return sa3_train_run(a);
+}
+
 // ─── yue2-nar-train ─────────────────────────────────────────────────────────
 //
 // YuE2 NAR-half LoRA trainer. Modelled on cmd_mm3_train_dit above, including
@@ -4665,6 +4791,103 @@ static int cmd_yue2_nar_train(int argc, char ** argv) {
     // MANDATORY: ggml_time_ms() divides by an uninitialised frequency otherwise.
     ggml_time_init();
     return yue2_nar_train_run(a);
+}
+
+// ─── heartmula-prepare ──────────────────────────────────────────────────────
+//
+// Sample list -> HeartCodec codes + prompt ids (train/heartmula-prepare.h).
+// TF32 off first, before any CUDA context: the driver reads it at creation.
+static int cmd_heartmula_prepare(int argc, char ** argv) {
+#ifdef _WIN32
+    _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+#else
+    setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+#endif
+    HeartmulaPrepareArgs a;
+    for (int i = 1; i < argc; i++) {
+        auto next = [&](const char * w) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "ace-train: %s needs a value\n", w); exit(2); }
+            return argv[++i];
+        };
+        if      (!strcmp(argv[i], "--dataset")) a.dataset     = next("--dataset");
+        else if (!strcmp(argv[i], "--out"))     a.out_dir     = next("--out");
+        else if (!strcmp(argv[i], "--models"))  a.models_dir  = next("--models");
+        else if (!strcmp(argv[i], "--encoder")) a.encoder_dir = next("--encoder");
+        else if (!strcmp(argv[i], "--ffmpeg"))  a.ffmpeg      = next("--ffmpeg");
+        else if (!strcmp(argv[i], "--force"))   a.force       = true;
+        else { fprintf(stderr, "ace-train heartmula-prepare: unknown option %s\n", argv[i]); return 2; }
+    }
+    try {
+        return heartmula_prepare_run(a);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "heartmula-prepare: %s\n", e.what());
+        return 1;
+    }
+}
+
+// ─── heartmula-train ────────────────────────────────────────────────────────
+//
+// HeartMuLa backbone LoRA (train/heartmula-train-run.h). TF32 off and the
+// mul_mat backward arm on before any CUDA context or graph: the frozen weights
+// are F16/BF16 and the default arm emits an OUT_PROD CUDA refuses for F16
+// (contract section 6.2, G1).
+static int cmd_heartmula_train(int argc, char ** argv) {
+#ifdef _WIN32
+    _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+    _putenv("GGML_BACKWARD_MM=1");
+#else
+    setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+    setenv("GGML_BACKWARD_MM", "1", 1);
+#endif
+    HeartmulaTrainArgs a;
+    for (int i = 1; i < argc; i++) {
+        auto next = [&](const char * w) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "ace-train: %s needs a value\n", w); exit(2); }
+            return argv[++i];
+        };
+        const char * o = argv[i];
+        if      (!strcmp(o, "--data"))          a.data_dir    = next(o);
+        else if (!strcmp(o, "--out"))           a.out_dir     = next(o);
+        else if (!strcmp(o, "--models"))        a.models_dir  = next(o);
+        else if (!strcmp(o, "--variant"))       a.variant     = next(o);
+        else if (!strcmp(o, "--type"))          a.type        = next(o);
+        else if (!strcmp(o, "--global"))        a.global_path = next(o);
+        else if (!strcmp(o, "--local"))         a.local_path  = next(o);
+        else if (!strcmp(o, "--name"))          a.name        = next(o);
+        else if (!strcmp(o, "--selftest"))      a.selftest    = next(o);
+        else if (!strcmp(o, "--weights"))       a.weights     = next(o);
+        else if (!strcmp(o, "--steps"))         a.steps       = atoll(next(o));
+        else if (!strcmp(o, "--rank"))          a.rank        = atoi(next(o));
+        else if (!strcmp(o, "--alpha"))         a.alpha       = (float) atof(next(o));
+        else if (!strcmp(o, "--lr"))            a.lr          = (float) atof(next(o));
+        else if (!strcmp(o, "--weight-decay"))  a.wd          = (float) atof(next(o));
+        else if (!strcmp(o, "--grad-accum"))    a.accum       = atoi(next(o));
+        else if (!strcmp(o, "--seed"))          a.seed        = strtoull(next(o), nullptr, 10);
+        else if (!strcmp(o, "--max-frames"))    a.max_frames  = atoll(next(o));
+        else if (!strcmp(o, "--max-grad-norm")) a.clip        = (float) atof(next(o));
+        else if (!strcmp(o, "--save-every"))    a.save_every  = atoi(next(o));
+        else if (!strcmp(o, "--stop-after"))    a.stop_after  = atoll(next(o));
+        else if (!strcmp(o, "--local-chunk"))   a.local_chunk = atoll(next(o));
+        else if (!strcmp(o, "--keep-layers"))   { const char * v = next(o); a.keep = strcmp(v, "auto") ? atoi(v) : -2; }
+        else if (!strcmp(o, "--attn"))          a.attn        = next(o);
+        else if (!strcmp(o, "--lora-dropout"))  a.dropout     = (float) atof(next(o));
+        else if (!strcmp(o, "--lora-mlp"))      a.mlp         = true;
+        else if (!strcmp(o, "--trigger"))       a.trigger     = next(o);
+        else if (!strcmp(o, "--eos"))           a.eos         = true;
+        else if (!strcmp(o, "--crop-frames"))   a.crop_frames = atoll(next(o));
+        else if (!strcmp(o, "--cb0-weighted"))  a.cb0_weighted = true;
+        else if (!strcmp(o, "--eval"))          a.eval.push_back(next(o));
+        else if (!strcmp(o, "--eval-samples"))  a.eval_samples = next(o);
+        else if (!strcmp(o, "--resume"))        a.resume      = true;
+        else { fprintf(stderr, "ace-train heartmula-train: unknown option %s\n", o); return 2; }
+    }
+    ggml_time_init();
+    try {
+        return heartmula_train_run(a);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "heartmula-train: %s\n", e.what());
+        return 1;
+    }
 }
 
 // ─── yue2-preprocess ────────────────────────────────────────────────────────
@@ -4799,6 +5022,36 @@ static int cmd_yue2_tokenize(int argc, char ** argv) {
     return yue2_tokenize_run(a);
 }
 
+// ─── yue2-guide ─────────────────────────────────────────────────────────────
+//
+// One file in, one source-guide file out (train/yue2-guide-run.h). TF32 off
+// first, for the same reason as yue2-tokenize.
+static int cmd_yue2_guide(int argc, char ** argv) {
+#ifdef _WIN32
+    _putenv_s("NVIDIA_TF32_OVERRIDE", "0");
+#else
+    setenv("NVIDIA_TF32_OVERRIDE", "0", 1);
+#endif
+    Yue2GuideArgs a;
+    for (int i = 1; i < argc; i++) {
+        auto next = [&](const char * w) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "ace-train: %s needs a value\n", w); exit(2); }
+            return argv[++i];
+        };
+        if      (!strcmp(argv[i], "--audio"))  a.audio      = next("--audio");
+        else if (!strcmp(argv[i], "--out"))    a.out        = next("--out");
+        else if (!strcmp(argv[i], "--tok"))    a.tok_path   = next("--tok");
+        else if (!strcmp(argv[i], "--models")) a.models_dir = next("--models");
+        else if (!strcmp(argv[i], "--ffmpeg")) a.ffmpeg     = next("--ffmpeg");
+        else if (!strcmp(argv[i], "--topk"))   a.topk       = atoi(next("--topk"));
+        else if (!strcmp(argv[i], "--lufs"))   a.lufs       = atof(next("--lufs"));
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
+        else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
+    }
+    ggml_time_init();
+    return yue2_guide_run(a);
+}
+
 // ─── yue2-align ─────────────────────────────────────────────────────────────
 //
 // Native forced alignment: fill the `cursor_words` slot the AR trainer's
@@ -4876,6 +5129,8 @@ static int cmd_yue2_sheet(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--fast"))     a.fast       = true;
         else if (!strcmp(argv[i], "--no-repair")) a.repair    = false;
         else if (!strcmp(argv[i], "--melody-only")) a.melody_only = true;
+        else if (!strcmp(argv[i], "--refined"))  a.refined    = true;
+        else if (!strcmp(argv[i], "--key-mode")) a.key_mode   = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
         else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
     }
@@ -6471,6 +6726,51 @@ static int cmd_yue2_joint_train(int argc, char ** argv) {
     if (rc != 0 && !error.empty()) fprintf(stderr, "ace-train yue2-joint-train: %s\n", error.c_str());
     return rc;
 }
+// ─── roundtrip ──────────────────────────────────────────────────────────────
+//
+// Source track -> a backend's training representation -> audio
+// (train/roundtrip-run.h). Included here, not at the top, because the ace path
+// resolves its VAE with resolve_model() above.
+#include "train/roundtrip-run.h"
+
+static int cmd_roundtrip(int argc, char ** argv) {
+    RoundtripArgs a;
+    for (int i = 1; i < argc; i++) {
+        auto next = [&](const char * w) -> const char * {
+            if (i + 1 >= argc) { fprintf(stderr, "ace-train: %s needs a value\n", w); exit(2); }
+            return argv[++i];
+        };
+        if      (!strcmp(argv[i], "--backend"))       a.backend       = next("--backend");
+        else if (!strcmp(argv[i], "--audio"))         a.audio         = next("--audio");
+        else if (!strcmp(argv[i], "--models"))        a.models_dir    = next("--models");
+        else if (!strcmp(argv[i], "--out"))           a.out           = next("--out");
+        else if (!strcmp(argv[i], "--ffmpeg"))        a.ffmpeg        = next("--ffmpeg");
+        else if (!strcmp(argv[i], "--vae"))           a.vae           = next("--vae");
+        else if (!strcmp(argv[i], "--enc"))           a.enc           = next("--enc");
+        else if (!strcmp(argv[i], "--max-duration"))  a.max_duration  = atoi(next("--max-duration"));
+        else if (!strcmp(argv[i], "--normalize"))     a.normalize     = next("--normalize");
+        else if (!strcmp(argv[i], "--target-db"))     a.target_db     = (float) atof(next("--target-db"));
+        else if (!strcmp(argv[i], "--dtype"))         a.dtype         = next("--dtype");
+        else if (!strcmp(argv[i], "--vae-chunk"))     a.vae_chunk     = atoi(next("--vae-chunk"));
+        else if (!strcmp(argv[i], "--vae-overlap"))   a.vae_overlap   = atoi(next("--vae-overlap"));
+        else if (!strcmp(argv[i], "--loudness-lufs")) a.loudness_lufs = atof(next("--loudness-lufs"));
+        else if (!strcmp(argv[i], "--seed"))          a.seed          = strtoull(next("--seed"), nullptr, 10);
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
+        else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
+    }
+    if (a.backend.empty() || a.audio.empty() || a.models_dir.empty() || a.out.empty() ||
+        (a.backend == "ace" && a.vae.empty())) {
+        fprintf(stderr, "ace-train roundtrip: --backend, --audio, --models and --out are required "
+                        "(and --vae for ace)\n");
+        return 2;
+    }
+    if (!pm_file_exists(a.audio)) {
+        fprintf(stderr, "ace-train roundtrip: audio not found: %s\n", a.audio.c_str());
+        return 2;
+    }
+    return roundtrip_run(a);
+}
+
 static int ace_train_main(int argc, char ** argv) {
     if (argc < 2) {
         print_usage();
@@ -6491,6 +6791,9 @@ static int ace_train_main(int argc, char ** argv) {
     }
     if (!strcmp(argv[1], "mm3-encode")) {
         return cmd_mm3_encode(argc - 1, argv + 1);
+    }
+    if (!strcmp(argv[1], "roundtrip")) {
+        return cmd_roundtrip(argc - 1, argv + 1);
     }
     if (!strcmp(argv[1], "detok-table")) {
         return cmd_detok_table(argc - 1, argv + 1);
@@ -6519,11 +6822,23 @@ static int ace_train_main(int argc, char ** argv) {
     if (!strcmp(argv[1], "mm3-train-dit")) {
         return cmd_mm3_train_dit(argc - 1, argv + 1);
     }
+    if (!strcmp(argv[1], "sa3-train") || !strcmp(argv[1], "sa3-train-check")) {
+        return cmd_sa3_train(argc - 1, argv + 1);
+    }
+    if (!strcmp(argv[1], "heartmula-prepare")) {
+        return cmd_heartmula_prepare(argc - 1, argv + 1);
+    }
+    if (!strcmp(argv[1], "heartmula-train")) {
+        return cmd_heartmula_train(argc - 1, argv + 1);
+    }
     if (!strcmp(argv[1], "yue2-preprocess")) {
         return cmd_yue2_preprocess(argc - 1, argv + 1);
     }
     if (!strcmp(argv[1], "yue2-tokenize")) {
         return cmd_yue2_tokenize(argc - 1, argv + 1);
+    }
+    if (!strcmp(argv[1], "yue2-guide")) {
+        return cmd_yue2_guide(argc - 1, argv + 1);
     }
     if (!strcmp(argv[1], "yue2-align")) {
         return cmd_yue2_align(argc - 1, argv + 1);

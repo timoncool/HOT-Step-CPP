@@ -369,6 +369,11 @@ struct Yue2Model {
         std::string path;
         std::string family;   // "ar" or "nar"
         int         tensors = 0;
+        // Basin re-base: the variant it was trained on ("base" for the base
+        // model) when that differs from the loaded LM's, and the installed file
+        // it was re-based onto ("" = that variant is not installed, so none).
+        std::string rebase_variant;
+        std::string rebase_file;
     };
     std::vector<MergedAdapter> lm_adapter_merged;
 
@@ -1430,6 +1435,16 @@ static bool yue2_apply_companion(Yue2Model * m, const GGUFModel & gf, std::vecto
     if (!m->companion_enabled) {
         return true;
     }
+    // An adapter trained on another tokenizer's codes (WannabeTokenizer) was
+    // trained without the companion, so the decoder it renders with goes
+    // without it too. Any one such adapter in the pick decides.
+    for (const Yue2AdapterSpec & spec : m->lm_adapter_want) {
+        if (!yue2_adapter_wants_companion(spec.path)) {
+            fprintf(stderr, "[YuE2-Companion] skipped: %s was trained on codes that render without it\n",
+                    spec.path.c_str());
+            return true;
+        }
+    }
     std::string path;
     for (const auto & dir : m->search_dirs) {
         const std::string cand = dir + YUE2_SEP + YUE2_COMPANION_FILE;
@@ -1546,9 +1561,70 @@ static bool yue2_apply_companion(Yue2Model * m, const GGUFModel & gf, std::vecto
     return true;
 }
 
+// Basin re-base (yue2-adapter.h, yue2_rebase_nudge) for every adapter in this
+// load trained on another variant, before the companion or any adapter merges.
+// The home file is the loaded quant in the adapter's variant when installed,
+// else that variant's best-first file. A variant that is not installed is not
+// an error: the adapter merges onto the loaded LM as it did before re-base
+// existed, and the log and /yue2/props say so. A tensor two adapters target is
+// nudged once, by the first.
+static bool yue2_apply_rebase(Yue2Model * m, const GGUFModel & gf, std::vector<std::string> * errs, bool ar, bool nar,
+                              std::map<std::string, std::pair<std::string, std::string>> * homes) {
+    const std::string     loaded   = yue2_lm_type_of(m->lm_file.path);
+    const std::string     variant  = yue2_lm_variant(loaded);
+    const std::string     quant    = variant.empty() ? loaded : loaded.substr(variant.size() + 1);
+    const int             n_blocks = (int) gf_get_u32(gf, "yue2.block_count");
+    std::set<std::string> nudged;
+    for (const Yue2AdapterSpec & spec : m->lm_adapter_want) {
+        const std::string probe = yue2_adapter_probe_family(spec.path);
+        WeightCtx * wctx = probe == "ar" && ar ? &m->wctx_lm : probe == "nar" && nar ? &m->wctx_nar : nullptr;
+        std::string              home_type;
+        std::vector<std::string> names;
+        if (!wctx || spec.scales.rebase <= 0.0f ||
+            !yue2_adapter_rebase_targets(spec.path, spec.scales, n_blocks, &home_type, &names)) {
+            continue;
+        }
+        const std::string want = yue2_lm_variant(home_type);
+        if (want == variant) {
+            continue;
+        }
+        const std::string label = want.empty() ? "base" : want;
+        std::string       file, path;
+        for (const Yue2Variant & v : m->lm_variants) {
+            if (yue2_lm_variant(v.type) != want) continue;
+            if (v.type == (want.empty() ? quant : want + "-" + quant)) { file = v.name; path = v.path; break; }
+            if (file.empty()) { file = v.name; path = v.path; }  // lm_variants is best-first
+        }
+        (*homes)[spec.path] = { label, file };
+        if (path.empty()) {
+            fprintf(stderr, "[YuE2-Adapter] %s was trained on the %s model, which is not installed: merging it onto %s "
+                            "without re-base\n", spec.path.c_str(), label.c_str(), m->lm_file.name.c_str());
+            continue;
+        }
+        std::vector<std::string> todo;
+        for (const auto & n : names) {
+            if (nudged.insert(n).second) todo.push_back(n);
+        }
+        Timer       t;
+        std::string err;
+        const int   n = yue2_rebase_nudge(wctx, gf, path, todo, spec.scales.rebase, m->backend, &err);
+        if (n < 0) {
+            errs->push_back("adapter " + spec.path + ": basin re-base onto " + file + ": " + err);
+            return false;
+        }
+        fprintf(stderr, "[YuE2-Adapter] %s: trained on %s, %d tensor(s) re-based toward %s at beta %.2f in %.1f ms\n",
+                spec.path.c_str(), label.c_str(), n, file.c_str(), (double) spec.scales.rebase, t.ms());
+    }
+    return true;
+}
+
 static bool yue2_apply_adapters(Yue2Model * m, const GGUFModel & gf, std::vector<std::string> * errs,
                                 bool ar = true, bool nar = true) {
     yue2_forget_merged(m, ar, nar);
+    std::map<std::string, std::pair<std::string, std::string>> homes;  // path -> (variant, file)
+    if (!yue2_apply_rebase(m, gf, errs, ar, nar, &homes)) {
+        return false;
+    }
     // Under every NAR load, before any user adapter: the companion is part of
     // the decoder, and user NAR adapters are trained on top of it.
     if (nar && !yue2_apply_companion(m, gf, errs)) {
@@ -1592,7 +1668,9 @@ static bool yue2_apply_adapters(Yue2Model * m, const GGUFModel & gf, std::vector
                             "yue2.blk.N.attn_q/ffn_*.lora_A.weight for an AR one)");
             return false;
         }
-        m->lm_adapter_merged.push_back({ spec.path, fam, n });
+        const auto home = homes.find(spec.path);
+        m->lm_adapter_merged.push_back({ spec.path, fam, n, home == homes.end() ? "" : home->second.first,
+                                         home == homes.end() ? "" : home->second.second });
     }
     // Recompute the aggregate from the merged list (both halves' entries): a
     // stack covering both halves is legal and disjoint — the AR and NAR blocks

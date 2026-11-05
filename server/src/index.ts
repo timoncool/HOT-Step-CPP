@@ -14,13 +14,19 @@ import { fileURLToPath } from 'url';
 
 import { config, PROJECT_ROOT, PORTABLE_MODE, APP_VERSION, DATA_ROOT } from './config.js';
 import { initLogger, closeLogger } from './services/logger.js';
-import { initDb, closeDb } from './db/database.js';
+import os from 'node:os';
+import { initDb, closeDb, getDb } from './db/database.js';
+import { startInstance, stopInstance } from './services/instance.js';
+import { recoverStalePipelines } from './services/training/pipelineRunner.js';
+import { recoverStaleBatches } from './services/training/yue2BatchRunner.js';
 // lireekDb is now part of the unified hotstep.db — no separate init needed
 import authRoutes from './routes/auth.js';
 import songRoutes from './routes/songs.js';
 import generateRoutes from './routes/generate.js';
 import modelRoutes from './routes/models.js';
 import healthRoutes from './routes/health.js';
+import updatesRoutes from './routes/updates.js';
+import { startUpdateCheck } from './services/updates/index.js';
 import shutdownRoutes from './routes/shutdown.js';
 import masteringRoutes from './routes/mastering.js';
 import downloadRoutes from './routes/download.js';
@@ -32,6 +38,8 @@ import analyzeRoutes from './routes/analyze.js';
 import uploadRoutes from './routes/upload.js';
 import supersepRoutes from './routes/supersep.js';
 import settingsRoutes from './routes/settings.js';
+import settingsBackupRoutes from './routes/settingsBackup.js';
+import { backupBodyParser } from './routes/settingsBackup.js';
 import modelManagerRoutes from './routes/modelManager.js';
 import stemStudioRoutes from './routes/stemStudio.js';
 import assistantRoutes from './routes/assistant.js';
@@ -81,6 +89,13 @@ console.log(`[Logger] Session logs: ${logDir}`);
 
 // Initialize databases
 initDb();
+// Register this process, then settle what earlier processes left behind.
+// Dev and prod can share this database and training folder: every sweep
+// below skips work a live process in the other copy owns (services/instance.ts).
+startInstance(getDb(), { copy: `${os.hostname()}:${config.server.port}` });
+recoverStaleJobs();
+recoverStalePipelines();
+recoverStaleBatches();
 reconcileYue2AitkRunsAtStartup();
 // Moves any old pulled ladders out of _remote, then copies each worker's runs here as they land.
 void startYue2Mirror();
@@ -96,6 +111,8 @@ app.use(cors());
 app.use('/api', workerTokenGate);
 app.use('/api', workerUpdateGate);
 app.use('/api/workers', workerRoutes);
+// Backups can exceed 50 MB; this parser runs first and the global one then skips the parsed body.
+app.use('/api/settings/backup', backupBodyParser);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -105,6 +122,7 @@ app.use('/api/songs', songRoutes);
 app.use('/api/generate', generateRoutes);
 app.use('/api/models', modelRoutes);
 app.use('/api/health', healthRoutes);
+app.use('/api/updates', updatesRoutes);
 app.use('/api/shutdown', shutdownRoutes);
 app.use('/api/mastering', masteringRoutes);
 app.use('/api/download', downloadRoutes);
@@ -116,6 +134,7 @@ app.use('/api/analyze', analyzeRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/supersep', supersepRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/settings/backup', settingsBackupRoutes);
 app.use('/api/model-manager', modelManagerRoutes);
 app.use('/api/stem-studio', stemStudioRoutes);
 app.use('/api/assistant', assistantRoutes);
@@ -209,8 +228,10 @@ import { setEngineReady } from './engineState.js';
 import { restoreMm3Selection } from './services/backends/minimax/index.js';
 import { restoreYue2Selection } from './services/backends/yue2/index.js';
 import { aceClient } from './services/aceClient.js';
-import { onEngineRestarted, retryIfGaveUp, startAceServer, stopAceServer } from './services/aceEngineProcess.js';
-import { killActiveChildren } from './services/training/labelingQueue.js';
+import { onEngineRestarted, retryIfGaveUp, startAceServer, startEngineWorkers, stopAceServer, stopEngineWorkers } from './services/aceEngineProcess.js';
+import { engineWorkers } from './services/engineWorkers.js';
+import { setWorkerConcurrency } from './services/generation/gpuLane.js';
+import { killActiveChildren, recoverStaleJobs } from './services/training/labelingQueue.js';
 
 // ── Required runtime DLL bootstrap ──────────────────────────────────
 // On first launch, the CUDA engine variant needs cuBLAS DLLs that aren't
@@ -379,6 +400,13 @@ async function ensureRequiredRuntime(): Promise<{ ok: boolean; missing: string[]
   setEngineReady(false, cudaReady ? 'Starting engine...' : 'Starting engine (CPU only — CUDA runtime missing)...');
   startAceServer();
   setEngineReady(true, cudaReady ? 'Ready' : 'Ready (CPU only — GPU runtime missing)');
+  // Multi-GPU opt-in: one more engine per further opted-in card. Each runs the
+  // restore hooks below in its own scope once its /health answers. A no-op
+  // with the opt-in empty (the default).
+  void startEngineWorkers();
+  // Generations run side by side only with two or more workers; one worker
+  // (the default) keeps the single lane. Placement skips a worker until it is ready.
+  setWorkerConcurrency(engineWorkers().length > 1);
 
   // The engine scans models once at boot, so wait for the whole queue to
   // drain before retrying — retrying after the first file can boot it on a
@@ -478,6 +506,7 @@ const server = app.listen(config.server.port, config.server.host, () => {
   // Workflow jobs: mark jobs a previous process left running as interrupted,
   // then start pending ones.
   startWorkflowJobs();
+  startUpdateCheck();
 });
 
 // Graceful shutdown
@@ -500,13 +529,16 @@ function shutdown() {
   // during the 1 s exit window.
   // Fire-and-forget: the 1 s process.exit delay below covers the wait.
   void stopAceServer('Server shutting down', undefined, { suspend: false });
+  void stopEngineWorkers('Server shutting down', undefined, { suspend: false });
 
   // Close HTTP server
   server.close(() => {
     console.log('[Server] HTTP server closed');
   });
 
-  // Close DB and logger
+  // Close DB and logger. Marking this instance stopped first lets the other
+  // copy recover anything of ours at once rather than after the heartbeat lapses.
+  stopInstance();
   closeDb();
   closeLogger();
   console.log('[Server] Goodbye!');

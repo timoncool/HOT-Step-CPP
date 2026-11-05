@@ -1,4 +1,4 @@
-import { apiClient, type ReadOptions } from './httpClient';
+import { apiClient, type ClientOptions, type ReadOptions } from './httpClient';
 
 export type DataFolderOperation = 'move' | 'repoint' | 'create' | 'import';
 export interface DataFolderPending {
@@ -27,14 +27,16 @@ export interface DataFolderPreview {
   freeBytes: number | null;
   blockers: string[];
 }
-async function request<T>(suffix = '', body?: unknown, opts: ReadOptions = {}): Promise<T> {
+async function request<T>(suffix = '', body?: unknown, opts: ClientOptions = {}): Promise<T> {
   return body === undefined
     ? apiClient.get<T>(`/settings/data-folder${suffix}`, opts)
     : apiClient.post<T>(`/settings/data-folder${suffix}`, body, opts);
 }
+// The write endpoints are silent: DataFolderPanel renders their failures
+// itself (its inline error line is the only notifier).
 export const dataFolderApi = {
   location: (opts?: ReadOptions) => request<DataFolderLocation>('', undefined, opts),
-  preview: (kind: DataFolderOperation, target: string) => request<DataFolderPreview>('/preview', { kind, target }),
-  schedule: (kind: DataFolderOperation, target: string) => request<{ pending: DataFolderPending; restartRequested: boolean }>('/schedule', { kind, target }),
-  cancel: () => request<{ cancelled: boolean }>('/cancel', {}),
+  preview: (kind: DataFolderOperation, target: string) => request<DataFolderPreview>('/preview', { kind, target }, { silent: true }),
+  schedule: (kind: DataFolderOperation, target: string) => request<{ pending: DataFolderPending; restartRequested: boolean }>('/schedule', { kind, target }, { silent: true }),
+  cancel: () => request<{ cancelled: boolean }>('/cancel', {}, { silent: true }),
 };

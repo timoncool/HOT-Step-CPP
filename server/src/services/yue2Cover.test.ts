@@ -8,13 +8,14 @@ import express from 'express';
 import type { Server } from 'node:http';
 import * as realQueue from './training/labelingQueue.js';
 import type { TrainingJob } from './training/labelingQueue.js';
-import { createYue2CoverService } from './yue2Cover.js';
+import { createYue2CoverService, YOURMT3_CHORDNET_MODEL_IDS } from './yue2Cover.js';
 import { createYue2CoverRouter } from '../routes/yue2Cover.js';
 import { readSidecar, writeSidecar } from './training/sidecarIO.js';
 import { sidecarPathFor } from './training/paths.js';
 import { abcSidecarPath, writeAbcSidecar } from './training/abcSidecar.js';
+import { MISSING_REFINED } from './training/yue2Sheet.js';
 
-function fixture(missing = false, defer = false) {
+function fixture(missing = false, defer = false, midi?: Parameters<typeof createYue2CoverService>[1]) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'yue2-cover-api-'));
   const referenceDir = path.join(root, 'references');
   const libraryDir = path.join(root, 'audio');
@@ -33,6 +34,9 @@ function fixture(missing = false, defer = false) {
   let failAbc = false;
   let pending: (() => Promise<void>) | undefined;
   let alignTimes: Array<[string, number]> = [];
+  let refinedInstalled = false;
+  let stored = { refined: false, keyMode: false };
+  let ranWith: unknown;
   const fakeQueue = {
     createJob: (_kind: string, datasetId: string) => {
       started++;
@@ -59,8 +63,10 @@ function fixture(missing = false, defer = false) {
   const service = createYue2CoverService({
     queue: fakeQueue, referenceDir, libraryDir, jobRoot,
     duration: async () => duration,
-    missingModels: () => missing ? ['SheetSage2'] : [],
+    missingModels: () => missing ? ['SheetSage2'] : stored.refined && !refinedInstalled ? [MISSING_REFINED] : [],
     model: () => missing ? '' : 'sheetsage2-f16.gguf',
+    refinedModel: () => refinedInstalled ? 'sheetsage2-refined-f16.gguf' : '',
+    transcriberSetting: () => stored,
     vocalStem: async (audioPath: string) => audioPath,
     align: async (_audio: Buffer, lyrics: string) => ({ words: alignTimes.map(([text, start]) => {
       const char0 = lyrics.indexOf(text);
@@ -72,13 +78,14 @@ function fixture(missing = false, defer = false) {
     },
     saveAbc: ({ audioPath }: { audioPath: string }, abc: string) => {
       if (failAbc) throw new Error('disk full');
-      return writeAbcSidecar(audioPath, abc, { keepBackups: true });
+      return writeAbcSidecar(audioPath, abc, { keepBackups: true, anySounding: true });
     },
     toMp3: async (file: string) => { const out = path.join(root, 'cover-mp3', path.basename(file) + '.mp3'); fs.mkdirSync(path.dirname(out), { recursive: true }); fs.writeFileSync(out, 'mp3'); return out; },
     datasetMatch: () => datasetAudio ? { datasetId: 'dataset-1', sampleId: 'sample-1', audioPath: datasetAudio } : null,
     song: (id, userId) => id === 'song-1' && userId === 'owner' ? { audio_url: '/audio/library.wav', title: 'Library track' } : undefined,
-    run: async (job, audioPath, dir) => {
+    run: async (job, audioPath, dir, transcriber) => {
       runnerCalls++;
+      ranWith = transcriber;
       ranOn = audioPath;
       job.status = 'running';
       job.phase = 'transcribing';
@@ -88,14 +95,104 @@ function fixture(missing = false, defer = false) {
       job.status = 'done';
       return 'X:1\nK:C\nC';
     },
-  });
+  }, midi);
   return { root, referenceDir, libraryDir, upload, service, setDuration: (n: number) => { duration = n; },
     setDatasetAudio: (audio: string | null) => { datasetAudio = audio; },
     failAbcWrites: (fail: boolean) => { failAbc = fail; },
     setAlign: (times: Array<[string, number]>) => { alignTimes = times; },
+    setRefined: (installed: boolean) => { refinedInstalled = installed; }, ranWith: () => ranWith,
+    setStored: (next: { refined: boolean; keyMode: boolean }) => { stored = next; },
     counts: () => ({ started, cancelled, runnerCalls }), ranOn: () => ranOn, drain: async () => { await pending?.(); },
     close: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
+
+test('readiness defaults to the stored sheet preference and explicit sources override it', () => {
+  const f = fixture();
+  const missing = fixture(true);
+  try {
+    assert.deepEqual(f.service.readiness(), { source: 'sheetsage2', ready: true,
+      model: 'sheetsage2-f16.gguf', refined: false, message: null });
+    f.setStored({ refined: true, keyMode: false });
+    assert.equal(f.service.readiness().source, 'sheetsage2-refined');
+    assert.equal(f.service.readiness().ready, false);
+    assert.match(f.service.readiness().message!, /yue2-sheetsage2-refined-f16/);
+    assert.equal(f.service.readiness('sheetsage2').ready, true);
+    assert.equal(f.service.readiness('sheetsage2-refined').ready, false);
+    f.setRefined(true);
+    assert.equal(f.service.readiness('sheetsage2-refined').ready, true);
+    assert.equal(f.service.readiness().ready, true);
+    for (const source of ['sheetsage2', 'sheetsage2-refined']) {
+      assert.equal(missing.service.readiness(source).ready, false);
+      assert.match(missing.service.readiness(source).message!, /yue2-sheetsage2-f16/);
+    }
+  } finally { f.close(); missing.close(); }
+});
+
+test('MuScriptor readiness requires the selected model, beat model and executable', () => {
+  const installed = new Set(['medium', 'large', 'beat-this']);
+  let chosen: 'small' | 'medium' | 'large' | null = null;
+  let executable: string | null = 'ace-midi';
+  const f = fixture(true, false, { modelChoice: () => chosen,
+    installed: model => installed.has(model), executable: () => executable });
+  try {
+    assert.deepEqual(f.service.readiness('muscriptor'), { source: 'muscriptor', ready: true,
+      model: 'muscriptor-medium', refined: false, message: null });
+    chosen = 'large';
+    assert.equal(f.service.readiness('muscriptor').model, 'muscriptor-large');
+    chosen = 'small';
+    assert.equal(f.service.readiness('muscriptor').ready, false);
+    assert.match(f.service.readiness('muscriptor').message!, /muscriptor-small.*Model Manager/);
+    installed.add('small');
+    installed.delete('beat-this');
+    assert.equal(f.service.readiness('muscriptor').ready, false);
+    assert.match(f.service.readiness('muscriptor').message!, /muscriptor-beat-this.*Model Manager/);
+    installed.add('beat-this');
+    executable = null;
+    assert.equal(f.service.readiness('muscriptor').ready, false);
+    assert.match(f.service.readiness('muscriptor').message!, /ace-midi/);
+    chosen = null;
+    installed.clear();
+    assert.match(f.service.readiness('muscriptor').message!, /muscriptor-small.*muscriptor-beat-this/);
+  } finally { f.close(); }
+});
+
+test('YourMT3 and ChordNet readiness names the shared placeholder registry ids', () => {
+  const f = fixture();
+  try {
+    const result = f.service.readiness('yourmt3-chordnet');
+    assert.equal(result.source, 'yourmt3-chordnet');
+    assert.equal(result.ready, false);
+    assert.equal(result.model, null);
+    assert.equal(result.refined, false);
+    assert.match(result.message!, /not installed yet/);
+    for (const id of YOURMT3_CHORDNET_MODEL_IDS) assert.ok(result.message!.includes(id));
+  } finally { f.close(); }
+});
+
+test('readiness route forwards sources and rejects unknown or structured query values with 400', async () => {
+  const f = fixture(true, false, { modelChoice: () => null,
+    installed: () => true, executable: () => 'ace-midi' });
+  const app = express();
+  app.set('query parser', 'extended');
+  app.use('/api/yue2-cover', createYue2CoverRouter(f.service, () => 'owner'));
+  const server: Server = app.listen(0);
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected TCP address');
+    const url = `http://127.0.0.1:${address.port}/api/yue2-cover/readiness`;
+    for (const source of ['sheetsage2', 'sheetsage2-refined', 'muscriptor', 'yourmt3-chordnet']) {
+      const response = await fetch(`${url}?source=${source}`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), f.service.readiness(source));
+    }
+    assert.deepEqual(await (await fetch(url)).json(), f.service.readiness());
+    for (const query of ['source=other', 'source=', 'source=muscriptor&source=sheetsage2', 'source[x]=muscriptor']) {
+      const response = await fetch(`${url}?${query}`);
+      assert.equal(response.status, 400);
+      assert.match((await response.json() as { error: string }).error, /source must be/);
+    }
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); f.close(); }
+});
 
 test('dataset sidecar supplies lyrics, tempo, key and a cached score without a job', async () => {
   const f = fixture(true);
@@ -159,6 +256,43 @@ test('force transcribes again even when the dataset has a cached score', async (
     const result = await f.service.start({ sourceAudioUrl: `/references/${f.upload}`, force: true }, 'owner');
     assert.equal(result.status, 'queued');
     assert.equal(f.counts().started, 1);
+  } finally { f.close(); }
+});
+
+test('SheetSage2-Refined is chosen per transcription and needs its overlay installed', async () => {
+  const f = fixture(false, true);
+  try {
+    const input = { sourceAudioUrl: `/references/${f.upload}`, transcriber: 'sheetsage2-refined', keyMode: true };
+    assert.equal(f.service.readiness().refined, false);
+    await assert.rejects(f.service.start(input, 'owner'), /yue2-sheetsage2-refined-f16.*Model Manager/);
+    await assert.rejects(f.service.start({ ...input, transcriber: 'other' }, 'owner'), /transcriber must be/);
+    assert.equal(f.counts().started, 0);
+    f.setRefined(true);
+    assert.equal(f.service.readiness().refined, true);
+    assert.equal((await f.service.start(input, 'owner')).status, 'queued');
+    await f.drain();
+    assert.deepEqual(f.ranWith(), { refined: true, keyMode: true });
+    // key_mode only means something with the refined decoder
+    await f.service.start({ sourceAudioUrl: `/references/${f.upload}`, keyMode: true }, 'owner');
+    await f.drain();
+    assert.deepEqual(f.ranWith(), { refined: false, keyMode: false });
+  } finally { f.close(); }
+});
+
+test('the Models dropdown choice applies when a transcription names none', async () => {
+  const f = fixture(false, true);
+  try {
+    const input = { sourceAudioUrl: `/references/${f.upload}` };
+    f.setStored({ refined: true, keyMode: true });
+    await assert.rejects(f.service.start(input, 'owner'), /chosen but not installed/);
+    f.setRefined(true);
+    await f.service.start(input, 'owner');
+    await f.drain();
+    assert.deepEqual(f.ranWith(), { refined: true, keyMode: true });
+    // an explicit SheetSage2 request still wins
+    await f.service.start({ ...input, transcriber: 'sheetsage2' }, 'owner');
+    await f.drain();
+    assert.deepEqual(f.ranWith(), { refined: false, keyMode: false });
   } finally { f.close(); }
 });
 
@@ -459,6 +593,13 @@ test('an accepted score plan saves lyrics and the revised score with backups, an
     assert.equal(started.status, 'done');
     assert.equal(started.abc, revised.trim());
     assert.equal(f.counts().started, 0);
+
+    // An instrumental score (silent Vocal, sounding Ins) saves and reloads.
+    const instrumental = revised.replace(/^C6\|D6\|$/m, 'Z2|').replace(/^E6\|F6\|$/m, 'Z2|') + ['V: Ins', 'C6|D6|', ''].join(String.fromCharCode(10));
+    const insPlan = await f.service.planScoreSections({ ...input, abc: instrumental, lyrics }, 'owner');
+    const saved = await f.service.saveDatasetDetails({ ...input, lyrics: insPlan.lyrics, abc: instrumental, revision: insPlan.revision }, 'owner') as { abcSaved?: boolean };
+    assert.equal(saved.abcSaved, true);
+    assert.equal(fs.readFileSync(abcFile, 'utf8').trim(), instrumental.trim());
   } finally { f.close(); }
 });
 

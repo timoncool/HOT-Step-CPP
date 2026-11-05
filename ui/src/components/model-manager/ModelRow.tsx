@@ -72,7 +72,7 @@ export const ModelRow: React.FC<Props> = ({ file, downloadJob, onDownload, onCan
             <>
               {confirmDelete ? (
                 <div className="flex items-center gap-1">
-                  <button onClick={() => { onDelete(file.filename); setConfirmDelete(false); }}
+                  <button onClick={() => { onDelete(file.muscriptorModel ? file.id : file.filename); setConfirmDelete(false); }}
                     className="text-[10px] px-2 py-1 rounded bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors">
                     {t('common.delete')}
                   </button>

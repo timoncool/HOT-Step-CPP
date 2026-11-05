@@ -34,6 +34,13 @@ function putFile(source: string, destination: string, link: (source: string, des
   }
 }
 
+/** Not fs.rmSync: on Windows, Node 24.11 silently skips a path with non-ASCII
+ * characters (an em dash in a title), so the copy after it hit EEXIST. */
+function removeFile(file: string): void {
+  try { fs.unlinkSync(file); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+}
+
 /** Separation must use the same flattened names as preprocessing. Old caches
  * without an audio_dir retain the original-folder fallback. */
 export function yue2SeparationAudioDir(manifestPath: string, sourceDir: string): string {
@@ -60,10 +67,22 @@ export function refreshYue2StagedSidecars(manifestPath: string): void {
       const destination = path.join(dir, `${stem(entry.name)}${suffix}`);
       // Older staging names may overlap suffixes; never unlink original files.
       if (path.resolve(source) === path.resolve(destination)) throw new Error('Invalid YuE2 staged sidecar mapping');
-      fs.rmSync(destination, { force: true });
+      removeFile(destination);
       if (fs.existsSync(source)) putFile(source, destination, fs.linkSync);
     }
   }
+}
+
+/** Staged name -> the ORIGINAL audio in the dataset folder, for a manifest whose
+ *  sources were staged by stageYue2Audio. Empty for a legacy cache (no map). */
+export function readYue2StagedSources(manifestPath: string): Map<string, string> {
+  const mapPath = path.join(path.dirname(path.resolve(manifestPath)), SOURCE_MAP);
+  const out = new Map<string, string>();
+  if (!fs.existsSync(mapPath)) return out;
+  for (const e of JSON.parse(fs.readFileSync(mapPath, 'utf8')) as StagedSource[]) {
+    if (e?.name && path.isAbsolute(e.source)) out.set(e.name, e.source);
+  }
+  return out;
 }
 
 /** Keep unique basenames; flatten colliding paths and protect sidecar stems too.

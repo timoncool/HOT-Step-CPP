@@ -4,6 +4,7 @@
 //   cl /std:c++17 /EHsc /I..\src /I..\src\train /I..\ggml\include test-yue2-aitk-resume.cpp
 //   c++ -std=c++17 -I../src -I../src/train -I../ggml/include test-yue2-aitk-resume.cpp
 #include "yue2-aitk-resume.h"
+#include "yue2-aitk-runtime.h"
 
 #include <cassert>
 #include <cmath>
@@ -47,7 +48,43 @@ static bool bits_equal(const std::vector<std::vector<float>> & a, const std::vec
     return true;
 }
 
+static void test_holdout_resume() {
+    using namespace yue2_aitk_runtime::detail;
+    std::string error;
+    std::vector<size_t> order;
+    assert(training_order(2, {0}, &order, &error) && order == std::vector<size_t>{1});
+    // Same split resumes its shuffled order and cursor unchanged.
+    assert(validate_resume_order(2, {0}, {0}, {1}, 0, &error));
+    assert(validate_resume_order(5, {0, 2}, {2, 0}, {4, 1, 3}, 2, &error));
+    // The review reproduction: equal split sizes, different identities. The
+    // old length check accepted [1], then filtering hold-out {1} erased it.
+    assert(!validate_resume_order(2, {1}, {0}, {1}, 0, &error));
+    assert(error.find("split mismatch") != std::string::npos);
+    assert(!validate_resume_order(2, {}, {0}, {1}, 0, &error));
+    // A missing saved split is an empty split. Legacy checkpoints continue
+    // without a hold-out, but cannot claim any previously seen item is held out.
+    assert(validate_resume_order(2, {}, {}, {1, 0}, 1, &error));
+    assert(!validate_resume_order(2, {0}, {}, {0, 1}, 0, &error));
+    assert(!validate_resume_order(2, {0}, {}, {1}, 0, &error));
+    // The order must contain every training index exactly once and no held
+    // item. A cursor at the end is invalid, even if below the dataset size.
+    assert(!validate_resume_order(3, {0}, {0}, {1, 1}, 0, &error));
+    assert(!validate_resume_order(3, {0}, {0}, {0, 1}, 0, &error));
+    assert(!validate_resume_order(3, {0}, {0}, {1}, 0, &error));
+    assert(!validate_resume_order(3, {0}, {0}, {1, 3}, 0, &error));
+    assert(!validate_resume_order(2, {0}, {0}, {}, 0, &error));
+    assert(!validate_resume_order(2, {0}, {0}, {1}, 1, &error));
+    assert(!validate_resume_order(2, {0}, {0}, {1}, UINT64_MAX, &error));
+    assert(!validate_resume_order(2, {0}, {0, 0}, {1}, 0, &error));
+    assert(!training_order(2, {0, 1}, &order, &error));
+    assert(!training_order(2, {2}, &order, &error));
+    assert(!training_order(2, {0, 0}, &order, &error));
+    assert(!training_order(0, {}, &order, &error));
+    std::puts("PASS hold-out resume: same split, changed split, legacy, complement and cursor");
+}
+
 int main() {
+    test_holdout_resume();
     const fs::path dir = fs::temp_directory_path() / ("y2resume-" + std::to_string(std::random_device{}()));
     fs::create_directories(dir);
     auto P = [&](const char * f) { return (dir / f).string(); };

@@ -14,6 +14,7 @@ import { renderYue2JointPreview, listYue2JointPreviews, Yue2PreviewCleanupError 
 import { yue2Unload } from '../backends/yue2/client.js';
 import { yue2StyleNormsForRun } from '../backends/yue2/scoreHealth.js';
 import { ensureYue2PreparedDataset } from './yue2AutoPrepare.js';
+import { selectYue2Audio, yue2StagedNames } from './yue2AudioStaging.js';
 import { FIXED_RECIPE_CAPTION_GRAMMAR } from './fixedRecipeCaption.js';
 import { YUE2_JOINT_FIXED_RECIPE_DROPOUTS } from '../../contracts/trainingRecipes.js';
 import { getDataset } from './datasetsRepo.js';
@@ -88,6 +89,10 @@ export interface ResolvedYue2JointTrainOptions {
   preview?: import('./types.js').Yue2JointPreviewOptions;
   alignment?: import('./types.js').Yue2AlignmentOptions;
   pauseAt?: number;
+  /** Live interval edits the trainer re-reads between steps (GH #307), and
+   *  the edit revision these arguments already carry. */
+  paramsFile?: string;
+  paramsRev?: number;
   preparation?: import('./yue2AitkPrepareRunner.js').ResolvedYue2AitkPrepareOptions;
   /** Optimizer: native CUDA AdamW8bit (default) or the shared LmOptim path
    *  ('adamw-lm' is AdamW on that path: fp32 moments, warmup+cosine). */
@@ -136,6 +141,11 @@ export interface ResolvedYue2JointTrainOptions {
    *  decoder alone for this many more steps (steps stays the cap). The KL
    *  checkpoint is still saved. 0/absent = end the run at the KL. */
   narExtraSteps?: number;
+  /** Held-out planner gate (GH #316). Needs narExtraSteps (the decoder's
+   *  budget once the planner freezes). holdoutIds name the songs by manifest
+   *  id; holdoutItems are their indices in the prepared manifest, resolved
+   *  when the run starts and kept in the record so a resume reuses the split. */
+  plannerGate?: Yue2PlannerGate;
   /** false keeps the engine running during training (generation stays
    *  available and shares the GPU). Absent/true stops it, as before. */
   stopEngine?: boolean;
@@ -246,17 +256,21 @@ export interface ResolvedYue2JointTrainOptions {
  *  with no Lyric Studio set or no generations keeps its own lyrics. */
 function withGeneratedPreviewLyrics<T extends { lyrics?: string; lyricsSource?: 'dataset' }>(job: TrainingJob, preview: T | undefined): T | undefined {
   if (!preview || preview.lyrics || preview.lyricsSource === 'dataset') return preview;
-  const ds = getDataset(job.datasetId);
-  // A dataset pushed to a training worker has no Lyric Studio set here; the
-  // controlling machine resolved its generation and sent it alongside.
-  const row = ds?.lyricsSetId ? latestGenerationLyrics(ds.lyricsSetId) : readPushedPreviewLyrics(ds?.sourceDir);
+  const row = datasetGenerationLyrics(getDataset(job.datasetId));
   if (!row) return preview;
   log(job, 'info', `Preview lyrics: Lyric Studio generation #${row.id}${row.title ? ` "${row.title}"` : ''} (caption from the dataset)`);
   return { ...preview, lyrics: row.lyrics };
 }
 
+/** The newest Lyric Studio generation for a dataset's artist. A dataset pushed to a training worker has no
+ *  Lyric Studio set here; the controlling machine resolved its generation and sent it alongside. HeartMuLa's
+ *  checkpoint previews use the same lookup. */
+export function datasetGenerationLyrics(ds: { lyricsSetId?: number; sourceDir?: string } | null | undefined): GenerationLyrics | undefined {
+  return ds?.lyricsSetId ? latestGenerationLyrics(ds.lyricsSetId) : readPushedPreviewLyrics(ds?.sourceDir);
+}
+
 export const PUSHED_PREVIEW_LYRICS = '_hotstep-preview-lyrics.json';
-type GenerationLyrics = { id: number; title: string; lyrics: string };
+export type GenerationLyrics = { id: number; title: string; lyrics: string };
 
 /** The newest Lyric Studio generation with lyrics for a lyrics set. */
 export function latestGenerationLyrics(setId: number): GenerationLyrics | undefined {
@@ -274,6 +288,60 @@ function readPushedPreviewLyrics(sourceDir: string | undefined): GenerationLyric
     const row = JSON.parse(fs.readFileSync(path.join(sourceDir, PUSHED_PREVIEW_LYRICS), 'utf-8')) as GenerationLyrics;
     return typeof row?.lyrics === 'string' && row.lyrics.trim() ? row : undefined;
   } catch { return undefined; }
+}
+
+/** The held-out planner gate's settings (see ResolvedYue2JointTrainOptions). */
+export interface Yue2PlannerGate {
+  every: number; minEpochs: number; patience: number; epsilon: number; evalSeed: number;
+  holdoutIds: string[]; holdoutItems?: number[];
+}
+/** Starting settings, not validated ones. */
+export const PLANNER_GATE_DEFAULTS = Object.freeze({ every: 10, minEpochs: 5, patience: 3, epsilon: 0.001, evalSeed: 42, share: 0.2, minSongs: 3 });
+
+/** The default hold-out: 20% of the songs rounded up, at least 3, picked by a
+ *  seeded shuffle of the sorted ids so the same songs come back for the same
+ *  seed. Fails when no training song would be left. */
+export function planPlannerGateHoldout(ids: string[], seed: number): { holdoutIds: string[] } | { error: string } {
+  const sorted = [...new Set(ids)].sort();
+  const count = Math.max(PLANNER_GATE_DEFAULTS.minSongs, Math.ceil(sorted.length * PLANNER_GATE_DEFAULTS.share));
+  if (sorted.length - count < 1) return { error: `The planner gate holds out ${count} songs and needs at least one more to train on; this dataset has ${sorted.length}.` };
+  let a = seed >>> 0;
+  const rand = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  for (let i = sorted.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [sorted[i], sorted[j]] = [sorted[j], sorted[i]]; }
+  return { holdoutIds: sorted.slice(0, count).sort() };
+}
+
+/** The ids preprocessing will give the dataset's songs, read from the current
+ *  source inventory and not from any cache, so the card can show the split
+ *  before the first stage runs and a cache never hides a changed song. Staged
+ *  names are the manifest source names, which become the prepared item ids;
+ *  the engine skips the server's old `.engine.wav` conversions. */
+export function yue2GateSongIds(samples: Parameters<typeof selectYue2Audio>[0]): string[] {
+  const files = selectYue2Audio(samples).files;
+  const names = yue2StagedNames(files);
+  return files.map(s => names.get(s.relPath)!).filter(name => !/\.engine\.wav$/i.test(name));
+}
+
+/** What GET /datasets/:id/yue2-joint-holdout answers. */
+export function yue2PlannerGatePreview(samples: Parameters<typeof selectYue2Audio>[0], seed: number):
+  { songs: number; holdoutIds: string[]; training: number; error?: string } {
+  const ids = yue2GateSongIds(samples);
+  if (!ids.length) return { songs: 0, holdoutIds: [], training: 0, error: 'This dataset has no included audio files.' };
+  const pick = planPlannerGateHoldout(ids, seed);
+  if ('error' in pick) return { songs: ids.length, holdoutIds: [], training: 0, error: pick.error };
+  return { songs: ids.length, holdoutIds: pick.holdoutIds, training: ids.length - pick.holdoutIds.length };
+}
+
+/** Map held-out ids to indices in the prepared manifest. A saved split (resume)
+ *  is only reused when the same ids still sit at the same indices. */
+export function resolvePlannerGateItems(manifestIds: string[], gate: Yue2PlannerGate): number[] | { error: string } {
+  const items = gate.holdoutIds.map(id => manifestIds.indexOf(id));
+  const missing = gate.holdoutIds.filter((_, i) => items[i] < 0);
+  if (missing.length) return { error: `Held-out songs are not in the prepared dataset: ${missing.join(', ')}` };
+  if (gate.holdoutItems && (gate.holdoutItems.length !== items.length || gate.holdoutItems.some((v, i) => v !== items[i])))
+    return { error: 'The prepared dataset no longer matches the held-out split of the run being resumed.' };
+  if (manifestIds.length - items.length < 1) return { error: 'The planner gate would leave no song to train on.' };
+  return items;
 }
 
 export const BASE_MATCHED_FORCED = Object.freeze({
@@ -378,7 +446,15 @@ export function buildYue2JointTrainArgs(o: ResolvedYue2JointTrainOptions): strin
   if (o.stopMode === 'loss' && o.targetLoss !== undefined) args.push('--target-loss', String(o.targetLoss));
   if (o.stopMode === 'kl' && o.targetKl !== undefined) args.push('--target-kl', String(o.targetKl));
   if (o.stopMode === 'kl' && o.targetKlMode === 'trend') args.push('--target-kl-mode', 'trend');
-  if (o.stopMode === 'kl' && o.narExtraSteps !== undefined && o.narExtraSteps > 0) args.push('--nar-extra-steps', String(o.narExtraSteps));
+  if ((o.stopMode === 'kl' || o.plannerGate) && o.narExtraSteps !== undefined && o.narExtraSteps > 0) args.push('--nar-extra-steps', String(o.narExtraSteps));
+  // Same flags on every segment and resume: the engine refuses a mismatch.
+  const gate = o.plannerGate;
+  if (gate) {
+    if (!gate.holdoutItems?.length) throw new Error('planner gate: held-out songs were not resolved against the prepared dataset');
+    args.push('--planner-gate-every', String(gate.every), '--planner-gate-min-epochs', String(gate.minEpochs),
+      '--planner-gate-patience', String(gate.patience), '--planner-gate-epsilon', String(gate.epsilon),
+      '--holdout-items', gate.holdoutItems.join(','), '--eval-seed', String(gate.evalSeed));
+  }
   if (o.lr !== undefined) args.push('--lr', String(o.lr));
   if (o.weightDecay !== undefined) args.push('--weight-decay', String(o.weightDecay));
   if (o.klWeight !== undefined) args.push('--kl-weight', String(o.klWeight));
@@ -444,6 +520,7 @@ export function buildYue2JointTrainArgs(o: ResolvedYue2JointTrainOptions): strin
   if (Number.isInteger(o.pauseAt) && (o.pauseAt as number) > 0) {
     args.push('--pause-at', String(o.pauseAt));
   }
+  if (o.paramsFile) args.push('--params-file', o.paramsFile, '--params-rev', String(o.paramsRev ?? 0));
   return args;
 }
 
@@ -496,6 +573,15 @@ function validateOptions(o: ResolvedYue2JointTrainOptions): string | null {
   if (o.stopMode && o.stopMode !== 'steps' && o.stopMode !== 'loss' && o.stopMode !== 'kl') return 'stopMode must be steps, loss or kl';
   if (o.stopMode === 'loss' && (o.targetLoss === undefined || !Number.isFinite(o.targetLoss) || o.targetLoss < 0)) return 'targetLoss must be a non-negative finite number when stopMode is loss';
   if (o.stopMode === 'kl' && (o.targetKl === undefined || !Number.isFinite(o.targetKl) || o.targetKl <= 0)) return 'targetKl must be a positive finite number when stopMode is kl';
+  const g = o.plannerGate;
+  if (g) {
+    if (!Number.isInteger(g.every) || g.every < 1 || !Number.isInteger(g.minEpochs) || g.minEpochs < 0 || !Number.isInteger(g.patience) || g.patience < 1) return 'planner gate: every and patience must be positive integers, minEpochs non-negative';
+    if (!Number.isFinite(g.epsilon) || g.epsilon < 0) return 'planner gate: epsilon must be a finite number >= 0';
+    if (!Number.isInteger(g.evalSeed) || g.evalSeed < 0 || g.evalSeed > 0xffffffff) return 'planner gate: evalSeed must fit uint32';
+    if (!g.holdoutIds.length) return 'planner gate: no held-out songs chosen';
+    if (!(o.narExtraSteps! > 0)) return 'planner gate needs a decoder budget (narExtraSteps above 0)';
+    if (o.lrSchedule === 'wsd') return 'planner gate does not support the wsd schedule';
+  }
   if (o.reconKeepDelta !== undefined && (!Number.isFinite(o.reconKeepDelta) || o.reconKeepDelta < 0 || o.reconKeepDelta > 1)) return 'reconKeepDelta must be between 0 and 1';
   if (o.method !== undefined && o.method !== 'tuned' && o.method !== 'base-matched' && o.method !== 'fixed-recipe') return 'method must be tuned, base-matched or fixed-recipe';
   if (o.warmup !== undefined && (!Number.isInteger(o.warmup) || o.warmup < 0 || o.warmup > o.steps)) return 'warmup must be an integer between 0 and steps';
@@ -570,7 +656,7 @@ export function reconKeepDecision(bestRecon: number | undefined, recon: number, 
   return { keep: false, bestRecon };
 }
 
-function relayJsonLine(job: TrainingJob, line: string, state: RelayState, clock?: TrainClock, thinning?: ReconThinning): void {
+export function relayJsonLine(job: TrainingJob, line: string, state: RelayState, clock?: TrainClock, thinning?: ReconThinning): void {
   const event = parseYue2JointEvent(line, state.totalSteps);
   if (!event) { log(job, 'info', line); return; }
   const raw = JSON.parse(line) as Record<string, unknown>;
@@ -651,7 +737,19 @@ function relayJsonLine(job: TrainingJob, line: string, state: RelayState, clock?
     // The freeze checkpoint is the KL target itself: no kl_mark fires there
     // (rungs stop below the target), and its checkpoint event came first.
     if (opts && opts.klCheckpointEvery! > 0) state.onRung?.(step);
-    log(job, 'info', `Planner reached its KL target at step ${step}; frozen there, decoder keeps training`);
+    log(job, 'info', raw.reason === 'planner_ce'
+      ? `Planner held-out loss stopped improving at step ${step}; frozen there, decoder keeps training`
+      : raw.reason === 'manual' ? `Planner frozen at step ${step}; decoder keeps training`
+      : `Planner reached its KL target at step ${step}; frozen there, decoder keeps training`);
+  } else if (stage === 'planner_gate' && step !== undefined) {
+    // A reading, not a phase: job.phase stays as it is.
+    const n = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    const ce = n(raw.ce), best = n(raw.best), stale = n(raw.stale), patience = n(raw.patience);
+    if (ce !== undefined && best !== undefined && stale !== undefined && patience !== undefined) {
+      pushEvent(job, { type: 'metric', metric: 'eval', ts: Date.now(), step, totalSteps: state.totalSteps, loss: ce,
+        plannerGate: { ce, best, bestStep: n(raw.best_step) ?? 0, stale, patience, armed: raw.armed === true, epoch: n(raw.epoch) ?? 0, items: n(raw.items) ?? 0 } });
+    }
+    log(job, 'info', `Planner gate at step ${step}: held-out CE ${raw.ce}, best ${raw.best} (step ${raw.best_step}), ${raw.stale}/${raw.patience} stale${raw.armed === true ? '' : ' (not armed yet)'}`);
   } else if (stage === 'target' && step !== undefined) {
     state.targetStopped = true;
     log(job, 'info', `Stop target reached at step ${step}; stopping early`);
@@ -708,6 +806,49 @@ export function parseYue2JointEvent(line: string, totalSteps: number): {
   } catch { return null; }
 }
 
+/** The checkpoint a finished segment must have left: the engine's own pause
+ *  or early stop, else the step cap. Never the requested pause: a live edit
+ *  can move it after the trainer's last read of the params file. */
+export function yue2JointExpectedStep(state: Pick<RelayState, 'pausedAt' | 'targetStopped' | 'lastStep'>, start: number, steps: number): number {
+  return state.pausedAt && state.pausedAt < steps ? state.pausedAt
+    : state.targetStopped && state.lastStep > start ? state.lastStep : steps;
+}
+
+/** Pacing of the joint runs training here, for live interval edits (GH #307):
+ *  the segment's first step and pause, and the preview options in use. */
+export interface LivePace { preview?: import('./types.js').Yue2JointPreviewOptions; start: number; pauseAt: number; previewPaced: boolean; rev: number }
+export const yue2JointLivePace = new Map<string, LivePace>();
+
+/** Change the checkpoint and preview interval of a running joint job. The
+ *  options change for the segments still to come, and `.params.json` in the
+ *  run folder carries them to the trainer running now, which re-reads it
+ *  between steps. A shorter preview interval that is already behind the
+ *  current step pauses at the next one. */
+export function updateYue2JointParams(job: TrainingJob, body: { saveEvery?: unknown; previewEvery?: unknown }):
+  { saveEvery: number; previewEvery?: number } | { error: string; status: number } {
+  const o = job.opts as ResolvedYue2JointTrainOptions | undefined;
+  const pace = yue2JointLivePace.get(job.id);
+  if (!o || !pace || job.status !== 'running') return { error: 'That run is not training on this machine', status: 409 };
+  const whole = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= o.steps;
+  if (body.saveEvery === undefined && body.previewEvery === undefined) return { error: 'Nothing to change: send saveEvery or previewEvery', status: 400 };
+  if (body.saveEvery !== undefined && !whole(body.saveEvery)) return { error: `saveEvery must be a whole number from 1 to ${o.steps}`, status: 400 };
+  if (body.previewEvery !== undefined) {
+    if (!(pace.preview && pace.preview.everySteps > 0)) return { error: 'This run does not pause for previews every N steps', status: 400 };
+    if (!whole(body.previewEvery)) return { error: `previewEvery must be a whole number from 1 to ${o.steps}`, status: 400 };
+  }
+  if (!fs.existsSync(o.outDir)) return { error: 'The trainer has not started yet; try again in a moment', status: 409 };
+  if (body.saveEvery !== undefined) o.saveEvery = body.saveEvery as number;
+  if (body.previewEvery !== undefined) {
+    pace.preview!.everySteps = body.previewEvery as number;
+    if (o.preview) o.preview.everySteps = body.previewEvery as number;
+    if (pace.previewPaced) pace.pauseAt = Math.min(o.steps, pace.start + (body.previewEvery as number));
+  }
+  pace.rev++;
+  fs.writeFileSync(path.join(o.outDir, '.params.json'), JSON.stringify({ rev: pace.rev, save_every: o.saveEvery, ...(pace.previewPaced ? { pause_at: pace.pauseAt } : {}) }));
+  log(job, 'info', `Intervals changed: checkpoint every ${o.saveEvery}${pace.preview && pace.preview.everySteps > 0 ? `, preview every ${pace.preview.everySteps}` : ''}`);
+  return { saveEvery: o.saveEvery, ...(pace.preview && pace.preview.everySteps > 0 ? { previewEvery: pace.preview.everySteps } : {}) };
+}
+
 export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
   const opts = job.opts as ResolvedYue2JointTrainOptions | undefined;
   if (isCancelled(job)) return;
@@ -733,6 +874,17 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
     .map(dir => path.join(dir, 'nar_lora_joint_v9.safetensors')).find(p => fs.existsSync(p));
   if (o.resume && o.companion !== companion) log(job, 'warn', `Companion decoder adapter differs from the run being resumed: was ${o.companion ?? 'not installed'}, now ${companion ?? 'not installed'}`);
   o.companion = companion;
+  if (o.plannerGate) {
+    // Resolved against the manifest this run actually trains on. A resume
+    // keeps its saved split and refuses a manifest that no longer matches it.
+    let ids: string[];
+    try { ids = (JSON.parse(fs.readFileSync(o.dataset, 'utf8')) as { items: Array<{ id?: unknown }> }).items.map(item => String(item?.id)); }
+    catch { finishJob(job, 'failed', 'planner gate: cannot read the prepared dataset manifest'); return; }
+    const items = resolvePlannerGateItems(ids, o.plannerGate);
+    if ('error' in items) { finishJob(job, 'failed', items.error); return; }
+    o.plannerGate.holdoutItems = items;
+    log(job, 'info', `Planner gate: ${items.length} of ${ids.length} songs held out (${o.plannerGate.holdoutIds.join(', ')}); ${ids.length - items.length} to train on`);
+  }
   log(job, 'info', `Companion decoder adapter: ${companion ?? 'not installed (training on the pristine decoder)'}`);
   // Training + a parallel render measured ~21 GB, before a 4-way recomposition
   // on top. On a 24 GB card WDDM spills into system RAM and both processes
@@ -792,6 +944,8 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
     let step = resumeStep;
     let segmentNo = 1;
     let previewChain: Promise<void> = Promise.resolve();
+    const pace: LivePace = { preview, start: step, pauseAt: 0, previewPaced: false, rev: 0 };
+    yue2JointLivePace.set(job.id, pace);
     // The first segment carries the caller's freeze (a resume from a chosen
     // checkpoint); later segments freeze only when a plan check says so.
     let freezeNext = !!(o.resume && o.freezePlannerNow);
@@ -804,7 +958,9 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
       const segmentOut = preview ? path.join(o.outDir, 'segments', `segment-${String(segmentNo).padStart(6, '0')}`) : o.outDir;
       const cadence = planCheck && !plannerFrozen ? planCheck.every : preview ? preview.everySteps : 0;
       const pauseAt = cadence > 0 ? Math.min(o.steps, step + cadence) : 0;
-      const segment = { ...o, outDir: segmentOut, resume: resume || undefined, pauseAt: pauseAt < o.steps ? pauseAt : undefined, freezePlannerNow: freezeNext };
+      Object.assign(pace, { start: step, pauseAt, previewPaced: !!preview && cadence > 0 && !(planCheck && !plannerFrozen) });
+      const segment = { ...o, outDir: segmentOut, resume: resume || undefined, pauseAt: pauseAt < o.steps ? pauseAt : undefined, freezePlannerNow: freezeNext,
+        paramsFile: path.join(o.outDir, '.params.json'), paramsRev: pace.rev };
       freezeNext = false;
       const state: RelayState = { fatalMessage: '', doneSeen: false, lastStep: step, targetStopped: false, totalSteps: o.steps };
       if (preview?.parallel) {
@@ -823,9 +979,7 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
       // A target-loss stop ends the run early: the engine checkpoints the
       // last completed step, so the validator must accept that step, not o.steps.
       // An engine-initiated pause (a KL rung) checkpoints wherever it lands.
-      const wanted = () => state.pausedAt && state.pausedAt < o.steps ? state.pausedAt
-        : state.targetStopped && state.lastStep > step
-          ? state.lastStep : (pauseAt > 0 && pauseAt < o.steps ? pauseAt : o.steps);
+      const wanted = () => yue2JointExpectedStep(state, step, o.steps);
       nativeAttempted = true;
       // The engine refuses an output folder that already exists, so a run
       // trained straight into outDir saves its norms only once it has made it.
@@ -928,6 +1082,7 @@ export async function runYue2JointTrainJob(job: TrainingJob): Promise<void> {
   } catch (err: unknown) {
     if (!isCancelled(job)) finishJob(job, 'failed', err instanceof Error ? err.message : String(err));
   } finally {
+    yue2JointLivePace.delete(job.id);
     // The output directory is created by ace-train. Record only after that
     // boundary, including failed/cancelled partial runs, and never before it.
     let outputExists = false;

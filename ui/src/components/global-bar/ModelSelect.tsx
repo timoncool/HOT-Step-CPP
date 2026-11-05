@@ -6,6 +6,8 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { ChevronDown, Check, Search } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { splitModel } from './modelLabels';
 
 /** Detect model format from the raw model name/path.
  *  ONNX detection: .onnx extension OR known ONNX directory name patterns
@@ -196,9 +198,10 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
   const selectedFormat = value && formatOf ? formatOf(value) : null;
 
   return (
-    <div ref={containerRef} className="relative" id={id}>
+    <div ref={containerRef} className="relative">
       {/* Trigger button */}
       <button
+        id={id}
         type="button"
         onClick={() => !disabled && setOpen(!open)}
         onKeyDown={handleTriggerKeyDown}
@@ -305,6 +308,62 @@ export const ModelSelect: React.FC<ModelSelectProps> = ({
           </div>
         </div>
       )}
+    </div>
+  );
+};
+
+/** Two-step picker: variant on top, quants of that variant below (the
+ *  HeartMuLa layout). Falls back to one plain ModelSelect when every option
+ *  belongs to the same variant, so single-model backends look unchanged. */
+export const VariantModelSelect: React.FC<ModelSelectProps & {
+  variantLabel?: (variant: string) => string;
+  quantLabel?: (name: string) => string;
+}> = ({ variantLabel, quantLabel, ...props }) => {
+  const { t } = useTranslation();
+  const groups = new Map<string, string[]>();
+  for (const o of props.options) {
+    const v = splitModel(o).variant;
+    groups.set(v, [...(groups.get(v) ?? []), o]);
+  }
+  // Nothing to group when every option is its own variant (or all share one).
+  if (groups.size < 2 || groups.size === props.options.length) return <ModelSelect {...props} />;
+
+  const formatLabel = props.formatLabel ?? ((n: string) => n);
+  const labelVariant = variantLabel ?? formatLabel;
+  const current = splitModel(props.value);
+  const pick = (variant: string) => {
+    const quants = groups.get(variant) ?? [];
+    const usable = quants.filter(o => !props.disabledReason?.(o));
+    // Keep the quant you had when the new variant has it.
+    return usable.find(o => splitModel(o).quant.toLowerCase() === current.quant.toLowerCase())
+      ?? usable[0] ?? quants[0];
+  };
+  return (
+    <div className="space-y-2">
+      <ModelSelect
+        {...props}
+        value={current.variant}
+        options={[...groups.keys()]}
+        onChange={(v) => props.onChange(pick(v))}
+        formatLabel={labelVariant}
+        formatOf={null}
+        disabledReason={undefined}
+        // '' is a real variant (bare quant tokens); without this it renders as "unset".
+        placeholder={props.value ? labelVariant(current.variant) : props.placeholder}
+      />
+      <div>
+        <label htmlFor={props.id && `${props.id}-quant`}
+          className="block text-[10px] font-medium text-zinc-500 uppercase tracking-wider mb-1">
+          {t('models.quantization', 'Quantization')}
+        </label>
+        <ModelSelect
+          {...props}
+          id={props.id && `${props.id}-quant`}
+          options={groups.get(current.variant) ?? []}
+          formatLabel={quantLabel ?? ((o) => splitModel(o).quant || formatLabel(o))}
+          filterable={false}
+        />
+      </div>
     </div>
   );
 };

@@ -7,9 +7,12 @@ React context. Server-sent event streams stay as the push channel and drive
 the cache through the bridge below. They never become a second fetch owner.
 
 This page is the contract every area builds on. The code lives in
-`ui/src/queries/` (`client.ts`, `contract.ts`, `keys.ts`, `sseBridge.ts`) and
-the transports in `ui/src/services/` (`api.ts`, `trainingApi.ts`,
-`httpClient.ts`, `sharedEventSource.ts`).
+`ui/src/queries/` (`client.ts`, `contract.ts`, `keys.ts`, `sseBridge.ts`,
+`invalidation.ts`, `writes.ts`) and the transports in `ui/src/services/`
+(`api.ts`, `trainingApi.ts`, `httpClient.ts`, `axiosClient.ts`,
+`sharedEventSource.ts`). The audit and migration plan that tracks where the
+code still falls short of this contract is
+[tanstack-query.md](tanstack-query.md).
 
 ## The client
 
@@ -65,9 +68,13 @@ Shared local resources omit `worker` and `backend`. A key never holds a
 credential: `session` is an opaque counter. `normalizeFilters` drops
 `undefined` and `''` and sorts the keys, so equal requests share an entry.
 
-Invalidate with `resourceKey(resource, scope?, id?)`. Matching is per slot, so
-`resourceKey('training-data/datasets', { worker: 'A' })` hits every dataset
-list on worker A and nothing on B or this PC.
+Build an invalidation prefix with `resourceKey(resource, scope?, id?)`.
+Matching is per slot, so `resourceKey('training-data/datasets', { worker: 'A' })`
+hits every dataset list on worker A and nothing on B or this PC. Pass the
+prefix to `queryManager` (`queries/invalidation.ts`): `queryManager.invalidate(client,
+...keys)`, `queryManager.filter(client, filter)` for a predicate, or a named
+group such as `queryManager.songs.views(client)`. `invalidation.ts` is the only
+file that calls `QueryClient.invalidateQueries`.
 
 ### Capture the target in the key
 
@@ -84,12 +91,14 @@ const datasetsQuery = (worker: string | null) => queryOptions({
 
 ### Auth sessions
 
-`AuthProvider` calls `startAuthSession(queryClient, token)` before the new
-token reaches any consumer, and exposes the result as `sessionEpoch` on
-`useAuth()`. A changed token bumps the epoch, cancels the old epoch's
-in-flight auth-scoped queries and removes them. Public keys are untouched.
-Build auth keys with `{ auth: true }` and read `sessionEpoch` from `useAuth()`
-in the component, so it re-renders when the epoch moves.
+`AuthProvider` calls `setAuthToken(token)` (`services/axiosClient.ts`) and
+`startAuthSession(queryClient, token)` before the new token reaches any
+consumer, and exposes the result as `sessionEpoch` on `useAuth()`. The
+transport reads the bearer from that accessor, so no read or command passes a
+token. A changed token bumps the epoch, cancels the old epoch's in-flight
+auth-scoped queries and removes them. Public keys are untouched. Build auth
+keys with `{ auth: true }` and read `sessionEpoch` from `useAuth()` in the
+component, so it re-renders when the epoch moves.
 
 ### Shared resources
 
@@ -107,7 +116,7 @@ consumer before making it, and adds invalidation for the events it handles.
 
 | Key | Canonical read | Cached shape | Owner |
 |---|---|---|---|
-| `sharedKeys.songs()` | `songApi.list(token, { signal })` | `{ songs: Song[] }`, normalized | shell-queue |
+| `sharedKeys.songs()` | `songApi.list({ signal })` | `{ songs: Song[] }`, normalized | shell-queue |
 | `sharedKeys.song(id)` | `songApi.get(id, { signal })` | `{ song: Song }`, normalized | shell-queue |
 | `sharedKeys.plugins()` | `apiClient.get('/plugins', { signal })` | raw registry JSON | global-models |
 | `sharedKeys.capabilities(backend)` | `apiClient.get('/capabilities?backend=<id>', { signal })` | raw JSON | global-models |
@@ -116,8 +125,8 @@ consumer before making it, and adds invalidation for the events it handles.
 | `sharedKeys.gpus()` | `settingsApi.getGpus({ signal })` | raw `GpusResponse` | shell-queue |
 | `sharedKeys.adapterScan(folder)` | `adapterApi.scan(folder, { signal })` | raw scan response | global-models |
 | `sharedKeys.browse(dir, filter?)` | `adapterApi.browse(dir, filter, { signal })` | raw `BrowseResponse` | shell-queue |
-| `sharedKeys.workflowJob(id, after = 0)` | `apiClient.get('/workflows/jobs/<id>?after=<after>', { token, signal })` | `WorkflowReplay` | shell-queue |
-| `sharedKeys.workflowDocument(id)` | `apiClient.get('/workflows/documents/<id>', { token, signal })` | `{ document: WorkflowDocument }` | shell-queue |
+| `sharedKeys.workflowJob(id, after = 0)` | `apiClient.get('/workflows/jobs/<id>?after=<after>', { signal })` | `WorkflowReplay` | shell-queue |
+| `sharedKeys.workflowDocument(id)` | `apiClient.get('/workflows/documents/<id>', { signal })` | `{ document: WorkflowDocument }` | shell-queue |
 | `sharedKeys.preparation(id)` | `getYue2Preparation(id, { signal })` | `Yue2PreparationSummary` | training-data |
 | `sharedKeys.preparationJob(id)` | `getYue2PreparationJob(id, { signal })` | job summary or null | training-data |
 | `sharedKeys.peaks(audioUrl)` | `GET /api/audio/peaks?url=<audioUrl>`, 4xx/5xx thrown | raw `Peaks`, may carry `unsupported` | shell-queue |
@@ -140,26 +149,42 @@ since only a rewrite changes them.
 Song rows appear in several areas' feeds. `SONG_VIEWS` in `keys.ts` lists
 every one of them: the two shared song keys, `shell-queue/recent-songs`,
 `studios/recent-songs` and `cover-lyrics/cover-songs`. Any song write, delete,
-completion or reconnect calls `invalidateSongViews(client)`, or passes
-`SONG_VIEWS` as a reconnect list, rather than naming feeds itself. An area may
-also edit its own feed in place first. `invalidateSidecars(client)` refreshes
+completion or reconnect calls `queryManager.songs.views(client)` (or names the
+`song:written` event in a `writeAndInvalidate` plan), or passes `SONG_VIEWS`
+as a reconnect list, rather than naming feeds itself. An area may also edit
+its own feed in place first. `queryManager.sidecars.all(client)` refreshes
 lyric sidecars after a crop or retranscription.
 
 `sharedKeys.songs()` is auth-scoped: read `token` and `sessionEpoch` from
-`useAuth()`, build the key in render, and keep the token in the `queryFn`
-closure, never in the key. `sharedKeys.song(id)` also carries the epoch, but
-its canonical read, `songApi.get(id, { signal })`, sends no bearer token. The
-epoch there only drops the entry at sign-out; it is not an auth guarantee. The
-workflow keys are auth-scoped like the songs list. Polling cadence stays per observer
+`useAuth()`, build the key in render and gate the query on the token
+(`enabled: !!token`). The token never goes in the key or the `queryFn`; the
+transport adds the bearer itself. `sharedKeys.song(id)` also carries the
+epoch, so the entry is dropped at sign-out. Since the axios request
+interceptor attaches the bearer to every request, its read,
+`songApi.get(id, { signal })`, carries the token too. The workflow keys are
+auth-scoped like the songs list. Polling cadence stays per observer
 (`refetchInterval`), so a consumer that wants faster VRAM updates sets its own
 interval without touching the owner's options.
 
 Each area keeps its own options, hooks and event mappings in
 `ui/src/queries/<area>/`, with resources named `<area>/<name>`. The areas are
 `training-data`, `training-runs`, `global-models`, `cover-lyrics`, `studios`
-and `shell-queue`.
+and `shell-queue`. `queries/sa3-previews/` is a folder of its own, but its
+resource, `training-runs/sa3-previews`, belongs to the training-runs area.
 
 ## Transports
+
+`ApiClient` (`httpClient.ts`) sends every JSON request through one axios
+instance (`axiosClient.ts`), with a 60 s default timeout that slow routes
+raise with `ClientOptions.timeout`. Its request interceptor adds the bearer
+from the auth session accessor. Its response interceptor is the one place a
+failure becomes an `ApiError` and gets logged or toasted (`handleFailure`):
+GET failures never toast, since reads show their error inline and retry per
+the policy above; aborts never surface; a request can opt out with
+`ClientOptions.silent`. Multipart `upload()` stays on XHR for its progress
+events and `streamEvents()` stays on fetch, and both report failures through
+the same `handleFailure`. The filters and status messages are in
+[tanstack-query.md](tanstack-query.md#errors).
 
 Every read in `api.ts` takes a trailing `opts?: ReadOptions` (`{ signal }`).
 Positional callers are unchanged, songs are still normalized, and errors are
@@ -191,6 +216,11 @@ Reads throw on failure. Never catch an error into an empty result inside a
   (`TrainingTarget`). Never read the selection inside `onSuccess`.
 - No automatic retry. A submit happens once, when the user asks.
 - On success, invalidate the related lists and details for the captured scope.
+  Outside a component, `writeAndInvalidate(client, command, plan)`
+  (`queries/writes.ts`) runs the command and then the plan: `events(...)` for
+  named events, `keysPlan(...)` for keys the write already knows. Uploads use
+  the `useUpload()` mutation, which wraps `apiClient.upload` with progress and
+  abort.
 - Mutations take no signal. Cancelling a read aborts that read; it never
   cancels a server job. Stopping a job is its own explicit mutation.
 - No generic get-or-submit query functions.
@@ -214,7 +244,8 @@ stream drops and reopens. The first open does nothing, because the server
 replays its buffer on connect. The caller captures its scope when it starts
 the bridge: the URL and every key `map` builds come from that capture. The
 returned teardown unsubscribes and drops pending invalidations, and nothing
-the old stream delivers afterwards touches the cache.
+the old stream delivers afterwards touches the cache. Coalesced invalidations
+flush through `invalidateKeys` in `invalidation.ts`.
 
 ```ts
 useEffect(() => bridgeEvents(queryClient, {
@@ -226,6 +257,15 @@ useEffect(() => bridgeEvents(queryClient, {
     : undefined,
 }), [jobId, worker]);
 ```
+
+## Sanctioned exceptions
+
+The single exception list is owned by
+[tanstack-query.md §Sanctioned exceptions](tanstack-query.md#sanctioned-exceptions-change-the-doc-before-fixing-one).
+Three of its rows started here as architectural patterns: the disabled query as
+a stream's cache slot, the queryable POST, and the side-effect-only observer.
+New code copies one only for the same reason, and changing a row starts in that
+table.
 
 ## Consumer manifest
 
@@ -249,28 +289,24 @@ Dispositions were reconciled against the integration audit's ledger in
 `a9748d5d`, then updated for the R1, R2 and R5 fixes. A row now holds the
 ledger's wording in place of the single values above. Counts in the first 187
 rows are still those at `0ae4bf36`. The rows after them are the 23 files the
-audit found, then files added since, counted when appended.
+audit found, then files added since, counted when appended. The last 25 rows
+were appended at `be3c85f8` (2026-10-23) for files that met the criteria but
+had no row. Of the listed files only `hooks/usePolling.ts` no longer exists.
 
 | File | Area | Services | fetch | SSE | Timers | Disposition |
 |---|---|---|---|---|---|---|
-| `App.tsx` | shell-queue | api, sharedEventSource | 7 | 1 | 2 | Query library; liveness transport, commands, log stream |
+| `App.tsx` | shell-queue | api, sharedEventSource | 7 | 1 | 2 | Query library; liveness transport, commands, log stream, queue projection observer |
 | `audio/peaksClient.ts` | shell-queue | - | 1 | - | - | Query: shared `peaks`; failures uncached, `forgetPeaks` removes the entry (R5) |
 | `components/assistant/AssistantPanel.tsx` | studios | assistantApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/cover-studio/ArtistSettingsPanel.tsx` | cover-lyrics | lireekApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/cover-studio/CoverArtistGrid.tsx` | cover-lyrics | lireekApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
-| `components/cover-studio/CoverRecentSongs.tsx` | cover-lyrics | api | 1 | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/cover-studio/CoverStudio.tsx` | cover-lyrics | api, coverWorkflowApi, lireekApi, studioDraftMirror, supersepApi, workflowApi, yue2CoverApi | 5 | - | 2 | Query consumer; forms/commands/streams stay client-owned |
-| `components/cover-studio/RecentCovers.tsx` | cover-lyrics | api | 1 | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/cover-studio/ScorePlanReview.tsx` | cover-lyrics | yue2CoverApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
-| `components/cover-studio/SectionMatchReview.tsx` | cover-lyrics | yue2CoverApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/cover-studio/SourcePanel.tsx` | cover-lyrics | api, supersepApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/cover-studio/Yue2Build.tsx` | cover-lyrics | yue2CoverApi | - | - | 1 | Query consumer; forms/commands/streams stay client-owned |
 | `components/cover-studio/Yue2CoverPanel.tsx` | cover-lyrics | lireekApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/cover-studio/Yue2CoverScore.tsx` | cover-lyrics | yue2CoverApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
-| `components/create/AdaptersAccordion.tsx` | shell-queue | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/create/AiGenerateModal.tsx` | shell-queue | inspireApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/create/CreatePanel.tsx` | shell-queue | api, studioDraftMirror, trainingApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/create/MasteringSection.tsx` | shell-queue | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/create/Mm3ComposeButton.tsx` | shell-queue | lireekApi | - | - | - | Area service/store adapter; Query reads, explicit commands/client state |
 | `components/create/trainingCreateDraft.ts` | shell-queue | trainingOperations | - | - | - | Explicit one-shot form handoff; command-time revision transport |
 | `components/details/MetadataEditorModal.tsx` | shell-queue | api | 1 | - | - | Area service/store adapter; Query reads, explicit commands/client state |
@@ -279,7 +315,6 @@ audit found, then files added since, counted when appended.
 | `components/global-bar/CoverArtDropdown.tsx` | global-models | - | 3 | - | 1 | Query consumer; forms/commands/streams stay client-owned |
 | `components/global-bar/GenerationDropdown.tsx` | global-models | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/global-bar/GlobalParamBar.tsx` | global-models | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/global-bar/MasteringDropdown.tsx` | global-models | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/global-bar/Mm3LmAdapterDropdown.tsx` | global-models | - | 1 | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/global-bar/ModelsDropdown.tsx` | global-models | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/global-bar/MonitorBar.tsx` | global-models | - | - | - | 1 | Query consumer; forms/commands/streams stay client-owned |
@@ -320,7 +355,7 @@ audit found, then files added since, counted when appended.
 | `components/player/TrimControls.tsx` | shell-queue | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/repaint-studio/RepaintStudio.tsx` | studios | api, repaintLayerWorkflowApi, studioDraftMirror, workflowApi | 1 | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/settings/DataFolderPanel.tsx` | shell-queue | dataFolderApi | 1 | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/settings/SettingsPanel.tsx` | shell-queue | api, lireekApi, stemStudioApi | 2 | - | - | Query consumer; forms/commands/streams stay client-owned |
+| `components/settings/SettingsPanel.tsx` | shell-queue | api, lireekApi, stemStudioApi | 2 | - | - | Query consumer; env draft/save/restart lifecycle delegated to `useEnvSettingsForm` |
 | `components/shared/FileBrowserModal.tsx` | shell-queue | api | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/shared/LatentImport.tsx` | shell-queue | - | 1 | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/shared/PresetSyncNotices.tsx` | shell-queue | presetCollection | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
@@ -365,7 +400,7 @@ audit found, then files added since, counted when appended.
 | `components/training-studio/TrainDitForm.tsx` | training-runs | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/training-studio/TrainLmForm.tsx` | training-runs | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `components/training-studio/TrainPanel.tsx` | training-runs | trainingApi, trainingRecipesApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/training-studio/TrainingRunStats.tsx` | training-runs | - | - | - | 1 | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/TrainingRunStats.tsx` | training-runs | - | - | - | - | Active job read from the job cache via `useActiveTrainingJob`; no independent HTTP read |
 | `components/training-studio/TrainingWorkerBar.tsx` | training-data | trainingApi | - | - | 1 | Query consumer; forms/commands/streams stay client-owned |
 | `components/training-studio/WorkersPanel.tsx` | training-runs | trainingApi | - | - | 1 | Query consumer; forms/commands/streams stay client-owned |
 | `components/training-studio/Yue2AitkTrainCard.tsx` | training-runs | api, preferencesApi, sharedEventSource, trainingApi, trainingOperations, trainingPreparationApi | - | 1 | 5 | Query consumer; forms/commands/streams stay client-owned |
@@ -380,7 +415,6 @@ audit found, then files added since, counted when appended.
 | `components/training-studio/Yue2TrainStages.tsx` | training-runs | trainingPreparationApi | - | - | 1 | Query consumer; forms/commands/streams stay client-owned |
 | `components/training-studio/sendAuditionToCustomGen.ts` | training-data | trainingApi, trainingOperations | 1 | - | - | Query: local `training-data/dataset` revision read (R2); explicit draft command |
 | `components/training-studio/useMm3Status.ts` | training-runs | trainingApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
-| `components/training-studio/useTrainingStream.ts` | training-data | sharedEventSource, trainingApi | - | 1 | - | Shared SSE; scoped Query job refresh |
 | `components/training-studio/useYue2ArStatus.ts` | training-runs | trainingApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/training-studio/useYue2Status.ts` | training-runs | trainingApi | - | - | - | Query consumer; forms/commands/streams stay client-owned |
 | `components/training-studio/yue2ChartData.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
@@ -424,7 +458,7 @@ audit found, then files added since, counted when appended.
 | `services/trainingReviewApi.ts` | training-runs | trainingApi, trainingOperations | - | - | - | Transport; area Query caller owns reads, commands/streams explicit |
 | `services/workflowApi.ts` | shell-queue | - | 2 | - | - | Transport; area Query caller owns reads, commands/streams explicit |
 | `services/yue2CoverApi.ts` | cover-lyrics | - | 1 | - | - | Query-backed reads; commands/working-copy reducers |
-| `stores/audioGenQueueStore.ts` | shell-queue | api, audioQueueApi, lireekApi, workflowApi | 1 | - | 1 | Query reads; client executor/scheduler and media transport |
+| `stores/audioGenQueueStore.ts` | shell-queue | api, audioQueueApi, lireekApi, workflowApi | 1 | - | - | Query reads and the queue-snapshot reducer; client executor/scheduler and media transport |
 | `stores/audioQueueStoreTestFake.ts` | shell-queue | preferencesTestFake | - | - | - | Test fake; excluded from production |
 | `stores/backendStore.ts` | global-models | - | 5 | - | - | Query exact-key projections and selection commands |
 | `stores/coverStemsStore.ts` | cover-lyrics | supersepApi | - | - | - | Query separation waiter; client execution/mixer |
@@ -449,6 +483,7 @@ audit found, then files added since, counted when appended.
 | `queries/global-models/presets.ts` | global-models | preferencesApi, workflowApi | - | - | - | Query owner/policy; area contract applies |
 | `queries/shell-queue/preferences.ts` | shell-queue | preferencesApi, workflowApi | - | - | - | Query owner/policy; area contract applies |
 | `queries/shell-queue/queue.ts` | shell-queue | api, audioQueueApi, httpClient | - | - | - | Query owner/policy; area contract applies |
+| `queries/shell-queue/projection.ts` | shell-queue | - | - | - | - | Query owner: dynamic `refetchInterval` for the server audio queue; `applyServerItems` reconciles snapshots |
 | `queries/shell-queue/settings.ts` | shell-queue | api, dataFolderApi, stemStudioApi | - | - | - | Query owner/policy; area contract applies |
 | `queries/shell-queue/songs.ts` | shell-queue | api | - | - | - | Query owner/policy; area contract applies |
 | `queries/studios/lyrics.ts` | studios | httpClient | 1 | - | - | Query owner/policy; area contract applies |
@@ -458,9 +493,37 @@ audit found, then files added since, counted when appended.
 | `queries/studios/workflows.ts` | studios | httpClient, workflowApi | - | - | - | Query owner/policy; area contract applies |
 | `queries/training-data/queries.ts` | training-data | api, trainingApi, trainingPreparationApi | - | - | - | Query owner/policy; area contract applies |
 | `queries/training-runs/events.ts` | training-runs | trainingApi | - | - | - | Query owner/policy; area contract applies |
-| `queries/training-runs/hooks.ts` | training-runs | trainingApi | - | - | - | Query owner/policy; area contract applies |
+| `queries/training-runs/hooks.ts` | training-runs | trainingApi | 1 | - | - | Query owner/policy; `useTrainingJobProjection` owns the active job's stream and cache, `useActiveTrainingJob` reads that cache, and the YuE2 chart cards keep their own metric-only subscription |
 | `queries/training-runs/queries.ts` | training-runs | api, trainingApi, trainingOperations, trainingPreparationApi, trainingRecipesApi, trainingReviewApi | - | - | - | Query owner/policy; area contract applies |
 | `stores/playbackStore.ts` | shell-queue | - | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `utils/mm3CaptionSource.ts` | shell-queue | - | - | - | - | Query-backed lireek read; client caption assembly |
 | `utils/paramProfiles.ts` | shell-queue | - | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
 | `queries/shell-queue/lyrics.ts` | shell-queue | - | 1 | - | - | Query owner for shared `lrc`/`lyrics-json` (R5); owner and transport for shared `score-abc` |
+| `components/compare-studio/CompareStudio.tsx` | compare | compareApi | - | - | - | Query consumer: sessions, session detail and library search; create/delete are mutations |
+| `components/compare-studio/DiffTrace.tsx` | compare | compareApi | - | - | - | Props only; the parent owns the diff query |
+| `components/compare-studio/SessionView.tsx` | compare | compareApi | - | - | - | Query consumer: per-take `analysis` and the active `diff`; archive/delete are mutations |
+| `components/compare-studio/TakeRow.tsx` | compare | compareApi | - | - | - | Query consumer: score and remove-take mutations over the session cache |
+| `components/compare-studio/useAbEngine.ts` | compare | - | 1 | - | - | Binary audio transport for the A/B engine's takes |
+| `components/cover-studio/PrepareLyrics.tsx` | cover-lyrics | yue2CoverApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/cover-studio/PrepareStructure.tsx` | cover-lyrics | yue2CoverApi | - | - | 1 | Client/types/props; the interval loops a recording's playback window, no server reads |
+| `components/cover-studio/SectionPlayback.tsx` | cover-lyrics | - | - | - | 2 | Client audio playback timers; no server reads |
+| `components/midi-studio/MidiExportPanel.tsx` | studios | midiStudioApi | - | - | - | Query consumer (`studios/midi-notes`); export and ABC lead-sheet commands, export invalidates notes and jobs |
+| `components/settings/AdapterReferencesAction.tsx` | shell-queue | lireekApi | - | - | - | Explicit cleanup command; `lireekApi` invalidates the lireek snapshots after it |
+| `components/settings/UpdatesPanel.tsx` | shell-queue | updatesApi | - | - | - | Query: `shell-queue/updates`, polled every 2 s while a check runs; Check now is a mutation that writes its result into the entry |
+| `components/storm/DriftPanel.tsx` | studios | - | - | - | - | Query consumer: 2 s `stormDriftOptions` snapshot poll while streaming; the four drift control POSTs are silent commands ([tanstack-query.md](tanstack-query.md) P4) |
+| `components/training-studio/Sa3TrainCard.tsx` | training-runs | api, sa3PreviewApi, trainingApi | - | - | - | Query consumer: component-local `training-data/sa3-status`, `training-runs/sa3-previews`, `global-models/sa3-adapters` and audition `shell-queue/generation-status`; start, cancel, render and audition are mutations; invalidates through `queryManager` ([tanstack-query.md](tanstack-query.md) F4#17) |
+| `components/training-studio/plugins/ace.tsx` | training-runs | trainingApi, trainingRecipesApi | - | - | - | Query consumer (ACE LM/DiT status and recipes); scoped training-store actions submit |
+| `components/training-studio/plugins/chips.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainGates.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainingPluginTypes.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `components/training-studio/trainingTargets.ts` | training-data | trainingApi | - | - | - | Client/types/props or scoped store projection; no independent HTTP read |
+| `queries/sa3-previews/queries.ts` | training-runs | sa3PreviewApi | - | - | - | Query owner/policy; area contract applies |
+| `queries/writes.ts` | foundation | httpClient | - | - | - | Query owner/policy: shared write helpers (`writeAndInvalidate`, `useUpload`) |
+| `services/axiosClient.ts` | foundation | apiError | 1 | - | - | Transport: the axios instance, its fetch adapter and the global error catch |
+| `services/compareApi.ts` | compare | httpClient | - | - | - | Transport; `queries/compare` owns the reads and commands |
+| `services/sa3PreviewApi.ts` | training-runs | httpClient | - | - | - | Transport; area Query caller owns reads, commands/streams explicit |
+| `services/updatesApi.ts` | shell-queue | httpClient | - | - | - | Transport; area Query caller owns reads, commands/streams explicit |
+| `queries/compare/queries.ts` | compare | compareApi | - | - | - | Query owner for sessions, session detail, picker search, analysis and diff |
+| `queries/compare/writes.ts` | compare | compareApi | - | - | - | Query owner: compare commands and the optimistic score cache follow-up |
+| `components/training-studio/useHeartmulaController.ts` | training-data | trainingApi | - | - | - | Query consumer (`training-data/heartmula-status`, `heartmula-previews`); prepare/train/batch are commands, the preview retry is a mutation |
+| `components/settings/useEnvSettingsForm.ts` | shell-queue | api | - | - | - | Query consumer (`shell-queue/env`, GPUs) and mutation owner (save/restart); draft seeded only while clean, `queryManager.env.values` invalidates |

@@ -118,6 +118,10 @@ struct Yue2SamplingParams {
     int   penalty_window     = 0;
     int   min_tokens         = 0;
     int   max_tokens         = 0;
+    // Not in the reference: drop every candidate whose probability is under
+    // min_p times the top one, after top-p. 0 (the default) leaves the chain
+    // exactly as the reference runs it.
+    float min_p              = 0.0f;
 };
 
 enum Yue2Phase { YUE2_PHASE_ABC = 0, YUE2_PHASE_SEMANTIC = 1 };
@@ -305,6 +309,19 @@ static inline void yue2_distribution(std::vector<float> & scores, const Yue2Samp
             }
         }
     }
+
+    // min_p (HOT-Step addition, off by default): p_i < min_p * p_max  <=>
+    // s_i < s_max + log(min_p). The top entry always survives.
+    if (sp.min_p > 0.0f) {
+        float mx = -INFINITY;
+        for (int64_t v = 0; v < V; v++) mx = std::max(mx, scores[(size_t) v]);
+        if (std::isfinite(mx)) {
+            const float floor = mx + std::log(sp.min_p);
+            for (int64_t v = 0; v < V; v++) {
+                if (scores[(size_t) v] < floor) scores[(size_t) v] = -INFINITY;
+            }
+        }
+    }
 }
 
 // ── The same chain over survivors only (the decode loops' fast path) ───────
@@ -424,6 +441,22 @@ static inline void yue2_distribution_survivors(float * scores, int64_t V, const 
         size_t w = 0;
         for (size_t i = 0; i < n; i++) {
             if (removed[i]) continue;
+            (*ids)[w]  = (*ids)[i];
+            (*vals)[w] = (*vals)[i];
+            w++;
+        }
+        ids->resize(w);
+        vals->resize(w);
+    }
+
+    // min_p, as in yue2_distribution: same floor, same survivors.
+    if (sp.min_p > 0.0f && !ids->empty()) {
+        float mx = -INFINITY;
+        for (float v : *vals) mx = std::max(mx, v);
+        const float floor = mx + std::log(sp.min_p);
+        size_t      w     = 0;
+        for (size_t i = 0; i < ids->size(); i++) {
+            if ((*vals)[i] < floor) continue;
             (*ids)[w]  = (*ids)[i];
             (*vals)[w] = (*vals)[i];
             w++;

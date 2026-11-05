@@ -15,6 +15,11 @@
 // prompt's own prefill is causal and unmasked, so later prompt rows still
 // carry information about the hidden ones; this is a soft timing control,
 // not a guarantee. Frame 0's logits come from the prefill and are unmasked.
+//
+// Under guidance (cfg_scale != 1) the negative prompt is the bare instruction
+// plus the same score (yue2_negative_prefix): no style, no lyrics. It hides
+// the same score lines at the same times, so the guidance still contrasts
+// style and lyrics only, now with the hidden lines missing from both sides.
 
 #include "yue2-lm-graph.h"   // Yue2MaskSpan
 #include "yue2-request.h"    // Yue2LyricSchedule
@@ -28,7 +33,10 @@
 
 // Prompt rows [a, b) of one section, in prefix positions.
 struct Yue2ScheduleRows {
-    std::vector<std::vector<std::pair<int64_t, int64_t>>> rows;  // per section
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> rows;   // per section
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> blind;  // per blind window
+    // The same score rows in the negative prompt (guidance only; empty without).
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> neg_rows, neg_blind;
 };
 
 // Byte offset of codepoint `cp` in UTF-8 `s`; -1 if past the end.
@@ -70,14 +78,26 @@ static inline bool yue2_rows_for_bytes(const BPETokenizer * tok, const std::vect
 
 // Map every section's spans to rows of the semantic prefix built by
 // yue2_token_prefixes(tok, style, lyrics, cot, &abc_ids): [EOD] + text + [ABC_START] + abc + ...
+// neg_abc_base >= 0 also maps the score rows into a negative prompt whose
+// abc_ids start there (guidance).
 static inline bool yue2_schedule_rows(const BPETokenizer * tok, const Yue2LyricSchedule & sc, const std::string & style,
                                       const std::string & lyrics, Yue2Cot cot, const std::string & abc_text,
-                                      const std::vector<int> & abc_ids, Yue2ScheduleRows * out, std::string * err) {
+                                      const std::vector<int> & abc_ids, Yue2ScheduleRows * out, std::string * err,
+                                      int64_t neg_abc_base = -1) {
     const std::string text      = yue2_assemble_text(style, lyrics, cot);
     const std::vector<int> tids = yue2_bpe_encode(tok, text);
     const int64_t lyric_at      = (int64_t) (text.size() - lyrics.size() - 1);  // lyrics sit before the final "\n"
     const int64_t abc_base      = 1 + (int64_t) tids.size() + 1;                 // after EOD, text, ABC_START
     out->rows.assign(sc.sections.size(), {});
+    out->neg_rows.assign(sc.sections.size(), {});
+    out->blind.assign(sc.blind.size(), {});
+    out->neg_blind.assign(sc.blind.size(), {});
+    // A score row goes to the positive prompt and, under guidance, the negative one.
+    auto abc_row = [&](std::pair<int64_t, int64_t> r, std::vector<std::pair<int64_t, int64_t>> & pos,
+                       std::vector<std::pair<int64_t, int64_t>> & neg) {
+        pos.push_back(r);
+        if (neg_abc_base >= 0) neg.push_back({ r.first - abc_base + neg_abc_base, r.second - abc_base + neg_abc_base });
+    };
     for (size_t k = 0; k < sc.sections.size(); k++) {
         const Yue2LyricSection & s = sc.sections[k];
         const int64_t l0 = yue2_cp_to_byte(lyrics, s.lyric_c0), l1 = yue2_cp_to_byte(lyrics, s.lyric_c1);
@@ -97,15 +117,36 @@ static inline bool yue2_schedule_rows(const BPETokenizer * tok, const Yue2LyricS
                 return false;
             }
             if (!yue2_rows_for_bytes(tok, abc_ids, abc_base, abc_text.size(), a0, a1, true, &r, err)) return false;
-            out->rows[k].push_back(r);
+            abc_row(r, out->rows[k], out->neg_rows[k]);
+        }
+    }
+    // Blind windows: lyric spans like a section's lyrics, score spans like its lines.
+    for (size_t k = 0; k < sc.blind.size(); k++) {
+        for (int pass = 0; pass < 2; pass++) {
+            const bool lyr = pass == 0;
+            const std::string & src = lyr ? lyrics : abc_text;
+            for (const auto & sp : lyr ? sc.blind[k].lyric : sc.blind[k].abc) {
+                const int64_t b0 = yue2_cp_to_byte(src, sp.first), b1 = yue2_cp_to_byte(src, sp.second);
+                if (b0 < 0 || b1 < 0 || b1 <= b0) {
+                    if (err) *err = "lyric_schedule: blind window " + std::to_string(k) + (lyr ? " lyric" : " abc") + " span is outside the text";
+                    return false;
+                }
+                std::pair<int64_t, int64_t> r;
+                const bool ok = lyr ? yue2_rows_for_bytes(tok, tids, 1, text.size(), lyric_at + b0, lyric_at + b1, false, &r, err)
+                                    : yue2_rows_for_bytes(tok, abc_ids, abc_base, abc_text.size(), b0, b1, true, &r, err);
+                if (!ok) return false;
+                if (lyr) out->blind[k].push_back(r);
+                else abc_row(r, out->blind[k], out->neg_blind[k]);
+            }
         }
     }
     return true;
 }
 
-// Rows hidden while composing the frame at t_sec. Sections are in score order.
+// Rows hidden while composing the frame at t_sec, in the positive prompt or
+// (neg) the negative one. Sections are in score order.
 static inline void yue2_schedule_spans(const Yue2LyricSchedule & sc, const Yue2ScheduleRows & rows, double t_sec,
-                                       std::vector<Yue2MaskSpan> * out) {
+                                       std::vector<Yue2MaskSpan> * out, bool neg = false) {
     out->clear();
     int64_t cur = -1;  // last section whose first note has passed
     for (size_t k = 0; k < sc.sections.size(); k++) {
@@ -115,8 +156,26 @@ static inline void yue2_schedule_spans(const Yue2LyricSchedule & sc, const Yue2S
         const bool future = sc.sections[k].start_sec - sc.lead_sec > t_sec;
         const bool stale  = sc.behind >= 0 && (int64_t) k < cur - sc.behind;
         if (!future && !stale) continue;
-        for (const auto & r : rows.rows[k]) {
+        for (const auto & r : (neg ? rows.neg_rows : rows.rows)[k]) {
             if (r.second > r.first) out->push_back({ r.first, r.second, sc.bias });
         }
     }
+    for (size_t k = 0; k < sc.blind.size(); k++) {
+        if (t_sec < sc.blind[k].from_sec || t_sec >= sc.blind[k].to_sec) continue;
+        for (const auto & r : (neg ? rows.neg_blind : rows.blind)[k]) {
+            if (r.second > r.first) out->push_back({ r.first, r.second, sc.bias });
+        }
+    }
+}
+
+// Whether replaying an n-frame prefix under the schedule hides anything
+// (token i runs under the spans due at frame i + 1). When it does not, a
+// plain prefill builds the same rows in one pass instead of n decodes.
+static inline bool yue2_schedule_touches_prefix(const Yue2LyricSchedule & sc, const Yue2ScheduleRows & rows, int64_t n) {
+    std::vector<Yue2MaskSpan> spans;
+    for (int64_t i = 0; i < n; i++) {
+        yue2_schedule_spans(sc, rows, (double) (i + 1) * 0.04, &spans);
+        if (!spans.empty()) return true;
+    }
+    return false;
 }

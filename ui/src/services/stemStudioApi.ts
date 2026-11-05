@@ -1,8 +1,9 @@
 import { queryClient } from '../queries/client';
-import { serverKey, resourceKey } from '../queries/keys';
+import { resourceKey } from '../queries/keys';
+import { extractProgressOptions, extractResultOptions } from '../queries/studios/resources';
 import { queryManager } from '../queries/invalidation';
 import { ACTIVE_POLL_MS } from '../queries/contract';
-import { waitForSnapshot } from '../queries/studios/wait';
+import { waitForQuery } from '../queries/wait';
 import { apiClient, type ReadOptions } from './httpClient';
 // stemStudioApi.ts — API client for Stem Studio extraction
 //
@@ -148,14 +149,16 @@ export async function listJobs(opts?: ReadOptions): Promise<ExtractJobSummary[]>
   return apiClient.get<ExtractJobSummary[]>(`${P}/jobs`, opts);
 }
 
-/** Delete a single extraction job and its files. */
+/** Delete a single extraction job and its files. Silent: RecentExtractions
+ *  renders the failure inline, so the transport must not toast a second copy. */
 export async function deleteJob(jobId: string): Promise<void> {
-  await apiClient.delete(`${P}/${jobId}`);
+  await apiClient.delete(`${P}/${jobId}`, { silent: true });
 }
 
-/** Delete ALL extraction jobs and stems. */
+// Silent: the settings storage row renders this failure itself (its inline
+// error line), so a transport toast would be a second copy of the same error.
 export async function deleteAllJobs(): Promise<void> {
-  await apiClient.delete(`${P}/all`);
+  await apiClient.delete(`${P}/all`, { silent: true });
 }
 
 /** Get stem storage statistics for the Settings page. */
@@ -172,15 +175,11 @@ export async function waitForExtraction(
   onProgress?: (p: ExtractProgress) => void,
   pollMs = ACTIVE_POLL_MS,
 ): Promise<ExtractJobResult> {
-  const p = await waitForSnapshot(serverKey('studios/extract-progress', { id: jobId }),
-    signal => getExtractProgress(jobId, { signal }),
+  const p = await waitForQuery<ExtractProgress>(extractProgressOptions(jobId),
     p => !['done', 'failed', 'cancelled'].includes(p.status), onProgress, { pollMs });
   if (p.status !== 'done') throw new Error(p.error || `Extraction ${p.status}`);
-  const result = await queryClient.query({
-    queryKey: serverKey('studios/extract-result', { id: jobId }),
-    queryFn: ({ signal }) => getExtractResult(jobId, { signal }),
-  });
-  await queryManager.keys(queryClient, resourceKey('studios/extractions'));
+  const result = await queryClient.query(extractResultOptions(jobId));
+  await queryManager.invalidate(queryClient, resourceKey('studios/extractions'));
   return result;
 }
 

@@ -43,14 +43,16 @@ file.
 | `fakeMm3Engine.ts` | The MiniMax-Music3 half of the fake engine: `/mm3/*`, including the live window stream |
 | `fakeTrainingRunner.ts` | Stand-ins for the trainer runners, installed with `labelingQueue.ts`'s `overrideTrainingRunner`; everything around them (routes, queue, SSE, job records) is real |
 | `restartChild.ts` | One life of the restart-interruption harness; run as a real child process by `client.restart.test.ts`, not imported |
-| `client.test.ts` | Create, Insta-Gen, Cover (open only), Repaint, Lego, stem separation |
+| `client.test.ts` | Create (direct submit, and resolve then the durable audio queue), Insta-Gen, Cover (open only), Repaint, Lego, stem separation |
 | `client.library.test.ts` | Song Builder, Library, Playlists, studio drafts, presets, import/export, settings/backends |
 | `client.training.test.ts` | ACE, MM3 and YuE2 training: dataset, revision, recipe resolve, start |
 | `client.trainingRuns.test.ts` | A training start that runs to a terminal state, per family, plus cancel and the one-job-per-dataset refusal |
 | `client.cover.test.ts` | Cover Studio's full chain: open, caption, transcribe, approve, render |
-| `client.streaming.test.ts` | STORM streaming/recording: start, control, record, export, disconnect |
-| `client.mm3stream.test.ts` | The live MM3 stream specifically (needs the MM3 backend active) |
-| `client.restart.test.ts` | A training job and a workflow job still running when the harness is killed, read back by a second process on the same data dir |
+| `client.lyric.test.ts` | Lyric Studio batch refusals: auth failure, rejected input, per-item preflight errors, an idempotency conflict, cancelling a finished or unknown job |
+| `client.lyric.chain.test.ts` | Lyric Studio's full chain (fetch, profile, generate, refine, render through the audio queue), with Genius and the LLMs as fixtures through `lyricWorkflow.ts`'s `overrideLyricWorkflowDeps` |
+| `client.streaming.test.ts` | STORM streaming/recording: start, control, record, export, disconnect; stream-session and MM3 stream refusals |
+| `client.mm3stream.test.ts` | The live MM3 stream specifically (makes the MM3 backend active) |
+| `client.restart.test.ts` | A training job, a workflow job and a YuE2 preparation pipeline still running when the harness is killed, read back by a second process on the same data dir |
 | `safetyGuards.test.ts` | Proves the guard mechanism itself: a violation is recorded even when production code catches the thrown error |
 
 ## Safety
@@ -60,7 +62,9 @@ Nothing mounted here may spawn a real process or reach a real network endpoint. 
 `execFile`/`fetch` call resolves to the guarded version. A blocked call is recorded in
 `FakeServer.violations` before it throws, so it stays visible even if production code catches
 the resulting error and degrades gracefully — the exact shape `essentiaClient.ts` and
-`workerUpdate.ts` use. Every test file's last test asserts `server.violations` is empty.
+`workerUpdate.ts` use. Every `client.*.test.ts` file asserts that no violation was recorded:
+its last test checks `server.violations`, and `client.restart.test.ts` checks each harness
+life's report.
 
 A route that cannot be isolated without a production change is reported as blocked, with the
 exact call site and a proposed dependency seam, in the test file's own header comment — never

@@ -6,7 +6,7 @@ can place individual children elsewhere.
 
 > Reference for the `mm3-lm-adapter-training` skill. Read only when the task needs it.
 
-## HOT-PiZZA is the default method since 2026-09-06 (Rob)
+## HOT-PiZZA is the default method since 2026-09-06
 
 `--hot-pizza` (implies `--pissa`): PiSSA with the rank-dropout mask on the
 principal component itself, so every micro-step a random `--rank-dropout`
@@ -32,7 +32,7 @@ starts and stops in any render or dataset track; use it before believing an LRC 
 
 Per-track captions are necessary (the shared caption gave 0/6) but not sufficient: the same recipe's per-plan
 natural-ending rate is 0.2-0.5, varies with the caption x lyrics pair and with the training draw (the trainer is
-deterministic per seed; two draws gave 2/6 and 3/6 with equal likeness), and Rob's in-app test on three fresh albums
+deterministic per seed; two draws gave 2/6 and 3/6 with equal likeness), and an in-app test on three fresh albums
 was 2 of 9. No training-side lever has raised it without losing likeness (score-last ends everything and sounds like
 nothing). The natural-ending candidates feature (3 takes, up to 4 rounds) is what makes a render end. The full ledger
 and the ordered list of what is left to try: `docs/plans/mm3-endings-checklist.md`. Pitch/tempo drift in adapter
@@ -59,17 +59,19 @@ trained on the same base. Since 2026-09-09 that half ships once:
   residual is found beside it); everything downstream is unchanged, VRAM too.
   NOT a plain LoRA: PEFT/SimpleTuner would apply (B-B0)(A-A0), which is
   nothing; the AS1.5 LM loader refuses the marker by name.
-- Standalone rank-2r exports (no residual beside the base, or the AS1.5 LM
-  trainer) are still written, now F16 (1.4 GB). Every older adapter loads as
-  before.
+- Standalone rank-2r exports (no residual beside the base, `mm3-lm-train
+  --pissa-standalone` since 2026-09-24, or the AS1.5 LM trainer) are still
+  written, now F16 (1.4 GB). `--pissa-standalone` is CLI only: it writes no
+  residual and exports ordinary PEFT files for loaders that merge them. Every
+  older adapter loads as before.
 - Missing residual at load: the engine error names the file and the Models
   page; download it there. Its SVD is deterministic but not bit-reproducible
   across GPUs, so the file is the truth, never recomputed on a user's machine
   for the shipped base.
 
 Also new that day: `saveEvery` default 100 (was 50) and the ~4.2 GB
-`resume-state.bin` is deleted when a run reaches its end unless "Keep resume
-state after completion" is ticked (`keepResumeState`); a run that stops short
+`resume-state.bin` is deleted when a run reaches its end unless the "Keep resume
+state after completion" toggle is on (`keepResumeState`); a run that stops short
 keeps it. `verifyExport: true` on the request runs `--verify-export` (every
 checkpoint round-trips the runtime loader; used for the first delta run).
 
@@ -101,8 +103,8 @@ both pairs rather than letting the job fail after the model loads.
 **None of this is in THE CURRENT BEST RECIPE block and none of it is
 ear-validated.** The DiT trainer's own blind listening test found that no
 parameterization beat plain LoRA — treat that as the prior for MM3 too until
-MM3 has run its own test. Full gate numbers and the open HiRA/HRA bugs:
-`docs/dev/training-internals.md` MM3 section.
+MM3 has run its own test. Full gate numbers and the HiRA estimator and HRA
+graph-sizing fixes: `docs/dev/training-internals.md` MM3 section.
 
 ## Supervising fewer positions does NOT buy VRAM
 
@@ -122,14 +124,17 @@ on 0..E without retaining prefix activations, supervise only the tail. **BUILT
 ## `--prefix-frames N`: real history in front of the crop
 
 Built 2026-08-26 (`engine/src/train/lm-kvprefix.h`; working notes in
-`docs/plans/2026-08-26-lm-frozen-kv-prefix.md`, gitignored). **Off by default,
-never ear-tested, no UI** — a run has to be launched by hand.
+`docs/plans/2026-08-26-lm-frozen-kv-prefix.md`, gitignored). The MM3 card
+exposes it as "History before crop (frames)" (`prefixFrames`). It was heard
+inside the 2026-09-06 stacked recipe (2048 frames) and the 2026-09-07 safe stack
+(1024), and has been off by default again since 2026-09-11: under whole-song
+training the track is its own history.
 
 The problem it solves is not coverage, it is CONTEXT. A crop at frame 3000
 carries its true RoPE position with ~750 keys of evidence in front of it, so
 the middle third of the stack — the layers doing long-range aggregation — is
 trained to produce position-3000 behaviour from a position-750 view. That is
-the band Rob switches off at render time with `scaleMid 0`.
+the band that renders better with the "Middle third" dial (`scaleMid`) at 0.
 
 A prefix needs no backward, so it escapes the quadratic term entirely: K and V
 cost **0.28125 MB per column** across MM3's 36 layers. Measured at crop 750,
@@ -148,7 +153,8 @@ will at render:
 | 5000 | 200 s | 94.4% | 1532 fr | 5.4x |
 | 6000 | 240 s | 98.0% | 1566 fr | 5.7x |
 
-**4096 is the default**: past it the curve flattens and you are spending
+**4096 was the default from 2026-08-26** (2048 from 2026-09-06, 1024 from
+2026-09-07, 0 since 2026-09-11): past it the curve flattens and you are spending
 quadratically to chase the tail. The flag is a CEILING, not a fixed cost -- a
 crop near the song's start has little history to load, which is why the mean at
 4096 is only ~1450 frames. VRAM is linear and never the binding constraint (1.7
@@ -188,8 +194,9 @@ at 1500 otherwise had no past. It has one now, so a tile crop is just an
 ordinary crop. **`--crop-start-frac 0.20 --crop-start-tiles 1`** is the
 reallocation: the opening keeps a share comparable to the ending's 0.15 (both
 are one event per song), and the freed 27% goes to random crops. Costs ~1.35x
-the prefill, because more steps land late where the prefix is longest.
-UNTESTED -- change it on its own run, not alongside a prefix change.
+the prefill, because more steps land late where the prefix is longest. This
+has been the in-app default since 2026-08-26 (`cropStartFrac 0.2`,
+`cropStartTiles 1` in `MM3_LM_DEFAULTS`).
 
 ## `--crop-anchor song` did nothing until 2026-08-26
 
@@ -204,9 +211,10 @@ PRESENTED: the model still saw every crop as the song's opening. Fixed via
 `LmCkptRun::pos_external`. `--crop-anchor zero` reproduces the old behaviour
 exactly, and pre-2026-08-26 runs are not comparable with later ones.
 
-**This LoRA configuration is FROZEN as of 2026-08-24** — settled by ear over a
-rank sweep at 64/128/256 with a full MLP dial at each. Further LoRA tuning is
-not planned; the open work is LoKr, Prodigy and the Muon step-size sweep.
+**This LoRA configuration was FROZEN on 2026-08-24** — settled by ear over a
+rank sweep at 64/128/256 with a full MLP dial at each. The open work then was
+LoKr, Prodigy and the Muon step-size sweep; HOT-PiZZA at rank 128 replaced
+plain LoRA as the method on 2026-09-06 (top of this file).
 
 Rank 128 was chosen over 256 because it matches by ear at **5.4 GB less VRAM,
 7% less step time and half the checkpoint size** (1.4 GB vs 2.7 GB) — which is
@@ -218,7 +226,9 @@ over a 6-album sweep plus a rank x optimizer 2x2 (2026-08-23/24).
 ## The three axes, which are separable
 
 This is the load-bearing insight. Earlier work conflated them and went in
-circles.
+circles. The MLP-dial values below were measured before the acoustic loss
+(2026-08-25); adapters trained with it render at MLP 1.0 (SKILL.md), and the
+dial values apply to pre-fix adapters through their sidecar `recommendedScales`.
 
 | axis | what it controls | setting |
 |---|---|---|
@@ -275,30 +285,28 @@ falling, mean |grad| was 11.6 vs AdamW's 4.5, and peak |grad| hit 300 vs 14.
 Every rank above ran at lr 8e-5, which bghira tuned at **rank 64**. Higher rank
 generally wants a different LR, so rank and learning rate are confounded in
 these results. Either sweep the LR per rank, or adopt an optimizer that sets its
-own (Prodigy — not implemented; `lm-optim.h` branches on a single `want_muon`
-bool and only knows adamw/muon).
+own. Prodigy has since been built (`--optimizer prodigy`, 2026-08-24; it
+resumes from state format v2). In the 2026-09-06 HOT-PiZZA recipe test AdamW
+at lr 8e-5 tied it by ear (69.5 against Prodigy's 72 of 90, inside the noise
+floor), so AdamW is the default at 2.3 GB less optimizer state.
 
 ## Dialling in the in-app trainer
 
 `MM3_LM_DEFAULTS` in `server/src/services/training/mm3Train.ts` is the single
-source of truth — the Jobs form is a VIEW of it and must never hold a second
-copy. It still carries the pre-sweep recipe. When testing ends:
+source of truth, with `MM3_LM_PRESETS` laid over it. The Training Studio's MM3
+card is a VIEW of them: it reads `defaults` and `presets` from `GET
+/api/training/datasets/:id/mm3` and submits through the recipe resolver
+(`server/src/services/training/recipes/operations.ts`). It must never hold a
+second copy. The 2026-08-24 plan this section used to carry is in (rank 128,
+lr 8e-5, lrEndFrac 0.005, an eval crop no longer than the window, which the
+route now clamps); the 128-frame random crops it proposed gave way to structured
+crops and then whole songs. Today's values are the SKILL.md recipe block.
 
-| field | current | target | why |
-|---|---|---|---|
-| `rank` / `alpha` | 64 / 64 | **128 / 128** | 64 eats the lyrics; 256 costs 5.4 GB for no audible gain |
-| `lr` | 5e-5 | **8e-5** | bghira's published value; ours was stale |
-| `steps` | 1000 | **2500** | ear picks land 750–2000; nothing improves after |
-| `saveEvery` | 100 | **250** | the ladder is auditioned, so rungs must exist |
-| `maxFrames` | 4096 | **128** | random short windows; 4096 is the old regime |
-| `cropMode` | `beginning` | **`random`** | pairs with the 128-frame window |
-| `evalEvery` | 50 | **250** | eval is only a divergence alarm now |
-| *(new)* `evalCrop` | — | **128** | MUST be <= maxFrames or eval silently dies |
-| `lrEndFrac` | 0.008 | **0.005** | matches the runs above |
-| `optimizer` | adamw | adamw | keep; do not offer Muon until it is retuned |
+Render-side: adapters trained with the acoustic loss (2026-08-25 onward) render
+at scaleMlp 1.0 and scaleAttn 1.0. The rank-dependent dial above (scaleMlp 0.75
+for a rank-128 adapter) applies to older adapters, through their sidecar
+`recommendedScales`.
 
-Render-side default for a rank-128 adapter: **scaleMlp 0.75** (0.63 worth
-trying), scaleAttn 1.00. Rank-dependent — see the dial table above.
-
-Anything still under test and NOT ready to promote: LoKr, Prodigy, the Muon
-step-size sweep.
+Still under test and NOT promoted: the Muon step-size sweep. LoKr stays
+selectable (it came last of the complete arms in the 2026-09-06 method test),
+and Prodigy tied AdamW (above).

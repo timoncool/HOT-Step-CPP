@@ -7,6 +7,15 @@ export interface HealthResponse {
   version: string;
   commit: string;
   dirty: boolean;
+  /** Package identity from build-info.json (config.ts BUILD_INFO). Without one,
+   *  sha falls back to the checkout's HEAD and the rest is null: never guessed. */
+  build: {
+    tag: string | null;
+    sha: string | null;
+    /** Exact asset variant, e.g. "cuda12-volta"; engine/.variant stays coarse. */
+    variant: string | null;
+    channel: 'release' | 'master' | null;
+  };
   /** ace-server.exe's mtime, or null if the file can't be stat'd. */
   engineBuiltAt: string | null;
   aceServer: {

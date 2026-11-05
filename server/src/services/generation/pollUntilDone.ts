@@ -1,11 +1,15 @@
 import { aceClient } from '../aceClient.js';
 import { engineCrashSeq } from '../aceEngineProcess.js';
+import { currentWorker } from '../engineWorkers.js';
 import type { GenerationJob } from './jobTypes.js';
 
 export interface PollWatchdogOptions {
   /** Submitted YuE2 chunk cap, bounded by the 9000-frame song ceiling.
    *  Used only during NAR, including the completed semantic handoff. */
   narChunkFrames?: number;
+  /** Completion phases with no guaranteed intermediate ticks. These use the
+   *  wall-clock timeout instead of an inactivity deadline. Opt-in per backend. */
+  quietCompletionPhases?: readonly string[];
 }
 
 /** Poll ace-server job until completion, with stall detection watchdog.
@@ -41,6 +45,7 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
     ? Math.max(STALE_TIMEOUT_QUIET_MS, Math.min(frames, 9000) * 400 + 120_000)
     : STALE_TIMEOUT_QUIET_MS;
   let inNar = false;
+  let acePhase: string | undefined;
   const isTickingStage = (s: unknown): boolean => typeof s === 'string' && /: Step \d+/.test(s);
   // A failing poll means "I can't see the job", not "the job stopped". The
   // engine stops answering HTTP while a single long op holds its request
@@ -77,6 +82,9 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
   let notFoundRun = 0;
   const NOT_FOUND_LIMIT = 3;
   const crashSeqAtStart = engineCrashSeq();
+  // The worker this poll talks to owns aceJobId; record it so calls made from
+  // outside the job's scope (route cancel, streams) reach the same engine.
+  job.workerId = currentWorker().id;
   // Heartbeat token from the ace-server poll body. adapter_progress is the
   // live delta index of an in-flight adapter precompute; during a lazy
   // inference-time DiT reload the phase is dit_inference and phase_step
@@ -110,7 +118,8 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
     const quietLimit = inNar ? narQuietMs : STALE_TIMEOUT_QUIET_MS;
     const staleLimit = inVaeDecode ? STALE_TIMEOUT_VAE_MS
                      : isTickingStage(lastStage) ? STALE_TIMEOUT_MS : quietLimit;
-    if (stalledFor > staleLimit && Date.now() - lastPollOkAt < BLIND_GRACE_MS
+    const quietCompletion = acePhase !== undefined && options.quietCompletionPhases?.includes(acePhase);
+    if (!quietCompletion && stalledFor > staleLimit && Date.now() - lastPollOkAt < BLIND_GRACE_MS
         && Date.now() - lastProbeAt > RUNNING_PROBE_MS) {
       lastProbeAt = Date.now();
       // Never let the watchdog destroy work the engine has already finished.
@@ -167,6 +176,7 @@ export async function pollUntilDone(aceJobId: string, job: GenerationJob, signal
         const step = status.phase_step ?? 0;
         const total = status.phase_total ?? 0;
         const phase = status.phase as string;
+        acePhase = phase;
         inNar = phase === 'nar' || (phase === 'semantic' && total > 0 && step >= total);
         job.acePhaseProgress = total > 0 ? `step ${step}/${total}` : '';
         const aceHeartbeat = `${status.phase}|${step}|${total}|${status.adapter_progress ?? -1}`;

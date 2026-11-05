@@ -1,25 +1,24 @@
-import { useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { queryManager } from '../../queries/invalidation';
 import { lireekApi } from '../../services/lireekApi';
 
 export function AdapterReferencesAction() {
   const { t } = useTranslation();
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<Awaited<ReturnType<typeof lireekApi.updateAdapterReferences>> | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const update = async () => {
-    if (running) return;
-    setRunning(true);
-    setResult(null);
-    setError(null);
-    try { setResult(await lireekApi.updateAdapterReferences()); }
-    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-    finally { setRunning(false); }
-  };
+  const client = useQueryClient();
+  const updateMut = useMutation({
+    mutationFn: lireekApi.updateAdapterReferences,
+    // The command rewrites preset adapter references inside lyrics sets, so
+    // every cached Lyric Studio snapshot that embeds one is stale.
+    onSuccess: () => queryManager.coverLyrics.lireek(client),
+  });
+  const running = updateMut.isPending;
+  const result = updateMut.data ?? null;
+  const error = updateMut.error?.message ?? null;
   return (
     <div className="px-4 py-3 space-y-2">
       <p className="setting-description">{t('settings.adapters.updateInfo')}</p>
-      <button className="placement-button" disabled={running} onClick={update}>
+      <button className="placement-button" disabled={running} onClick={() => updateMut.mutate()}>
         {t(running ? 'settings.adapters.updating' : 'settings.adapters.update')}
       </button>
       <div role="status" aria-live="polite" className="text-sm text-zinc-700 dark:text-zinc-300">

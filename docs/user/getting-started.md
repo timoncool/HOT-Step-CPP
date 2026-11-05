@@ -8,7 +8,7 @@ download to your first finished song.
 
 Every release on the [releases page](https://github.com/scragnog/HOT-Step-CPP/releases/latest)
 has one archive per platform and GPU. The file name says which: for example
-`HOT-Step-CPP-v1.3.4-win-x64-cuda13.1.zip`.
+`HOT-Step-CPP-v1.4.2-win-x64-cuda13.1.zip`.
 
 | Your hardware | Windows | Linux | macOS |
 |---|---|---|---|
@@ -61,19 +61,24 @@ Each archive has a matching `.sha256` file if you want to check the download.
 3. A console window shows the server's output. Leave it open; closing it stops the app.
 4. Your browser opens at `http://localhost:3001`. If it does not, open that address yourself.
 
+Unless an earlier version already set one up, the first start also creates the data folder,
+`HOT-Step-Data`, beside the app folder. Your models, songs, settings and logs go there; see
+[Where things live on disk](#where-things-live-on-disk).
+
 On Windows CUDA builds, the first launch downloads the CUDA runtime libraries (about 510 MB
-for CUDA 13, about 810 MB for CUDA 12) from Hugging Face into `engine/` before the engine
-starts. Progress prints in the console. Generation is unavailable until it finishes. If the
-download fails, the engine starts on CPU only; see
+for CUDA 13, about 810 MB for CUDA 12) from Hugging Face into the data folder's
+`tools/runtime/` before the engine starts. Progress prints in the console. Generation is
+unavailable until it finishes. If the download fails, the engine starts on CPU only; see
 [Troubleshooting](troubleshooting.md#the-gpu-is-not-used).
 
 ## Download your first models
 
 The archive contains no model weights. On a fresh install the engine finds nothing to load,
-logs `no models found`, and stops after three attempts. That is expected at this point.
-About eight seconds after the page loads, the [Model Manager](studios/model-manager.md) opens
-on its own. You can also open it any time with **Get More Models** at the bottom of the Models
-section in the top bar.
+logs `no models found` and waits. That is expected at this point. A banner under the top bar
+says no models are installed, and about eight seconds after the page loads the
+[Model Manager](studios/model-manager.md) opens on its own. You can also open it with
+**Open Model Manager** on that banner, or any time with **Get More Models** at the bottom of
+the Models section in the top bar.
 
 1. Stay on the **ACE-Step 1.5** tab. It is the default backend and the only one every studio
    supports.
@@ -81,17 +86,19 @@ section in the top bar.
    Q8_0, the 4B language model at Q8_0, the text encoder, and the standard, ScragVAE and
    PP-VAE decoders, about 9 GB in all.
 3. Wait for the progress bars to finish. A stalled download can be resumed.
-4. Click **Restart** in the sidebar and confirm. The engine only scans the models folder when
-   it starts, so this is what makes the new files usable.
+4. When the last download finishes, the engine starts by itself and the models appear in the
+   top bar. Files you download later, while the engine is running, need **Restart** in the
+   sidebar: the engine only scans the models folder when it starts.
 
-The other two music models, MiniMax-Music3 and YuE2, have their own tabs and packs. See
-[Backends](backends.md) for what each one does and [Model files](models.md) for every file
-in the catalogue.
+MiniMax-Music3 and YuE2 have their own tabs and packs. Stable Audio 3 has no tab of its own;
+its files, and the **Stable Audio 3 Training** pack, are on the **Shared** tab. See
+[Backends](backends.md) for what each backend does and [Model files](models.md) for every
+file in the catalogue.
 
 ### Which pack fits your GPU
 
-The registry states VRAM figures for only a few packs. Where it gives none, the table says so
-rather than guessing.
+Only a few packs have a stated VRAM figure. Where there is none, the table says so rather
+than guessing.
 
 | Pack | Backend | Download | VRAM |
 |---|---|---|---|
@@ -124,7 +131,7 @@ For which quant sounds best, see [Getting higher quality output](quality.md).
 2. Type a **Style Description**: genre, instruments, vocal style, tempo. "Warm 90s trip-hop,
    dusty breakbeat, upright bass, breathy female vocals, 88 BPM" works better than "chill song".
 3. Write **Lyrics** with section tags such as `[Verse]` and `[Chorus]`, each on its own line,
-   or turn on **Instrumental**.
+   or turn on **Instrumental (no vocals)**.
 4. Click **Generate**. Progress shows in the queue, and the Terminal in the right-hand column
    shows the engine's live output.
 5. The finished song appears in the [Library](studios/library.md).
@@ -136,7 +143,8 @@ models, solver, steps and guidance.
 
 ## Where things live on disk
 
-Everything stays inside the folder you extracted.
+The app folder holds only what the archive shipped. Everything you add goes in the data
+folder, `HOT-Step-Data` beside the app folder by default.
 
 | Path | Contents |
 |---|---|
@@ -147,9 +155,11 @@ Everything stays inside the folder you extracted.
 | `HOT-Step-Data/settings/.env` | Saved settings and service credentials. |
 | App `engine/`, `server/data/` | Shipped binaries and immutable catalogues. Downloaded runtimes go in the data folder's `tools/runtime/`. |
 
-The saved location survives a fresh unzip. Change it through Settings with a move or
-repoint action. See [Data folder and upgrades](data-folder.md) for imports and recovery.
-Development checkouts keep their existing paths; see [Configuration](../dev/config.md).
+The saved location survives a fresh unzip. Change it on the **Storage & Data** tab of
+Settings with a move or repoint action. See [Data folder and upgrades](data-folder.md) for
+imports and recovery.
+Development checkouts keep their own paths until you change them in Settings; see
+[Configuration](../dev/config.md).
 
 
 ## Install on your phone
@@ -173,7 +183,8 @@ alone does not turn an HTTP URL into HTTPS.
 ## Running from source
 
 `HOT-Step.bat` and `HOT-Step.sh` are the release launchers; a git checkout uses `LAUNCH.bat`,
-`launch.sh` or the hot-reload `dev.bat` instead, all covered in [Building from source](../dev/building.md).
+`launch.sh` or the hot-reload `dev.bat` (`dev.sh` on Linux and macOS) instead, all covered in
+[Building from source](../dev/building.md).
 
 ## Related
 

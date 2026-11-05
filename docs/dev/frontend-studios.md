@@ -4,31 +4,36 @@ Resolve runtime paths first using the [data folder configuration](config.md#dev-
 `<data root>/...` paths below describe the managed layout; environment overrides
 can place individual children elsewhere.
 
-Insta-Gen, Cover, Repaint, Lego (stem layer) and Lyric Studio batches are all
-`WorkflowKind`s on the one generic envelope at `/api/workflows`
+Auto-Gen, Cover, Repaint, Stem Builder's layer render and Lyric Studio
+batches are all `WorkflowKind`s on the one generic envelope at
+`/api/workflows`
 ([contracts/workflow.ts](../../server/src/contracts/workflow.ts),
-[routes/workflows.ts](../../server/src/routes/workflows.ts)). Per-kind wire
-shapes live in
+[routes/workflows.ts](../../server/src/routes/workflows.ts)). Auto-Gen is the
+UI's name for the studio the code, its kinds (`insta-*`) and its source tag
+(`insta-gen`) still call Insta-Gen. Per-kind wire shapes live in
 [contracts/studioWorkflows.ts](../../server/src/contracts/studioWorkflows.ts);
 the services under `services/workflows/` and `services/lireek/` import those
-schemas rather than redefining them, so this page and the code cannot drift
-apart silently. Stem separation is its own section below, on the same plain
-Express routes it has always used (not a `WorkflowKind`). Create's full
-control dictionary is published on its own page; this one does not cover it.
+schemas rather than redefining them, so the published shapes are the ones the
+server validates against. Cover's YuE2 score and Build steps, and stem
+separation, are plain Express routes (not `WorkflowKind`s), each in its own
+section below. Create's control dictionary is on
+[frontend-create-controls.md](frontend-create-controls.md); this page does not
+cover it.
 
 ## The shared envelope
 
-Every route below requires `Authorization: Bearer <token>`, like the rest of
-the API; a missing or invalid token is 401 before any kind runs.
+Every `/api/workflows` route requires `Authorization: Bearer <token>`; a
+missing or invalid token is 401 before any kind runs.
 
 **Submit:** `POST /api/workflows/jobs` with `{ kind, idempotencyKey, input }`.
 `input` is validated against that kind's schema; a validation failure is 400
-with `{ error, issues: [{ path, message }] }`. Resubmitting the same
-`idempotencyKey` with the same `input` returns the existing job (200);
-a different `input` under the same key is 409. A fresh submit is 201. The
-response and every other job route return `{ job: WorkflowJob }` (or `{ jobs:
-[...] }` for the list), carrying `status`, `result`, `error`, `attempt` and
-the cursor fields below.
+with `{ error, issues: [{ path, message }] }`, and an unknown kind is 400.
+Resubmitting the same `idempotencyKey` with the same `input` returns the
+existing job (200); a different `input` under the same key is 409. A fresh
+submit is 201. The submit answers `{ job: WorkflowJob, created }`; every other
+job route returns `{ job }` (or `{ jobs: [...] }` for the list, `GET
+/api/workflows/jobs[?kind=&status=]`), carrying `status`, `result`, `error`,
+`attempt` and the cursor fields below.
 
 **Poll or stream:** `GET /api/workflows/jobs/:id?after=N` returns `{ job,
 events, gap }` — events are only those after cursor `N`; `gap: true` means
@@ -40,28 +45,32 @@ resumes without loss or repeats. The stream closes itself once the job
 reaches a final status.
 
 **Cancel and retry:** `POST /api/workflows/jobs/:id/cancel` acknowledges a
-pending or running job; a step that ignores the abort signal still ends
-`cancelled` once it returns, and its result is discarded. `POST
-/api/workflows/jobs/:id/retry` only accepts `failed`, `cancelled` or
+pending or running job (409 for one already final); a step that ignores the
+abort signal still ends `cancelled` once it returns, and its result is
+discarded. `POST /api/workflows/jobs/:id/retry` only accepts `failed`, `cancelled` or
 `interrupted` jobs (a job the server left running across a restart becomes
 `interrupted`, never auto-rerun) and reuses any audio queue item the earlier
 attempt already produced.
 
 **Documents:** a handful of kinds persist a revisioned draft between steps
-(Insta-Gen's preview, Cover's draft) using the same plain documents the
+(Auto-Gen's preview, Cover's draft) using the same plain documents the
 client can read directly: `GET /api/workflows/documents/:id` returns `{
 document }`; `PUT .../documents/:id` takes `{ expectedRevision, data }` and
 is 409 with `{ error, currentRevision }` on a stale revision; `DELETE
 .../documents/:id?expectedRevision=N` returns `{ removed: true }`. Clients
-normally only read these — the kind itself writes them.
+normally only read these; the kind itself writes them. These routes refuse,
+with 400, the typed document kinds other domains serve (studio drafts and
+the playlist, preference presets).
 
-## Insta-Gen (`insta-preview`, `insta-direct`, `insta-approve`)
+## Auto-Gen (`insta-preview`, `insta-direct`, `insta-approve`)
 
 `insta-preview` and `insta-direct` share [`instaInputSchema`](../../server/src/contracts/studioWorkflows.ts)
 (caption/genres/lyricMode, an LLM subject for `lyrics-ai` mode, `engineParams`
 passed straight to the engine, and `expectedBackend` pinning the active
-backend — a 409 if it changed before the job could run). `lyricMode:
-'lyrics-ai'` requires `provider`, and a non-empty `subject` unless
+backend, a 409 if it changed before the job could run). Every key except
+`systemPrompt` is required, `model` included; an empty `model` takes the
+provider's default model. `lyricMode` is `instrumental`, `lyrics` or
+`lyrics-ai`; `lyrics-ai` requires `provider`, and a non-empty `subject` unless
 `randomSubject` is set.
 
 - `insta-preview` resolves caption/lyrics/metadata without rendering and
@@ -101,58 +110,114 @@ source asset's hash no longer matches what the draft was opened against.
   and returns `{ documentId, revision, caption }`.
 - `cover-transcribe({ ...ref, force })` resolves a YuE2 ABC score for the
   source and returns `{ documentId, revision, abc, scoreSource? }`. The score
-  is not yet "approved" — the client sets the draft's `approvedAbc` via `PUT
-  /api/workflows/documents/:id` before rendering on `yue2`.
+  is not yet "approved", and a new transcription clears any earlier approval.
+  The bundled UI approves with `POST /api/yue2-cover/drafts/:id/approve-score`
+  and `{ revision, abc }`, which checks the source and the score (non-empty,
+  at most 64 KB) and writes both `abc` and `approvedAbc`; it answers `{
+  document, sourceId, sourceLabel, abc }`, or 409 on a stale revision. A `PUT
+  /api/workflows/documents/:id` that sets `approvedAbc` also works.
 - `cover-render({ ...ref, expectedBackend, engineParams, title, lyrics,
   caption, instrumental, controls, ... })` renders on `ace` or `yue2`. `yue2`
   is 409 `Review and approve the score first` if the draft has no
   `approvedAbc`, and 400 if `controls.pairMode === 'pair'` without both
-  adapter halves set. Returns `{ request, audioIntentId, audio }` like
-  Insta-Gen's render.
+  adapter halves set. On `yue2` an optional `prepare` (the Prepare document,
+  [contracts/yue2Prepare.ts](../../server/src/contracts/yue2Prepare.ts))
+  must be current and built on the approved score, and must agree with
+  `instrumental` (409 otherwise); its exported lyrics replace `lyrics`. Empty
+  lyrics without `instrumental` are 400, and so is a backend without covers.
+  Returns `{ request, audioIntentId, audio, elapsedSeconds }`, the Auto-Gen
+  render shape plus the render time.
+
+### YuE2 score and Build routes (`/api/yue2-cover`)
+
+Cover's YuE2 Prepare and Build steps are plain routes under `/api/yue2-cover`
+([routes/yue2Cover.ts](../../server/src/routes/yue2Cover.ts)). Every one needs
+the token; a refusal is `{ error }`. A Build session keeps its own revision.
+Every `/build/:id/*` command except `cancel` and `preview` names the revision
+the client saw, and is 409 when it is stale; the session rules are in
+[architecture.md](architecture.md#yue2-build-sessions).
+
+| Routes | Purpose |
+|---|---|
+| `GET /readiness` | Whether lead-sheet transcription can run. A supplied ABC does not need it. |
+| `POST /transcriptions`, `GET` and `DELETE /transcriptions/:jobId` | A lead sheet for a source (`sourceAudioUrl` or `songId`, optional `abc`, `force`). It answers 200 `{ status: 'done', abc, sections, ... }` from a supplied ABC or a matching dataset sidecar, otherwise 202 `{ status: 'queued', jobId, ... }` to poll or cancel. |
+| `POST /drafts/:id/approve-score`, `POST /drafts/:id/save-score-details` | Approve a `cover-draft`'s score (above); write the BPM and key read from a score to the matching dataset song. |
+| `POST /score/remeter`, `POST /score/shift-bars` | Previews that store nothing: 2/4 to 4/4 (`{ abc, pickup }`) and bar lines moved by whole beats (`{ abc, beats }`). 422 when the score cannot be changed that way. |
+| `POST /sections/review`, `/sections/match`, `/sections/plan-score`, `/sections/suggest`, `/sections/save-dataset` | Prepare's section tools: list a score's sections and check them against lyrics; match or plan them from where the source vocal sings each lyric block; suggest lyric assignments for a Prepare document; save lyrics, score, BPM or key to the matching dataset song. |
+| `POST /source-metadata` | The matching dataset song's BPM, key, instrumental flag, lyrics and score, when the source is one (`{ matched: false }` otherwise). |
+| `POST /drift/:songId` | Measure how far a saved YuE2 cover drifted from its score; the result is cached on the song. |
+| `POST /build`, `GET /build/:id`, `DELETE /build/:id` and the `/build/:id/*` commands | Build by section: create a session from the cover's `params` (and optional `lyrics`), then `generate`, `cancel`, `keep`, `undo`, `crop`, `trim`, `preview`, `lyrics`, `occurrence-lyrics`, `settings` and `plan`; `DELETE /build/:id/takes/:take` drops one take. `POST /build/lyrics-check` checks a lyrics draft before a session exists. |
 
 ## Repaint and Lego layer (`repaint-render`, `layer-render`)
 
-Both take a `source` discriminated on `kind: 'asset' | 'song'`, pinned by
-`expectedUrl` — a 409 `Source changed; select it again` /
-`Source song changed; select it again` if the asset or song's current URL no
-longer matches what the client picked. Neither has a draft document: a retry
-resends the original `input`.
+`layer-render` is the Stem Builder studio's render. Both take a `source`
+discriminated on `kind: 'asset' | 'song'`, pinned by `expectedUrl`: a 409
+`Source changed; select it again` / `Source song changed; select it again`
+if the asset or song's current URL no longer matches what the client picked.
+Both also take `expectedBackend` and `engineParams`, and are 409 when the
+active backend changed or 400 when it lacks the `repaint` or `lego` feature.
+Neither has a draft document: a retry resends the original `input`.
 
 - `repaint-render` adds `regionStart`/`regionEnd` (checked against the
   source's actual duration at run time — 400 `Region exceeds source
-  duration`, not at submit), `lyrics`, `styleCaption`, `repaintMode`
-  (`conservative` | `balanced` | `aggressive`) and `crossfadeFrames`.
-- `layer-render` adds `trackName` (one of the twelve stem names) and
-  `buildModel`, which must match a plain Base DiT checkpoint
+  duration`, or `Region end must follow start`, not at submit), `lyrics`,
+  `styleCaption`, `sourceName` (the render's title is `<sourceName>
+  (Repaint)`), `repaintMode` (`conservative` | `balanced` | `aggressive`) and
+  `crossfadeFrames`.
+- `layer-render` adds `trackName` (one of the twelve stem names), `caption`
+  and `buildModel`, which must match a plain Base DiT checkpoint
   (`^acestep-v15-(?:xl-)?base-`) — 400 otherwise.
 
 Both return `{ request, audioIntentId, audio }`.
 
 ## Lyric Studio batch (`lyric-batch`)
 
-One job kind, not six. `lyric-batch`'s `input` is `{ items: [...] }`, 1-200
-entries, each a discriminated union on `type`: `profile`, `generate`,
-`refine`, `fetch`, `render` or `preflight-error`. The client does not build
-these items directly — it calls the existing Lyric Studio capture helpers
+One job kind, not six. `lyric-batch`'s `input` is `{ items: [...], profiles?,
+histories?, concurrency? }`: 1 to 10,000 items, each a discriminated union on
+`type` (`profile`, `generate`, `refine`, `fetch`, `render` or
+`preflight-error`). The client does not build these items. It posts its
+requests to one of two Lyric Studio routes, which capture them
 (`captureLyricItems`/`captureRenderItems` in
-[services/lireek/lyricWorkflow.ts](../../server/src/services/lireek/lyricWorkflow.ts)),
-which resolve each requested operation against the library, stamp a source
-revision for staleness checks, and turn anything that fails to resolve into
-a `preflight-error` item instead of failing the whole submit.
+[services/lireek/lyricWorkflow.ts](../../server/src/services/lireek/lyricWorkflow.ts))
+and submit the job:
+
+- `POST /api/lireek/workflow-batches` with `{ items, concurrency?,
+  idempotencyKey? }`: 1 to 1000 requests of `{ type, targetId, provider,
+  model?, count? }` for `profile` (a lyrics set), `generate` (a profile) or
+  `refine` (a generation), plus `extraInstructions`, `userSubject` and
+  `noThink` for `generate`. A `fetch` request is `{ type: 'fetch', artist,
+  album?, maxSongs? }` (default 50, at most 200). `count` (1 to 50) repeats a
+  request, and the expanded batch holds at most 10,000 items.
+- `POST /api/lireek/workflow-renders` with `{ intents, idempotencyKey? }`: 1
+  to 200 written-song intents to render.
+
+Both need the token and answer `{ job, created }`: 201 for a new job, 200
+when the idempotency key repeats it (a key is made up when none is sent), 409
+when the key was used for a different batch, 400 for a malformed request.
+Capture resolves each request against the library, stamps a source revision
+for staleness checks, and turns anything that fails to resolve into a
+`preflight-error` item instead of failing the whole submit.
 
 The job's `result` is `{ results: [{ index, status: 'done' | 'error', value?,
-error? }] }`, one entry per submitted item, in order — this is the per-item
+error? }] }`, one entry per submitted item, in order. This is the per-item
 error reporting the other kinds don't need. `value`'s shape depends on the
-item: `{ id, ... }` for `profile`/`generate`, `{ artist_id, lyrics_set_id,
-songs_fetched }` for `fetch`, `{ audioIntentId, generationId, jobId }` for
-`render`. A `preflight-error` item always reports `error` and never runs.
-Items whose source changed since submission (revision mismatch against the
-live row) fail with `Source changed since submission` rather than running
-against stale data. `render` items are queued onto the audio queue together
-before any of them are awaited, so a full-render batch is admitted as one
-unit. Cancellation and retry use the shared job endpoints; retry skips items
-a prior attempt already completed (recorded per `(jobId, index)`), so a
-partial batch resumes rather than restarting from item 0.
+item: `{ id, ... }` for `profile`, `generate` and `refine`, `{ artist_id,
+lyrics_set_id, songs_fetched }` for `fetch`, `{ audioIntentId, generationId,
+jobId }` for `render`. A `preflight-error` item always reports `error` and
+never runs. Items whose source changed since submission (revision mismatch
+against the live row) fail with `Source changed since submission` (`Written
+song or preset changed since submission` for a render) rather than running
+against stale data. Items run in lanes, one per artist with each render a
+lane of its own, in order within a lane, so each song sees the subjects, keys
+and titles the songs before it picked; `concurrency` (1 to 16, default 1)
+sets how many lanes run at once. The job emits `item-start`, `item-result`
+and `item-error` events, and `phase` and `chunk` events while an LLM writes.
+When the batch holds only `render` (and `preflight-error`) items, the renders
+are queued onto the audio queue together before any of them are awaited, so
+a full-render batch is admitted as one unit. Cancellation and retry use the
+shared job endpoints; retry skips items a prior attempt already completed
+(recorded per `(jobId, index)`), so a partial batch resumes rather than
+restarting from item 0.
 
 ## Stem separation
 
@@ -164,9 +229,10 @@ shapes are in
 [contracts/stemSeparation.ts](../../server/src/contracts/stemSeparation.ts);
 both route files import the request schemas from there.
 
-### Stem Studio (`/api/stem-studio`)
+### Stem Separator (`/api/stem-studio`)
 
-Stem Studio runs its own pipeline and keeps every result on disk under
+These are the Stem Separator studio's routes (the code calls it Stem Studio).
+They run their own pipeline and keep every result on disk under
 `<data root>/library/stems/<jobId>/`, independent of ace-server's job pool.
 
 - `POST /extract` with `{ sourceAudioUrl, sourceFileName?, tracks, style?,
@@ -206,14 +272,15 @@ Stem Studio runs its own pipeline and keeps every result on disk under
 
 A separate, thinner route used by Cover Studio's splitter: no job
 persistence, Node forwards to ace-server's own `/supersep/*` endpoints. The
-five handlers below do NOT all relay the response the same way — each is
+six handlers below do NOT all relay the response the same way; each is
 documented on its own because Node reshapes some of them:
 
 - `POST /separate?level=0..5` with `{ audioUrl }` — reads that file off disk
   (`/references/...` or `/audio/...`), converts it to an engine-compatible
   format (400 `Audio conversion failed: ...` if that fails), and forwards
   the bytes to ace-server. 400 `audioUrl required in request body` if
-  missing. Returns ace-server's own response verbatim.
+  missing. A 2xx from ace-server comes back as its own JSON; a non-2xx comes
+  back with ace-server's status and `{ error: <ace-server's response text> }`.
 - `GET /:jobId/progress` always replies 200 with ace-server's decoded JSON
   body (`{ status, progress, message, error? }`) — Node does not check
   ace-server's HTTP status here, so an upstream error still arrives as a 200.

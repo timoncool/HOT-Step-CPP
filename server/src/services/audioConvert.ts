@@ -78,16 +78,22 @@ function isEngineCompatibleWav(filePath: string): boolean {
  * Converted files are cached as `<original>.engine.wav` next to the original.
  */
 export function ensureEngineFormat(filePath: string, cacheDir?: string): Buffer {
+  return fs.readFileSync(engineFormatPath(filePath, cacheDir));
+}
+
+/** ensureEngineFormat for callers that hand the engine a path (ace-midi):
+ *  the original path when it decodes as-is, else the converted WAV's path. */
+export function engineFormatPath(filePath: string, cacheDir?: string): string {
   const ext = path.extname(filePath).toLowerCase();
 
   // MP3: always engine-compatible
   if (ext === '.mp3') {
-    return fs.readFileSync(filePath);
+    return filePath;
   }
 
   // WAV: only compatible if 16-bit PCM
   if (ext === '.wav' && isEngineCompatibleWav(filePath)) {
-    return fs.readFileSync(filePath);
+    return filePath;
   }
 
   // Everything else needs conversion (or WAV with non-16-bit format)
@@ -106,7 +112,7 @@ export function ensureEngineFormat(filePath: string, cacheDir?: string): Buffer 
   if (cacheDir) fs.mkdirSync(cacheDir, { recursive: true });
   if (fs.existsSync(wavPath)) {
     console.log(`[audioConvert] Using cached conversion: ${path.basename(wavPath)}`);
-    return fs.readFileSync(wavPath);
+    return wavPath;
   }
 
   // Convert via ffmpeg
@@ -115,7 +121,7 @@ export function ensureEngineFormat(filePath: string, cacheDir?: string): Buffer 
     // Last resort: if it's a WAV we can't convert, return it anyway and hope for the best
     if (ext === '.wav') {
       console.warn(`[audioConvert] ffmpeg not available — returning non-16-bit WAV as-is (engine may reject it)`);
-      return fs.readFileSync(filePath);
+      return filePath;
     }
     throw new Error('ffmpeg not available — cannot convert non-WAV/MP3 audio');
   }
@@ -148,7 +154,7 @@ export function ensureEngineFormat(filePath: string, cacheDir?: string): Buffer 
   const size = (fs.statSync(wavPath).size / 1024 / 1024).toFixed(1);
   console.log(`[audioConvert] Done in ${elapsed}s → ${path.basename(wavPath)} (${size} MB)`);
 
-  return fs.readFileSync(wavPath);
+  return wavPath;
 }
 
 /**

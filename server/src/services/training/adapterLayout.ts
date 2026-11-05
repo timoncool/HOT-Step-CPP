@@ -26,6 +26,112 @@ import fs from 'fs';
 import path from 'path';
 import { config } from '../../config.js';
 import type { LmSize } from './types.js';
+import { randomUUID } from 'node:crypto';
+
+export function sa3RunsRoot(datasetSlug: string): string {
+  if (!/^[a-z0-9][a-z0-9_-]*$/i.test(datasetSlug)) throw new Error('Invalid SA3 dataset slug');
+  return path.join(config.aceServer.adapters, 'sa3-medium', datasetSlug);
+}
+
+/** Validate our F32 dora-rows export, including every tensor's bounds and
+ * finite values. Raw resume adapters never enter the inference catalogue. */
+export function validateSa3Export(file: string, expectedBase?: string): string {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    let pos = 0;
+    const read = (n: number): Buffer => {
+      if (!Number.isSafeInteger(n) || n < 0 || n > 1_048_576 || pos + n > size) throw new Error('Truncated SA3 GGUF');
+      const b = Buffer.alloc(n);
+      if (fs.readSync(fd, b, 0, n, pos) !== n) throw new Error('Truncated SA3 GGUF');
+      pos += n;
+      return b;
+    };
+    const u32 = () => read(4).readUInt32LE();
+    const u64 = (): number => {
+      const n = Number(read(8).readBigUInt64LE());
+      if (!Number.isSafeInteger(n)) throw new Error('Oversized SA3 GGUF');
+      return n;
+    };
+    const str = () => read(u64()).toString('utf8');
+    if (read(4).toString() !== 'GGUF' || u32() !== 3) throw new Error('Invalid SA3 GGUF header');
+    const count = u64(), keys = u64();
+    if (count < 3 || count > 10000 || count % 3 || keys > 1000) throw new Error('Invalid SA3 tensor count');
+    const meta = new Map<string, string | number>();
+    for (let i = 0; i < keys; i++) {
+      const key = str(), type = u32();
+      if (meta.has(key)) throw new Error('Duplicate SA3 metadata');
+      if (type === 8) meta.set(key, str());
+      else if (type === 4) meta.set(key, u32());
+      else throw new Error('Unsupported SA3 export metadata');
+    }
+    const base = meta.get('sa3.inference_base_id');
+    if (meta.get('general.architecture') !== 'sa3-adapter' || meta.get('sa3.adapter_format') !== 'dora-rows-v1'
+      || typeof base !== 'string' || !/^stabilityai\/stable-audio-3-medium sha256:[a-f0-9]{64}$/.test(base)
+      || (expectedBase && base !== expectedBase)) throw new Error('SA3 export format or inference provenance mismatch');
+    const tensors = new Map<string, { dims: number[]; offset: number; bytes: number }>();
+    for (let i = 0; i < count; i++) {
+      const name = str(), nd = u32();
+      if (nd < 1 || nd > 2 || !/^model\..*\.weight\.(lora_a|lora_b|row_scale)$/.test(name)
+        || tensors.has(name)) throw new Error('Invalid SA3 tensor name or dimensions');
+      const dims = Array.from({ length: nd }, u64);
+      if (dims.some(n => n < 1 || n > 1_000_000) || u32() !== 0) throw new Error('SA3 export must contain F32 tensors');
+      const offset = u64(), bytes = dims.reduce((a, b) => a * b, 4);
+      if (!Number.isSafeInteger(bytes)) throw new Error('Oversized SA3 tensor');
+      tensors.set(name, { dims, offset, bytes });
+    }
+    const alignment = meta.get('general.alignment') ?? 32;
+    if (typeof alignment !== 'number' || alignment < 1 || alignment > 4096 || (alignment & (alignment - 1))) throw new Error('Invalid SA3 alignment');
+    const start = Math.ceil(pos / alignment) * alignment;
+    let end = start;
+    const chunk = Buffer.alloc(65536);
+    for (const [name, tensor] of [...tensors].sort((a, b) => a[1].offset - b[1].offset)) {
+      if (tensor.offset % alignment || start + tensor.offset < end || start + tensor.offset + tensor.bytes > size) throw new Error('Truncated or overlapping SA3 tensors');
+      end = start + tensor.offset + tensor.bytes;
+      if (name.endsWith('.lora_a')) {
+        const stem = name.slice(0, -7), b = tensors.get(`${stem}.lora_b`), s = tensors.get(`${stem}.row_scale`);
+        if (tensor.dims.length !== 2 || !b || b.dims.length !== 2 || !s || s.dims.length !== 1
+          || tensor.dims[1] !== b.dims[0] || b.dims[1] !== s.dims[0]) throw new Error('Incomplete SA3 DoRA target');
+      } else {
+        const stem = name.replace(/\.(lora_b|row_scale)$/, '');
+        if (!tensors.has(`${stem}.lora_a`)) throw new Error('Unpaired SA3 target');
+      }
+      for (let off = 0; off < tensor.bytes; off += chunk.length) {
+        const n = Math.min(chunk.length, tensor.bytes - off);
+        if (fs.readSync(fd, chunk, 0, n, start + tensor.offset + off) !== n) throw new Error('Truncated SA3 data');
+        for (let j = 0; j < n; j += 4) if (!Number.isFinite(chunk.readFloatLE(j))) throw new Error('Non-finite SA3 tensor');
+      }
+    }
+    return base;
+  } finally { fs.closeSync(fd); }
+}
+
+export function listSa3Adapters(modelsDir = config.aceServer.models): Array<{ name: string; sizeMb: number }> {
+  const dir = path.join(modelsDir, 'sa3-adapters');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter(f => f.endsWith('.gguf') && fs.statSync(path.join(dir, f)).isFile())
+    .map(f => ({ name: f.slice(0, -5), sizeMb: Math.round(fs.statSync(path.join(dir, f)).size / 1e6) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Copy and validate privately, then link atomically with no overwrite. The
+ * temporary file lives on the catalogue volume, so cross-drive runs work. */
+export function publishSa3Export(file: string, name: string, expectedBase: string, modelsDir = config.aceServer.models): string {
+  if (!/^[a-z0-9][a-z0-9_-]{0,180}$/i.test(name)) throw new Error('Invalid SA3 publication name');
+  const dir = path.join(modelsDir, 'sa3-adapters');
+  fs.mkdirSync(dir, { recursive: true });
+  const temp = path.join(dir, `.${randomUUID()}.part`);
+  try {
+    fs.copyFileSync(file, temp, fs.constants.COPYFILE_EXCL);
+    validateSa3Export(temp, expectedBase);
+    for (let i = 1; i < 10000; i++) {
+      const dest = path.join(dir, `${name}${i === 1 ? '' : `-${i}`}.gguf`);
+      try { fs.linkSync(temp, dest); return path.basename(dest, '.gguf'); }
+      catch (err: any) { if (err.code !== 'EEXIST') throw err; }
+    }
+    throw new Error('SA3 catalogue name exhausted');
+  } finally { fs.rmSync(temp, { force: true }); }
+}
 
 // ── planner-LM sizes ────────────────────────────────────────────────────────
 

@@ -1,10 +1,11 @@
+import { queryOptions } from '@tanstack/react-query';
 import { queryClient } from '../client';
 import { queryManager } from '../invalidation';
 import { localOptions } from './options';
 import { preferencesApi, type PresetFamily, type ImportPreferenceItem } from '../../services/preferencesApi';
 import type { TypedDocument } from '../../services/workflowApi';
 
-const options = <T>(family: PresetFamily) => ({
+const options = <T>(family: PresetFamily) => queryOptions({
   ...localOptions<{ documents: TypedDocument<T>[] }>('vst-presets', `/preferences/presets/${family}`, { family }),
   // refresh() also supplies conflict read-back: it must see the current revision.
   staleTime: 0,
@@ -12,7 +13,7 @@ const options = <T>(family: PresetFamily) => ({
 async function write<T>(family: PresetFamily, command: () => Promise<T>) {
   await queryClient.cancelQueries({ queryKey: options(family).queryKey });
   try { return await command(); }
-  finally { await queryManager.keys(queryClient, options(family).queryKey); }
+  finally { await queryManager.invalidate(queryClient, options(family).queryKey); }
 }
 
 // The collection retains unsaved edits, import decisions and revision conflicts.

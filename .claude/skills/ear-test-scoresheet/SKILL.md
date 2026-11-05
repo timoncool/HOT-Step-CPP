@@ -1,6 +1,6 @@
 ---
 name: ear-test-scoresheet
-description: The standard way to run a listening test in HOT-Step - a local HTML score sheet next to the renders where Rob plays each track, scores it 1-5 on named criteria, and the page charts the two score groups by rung so the point where likeness and quality cross is visible. Use whenever renders need judging by ear - checkpoint ladders, recipe A/B tests, sampler or quant comparisons - and whenever you are about to ask Rob to "listen to these files and tell me".
+description: The standard way to run a listening test in HOT-Step - a local HTML score sheet next to the renders where the user plays each track, scores it 1-5 on named criteria, and the page charts the two score groups by rung so the point where likeness and quality cross is visible. Use whenever renders need judging by ear - checkpoint ladders, recipe A/B tests, sampler or quant comparisons - and whenever you are about to ask the user to "listen to these files and tell me".
 ---
 
 # Ear-test score sheet
@@ -9,7 +9,7 @@ Resolve runtime paths first using [Finding the data folder](../../../AGENTS.md#f
 `<data root>/...` paths below describe the managed layout; environment overrides
 can place individual children elsewhere.
 
-Rob's verdict (2026-09-23): "the best way so far we've had to score tests like
+The user's verdict (2026-09-23): "the best way so far we've had to score tests like
 this". Use it instead of asking for free-text impressions of a folder of WAVs.
 
 What it gives you:
@@ -19,13 +19,14 @@ What it gives you:
 - A chart per group that averages the criteria into two lines, one for what
   you're pushing for (likeness) and one for what breaks (quality), plotted by rung.
 - Rows for renders that don't exist yet say "Rendering…" and fill in on their
-  own when the file appears, so Rob can start while the rest render.
+  own when the file appears, so the user can start while the rest render.
 - Scores save to `scores.json` beside the page, which is how you read them.
 
 Files in this folder:
-- `template.html` — the page (local file; the default).
-- `make-scoresheet.mjs` — writes `index.html` from a `study.json`.
-- `template-artifact.html` — the claude.ai-hosted variant, only for when Rob
+- `template.html`: the page (local file; the default).
+- `make-scoresheet.mjs`: writes `index.html` from a `study.json`, splicing in the
+  shared save logic from `tools/listening-save.mjs`.
+- `template-artifact.html`: the claude.ai-hosted variant, only for when the user
   can't open files on this machine (see the end).
 
 ## Running a test
@@ -34,7 +35,8 @@ Files in this folder:
 
 Put renders under `_experiments/_LISTENING/<date>-<study>/` (the listening-hub
 convention), e.g. `round1/<group>/NN-<label>.wav`. The page lives at the top
-of that folder and refers to tracks by relative path.
+of that folder and refers to tracks by relative path. Keep the folder name to
+letters, digits, `.`, `_` and `-`: the app serves only names of that shape.
 
 ### 2. Write study.json and generate the page
 
@@ -57,10 +59,10 @@ of that folder and refers to tracks by relative path.
   "axis": {"1": "Decoder step"},
   "pickLabel": "Last good rung",
   "tracks": [
-    {"id": "r1-rbf-01", "round": 1, "group": "rbf_whyrockhard", "order": 1,
-     "label": "Base", "sublabel": "no adapter", "reference": true, "file": "round1/rbf_whyrockhard/01-base.wav"},
-    {"id": "r1-rbf-02", "round": 1, "group": "rbf_whyrockhard", "order": 2,
-     "label": "Decoder 300", "sublabel": "planner frozen at 240", "x": 300, "file": "round1/rbf_whyrockhard/02-nar300.wav"}
+    {"id": "r1-a-01", "round": 1, "group": "album_a", "order": 1,
+     "label": "Base", "sublabel": "no adapter", "reference": true, "file": "round1/album_a/01-base.wav"},
+    {"id": "r1-a-02", "round": 1, "group": "album_a", "order": 2,
+     "label": "Decoder 300", "sublabel": "planner frozen at 240", "x": 300, "file": "round1/album_a/02-nar300.wav"}
   ]
 }
 ```
@@ -74,17 +76,28 @@ node .claude/skills/ear-test-scoresheet/make-scoresheet.mjs <study-folder>/study
   scoring per render. Keep two series, "pushing for" and "what breaks".
 - `reference: true` marks a control (base model, no adapter): scorable, but
   off the chart and out of the picker. Always include one; it anchors the scale.
+- Repeated takes of one rung are separate tracks with the same `x`; the chart
+  averages them into one point.
 - List every planned render up front, rendered or not. To add a round later,
   append tracks and re-run the generator. Scores are keyed by track id, so
   they survive.
 
-### 3. Hand it to Rob
+### 3. Hand it to the user
 
-Give him the path to `index.html`. On first use he clicks **Save scores to a
+Served by the app (the default when it is running): give the user
+`http://localhost:3001/listening/<folder>/`, where `<folder>` is the study
+folder directly under `_experiments/_LISTENING/`. The Node server serves the
+folder (`index.html` by default), loads any `scores.json` already there, and
+every change POSTs to `/listening/<folder>/scores`, which writes `scores.json`
+beside the page: no dialog, no download. The route answers loopback requests
+only and refuses foreign origins (`server/src/routes/listening.ts`). Vite on
+:3000 does not proxy `/listening`, so this page opens on :3001.
+
+Opened from disk (`file://`): on first use the user clicks **Save scores to a
 file…** and saves `scores.json` next to the page. After that every change
 writes to it; the browser remembers the file and asks once per session to
 reconnect. Scores are also kept in the browser either way. Browsers without
-file saving (Firefox) get **Export scores** instead: he exports and drops
+file saving (Firefox) get **Export scores** instead: the user exports and drops
 `scores.json` in the folder.
 
 ### 4. Read the results
@@ -92,7 +105,7 @@ file saving (Firefox) get **Export scores** instead: he exports and drops
 `scores.json`: `{scores: {<track id>: {<criterion>: 1-5, verdict?, note?}},
 picks: {"r<round>-<group>": {lastGood, note}}}`.
 
-**Scores alone are enough.** On the first study Rob skipped verdicts and picks
+**Scores alone are enough.** On the first study the user skipped verdicts and picks
 and the criteria still answered the question. Average each series per rung,
 lay the groups side by side, and read the trend, not single rungs.
 
@@ -102,13 +115,13 @@ lay the groups side by side, and read the trend, not single rungs.
   seed through `/api/generate` gave different songs of different lengths.
   Every rung is a fresh take, so plan two renders per rung when a decision
   rests on it.
-- **Rob's scoring noise is about ±1 per criterion.** Measured by putting the
+- **The user's scoring noise is about ±1 per criterion.** Measured by putting the
   same combination in two rounds without saying so. Treat a difference under
   ~0.5 on a series average as noise. A single low rung between two good ones
   is noise, not a line.
 - **Keep automated metrics off the page.** They bias the ear. Compare them
-  afterwards; the forced-aligner diction score correlated only 0.37 with Rob's
-  diction scores.
+  afterwards; the forced-aligner diction score correlated only 0.37 with the
+  user's diction scores.
 - **Note boxes carry the surprises** ("there are no vocals in this track").
   Read every note.
 
@@ -119,8 +132,12 @@ lay the groups side by side, and read the trend, not single rungs.
 scores diction with `/yue2/align`, writes numbered WAVs plus `results.jsonl`,
 and restores the user's adapter picks at the end. It skips WAVs that already
 exist, so re-running after a failure only fills the gaps. Config:
-`{runDir, outDir, caption, lyrics, seed, pairs: [[arStep, narStep], ...]}`;
-`[0, 0]` is the base-model reference.
+`{runDir, outDir, caption, lyrics, seed, pairs: [[arStep, narStep], ...], takes?}`;
+`[0, 0]` is the base-model reference. `takes` above 1 renders each pair that
+many times (seed, seed+1, ...) as `-t1`, `-t2` files. It needs the app running
+with YuE2 as the active backend, and talks to `HOTSTEP_URL` (default
+`http://localhost:3001`) and the engine at `ACE_URL` (default
+`http://127.0.0.1:8085`).
 
 ## Traps
 
@@ -128,13 +145,15 @@ exist, so re-running after a failure only fills the gaps. Config:
   `/api/backends/models` does not, so a script can change the picks and then
   fail to render. The ladder script handles both.
 - Editing `server/src` restarts the dev server and kills any running training
-  batch. Put tools in `server/scripts/` (tracked, not watched); `tools/yue2-*`
-  is gitignored.
+  batch. Put tools in `server/scripts/` (tracked, not watched); new files under
+  `tools/` are gitignored unless `.gitignore` whitelists them.
 - Watch free space on D: before a long ladder. A full disk cut one render off
   mid-write (a 0-byte WAV); delete it and re-run the ladder.
 - Prompts: use Lyric Studio lyrics the adapter never trained on, with their
-  own caption (`generations` table in `<data root>/library/hotstep.db`: `caption`,
-  `lyrics`). The same prompt and seed for every rung of a group.
+  own caption (`generations` table in `<data root>/library/hotstep.db`: `lyrics`
+  plus the caption for the backend under test, `caption` for ACE-Step,
+  `caption_yue2` for YuE2, `caption_mm3` for MM3). The same prompt and seed for
+  every rung of a group.
 
 ## Hosted variant (only when needed)
 

@@ -92,6 +92,34 @@ export const LmThinkingDropdown: React.FC = () => {
         infoMeta="default 0.92 · range 0-1"
         info="Nucleus sampling threshold: only tokens whose combined probability reaches this fraction are considered. Lower keeps only the most confident choices; higher (toward 1) lets rarer tokens through." />
 
+      <Slider label="Min-P" value={gp.lmMinP}
+        onChange={gp.setLmMinP} min={0} max={0.5} step={0.01} showInput
+        defaultValue={GLOBAL_PARAM_DEFAULTS.lmMinP}
+        infoMeta="default 0 (off) · range 0-0.5"
+        info="After Top-P, drops every audio code whose probability is under this fraction of the most likely code's. Cuts the unlikely tail that causes stray artefacts while leaving close choices open, unlike a lower Top-K. 0 turns it off." />
+
+      <Slider label="CFG Plausibility" value={gp.lmCfgMinP}
+        onChange={gp.setLmCfgMinP} min={0} max={0.5} step={0.01} showInput
+        defaultValue={GLOBAL_PARAM_DEFAULTS.lmCfgMinP}
+        infoMeta="default 0 (off) · range 0-0.5"
+        info="Applies CFG only to codes the conditioned pass itself gives at least this fraction of its top probability; the rest keep their unguided value. Stops guidance from promoting codes the model thinks are implausible. 0 turns it off." />
+
+      <Slider label="CFG Rescale" value={gp.lmCfgRescale}
+        onChange={gp.setLmCfgRescale} min={0} max={1} step={0.05} showInput
+        defaultValue={GLOBAL_PARAM_DEFAULTS.lmCfgRescale}
+        infoMeta="default 0 (off) · range 0-1"
+        info="Pulls the guided distribution's spread back toward the conditioned pass's, so a high CFG Scale changes which codes win without sharpening or flattening the whole distribution. 0 turns it off." />
+
+      <div className="flex items-center justify-between">
+        <ParamLabel
+          label="CFG in Log-Probabilities"
+          className="text-sm text-zinc-600 dark:text-zinc-400"
+          info="Blends the conditioned and unconditioned passes after normalising each to log-probabilities instead of on raw logits. Off is the standard blend."
+          onReset={gp.lmCfgLogprob !== GLOBAL_PARAM_DEFAULTS.lmCfgLogprob ? () => gp.setLmCfgLogprob(GLOBAL_PARAM_DEFAULTS.lmCfgLogprob) : undefined}
+        />
+        <Toggle checked={gp.lmCfgLogprob} onChange={gp.setLmCfgLogprob} accent="purple" size="sm" />
+      </div>
+
       {/* Anti-loop: windowed repetition penalty on audio-code sampling.
           1.0 = off. Breaks the stuck-loop failure mode (planner adapters
           sharpen the code distribution into repetition attractors). */}

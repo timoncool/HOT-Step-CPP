@@ -4,14 +4,13 @@
 // 2s, and on completion it also refreshes the dataset list so newly-created
 // datasets appear without a manual reload.
 //
-// DEVIATION from plan §5.2, which forbade wiring useTrainingStream here to keep
-// that SSE hook per-dataset. The stage CHIPS say which stage an item is on and
-// nothing about how far through it is, so a multi-hour train-dit inside a bulk
-// run had no visible progress anywhere in the app (Rob, 2026-07-31). The
-// subscription is delegated to PipelineStageProgress, which owns exactly one
-// stream — the single running stage's — and unsubscribes when it changes. The
-// per-dataset invariant §5.2 was protecting still holds; what changed is that
-// the bulk runner is now also a legitimate owner of a job worth watching.
+// DEVIATION from plan §5.2, which kept the SSE hook per-dataset. The stage
+// CHIPS say which stage an item is on and nothing about how far through it is,
+// so a multi-hour train-dit inside a bulk run had no visible progress anywhere
+// in the app (Rob, 2026-07-31). PipelineStageProgress now points the studio's
+// single job projection at the running stage and restores the previous
+// selection when it changes. The per-dataset invariant §5.2 was protecting
+// still holds: there is never more than one stream opener.
 
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Clock, Loader2, Pause, PauseCircle, Play, XCircle } from 'lucide-react';
@@ -22,6 +21,7 @@ import { trainingQueries } from '../../queries/training-data/queries';
 import { queryManager } from '../../queries/invalidation';
 import { PIPELINE_STAGES, type PipelineItem, type PipelineStage, type PipelineSummary } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
+import { formatDayTime } from '../../utils/dateUtils';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { PipelineStageProgress } from './PipelineStageProgress';
 
@@ -47,11 +47,6 @@ const CHIP_STYLE: Record<string, string> = {
 
 function folderBasename(dir: string): string {
   return dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? dir;
-}
-
-function formatWhen(ts: number): string {
-  if (!ts) return '';
-  return new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 const PipelineItemRow: React.FC<{ item: PipelineItem; stages: PipelineStage[] }> = ({ item, stages }) => {
@@ -141,7 +136,7 @@ const RecentPipelineRow: React.FC<{ pipeline: PipelineSummary; resumeBlocked: bo
           </span>
         </button>
         <span className="text-[11px] text-zinc-500 flex items-center gap-1 flex-shrink-0">
-          <Clock size={11} /> {formatWhen(pipeline.createdAt)}
+          <Clock size={11} /> {formatDayTime(pipeline.createdAt)}
         </span>
         {resumable && (
           <button
@@ -195,7 +190,7 @@ const PipelineCard: React.FC<{ pipeline: PipelineSummary; active: boolean }> = (
           )}
         </div>
         <span className="text-[11px] text-zinc-500 flex items-center gap-1 flex-shrink-0">
-          <Clock size={11} /> {formatWhen(pipeline.createdAt)}
+          <Clock size={11} /> {formatDayTime(pipeline.createdAt)}
         </span>
         {active && (pausePending || pipeline.status === 'paused' ? (
           <button
@@ -264,7 +259,7 @@ export const MonitorPanel: React.FC = () => {
   const wasRunningRef = useRef(false);
   useEffect(() => {
     if (!activePipeline) {
-      if (wasRunningRef.current) { wasRunningRef.current = false; void queryManager.keys(client, trainingQueries.datasets(worker).queryKey).then(() => loadDatasets()); }
+      if (wasRunningRef.current) { wasRunningRef.current = false; void queryManager.invalidate(client, trainingQueries.datasets(worker).queryKey).then(() => loadDatasets()); }
       return;
     }
     wasRunningRef.current = true;

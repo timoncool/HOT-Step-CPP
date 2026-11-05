@@ -12,6 +12,7 @@ import type { ReadOptions } from './httpClient';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { StudioDraftBody } from '../../../server/src/contracts/studioDrafts';
 import { studioDraftsApi, type StudioDraftDocument } from './studioDraftsApi';
+import { HttpStatus } from './apiError';
 
 export interface DraftPointer { id: string; revision: number; saved: string }
 
@@ -48,9 +49,9 @@ export function createDraftMirror(deps: DraftMirrorDeps) {
         else {
           try { document = (await deps.api.update(current.id, current.revision, body)).document; }
           catch (err) {
-            if (statusOf(err) !== 409 && statusOf(err) !== 404) throw err;
+            if (statusOf(err) !== HttpStatus.conflict && statusOf(err) !== HttpStatus.notFound) throw err;
             document = (await deps.api.create(body)).document;
-            if (statusOf(err) === 409) notice = 'The saved draft changed elsewhere; your edits were saved as a new draft.';
+            if (statusOf(err) === HttpStatus.conflict) notice = 'The saved draft changed elsewhere; your edits were saved as a new draft.';
           }
         }
         if (started !== epoch) continue; // a draft was loaded meanwhile; it now owns this editor

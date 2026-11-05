@@ -1,0 +1,1058 @@
+{
+  "repo": "scragnog/HeartMuLa-GGUF",
+  "revision": "cd004bd419931f9ecf6bf718fb8a627000758935",
+  "public": true,
+  "fileCount": 130,
+  "totalBytes": 150260314195,
+  "files": [
+    {
+      "path": "heartcodec-flow-F16.gguf",
+      "sizeBytes": 2974881920,
+      "sha256": "45b4309948f7e22810bb4e6daf039c62577cc059544eb0987e5e9a4f3bd077e7",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-flow-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-flow-Q8_0.gguf",
+      "sizeBytes": 1609869536,
+      "sha256": "f9b67fd65b6873c371b62680cd0ae2d3064d0b1081e8758a4f538d076734f83c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-flow-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-muencoder-F16.gguf",
+      "sizeBytes": 651074464,
+      "sha256": "871ac1e66785a1ed6eee6b4f79c32f69556965223c5f701f2967123abde7e864",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-muencoder-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-query-F16.gguf",
+      "sizeBytes": 59549952,
+      "sha256": "446d0ce24ef7f314f4f59e4f9d941f27081f50ae0625e6e4dcfbecd1262dce98",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-query-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-rvq-F32.gguf",
+      "sizeBytes": 17194624,
+      "sha256": "d292f57cbcb204a06f998c8bf0f4a2ef671ba82b1a0071904d102435e3525b44",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-rvq-F32.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-scalar-decoder-F16.gguf",
+      "sizeBytes": 167671648,
+      "sha256": "cc53325408d2527b99f09cfdf65451bee72cb952b0c52ff135d673b4aacb087f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-scalar-decoder-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-wavlm-F16.gguf",
+      "sizeBytes": 189171488,
+      "sha256": "afe8f3f6da22339da19d9c80c6605a69a0c03077f04d9193d4e8f0e5b82476c6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-wavlm-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartcodec-whisper-F16.gguf",
+      "sizeBytes": 178950976,
+      "sha256": "2ab07c9e51c64d9d474b5e4e7c549e4c8d815194945cf91dd6e57bc9f46885fc",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartcodec-whisper-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-F16.gguf",
+      "sizeBytes": 6882411520,
+      "sha256": "2f79ef996e2efa6ae0ad22f30dcd34b27e6d62e45afce770eaa2523558c84bee",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ1_M.gguf",
+      "sizeBytes": 974099648,
+      "sha256": "05480b75e4be077c63bae9d6dc3bd4fdb77c715a88449b2be27900bf9947ecb6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ1_S.gguf",
+      "sizeBytes": 765232704,
+      "sha256": "57237a0834929e060558ea4975bd722201abcc8cb9a9a8e3f23b962f5a21f212",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ2_XS.gguf",
+      "sizeBytes": 1178473664,
+      "sha256": "4dde6e76dd13ce41ee1e9f5990698f7b0026e78eb66f71b4223440ded20ce982",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ2_XXS.gguf",
+      "sizeBytes": 1093932224,
+      "sha256": "29579eaecbf0b0543b1e8c208f28ddab10eff4b28bf1cfdb21036dee1b7a4e01",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ3_XXS.gguf",
+      "sizeBytes": 1526487104,
+      "sha256": "3f7603601ef3b2b9376aac17ec02e76eae211cb3773cb374a4b759d174bf5d6d",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-IQ4_XS.gguf",
+      "sizeBytes": 2010486784,
+      "sha256": "41a6b8cc25a72ef8db167be2d7c6a697eb3a3eb674bbadc817f8cf5a8068ebf6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-MXFP4.gguf",
+      "sizeBytes": 2160796352,
+      "sha256": "3559d9de55574f844e11a1e786d65c3c8a36392e44834569a771a31b175afc9e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-NVFP4.gguf",
+      "sizeBytes": 2248876736,
+      "sha256": "a07997ff74fb50656f1aef54fb0dd501198f748e633784052e04012ae1e1e1d3",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q2_K.gguf",
+      "sizeBytes": 1464506368,
+      "sha256": "648baf8b1aa84897a23da1e270f0479305b1b34016eb8a2168553ee89f45a565",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q3_K_L.gguf",
+      "sizeBytes": 1996724224,
+      "sha256": "9b82fe7dbab9cd69b1453ef26a14541ebbfdb6e5f71201208140e98be941f15b",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q3_K_M.gguf",
+      "sizeBytes": 1826412544,
+      "sha256": "282cc0a8004c5757c5af2c7560b84d5c3c2c1bb3a027771613f5aeffc88fb5a2",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q3_K_S.gguf",
+      "sizeBytes": 1724225536,
+      "sha256": "708bbc013ccd5381c258c8ff67a2fcfe936a9833ae4b05880d4b77e1fbd2949f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q4_K_M.gguf",
+      "sizeBytes": 2200754176,
+      "sha256": "b05f42b378e07a30dbc68e23c82fca2787e82ded80ff4fd15b44a8d655843add",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q4_K_S.gguf",
+      "sizeBytes": 2112722944,
+      "sha256": "86b30b7f352b7bd18359c76b9e2f10c95e69b932e033dd1974e904a332882527",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q5_K_M.gguf",
+      "sizeBytes": 2503530496,
+      "sha256": "30c060d1e2ba5d189ab3a84173df58a467c486dfb675eee26cc8148152401232",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q5_K_S.gguf",
+      "sizeBytes": 2450888704,
+      "sha256": "17dd9165aa4f2ad99163d1554c8553966cfe476c1b1e9bcdf3dd417577d6e4b9",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q6_K.gguf",
+      "sizeBytes": 2825230336,
+      "sha256": "4b3319f858a4c2ea8522066bd4a37f2844b7df849ef96eb4c283eff7b3c5bde5",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-global-Q8_0.gguf",
+      "sizeBytes": 3658162880,
+      "sha256": "54546b73a4a1a47af91d064c9cf36f9f58ab817bb5b8782aa1d49f952aba247e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-global-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-F16.gguf",
+      "sizeBytes": 6882411552,
+      "sha256": "0b469ca5267837dbf2dd3f82142f6d716ee19974a74146124fed2d8ed66459b3",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ1_M.gguf",
+      "sizeBytes": 974099712,
+      "sha256": "b6942a65f2f81b6ff8029c9dc2bfc5fcfa436fddf4b9b69a3a68804f0e05d8b6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ1_S.gguf",
+      "sizeBytes": 765232768,
+      "sha256": "67b129f4e2a23671fe517579f2030b536f795a38d00d5f856830ef97ad8180d5",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ2_XS.gguf",
+      "sizeBytes": 1178473728,
+      "sha256": "b943fda2497a45b54993db9c6b4494348ef3ee45ca981d7e3595c5b3aa56b7f7",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ2_XXS.gguf",
+      "sizeBytes": 1093932288,
+      "sha256": "7eede8eefbdb4b63e1ca9d513a226e6ff47a7ac7bf983b6b39392b28f592491a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ3_XXS.gguf",
+      "sizeBytes": 1526487168,
+      "sha256": "d6e1f4e61cf33865fa03089f6548ff2f0883b3d45dcb2d2f96fa13119717aa6c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-IQ4_XS.gguf",
+      "sizeBytes": 2010486848,
+      "sha256": "63edcc338fb6e58c4a21c9ba6d49c74e712080d8c6a6c1bcf9c50093aa0593eb",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-MXFP4.gguf",
+      "sizeBytes": 2160796416,
+      "sha256": "cbd7545c4ea35b790bf928f22ecb14981a59c01ad8647a2d801c09cca84dc86f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-NVFP4.gguf",
+      "sizeBytes": 2248876800,
+      "sha256": "5385db8b3f5e54389bff183e41458caacfe938218cc22e56bee5642d64ce6a3f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q2_K.gguf",
+      "sizeBytes": 1464506400,
+      "sha256": "949a8b6ec7a90be92bb264046900a06fd5746a6b2685f8bc30b9e6afa342562c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q3_K_L.gguf",
+      "sizeBytes": 1996724288,
+      "sha256": "d81f83a783660104530d76e79062ed453f1bf6aac1ac9e8804d8cec0ab1734cb",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q3_K_M.gguf",
+      "sizeBytes": 1826412608,
+      "sha256": "ab5f518c8efe4be924ec7120bf2d82de6220146ef447881f5334ee4791c619ac",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q3_K_S.gguf",
+      "sizeBytes": 1724225600,
+      "sha256": "344f9b0b785c39c146d594499b97692378d63ef6a9665998bc6d0e0503d7e73b",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q4_K_M.gguf",
+      "sizeBytes": 2200754240,
+      "sha256": "2dd10336ea229242d2a815e0b4efcb2233485eb1d83a75f69cb67b2e55dee211",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q4_K_S.gguf",
+      "sizeBytes": 2112723008,
+      "sha256": "0cacca5a96fa858eaf0aa096ad9a10702baea5b68de07e09998a535164150963",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q5_K_M.gguf",
+      "sizeBytes": 2503530560,
+      "sha256": "213cd375787916ae21782513fc718add8af887f4d34bee4d5dd21c78909bcdea",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q5_K_S.gguf",
+      "sizeBytes": 2450888768,
+      "sha256": "1c185fecfa813bede5b3a12e6fc378a99380e8af2eed8131768c6403642d030f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q6_K.gguf",
+      "sizeBytes": 2825230368,
+      "sha256": "8dd660066a33ca71475ba5f9854a89ce3c2a4024851aa4f8176902942741526a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-global-Q8_0.gguf",
+      "sizeBytes": 3658162912,
+      "sha256": "6321e4a676df3c48b371e39498e314bdec88961570088adeffadf357d91b2a36",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-global-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-F16.gguf",
+      "sizeBytes": 994370880,
+      "sha256": "592799aa8f25e44c016bbcba832186396885d6141634f12b9d63604c95ade661",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ1_M.gguf",
+      "sizeBytes": 176192160,
+      "sha256": "9f1db745d0da26f2f2ddaa11dd71bc07b8fab1f5e31706439d1592a2b5869821",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ1_S.gguf",
+      "sizeBytes": 127469728,
+      "sha256": "c595760930fd4d6f8a05bebb04d60880cfe066dbe3b2f252befea04410b12ad5",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ2_XS.gguf",
+      "sizeBytes": 202992288,
+      "sha256": "29747677d655a94c32b44994f896c2e42f1e663d8bf29bb3ef1d18376dd54c8a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ2_XXS.gguf",
+      "sizeBytes": 196061856,
+      "sha256": "e0af446528bd669feb02a662205bbe091c55cfe0588237a95b47026a2560d0c5",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ3_XXS.gguf",
+      "sizeBytes": 260304672,
+      "sha256": "7df74e5380380b7ff9590489df5c9c07d1db7cba69932dfed597e009a478dc22",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-IQ4_XS.gguf",
+      "sizeBytes": 317888288,
+      "sha256": "40bb69965378ecb33870263ba279b1fdc8f4d8bdf21283cb44fc2a08d127fa04",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-MXFP4.gguf",
+      "sizeBytes": 362863776,
+      "sha256": "79ad2043d5a05e2ea2fa2673f281887c5574513f73625540c49375fa5be4f651",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-NVFP4.gguf",
+      "sizeBytes": 372595872,
+      "sha256": "0d96580f52b831bfd4d917115f0a8702d744078898c907cb66358a58964c571e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q2_K.gguf",
+      "sizeBytes": 275642144,
+      "sha256": "920c5e1e45ca1ea08182561bf0c8541ddf0088be479a310f2c3b44fbb460180a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q3_K_L.gguf",
+      "sizeBytes": 316671776,
+      "sha256": "f3b149a654dbcd10046b87d366cfae4b45abc5698db2ea9cc87636c91b8b5859",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q3_K_M.gguf",
+      "sizeBytes": 293963552,
+      "sha256": "29fc8d4907517f67818df9488206e47ba96f3b1035c3ccd20629e18e4866f262",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q3_K_S.gguf",
+      "sizeBytes": 286258976,
+      "sha256": "bd4758881f1aa468c311bfd3b675724472e1ebfe1a09c71ffc07faf2a19dd8b4",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q4_K_M.gguf",
+      "sizeBytes": 335324960,
+      "sha256": "019920357950dd052b33314aef668d5f69d65ac1b4b81cf17340df485131377f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q4_K_S.gguf",
+      "sizeBytes": 338827040,
+      "sha256": "9e9733bdb8b0c6e702d49508b73a4ac03c9b56608bcaccf93504c9ab2182c7f9",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q5_K_M.gguf",
+      "sizeBytes": 370517792,
+      "sha256": "1f161104666e3a64b569be6b80cc8e55b1eb224505cb0d7fed348121c03b349e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q5_K_S.gguf",
+      "sizeBytes": 366548768,
+      "sha256": "4882c47c727ef38f379d6d3ffe47bc69fe8074fdd2d297a8deb4b823dbf1573a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q6_K.gguf",
+      "sizeBytes": 407910176,
+      "sha256": "12e95f6ed8cdd5c73fa21140f35cf33cf500fb2785649d4067d7ebf1c38ef264",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-local-Q8_0.gguf",
+      "sizeBytes": 528309408,
+      "sha256": "c1bf611a9bd5ab014feee06ddab5c3365630ac681ad024fdd3f4327de2d63668",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-local-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-happy-new-year-quant-manifest.json",
+      "sizeBytes": 16722,
+      "sha256": "9238666e8e87ec08ec40ffae8eed2a719501f63a11b60657639c123691e37402",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-happy-new-year-quant-manifest.json",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "heartmula-3b-local-F16.gguf",
+      "sizeBytes": 994370816,
+      "sha256": "b8883db1e6f442a4436b401819dc3ad0519a05bf9bd80e9c10b1bfbf3fc45747",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ1_M.gguf",
+      "sizeBytes": 176192096,
+      "sha256": "8c9e7214521d5ab2f1be0bf696904ed765c661b5f4ec78df8981d5de047daa73",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ1_S.gguf",
+      "sizeBytes": 127469664,
+      "sha256": "6f463c193fa7a9597e9890b6a76477229805ac36e4e21fcf265459890b6fdd56",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ2_XS.gguf",
+      "sizeBytes": 202992224,
+      "sha256": "96c15a21c9784e5151e203f83a0ac4b1a8fd7a3c63717c417eb1f8e3eae980ef",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ2_XXS.gguf",
+      "sizeBytes": 196061792,
+      "sha256": "30edad9e6b1caa88c4add00b89e362db261c400dfdcd9dd3b9a752c0ad3367af",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ3_XXS.gguf",
+      "sizeBytes": 260304608,
+      "sha256": "cf1baefe76be725f1dceffb001c5bb86f3ed0a38c8cce576154ee69516bd21ad",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-IQ4_XS.gguf",
+      "sizeBytes": 317888224,
+      "sha256": "191b3a0c01dde94c6a2b9729ed0d21e9192161ee146920c4f201f959a3b9c7ba",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-MXFP4.gguf",
+      "sizeBytes": 362863712,
+      "sha256": "324030c8b41912ea30688a0acca4fcc4f9453536c1f37904fde66d38e77a5ba6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-NVFP4.gguf",
+      "sizeBytes": 372595808,
+      "sha256": "5eb78245d5c31d9d321c4a03e7f58cb7e5e2c6a4e21cf5eca8caa3f192b50fcb",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q2_K.gguf",
+      "sizeBytes": 275642080,
+      "sha256": "f3c561540fe0367bc0249d7ea83a289a6d716a7165b71efd5575b077abfeace0",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q3_K_L.gguf",
+      "sizeBytes": 316671712,
+      "sha256": "d3bd25a4c502ba543e581265f6dab25c51c471b0182713aca6ff7d1206782140",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q3_K_M.gguf",
+      "sizeBytes": 293963488,
+      "sha256": "6b2fe78f7d300ce0d37395ff84d7a1489be023bf26c309846bbd8efc106fcc8d",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q3_K_S.gguf",
+      "sizeBytes": 286258912,
+      "sha256": "7e545701551b8c4f6f1b14208d03973ff2cf3f6ec3615af17a4db26a7c271f09",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q4_K_M.gguf",
+      "sizeBytes": 335324896,
+      "sha256": "623dae25c8e201a9aad52174e1cdf3079690fc8ce54714310dad82f4c49d4c05",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q4_K_S.gguf",
+      "sizeBytes": 338826976,
+      "sha256": "bdcda5633f314b3ad20df5d155e01a799ea71b237c04eee563ba54211908617c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q5_K_M.gguf",
+      "sizeBytes": 370517728,
+      "sha256": "55e0b2343c74ab84f43f0bc8ae8a54aa4d33b11fdf4a8fa9c8616ab8d7722445",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q5_K_S.gguf",
+      "sizeBytes": 366548704,
+      "sha256": "d1715095ca07159fed3c27da788ee4993a345c06453af32eb2fef15a4f11314a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q6_K.gguf",
+      "sizeBytes": 407910112,
+      "sha256": "b046c2dc5d0305a405f4566b564dbb647f1409b6e487518bf9f4620ce70fae82",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-local-Q8_0.gguf",
+      "sizeBytes": 528309344,
+      "sha256": "0533e957c05feb704f32cc422a17818035e63dda64ce41f878cd6bfb6d823724",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-local-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-quant-manifest.json",
+      "sizeBytes": 16167,
+      "sha256": "69003933511f71a620c89fb75b81db9baf582963db2bbc47772a2e9b6deee4a0",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-quant-manifest.json",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "heartmula-3b-rl-global-F16.gguf",
+      "sizeBytes": 6882411520,
+      "sha256": "cb6c9d8e9ba2bf0256025750983a78b13068e1920dc04e2ad7e00df703882d2f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ1_M.gguf",
+      "sizeBytes": 974099648,
+      "sha256": "be8177b99d94519dd719eb30153875a822c42e708e1e73119c3a0d05f6d3d58e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ1_S.gguf",
+      "sizeBytes": 765232704,
+      "sha256": "7213eef89ea8ec799f8c444e32a47df8a1f68ed648069746fcc480174d536aef",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ2_XS.gguf",
+      "sizeBytes": 1178473664,
+      "sha256": "812176b5b5edd2b92fb3bcbc7a79aaa9d29b3f08d1b8c0530d07d050db64338b",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ2_XXS.gguf",
+      "sizeBytes": 1093932224,
+      "sha256": "965656f80ee71b0ef6db8f5810b53c8b6bfb739de61cef2c64d56a542fb72bf1",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ3_XXS.gguf",
+      "sizeBytes": 1526487104,
+      "sha256": "6af6ca9b33071272c86d7d06da8028a2eec00a45c45e7569a8051c3dc1d58810",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-IQ4_XS.gguf",
+      "sizeBytes": 2010486784,
+      "sha256": "8691d8355b8c241826fc9b56026fd2f09eaeb47a2683133ce1e7c309e00dc927",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-MXFP4.gguf",
+      "sizeBytes": 2160796352,
+      "sha256": "ab3930f16b85d529095e5975c7964df28e8a8e04a01eb2f57f1980dc51d5701a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-NVFP4.gguf",
+      "sizeBytes": 2248876736,
+      "sha256": "a56544e8d5c324fd53f0b6beca34e0a9e176758fab518a9bc4ecd32a6b81120d",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q2_K.gguf",
+      "sizeBytes": 1464506368,
+      "sha256": "40270e3548080f6c22f6a58776c8b09b1b0b1bdd2d03fd15772ac66a9a19ee4c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q3_K_L.gguf",
+      "sizeBytes": 1996724224,
+      "sha256": "1aaacacd487d3641a7f9696e149d9f3b4cf5106f5799a330a737b8c0a765cdb7",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q3_K_M.gguf",
+      "sizeBytes": 1826412544,
+      "sha256": "9e0a8c73290b0b34e189920adbb419edbad9fd0be0b3872c1974d50b947daddf",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q3_K_S.gguf",
+      "sizeBytes": 1724225536,
+      "sha256": "d05b6112226a9bff5b0b35047f0c30e70c5daa42e161c3230253f199e7cdfbae",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q4_K_M.gguf",
+      "sizeBytes": 2200754176,
+      "sha256": "09ce7e8acc06f46a87de3a1e7b31f4af255f572da36f1142a2b15ebd0ed2f9b1",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q4_K_S.gguf",
+      "sizeBytes": 2112722944,
+      "sha256": "589001208b0b06f37f4fe793f213abdff98d7308e9fdf1158f56c8b21df88f28",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q5_K_M.gguf",
+      "sizeBytes": 2503530496,
+      "sha256": "7f777e9bf5ad9357b64155c7af1199dde9856d800fd3ff352f052a27cb019ea1",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q5_K_S.gguf",
+      "sizeBytes": 2450888704,
+      "sha256": "8230c014b8ba17c8660d33ce79b487c57a32b1f6825196d9356483e4790b5ed8",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q6_K.gguf",
+      "sizeBytes": 2825230336,
+      "sha256": "6c08ac1873d9c772e4b32a351e7161442570b878933ce284ee5ad0a4f23d289f",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-global-Q8_0.gguf",
+      "sizeBytes": 3658162880,
+      "sha256": "6e7b61a749cbd34d8726c3d5baf482aa89b88f69bf3178b7215a7330a4a1f12c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-global-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-F16.gguf",
+      "sizeBytes": 994370848,
+      "sha256": "1907a35befde8b40a71f2cefbdaaac4fd70985f11c00e8f2310edb3ff0977fea",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-F16.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ1_M.gguf",
+      "sizeBytes": 176192096,
+      "sha256": "c57767cf2c5926527dfa5b150b0156138c202033aaca9429dd80ff58c0f48f36",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ1_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ1_S.gguf",
+      "sizeBytes": 127469664,
+      "sha256": "ce9b91fa18809ddb181a4ad1171b79ec861d2c1c85eeb9265de9b7dcc01c7131",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ1_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ2_XS.gguf",
+      "sizeBytes": 202992224,
+      "sha256": "0afef414e97f512c4de5bb311549689f1b7741e372c823a68aedb906f6c2d12a",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ2_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ2_XXS.gguf",
+      "sizeBytes": 196061792,
+      "sha256": "c5c9fe84b32f160da3d3268b42b2d0bc18d4981417965556a0a573981e216bc6",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ2_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ3_XXS.gguf",
+      "sizeBytes": 260304608,
+      "sha256": "c6b492ad653b1c0ad497ee793b33c3850cbaf6ee774a5cedc770eed8a9cf3ba7",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ3_XXS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-IQ4_XS.gguf",
+      "sizeBytes": 317888224,
+      "sha256": "4bc9bac02652e9b85733d20e5a2f7f64c4ebba5e09cd4164bcc127c13d021429",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-IQ4_XS.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-MXFP4.gguf",
+      "sizeBytes": 362863712,
+      "sha256": "f51a6f69ee2b5e0bb108cee0a52ed0bdd1c9453ecd94b735a0c23386615bbc73",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-MXFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-NVFP4.gguf",
+      "sizeBytes": 372595808,
+      "sha256": "ab51ecc99a47ed79c0cada78f551f194ecf8dfe6e0b9be2338db9909ece4e016",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-NVFP4.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q2_K.gguf",
+      "sizeBytes": 275642080,
+      "sha256": "7959a88ec4de72ee039248e7b1b49e13022ec3cc13dc0f2e4dde4b83a4a2c248",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q2_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q3_K_L.gguf",
+      "sizeBytes": 316671712,
+      "sha256": "d7d823e67c487f53b5f8769d3d703b6899d1d60c83d3e880799411c439d385a1",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q3_K_L.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q3_K_M.gguf",
+      "sizeBytes": 293963488,
+      "sha256": "0166edacc588d4764b22a9c99aa4363d647046e9516f2306a126c95d10ead1ab",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q3_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q3_K_S.gguf",
+      "sizeBytes": 286258912,
+      "sha256": "b1327c5bb5c334eb111d5a8757f4a21efc6adf60c6eb54e1d08fad681668b626",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q3_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q4_K_M.gguf",
+      "sizeBytes": 335324896,
+      "sha256": "f468d0a78fa120320177ba216c76aa0347dba666149a66f173f4a3f50b8ca3a7",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q4_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q4_K_S.gguf",
+      "sizeBytes": 338826976,
+      "sha256": "2dcb8acf6569fe4cd249d3061fe8c219193dcbcd5157a4380970b55636ae685d",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q4_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q5_K_M.gguf",
+      "sizeBytes": 370517728,
+      "sha256": "b9f9fb9fc261beb3edca0d97dbddee558f32c3728bac7ed0cdbae062381c4819",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q5_K_M.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q5_K_S.gguf",
+      "sizeBytes": 366548704,
+      "sha256": "107365bb89dc22dc436abfe0e6207cdd385e006f079cbb9d37e926bb95e7cc7c",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q5_K_S.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q6_K.gguf",
+      "sizeBytes": 407910112,
+      "sha256": "6013d6c4aa7ad37be529a4440ceacd4402739ec160849403ece4ceee3d291ce4",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q6_K.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-local-Q8_0.gguf",
+      "sizeBytes": 528309344,
+      "sha256": "6d37fdb8f84417d15ebd36aa7b7773ae06f596d8429d12b148d93e9848f0a6ff",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-local-Q8_0.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "heartmula-3b-rl-quant-manifest.json",
+      "sizeBytes": 16278,
+      "sha256": "8cfb9ddbea9e7a26f0d6946dc32ebc113fcedb6c8af52bf1c3ead1060534606b",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-3b-rl-quant-manifest.json",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "heartmula-tokenizer.gguf",
+      "sizeBytes": 7852064,
+      "sha256": "d4881e7fd90d6bc80367d909cc1453da93b666f29d4ab89a8befbba00f4c3cb1",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/heartmula-tokenizer.gguf",
+      "resolveStatus": 200,
+      "method": "HF LFS object SHA-256 plus public resolve URL"
+    },
+    {
+      "path": "README.md",
+      "sizeBytes": 3768,
+      "sha256": "fe444097ae0c1d4809d77c16acad69f789d64076060ddac0bea6818b5d81fd48",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/README.md",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "LICENSE",
+      "sizeBytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/LICENSE",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "NOTICE",
+      "sizeBytes": 425,
+      "sha256": "3d77fca0e4f34031fcd4fd4ceec3b7a7686263165d42e73861955ccc228c176d",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/NOTICE",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    },
+    {
+      "path": "manifest.json",
+      "sizeBytes": 26950,
+      "sha256": "e6aae9f817ef763b517c28dab9a337d2da9a240b09ffcbe9981dde99356ff54e",
+      "url": "https://huggingface.co/scragnog/HeartMuLa-GGUF/resolve/main/manifest.json",
+      "resolveStatus": 200,
+      "method": "Downloaded bytes SHA-256"
+    }
+  ],
+  "appDownload": {
+    "jobId": "98b190d5",
+    "status": "completed",
+    "file": "heartmula-tokenizer.gguf",
+    "sizeBytes": 7852064,
+    "sha256": "d4881e7fd90d6bc80367d909cc1453da93b666f29d4ab89a8befbba00f4c3cb1",
+    "origin": "http://localhost:3000",
+    "installed": true
+  }
+}

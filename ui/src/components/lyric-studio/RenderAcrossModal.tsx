@@ -21,6 +21,7 @@ import type { Generation, LyricsSet, AlbumPreset } from '../../services/lireekAp
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
+import { QueryError } from '../shared/QueryError';
 
 export interface RenderTarget {
   lyricsSetId: number;
@@ -131,6 +132,16 @@ export const RenderAcrossModal: React.FC<RenderAcrossModalProps> = ({
         </div>
 
         <div className="p-6 space-y-4">
+          {(albumQuery.isError || presetQuery.isError || (mode === 'from' && generationQuery.isError)) && (
+            <QueryError
+              error={albumQuery.error || presetQuery.error || (mode === 'from' ? generationQuery.error : null)}
+              onRetry={() => {
+                void albumQuery.refetch();
+                void presetQuery.refetch();
+                if (mode === 'from') void generationQuery.refetch();
+              }}
+            />
+          )}
           <label className="flex flex-col gap-1">
             <ParamLabel
               label={mode === 'as' ? t('lyric.renderAsAlbum', 'Render as') : t('lyric.renderFromAlbum', 'Source album')}

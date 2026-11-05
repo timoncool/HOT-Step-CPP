@@ -1,4 +1,4 @@
-import { serverKey } from '../../queries/keys';
+import { lmAdaptersOptions } from '../../queries/global-models/options';
 import { useQuery } from '@tanstack/react-query';
 import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 /**
@@ -35,7 +35,6 @@ import {
 } from '../../stores/streamingStore';
 import type { QueueItemType } from '../../stores/streamingStore';
 import { lireekApi } from '../../services/lireekApi';
-import { adapterApi } from '../../services/api';
 import type { Artist, LyricsSet, Profile, AlbumPreset, Generation } from '../../services/lireekApi';
 import { captureWrittenSongIntent } from '../../stores/audioGenQueueStore';
 import { lyricWorkflowApi } from '../../services/lyricWorkflowApi';
@@ -178,11 +177,11 @@ export const QueuePanel: React.FC<QueuePanelProps> = ({
   const [browserTarget, setBrowserTarget] = useState<'adapter' | 'matchering'>('adapter');
   // Planner-LM adapter bulk assignment (local HOT-Step feature)
   const [lmAdapterPath, setLmAdapterPath] = useState('');
-  let lmFolder = '';
-  try { lmFolder = JSON.parse(localStorage.getItem('hs-lmAdapterFolder') || '""') || ''; } catch { /* default */ }
+  // Read the folder from the params store, not localStorage during render:
+  // a folder change must re-key the observer.
+  const lmFolder = globalParams.lmAdapterFolder || '';
   const lmQuery = useQuery({
-    queryKey: serverKey('global-models/lm-adapters', { filters: { folder: lmFolder } }),
-    queryFn: ({ signal }) => adapterApi.lmList(lmFolder || undefined, { signal }),
+    ...lmAdaptersOptions(lmFolder),
     enabled: open && mode === 'presets',
   });
   const lmAdapterList = lmQuery.data?.adapters ?? [];

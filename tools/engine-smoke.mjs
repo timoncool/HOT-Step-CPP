@@ -13,6 +13,11 @@
 // --self-test renders 6 tracks, corrupts 5 inside ace-synth
 // (HOTSTEP_CHECK_INJECT), then forces a write failure; it passes only if every
 // fault is caught.
+//
+// "heartmula" is a 4 s HeartMuLa render through heartmula-generate (the same
+// pipeline as POST /heartmula/synth), held to the same checks; its WAV must be
+// exactly frames x 3840 samples. It is skipped, not failed, when the models
+// folder has no HeartMuLa files. --self-test corrupts five copies of its output.
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -26,6 +31,9 @@ const selfTest = args.includes('--self-test');
 const exe = ['engine/build/Release/ace-synth.exe', 'engine/build/ace-synth.exe', 'engine/build/ace-synth', 'engine/ace-synth.exe', 'engine/ace-synth']
   .map((p) => join(root, p)).find(existsSync);
 if (!exe) { console.error('engine-smoke: no ace-synth binary under engine/build; build the engine first'); process.exit(1); }
+
+const hmExe = ['engine/build/Release/heartmula-generate.exe', 'engine/build/heartmula-generate.exe', 'engine/build/heartmula-generate']
+  .map((p) => join(root, p)).find(existsSync);
 
 let models = opt('--models');
 if (!models) {
@@ -101,6 +109,35 @@ function render(name, req, { env = {}, extra = [] } = {}) {
 const fails = [];
 const expect = (cond, what) => { if (!cond) fails.push(what); };
 
+// HeartMuLa case: { status, lines, frames, t0 } or null when skipped.
+function heartmula(name, env = {}) {
+  const hmModels = [join(models, 'heartmula'), models].filter(existsSync);
+  const present = hmModels.some((d) => readdirSync(d).some((f) => /^heartmula-.+-global-.+\.gguf$/.test(f)));
+  if (!hmExe || !present) {
+    console.log(`\n[${name}] skipped: ${hmExe ? 'no HeartMuLa models under ' + models : 'no heartmula-generate binary'}`);
+    return null;
+  }
+  const request = join(outDir, `${name}.json`);
+  writeFileSync(request, JSON.stringify({
+    tags: 'pop, upbeat, synth, drums, female vocals',
+    lyrics: '[verse]\nCity lights are calling out my name',
+    duration_s: 4,
+    seed: 42,
+  }, null, 2));
+  const t0 = Date.now();
+  const r = spawnSync(hmExe, ['--models', models, '--request', request, '--out', join(outDir, `${name}0.wav`), '--check'],
+    { env: { ...process.env, ...env }, encoding: 'utf8', timeout: 15 * 60_000, maxBuffer: 256 << 20 });
+  const log = (r.stdout ?? '') + (r.stderr ?? '');
+  writeFileSync(join(outDir, `${name}.log`), log);
+  const lines = log.split(/\r?\n/).filter((l) => l.startsWith('[Check Batch') || l.includes('FATAL'));
+  const frames = Number(log.match(/^run 0: ok .*?frames=(\d+)\//m)?.[1] ?? -1);
+  const t = log.match(/^timings: .*?load (\d+) ms, prefill (\d+) ms, frames (\d+) ms, codec (\d+) ms/m);
+  console.log(`\n[${name}] exit ${r.status ?? r.error?.message} after ${((Date.now() - t0) / 1000).toFixed(1)}s (log ${rel}/${name}.log)`);
+  lines.forEach((l) => console.log('  ' + l));
+  console.log('  stages: ' + (t ? `load ${t[1]} ms, prefill ${t[2]} ms, frames ${t[3]} ms, codec ${t[4]} ms` : 'none found'));
+  return { status: r.status, lines, frames, t0, timed: !!t };
+}
+
 if (selfTest) {
   const faults = ['none', 'nan', 'subnormal', 'silence', 'dc', 'clip'];
   const tags = ['PASS', 'nonfinite=1 [FAIL]', 'subnormal=1 [FAIL]', '[FAIL silence]', '[FAIL dc]', '[FAIL clip]'];
@@ -121,6 +158,16 @@ if (selfTest) {
   const caught = w.status === 1 && w.lines.some((l) => l.includes('FATAL: failed to write'));
   console.log(`  self-test write failure: ${caught ? 'caught' : 'MISSED'} (exit ${w.status}, want 1)`);
   expect(caught, 'self-test write failure');
+
+  const h = heartmula('heartmula-selftest', { HOTSTEP_CHECK_INJECT: faults.join(',') });
+  if (h) {
+    faults.forEach((f, b) => {
+      const hit = h.lines.some((l) => l.startsWith(`[Check Batch${b}]`) && l.includes(tags[b]));
+      console.log(`  self-test heartmula ${b} (${f}): ${hit ? 'caught' : 'MISSED'}`);
+      expect(hit, `self-test heartmula ${f}`);
+    });
+    expect(h.status === 2, `self-test heartmula exit ${h.status}, want 2`);
+  }
 } else {
   const cases = [
     { name: 'round', req: { duration: 10, seed: 42 }, extra: [] },
@@ -138,6 +185,18 @@ if (selfTest) {
     expect(r.lines.length === 1 && r.lines[0].includes(' PASS '), `${c.name} check`);
     expect(fresh && got === want, `${c.name} wav length ${got} != ${want}`);
     expect(r.times.dit !== undefined && r.times.vae !== undefined, `${c.name} stage times missing from log`);
+  }
+  const h = heartmula('heartmula');
+  if (h) {
+    const wav = join(outDir, 'heartmula0.wav');
+    const fresh = existsSync(wav) && statSync(wav).mtimeMs >= h.t0 - 2000;
+    const got = fresh ? wavSamples(wav) : -1;
+    const want = h.frames * 3840;  // 80 ms frames at 48 kHz; the song may end before 4 s
+    console.log(`  wav: ${fresh ? `${got} samples/ch (want ${want}, ${h.frames} frames, ${(want / 48000).toFixed(2)} s)` : 'MISSING or stale'}`);
+    expect(h.status === 0, `heartmula exit ${h.status}`);
+    expect(h.lines.length === 1 && h.lines[0].includes(' PASS '), 'heartmula check');
+    expect(h.frames > 0 && fresh && got === want, `heartmula wav length ${got} != ${want}`);
+    expect(h.timed, 'heartmula stage times missing from log');
   }
 }
 

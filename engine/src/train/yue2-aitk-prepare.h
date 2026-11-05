@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -73,7 +74,7 @@ inline bool read_file(const std::filesystem::path & path, std::vector<uint8_t> *
     return true;
 }
 
-inline bool token_ids(const PromptInput & p, size_t frames, std::string * e) {
+inline bool token_ids(const PromptInput & p, std::string * e) {
     if (p.retained_prefix_ids.empty() || p.dropped_prefix_ids.empty()) return prep_fail(e, "verified prefixes cannot be empty");
     for (const auto & ids : {std::cref(p.retained_prefix_ids), std::cref(p.dropped_prefix_ids), std::cref(p.abc_ids),
                              std::cref(p.retained_nocap_prefix_ids), std::cref(p.dropped_nocap_prefix_ids),
@@ -86,22 +87,6 @@ inline bool token_ids(const PromptInput & p, size_t frames, std::string * e) {
         const int present = !p.retained_nolyrics_prefix_ids.empty() + !p.dropped_nolyrics_prefix_ids.empty() + !p.retained_notext_prefix_ids.empty() +
                             !p.dropped_notext_prefix_ids.empty() + !p.retained_uncond_prefix_ids.empty() + !p.dropped_uncond_prefix_ids.empty();
         if (present != 0 && present != 6) return prep_fail(e, "condition-dropout prefixes must come as a complete set of six");
-    }
-    const size_t crop = std::min(frames, size_t(1500));
-    if (p.retained_prefix_ids.size() + p.abc_ids.size() + 2 * crop + 5 > 24576 ||
-        p.dropped_prefix_ids.size() + p.abc_ids.size() + 2 * crop + 5 > 24576)
-        return prep_fail(e, "prompt context exceeds YuE2 sequence limit");
-    // the language model learns the whole song: the reader refuses a song whose prompt, score and frames pass the context
-    const size_t prompt = std::max(p.retained_prefix_ids.size(), p.dropped_prefix_ids.size());
-    if (prompt + p.abc_ids.size() + frames + 3 > 24576) {
-        if (e) {
-            *e = "too long to train on: its style and lyrics (" + std::to_string(prompt) + " tokens), score (" +
-                 std::to_string(p.abc_ids.size()) + ") and " + std::to_string(frames / 25 / 60) + " min " +
-                 std::to_string(frames / 25 % 60) + " s of audio (" + std::to_string(frames) + " frames) make " +
-                 std::to_string(prompt + p.abc_ids.size() + frames + 3) +
-                 " tokens, the model takes 24576; shorten the song or train it without its score";
-        }
-        return false;
     }
     return true;
 }
@@ -266,11 +251,22 @@ inline bool prepare_dataset(const PrepareRequest & request, std::string * error 
         const auto & item = request.items[index];
         if (item.id.empty() || !no_nul(item.id) || !ids.insert(item.id).second || item.frames == 0 || item.frames > 24576)
             return prep_fail(error, "native item metadata is invalid");
-        std::string token_error;
-        if (!token_ids(item.prompt, item.frames, &token_error)) {
+        if (std::string token_error; !token_ids(item.prompt, &token_error)) {
             if (error) *error = "song " + item.id + ": " + token_error;
             return false;
         }
+        // A track the trainer cannot fit is left out by name, not the album.
+        if (const size_t need = dataset_detail::context_tokens(item.prompt, item.frames); need > dataset_detail::kMaxFrames) {
+            const size_t prompt = std::max(item.prompt.retained_prefix_ids.size(), item.prompt.dropped_prefix_ids.size());
+            std::fprintf(stderr,
+                         "[yue2-prepare] NOTE: %s needs %zu tokens, over the %zu-token YuE2 context; skipped "
+                         "(style and lyrics %zu, score %zu, %zu min %zu s of audio = %zu frames; "
+                         "shorten the song or train it without its score)\n",
+                         item.id.c_str(), need, dataset_detail::kMaxFrames, prompt, item.prompt.abc_ids.size(),
+                         item.frames / 25 / 60, item.frames / 25 % 60, item.frames);
+            continue;
+        }
+        const size_t written = yyjson_mut_arr_size(items);
         if (item.prompt.cursor.present &&
             (!no_nul(item.prompt.cursor.lyrics_sha256) || !no_nul(item.prompt.cursor.tokenizer_sha256)))
             return prep_fail(error, "cursor provenance contains embedded NUL");
@@ -297,7 +293,7 @@ inline bool prepare_dataset(const PrepareRequest & request, std::string * error 
             if (value < 0 || value >= kCodecSize) return prep_fail(error, "native semantic code outside raw codec range");
             semantic[j] = value;
         }
-        const std::string payload_name = "payload/item_" + std::to_string(index) + ".f32";
+        const std::string payload_name = "payload/item_" + std::to_string(written) + ".f32";
         const auto payload_path = request.output_dir / payload_name;
         if (!std::filesystem::create_directory(request.output_dir / "payload", ec) &&
             !std::filesystem::is_directory(request.output_dir / "payload", ec)) return prep_fail(error, "cannot create payload directory");
@@ -337,6 +333,7 @@ inline bool prepare_dataset(const PrepareRequest & request, std::string * error 
         if (item.prompt.cursor.present && !add_cursor(doc, obj, item.prompt.cursor))
             return prep_fail(error, "cannot serialize cursor metadata");
     }
+    if (yyjson_mut_arr_size(items) == 0) return prep_fail(error, "every track exceeds the YuE2 context; none can train");
     yyjson_mut_obj_add_val(doc, root, "items", items);
     size_t json_len = 0; char * json = yyjson_mut_write(doc, 0, &json_len);
     if (!json) return prep_fail(error, "cannot serialize dataset manifest");

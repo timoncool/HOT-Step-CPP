@@ -12,11 +12,11 @@ import { queryOptions } from '@tanstack/react-query';
 import { generateApi, songApi } from '../../services/api';
 import { audioQueueApi } from '../../services/audioQueueApi';
 import { apiClient } from '../../services/httpClient';
-import type { WorkflowReplay } from '../../../../server/src/contracts/workflow';
 import { queryClient } from '../client';
 import { ACTIVE_POLL_MS } from '../contract';
-import { serverKey, sharedKeys } from '../keys';
+import { serverKey } from '../keys';
 import { songOptions } from './songs';
+import { workflowOptions } from '../cover-lyrics/workflows';
 
 export const audioQueueItemsOptions = () => queryOptions({
   queryKey: serverKey('shell-queue/audio-queue', { auth: true }),
@@ -24,15 +24,85 @@ export const audioQueueItemsOptions = () => queryOptions({
   retry: false,
 });
 
-export const generationStatusOptions = (jobId: string) => queryOptions({
+export const generationStatusOptions = (jobId: string, options: { signal?: AbortSignal } = {}) => queryOptions({
   queryKey: serverKey('shell-queue/generation-status', { id: jobId }),
-  queryFn: ({ signal }) => generateApi.status(jobId, { signal }),
+  queryFn: ({ signal }) => generateApi.status(jobId, {
+    signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal,
+  }),
   retry: false,
 });
 
-export const workflowJobOptions = (jobId: string) => queryOptions({
-  queryKey: sharedKeys.workflowJob(jobId),
-  queryFn: ({ signal }) => apiClient.get<WorkflowReplay>(`/workflows/jobs/${encodeURIComponent(jobId)}?after=0`, { signal }),
+export interface CoverArtJob {
+  status: string;
+  error?: string;
+  result?: { coverUrl?: string };
+}
+
+/** One cover-art generation job, polled by the prompt modal. */
+export const coverArtJobOptions = (jobId: string) => queryOptions({
+  queryKey: serverKey('shell-queue/cover-art-job', { id: jobId }),
+  queryFn: ({ signal }) => apiClient.get<CoverArtJob>(`/cover-art/generate/${encodeURIComponent(jobId)}`, { signal }),
+  staleTime: 0,
+});
+
+export interface CoverArtFileProgress {
+  filename: string;
+  description: string;
+  status: string;
+  bytesDownloaded: number;
+  totalBytes: number;
+  speed: number;
+}
+export interface CoverArtStatus {
+  installed: boolean;
+  missingFiles: string[];
+  download: {
+    phase: string;
+    files: CoverArtFileProgress[];
+    totalBytes: number;
+    downloadedBytes: number;
+    overallProgress: number;
+  };
+}
+/** Cover-art model install status, polled while a download runs. */
+export const coverArtStatusOptions = () => queryOptions({
+  queryKey: serverKey('shell-queue/cover-art-status'),
+  queryFn: ({ signal }) => apiClient.get<CoverArtStatus>('/cover-art/status', { signal }),
+});
+
+export interface SavedSeed {
+  name: string;
+  seed: number;
+  saved_at: string | null;
+  description: string;
+  tags: string[];
+  favorite: boolean;
+}
+/** The seed manager's saved list. Written by the drawer's own mutations. */
+export const seedsOptions = () => queryOptions({
+  queryKey: serverKey('shell-queue/seeds'),
+  queryFn: ({ signal }) => apiClient.get<{ seeds: SavedSeed[] }>('/seeds', { signal }),
+});
+
+/** The Directed Drift panel's live control snapshot (GET /storm/control). */
+export interface DriftSnapshot {
+  pos: Record<string, number>;
+  captionWeights: Record<string, number>;
+  seed: number;
+  slot: number;
+  pull: number;
+  rate: number;
+  jitter: number;
+  targetCaption: string[];
+}
+
+/** Polled by the panel only while its stream is playing; no retry, because a
+ *  dropped tick is replaced by the next one anyway. */
+export const stormDriftOptions = (streamId: string) => queryOptions({
+  queryKey: serverKey('shell-queue/storm-drift', { filters: { streamId } }),
+  queryFn: ({ signal }) => apiClient.get<{ drift?: DriftSnapshot }>(
+    `/generate/storm/control?streamId=${encodeURIComponent(streamId)}`, { signal }),
+  staleTime: 0,
   retry: false,
 });
 
@@ -60,7 +130,7 @@ export const readGenerationStatus = (jobId: string) =>
   queryClient.query({ ...generationStatusOptions(jobId), staleTime: ACTIVE_POLL_MS - 500 });
 
 export const readWorkflowJob = (jobId: string) =>
-  queryClient.query({ ...workflowJobOptions(jobId), staleTime: 0 });
+  queryClient.query({ ...workflowOptions(jobId), retry: false, staleTime: 0 });
 
 /** A finished render's song row, fresh: the queue reads it the moment the
  *  render is saved. Shares the canonical song key with every other reader. */

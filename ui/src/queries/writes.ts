@@ -26,7 +26,7 @@ export function events(...refs: EventRef[]): WritePlan {
 /** A parameterized plan: the write knows its own keys (a worker scope, an id)
  *  and names them here; the manager still owns the invalidateQueries call. */
 export function keysPlan(...keys: QueryKey[]): WritePlan {
-  return client => queryManager.keys(client, ...keys);
+  return client => queryManager.invalidate(client, ...keys);
 }
 
 /** Run a command and invalidate what it dirtied. The plan is required: a
@@ -50,9 +50,12 @@ export interface UploadInput<T = unknown> {
   /** Per-call success handler — contextual UI only, never toasts (the global
    *  handler owns error notification). */
   onSuccess?: (data: T) => void;
-  /** Per-call failure handler for inline error text. Transport failures are
-   *  already toasted globally; this is for component-local state. */
+  /** Per-call failure handler for inline error text. Without `silent`,
+   *  transport failures are also toasted globally — pass `silent: true` when
+   *  this handler renders the failure itself, so it is the only notifier. */
   onError?: (err: unknown) => void;
+  /** Skip the global failure toast (the caller's `onError` renders it). */
+  silent?: boolean;
 }
 
 /** The one upload mutation: progress + abort over apiClient.upload, with the
@@ -71,6 +74,7 @@ export function useUpload<T = unknown>() {
       return apiClient.upload<T>(input.path, input.files, {
         fields: input.fields,
         signal: controller.signal,
+        silent: input.silent,
         onProgress: fraction => { setProgress(fraction); input.onProgress?.(fraction); },
       });
     },

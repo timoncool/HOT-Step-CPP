@@ -31,9 +31,116 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { config, getFFmpegPath } from '../../config.js';
 import { CAPTION_INSTRUCTIONS } from './captionPrompt.js';
+import { normalizeYue2Caption } from '../lireek/prompts.js';
+import { normaliseLyricTags } from './lyricTags.js';
 
 /** Modes `ace-caption` can decode off a single encode. */
-export type MossMode = 'prose' | 'mm3' | 'lyrics';
+export type MossMode = 'prose' | 'mm3' | 'lyrics' | 'yue2';
+
+/**
+ * The local audio models `ace-caption` runs. Both take the same modes, prompts and
+ * batching; the binary picks the family from the models folder. Music Flamingo is
+ * the stronger lyric transcriber by a wide margin (median WER 24% vs MOSS's 59% on
+ * a 17-track album test, with section tags on every track).
+ */
+export type LocalCaptioner = 'moss' | 'flamingo';
+
+export const LOCAL_CAPTIONER_NAMES: Record<LocalCaptioner, string> = {
+  moss: 'MOSS-Music-8B',
+  flamingo: 'Music Flamingo',
+};
+
+export function isLocalCaptioner(provider: string | undefined | null): provider is LocalCaptioner {
+  return provider === 'moss' || provider === 'flamingo';
+}
+
+/**
+ * Lyric transcription prompt for the local models. The exact wording the lyric
+ * bake-off measured (Music Flamingo, median WER 24% with section tags on every
+ * track); passed via `--prompt-file lyrics=` like the other modes.
+ */
+export const LYRICS_INSTRUCTIONS: string =
+  'Transcribe the complete lyrics of this song.\n\n'
+  + 'Format the output exactly like this:\n'
+  + '- Mark every section with a bracketed tag on its own line: [Intro], [Verse], [Pre-Chorus], '
+  + '[Chorus], [Bridge], [Breakdown], [Instrumental], [Outro].\n'
+  + '- Put the sung words underneath each tag, one line per sung line.\n'
+  + '- Use [Instrumental] for passages with no vocals.\n'
+  + '- Transcribe only what is actually sung. Do not invent lines, do not translate, and do not '
+  + 'add commentary, timestamps or explanations.\n\n'
+  + 'If the track has no vocals at all, reply with exactly: [Instrumental]';
+
+/**
+ * The YuE2 planner caption, from the local model's ears and no chat provider.
+ *
+ * Neither local model can hold the one-sentence, fixed-order format: given the
+ * chat prompt (YUE2_CAPTION_SYSTEM_PROMPT) both wrote 150-300 word paragraphs.
+ * Both fill short labelled fields reliably, so they answer six fields and
+ * `assembleYue2FromFields` builds the sentence in that order; BPM comes from
+ * local analysis via normalizeYue2Caption, as it does on the chat path.
+ */
+export const YUE2_LOCAL_INSTRUCTIONS: string =
+  'Listen to this track and fill in these six fields, one per line, each a short phrase of a few words:\n\n'
+  + 'language: <the language the vocal is sung in, or "instrumental">\n'
+  + 'genre: <the specific style you hear, with era words if they help; never a bare umbrella like "rock" or "pop">\n'
+  + 'vocal: <register, gender and delivery of the lead voice, or what carries the lead line if instrumental>\n'
+  + 'instruments: <the instruments actually present, named concretely>\n'
+  + 'mood: <two to four plain words>\n'
+  + 'production: <the mix and era character>\n\n'
+  + 'Write only those six lines. Do not name the artist, the band or the song, and do not quote the lyrics.';
+
+const YUE2_FIELDS = ['language', 'genre', 'vocal', 'instruments', 'mood', 'production'] as const;
+
+/**
+ * Six field answers -> the YuE2 sentence body (no BPM; normalizeYue2Caption adds
+ * it). Accepts `key: value` lines (Flamingo) or six bare lines in order (MOSS).
+ * Each answer is cut to its first clause and parentheticals are dropped — that is
+ * where a model names the original song ("(as a cover of ...)").
+ */
+export function assembleYue2FromFields(raw: string): string {
+  const lines = String(raw ?? '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const labelled = new Map<string, string>();
+  for (const l of lines) {
+    const m = /^(language|genre|vocal|instruments|mood|production)\s*:\s*(.*)$/i.exec(l);
+    if (m) labelled.set(m[1].toLowerCase(), m[2]);
+  }
+  const values = labelled.size >= 4
+    ? YUE2_FIELDS.map(f => labelled.get(f) ?? '')
+    : lines.slice(0, YUE2_FIELDS.length);
+  const clean = (v: string, maxWords: number) => {
+    let s = v.replace(/\([^)]*\)/g, ' ').replace(/[“”"]/g, '')
+      .split(/\.\s|\s[–—-]\s|\.$/)[0]
+      .replace(/;/g, ' /').replace(/\s+/g, ' ').replace(/[\s,.;:]+$/, '').trim();
+    const words = s.split(' ');
+    if (words.length > maxWords) {
+      // Over the cap: back off to the last comma or slash in range, else to the
+      // cap, and never end on a dangling "with" / "for a".
+      s = words.slice(0, maxWords).join(' ');
+      const cut = Math.max(s.lastIndexOf(','), s.lastIndexOf(' /'));
+      if (cut > s.length / 3) s = s.slice(0, cut);
+      s = s.replace(/(?:\s+(?:a|an|the|and|or|with|for|of|to|in|on|at|by|that|which|is|are))+\s*$/i, '')
+        .replace(/[\s,.;:/]+$/, '');
+    }
+    return s;
+  };
+  const caps = [3, 10, 16, 18, 6, 14];
+  return values.map((v, i) => clean(v, caps[i])).filter(Boolean).join(', ');
+}
+
+/**
+ * The per-track hint for the local models: the file's own genre tag. Without it
+ * both models recognise a cover from its lyrics and describe the ORIGINAL song's
+ * genre — on a dataset of lounge covers of rock songs they wrote "garage punk",
+ * "synth-pop" and "hip-hop"; with it they describe the piano, brushed drums and
+ * crooned vocal actually on the recording (measured 2026-10-24, both models).
+ */
+export function genreHint(genre: string | undefined | null): string {
+  const g = (genre ?? '').replace(/[\t\r\n]+/g, ' ').trim();
+  return g
+    ? `The file is tagged with the genre "${g}". Describe the arrangement you actually hear, `
+      + "which may be a cover in a different style from the song's original."
+    : '';
+}
 
 /**
  * The MM3 Structured Caption prompt.
@@ -96,29 +203,56 @@ const BIN = process.platform === 'win32' ? '.exe' : '';
  * both should get the small one, and the resolution order here must not disagree
  * with the engine's or the UI would advertise a model the engine won't load.
  */
-export function resolveMossPaths(): { paths: MossPaths } | { missing: string } {
+export function resolveMossPaths(model: LocalCaptioner = 'moss'): { paths: MossPaths } | { missing: string } {
   const exe = path.join(path.dirname(config.aceServer.exe), `ace-caption${BIN}`);
   if (!fs.existsSync(exe)) return { missing: `ace-caption${BIN} not built` };
 
-  const modelsDir = path.join(config.aceServer.models, 'moss');
-  const lm = ['moss-lm-q8_0.gguf', 'moss-lm-f16.gguf']
+  // models/moss holds moss-*.gguf, models/flamingo holds flamingo-*.gguf.
+  const modelsDir = path.join(config.aceServer.models, model);
+  const lm = [`${model}-lm-q8_0.gguf`, `${model}-lm-f16.gguf`]
     .map(n => path.join(modelsDir, n))
     .find(p => fs.existsSync(p));
-  const audio = path.join(modelsDir, 'moss-aud-f16.gguf');
+  const audio = path.join(modelsDir, `${model}-aud-f16.gguf`);
 
-  if (!lm) return { missing: `no moss-lm-*.gguf in ${modelsDir}` };
-  if (!fs.existsSync(audio)) return { missing: `moss-aud-f16.gguf missing from ${modelsDir}` };
+  if (!lm) return { missing: `no ${model}-lm-*.gguf in ${modelsDir}` };
+  if (!fs.existsSync(audio)) return { missing: `${model}-aud-f16.gguf missing from ${modelsDir}` };
   return { paths: { exe, modelsDir, lm, audio } };
 }
 
-export function mossCaptionAvailable(): boolean {
-  return 'paths' in resolveMossPaths();
+export function mossCaptionAvailable(model: LocalCaptioner = 'moss'): boolean {
+  return 'paths' in resolveMossPaths(model);
 }
 
 // ── Running the model ────────────────────────────────────────────────────
 
+/**
+ * Repetition penalty for redoing a lyric transcript that looped. Decoding runs with
+ * none (MOSS_REP_PENALTY, 1.0): on the 17-track album test that scored median WER
+ * 19.6% against 24.0% at 1.05, but looped on 3 tracks (one at 136% WER). ace-caption
+ * redoes just those, in-process and off the same prefill (--retry-loops), giving
+ * median 20.0% / mean 22.5% against 19.6% / 29.4% for one pass. Quantisation (q8_0
+ * vs f16), sampling (temperature 0.4/0.7) and penalty 1.02 were measured and did
+ * not help.
+ *
+ * In-process on purpose: a redo as a second ace-caption run queued behind the
+ * dataset's batch (one Flamingo process at a time, for VRAM), so four looped tracks
+ * stalled a label job's whole worker pool until the batch finished.
+ */
+const LYRICS_RETRY_REP_PENALTY = 1.05;
+
+function retryLoopArgs(model: LocalCaptioner, modes: MossMode[]): string[] {
+  return model === 'flamingo' && modes.includes('lyrics')
+    ? ['--retry-loops', String(LYRICS_RETRY_REP_PENALTY)] : [];
+}
+
 export interface MossRunOptions {
+  /** Which local model; default MOSS. */
+  model?: LocalCaptioner;
   modes: MossMode[];
+  /** Single-track runs: appended to every non-lyrics prompt (`--hint`). */
+  hint?: string;
+  /** Batch runs: audio path -> hint (the list file's third column). */
+  hints?: Map<string, string>;
   /** Per-mode prompt overrides. `prose` normally carries CAPTION_INSTRUCTIONS. */
   prompts?: Partial<Record<MossMode, string>>;
   maxTokens?: number;
@@ -191,15 +325,18 @@ async function runMossCaptionInner(
   audioPath: string,
   opts: MossRunOptions,
 ): Promise<Partial<Record<MossMode, string>>> {
-  const resolved = resolveMossPaths();
-  if ('missing' in resolved) throw new Error(`MOSS captioning unavailable: ${resolved.missing}`);
+  const model = opts.model ?? 'moss';
+  const resolved = resolveMossPaths(model);
+  if ('missing' in resolved) throw new Error(`${LOCAL_CAPTIONER_NAMES[model]} unavailable: ${resolved.missing}`);
   const { exe, modelsDir } = resolved.paths;
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'hs_moss_'));
   const outBase = path.join(work, 'out.txt');
   const args: string[] = [
     '--models', modelsDir,
+    '--family', model,
     '--src-audio', audioPath,
+    ...(opts.hint ? ['--hint', opts.hint] : []),
     '--mode', opts.modes.join(','),
     '-o', outBase,
     '--temperature', String(opts.temperature ?? MOSS_TEMPERATURE),
@@ -208,6 +345,7 @@ async function runMossCaptionInner(
   ];
   if (opts.maxTokens) args.push('--max-tokens', String(opts.maxTokens));
   if (opts.maxSeconds) args.push('--max-seconds', String(opts.maxSeconds));
+  args.push(...retryLoopArgs(model, opts.modes));
 
   // ffmpeg is only consulted for non-WAV/MP3 input, but passing our resolved
   // path means a portable release doesn't depend on ffmpeg being on PATH.
@@ -234,7 +372,7 @@ async function runMossCaptionInner(
         });
     });
     const timing = /encode[^\n]*|\b\d+\.\d+\s*s\b/.exec(stderr);
-    if (timing) opts.log?.('info', `MOSS: ${timing[0].trim()}`);
+    if (timing) opts.log?.('info', `${LOCAL_CAPTIONER_NAMES[model]}: ${timing[0].trim()}`);
 
     const out: Partial<Record<MossMode, string>> = {};
     for (const mode of opts.modes) {
@@ -252,7 +390,7 @@ async function runMossCaptionInner(
     if (Object.keys(out).length === 0) {
       // Never fail silently. A zero-output run means the CLI contract moved, and
       // the caller must not mistake it for "the model had nothing to say".
-      opts.log?.('warn', `MOSS produced no output for modes: ${opts.modes.join(',')}`);
+      opts.log?.('warn', `${LOCAL_CAPTIONER_NAMES[model]} produced no output for modes: ${opts.modes.join(',')}`);
     }
     return out;
   } finally {
@@ -292,6 +430,16 @@ async function runMossCaptionInner(
  * description before adding it bare.
  */
 export const GENRE_HINTS: ReadonlyArray<readonly [RegExp, string]> = [
+  // — lounge / swing (2026-10-24) — PREPENDED above everything: a lounge cover
+  // of a rock song is described as "a lounge cover ... of a punk anthem", and
+  // the arrangement, not the source song, is the genre. Before these existed a
+  // whole dataset of lounge covers labelled as House, Pop and Hip-Hop.
+  [/\bbig[-\s]?band\b/i, 'Big Band'],
+  [/\bbossa[-\s]?nova\b/i, 'Bossa Nova'],
+  [/\beasy[-\s]?listening\b/i, 'Easy Listening'],
+  [/\bexotica\b/i, 'Exotica'],
+  [/\blounge\b/i, 'Lounge'],
+  [/\bswing\b(?!\s+(?:feel|rhythm|groove|eighths?|note)s?\b)/i, 'Swing'],
   // — rock family (validated ordering, do not reorder) —
   // The 2026-08-18 block below is PREPENDED, not reordered: each term contains
   // an umbrella lower in the family (post-rock ⊃ rock, midwest emo ⊃ emo …),
@@ -329,7 +477,8 @@ export const GENRE_HINTS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\bfrench house\b/i, 'French House'],
   [/\btrance\b/i, 'Trance'],
   [/\btechno\b/i, 'Techno'],
-  [/\bhouse\b/i, 'House'],
+  // Not "coffee-house atmosphere" or "in-house"; Flamingo writes U+2011 hyphens.
+  [/(?<!coffee[\s\-‐‑]?|in[\-‐‑])\bhouse\b/i, 'House'],
   // "ambient <production noun>" is mix vocabulary, not a genre claim.
   [/\bambient\b(?!\s+(?:space|texture|pad|tail|wash|noise|bed|layer|reverb|atmosphere)s?\b)/i, 'Ambient'],
   // — hip-hop / r&b —
@@ -641,6 +790,7 @@ const batchPending = new Map<string, Promise<Partial<Record<MossMode, string>> |
 /** Drop anything left over. Call when a job ends, however it ends. */
 export function clearMossBatch(): void {
   batchPending.clear();
+  lyricsPending.clear();
 }
 
 /**
@@ -654,7 +804,10 @@ export function clearMossBatch(): void {
 export async function prepareMossBatch(
   audioPaths: string[],
   opts: {
-    wantMm3?: boolean; wantLyrics?: boolean; maxSeconds?: number;
+    model?: LocalCaptioner;
+    wantMm3?: boolean; wantLyrics?: boolean; wantYue2?: boolean; maxSeconds?: number;
+    /** audio path -> per-track hint (genreHint), appended to non-lyrics prompts. */
+    hints?: Map<string, string>;
     signal?: AbortSignal; log?: (level: 'info' | 'warn', message: string) => void;
   } = {},
 ): Promise<void> {
@@ -663,12 +816,75 @@ export async function prepareMossBatch(
 
   const modes: MossMode[] = ['prose'];
   if (opts.wantMm3) modes.push('mm3');
+  if (opts.wantYue2) modes.push('yue2');
   if (opts.wantLyrics) modes.push('lyrics');
 
-  runMossBatch(audioPaths, {
-    modes, prompts: { prose: CAPTION_INSTRUCTIONS, mm3: MM3_INSTRUCTIONS },
+  void runMossBatch(audioPaths, {
+    model: opts.model, modes, hints: opts.hints,
+    prompts: {
+      prose: CAPTION_INSTRUCTIONS, mm3: MM3_INSTRUCTIONS,
+      lyrics: LYRICS_INSTRUCTIONS, yue2: YUE2_LOCAL_INSTRUCTIONS,
+    },
     maxSeconds: opts.maxSeconds, signal: opts.signal, log: opts.log,
   });
+  // Lyrics that ride the caption batch are claimed separately (takeLocalLyrics),
+  // so the label job can use them per track whether or not it captions.
+  if (opts.wantLyrics) {
+    for (const p of audioPaths) {
+      const entry = batchPending.get(p);
+      if (entry) lyricsPending.set(p, entry.then(r => r?.lyrics?.trim() || undefined));
+    }
+  }
+}
+
+// ── Local lyrics, per track ─────────────────────────────────────────────
+
+/** audio path -> lyrics promise, from prepareMossBatch(wantLyrics) or
+ *  prepareLocalLyrics. Consumed once by takeLocalLyrics. */
+const lyricsPending = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Start Music Flamingo lyric transcription for every path that is not already
+ * covered (by a Flamingo caption batch that includes lyrics), in ONE process.
+ * Returns at once; each track's lyrics resolve as that track finishes, so a label
+ * job writes them per track instead of after the whole dataset.
+ */
+export function prepareLocalLyrics(
+  audioPaths: string[],
+  opts: { maxSeconds?: number; signal?: AbortSignal; log?: (level: 'info' | 'warn', message: string) => void } = {},
+): void {
+  const todo = audioPaths.filter(p => !lyricsPending.has(p));
+  if (todo.length === 0) return;
+  const pending = new Map<string, Promise<Partial<Record<MossMode, string>> | undefined>>();
+  void runMossBatch(todo, {
+    model: 'flamingo', modes: ['lyrics'], prompts: { lyrics: LYRICS_INSTRUCTIONS },
+    maxSeconds: opts.maxSeconds, signal: opts.signal, log: opts.log,
+  }, pending);
+  for (const p of todo) {
+    lyricsPending.set(p, pending.get(p)!.then(r => r?.lyrics?.trim() || undefined));
+  }
+}
+
+/** This track's local lyrics: from the prepared batch when there is one, else a
+ *  single-track run. `undefined` when the model returned nothing. A looped
+ *  transcript is already redone inside ace-caption (--retry-loops). */
+export async function takeLocalLyrics(
+  audioPath: string,
+  opts: { signal?: AbortSignal; log?: (level: 'info' | 'warn', message: string) => void } = {},
+): Promise<string | undefined> {
+  const pending = lyricsPending.get(audioPath);
+  if (pending) lyricsPending.delete(audioPath);
+  const raw = (pending ? await pending : undefined) ?? (await runMossCaption(audioPath, {
+    model: 'flamingo', modes: ['lyrics'], prompts: { lyrics: LYRICS_INSTRUCTIONS },
+    signal: opts.signal, log: opts.log,
+  })).lyrics?.trim();
+  return raw ? normaliseLyricTags(raw) : undefined;
+}
+
+/** A track that no longer needs local lyrics (Genius found them). The batch
+ *  still produces them; this just stops the entry being kept. */
+export function dropLocalLyrics(audioPath: string): void {
+  lyricsPending.delete(audioPath);
 }
 
 /**
@@ -687,15 +903,21 @@ export async function prepareMossBatch(
  * dataset filenames collide across albums, and two tracks resolving to the same
  * base would silently overwrite one caption with another's.
  */
-function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
+function runMossBatch(
+  audioPaths: string[],
+  opts: MossRunOptions,
+  pending: Map<string, Promise<Partial<Record<MossMode, string>> | undefined>> = batchPending,
+): Promise<void> {
   const settlers = new Map<string, (v: Partial<Record<MossMode, string>> | undefined) => void>();
   for (const audioPath of audioPaths) {
-    batchPending.set(audioPath, new Promise(resolve => { settlers.set(audioPath, resolve); }));
+    pending.set(audioPath, new Promise(resolve => { settlers.set(audioPath, resolve); }));
   }
+  const model = opts.model ?? 'moss';
+  const name = LOCAL_CAPTIONER_NAMES[model];
 
   const done = serialised(async () => {
-    const resolved = resolveMossPaths();
-    if ('missing' in resolved) throw new Error(`MOSS captioning unavailable: ${resolved.missing}`);
+    const resolved = resolveMossPaths(model);
+    if ('missing' in resolved) throw new Error(`${name} unavailable: ${resolved.missing}`);
     const { exe, modelsDir } = resolved.paths;
 
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'hs_mossb_'));
@@ -703,12 +925,16 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
     try {
       fs.writeFileSync(
         path.join(work, 'list.txt'),
-        audioPaths.map((p, i) => `${p}\t${bases[i]}`).join('\n'),
+        audioPaths.map((p, i) => {
+          const hint = (opts.hints?.get(p) ?? '').replace(/[\t\r\n]+/g, ' ').trim();
+          return hint ? `${p}\t${bases[i]}\t${hint}` : `${p}\t${bases[i]}`;
+        }).join('\n'),
         'utf8',
       );
 
       const args: string[] = [
         '--models', modelsDir,
+        '--family', model,
         '--src-list', path.join(work, 'list.txt'),
         '--mode', opts.modes.join(','),
         '--temperature', String(opts.temperature ?? MOSS_TEMPERATURE),
@@ -717,6 +943,7 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
       ];
       if (opts.maxTokens) args.push('--max-tokens', String(opts.maxTokens));
       if (opts.maxSeconds) args.push('--max-seconds', String(opts.maxSeconds));
+      args.push(...retryLoopArgs(model, opts.modes));
       const ffmpeg = getFFmpegPath();
       if (ffmpeg) args.push('--ffmpeg', ffmpeg);
       for (const [mode, text] of Object.entries(opts.prompts ?? {})) {
@@ -756,8 +983,9 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
             resolve();
           });
 
-        // `[MOSS] <mode>   -> <base> (N.Ns)`, one line per written file. A
-        // track is complete when all its requested modes have reported.
+        // `[MOSS] <mode>   -> <base> (N.Ns)` (or `[Flamingo] ...`), one line
+        // per written file. A track is complete when all its requested modes
+        // have reported.
         const reported = new Map<number, number>();
         let buffer = '';
         child.stderr?.setEncoding('utf8');
@@ -766,9 +994,9 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
           let nl: number;
           while ((nl = buffer.indexOf('\n')) >= 0) {
             const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
-            const m = /^\[MOSS\] \S+\s+-> (.+?) \(\d+(?:\.\d+)?s\)\s*$/.exec(line);
+            const m = /^\[(?:MOSS|Flamingo)\] \S+\s+-> (.+?) \(\d+(?:\.\d+)?s\)\s*$/.exec(line);
             if (!m) continue;
-            const base = m[1].replace(/\.(?:prose|mm3|lyrics)\.txt$/, '').replace(/\.txt$/, '');
+            const base = m[1].replace(/\.(?:prose|mm3|lyrics|yue2)\.txt$/, '').replace(/\.txt$/, '');
             const i = bases.indexOf(base);
             if (i < 0) continue;
             const n = (reported.get(i) ?? 0) + 1;
@@ -779,7 +1007,7 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
       });
 
       audioPaths.forEach((_, i) => settle(i));   // stragglers: read what exists
-      opts.log?.('info', `MOSS: batch of ${audioPaths.length} tracks complete`);
+      opts.log?.('info', `${name}: batch of ${audioPaths.length} tracks complete`);
     } finally {
       // Everything unsettled — spawn failure, abort, missing weights — falls
       // back to a per-track run rather than hanging its consumer.
@@ -788,9 +1016,9 @@ function runMossBatch(audioPaths: string[], opts: MossRunOptions): void {
       try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* tmp */ }
     }
   });
-  done.catch((err: any) => {
+  return done.catch((err: any) => {
     if ((err as NodeJS.ErrnoException)?.name === 'AbortError') return;
-    opts.log?.('warn', `MOSS batch failed (${String(err?.message || err).slice(0, 160)}) — falling back to per-track runs`);
+    opts.log?.('warn', `${name} batch failed (${String(err?.message || err).slice(0, 160)}) — falling back to per-track runs`);
   });
 }
 
@@ -800,6 +1028,8 @@ export interface MossCaptionResult {
   /** MM3 Structured Caption, already fact-substituted. */
   mm3?: string;
   lyrics?: string;
+  /** The YuE2 planner caption, normalised (BPM from local facts). */
+  yue2?: string;
 }
 
 /**
@@ -813,8 +1043,12 @@ export async function captionWithMoss(
   audioPath: string,
   facts: LocalFacts,
   opts: {
+    model?: LocalCaptioner;
     wantMm3?: boolean;
     wantLyrics?: boolean;
+    wantYue2?: boolean;
+    /** genreHint() of the file's tag; only used when no batch result is waiting. */
+    hint?: string;
     maxSeconds?: number;
     signal?: AbortSignal;
     log?: (level: 'info' | 'warn', message: string) => void;
@@ -822,6 +1056,7 @@ export async function captionWithMoss(
 ): Promise<MossCaptionResult> {
   const modes: MossMode[] = ['prose'];
   if (opts.wantMm3) modes.push('mm3');
+  if (opts.wantYue2) modes.push('yue2');
   if (opts.wantLyrics) modes.push('lyrics');
 
   // Prefetched by prepareMossBatch, if the caller ran one. The entry is a
@@ -835,16 +1070,26 @@ export async function captionWithMoss(
   const prefetched = pending ? await pending : undefined;
 
   const raw = prefetched ?? await runMossCaption(audioPath, {
+    model: opts.model,
     modes,
+    hint: opts.hint,
     // The AS1.5 prompt is passed by file rather than restated in C++ so the two
     // can't drift; it is the same string the cloud providers get.
-    prompts: { prose: CAPTION_INSTRUCTIONS, mm3: MM3_INSTRUCTIONS },
+    prompts: {
+      prose: CAPTION_INSTRUCTIONS, mm3: MM3_INSTRUCTIONS,
+      lyrics: LYRICS_INSTRUCTIONS, yue2: YUE2_LOCAL_INSTRUCTIONS,
+    },
     maxSeconds: opts.maxSeconds,
     signal: opts.signal,
     log: opts.log,
   });
 
   const out: MossCaptionResult = { prose: raw.prose, lyrics: raw.lyrics };
+  if (raw.yue2?.trim()) {
+    const bpm = Number(facts.bpm);
+    const body = assembleYue2FromFields(raw.yue2);
+    if (body) out.yue2 = normalizeYue2Caption(body, { bpm: bpm > 0 ? bpm : undefined });
+  }
   if (raw.mm3) {
     // The freshest audio-observed evidence for the Basic Attributes genre is
     // the prose MOSS wrote seconds ago FROM THIS SAME ENCODE — its line-1

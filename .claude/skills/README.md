@@ -13,6 +13,8 @@ so. `node tools/docs/check-docs.mjs` fails if a skill folder here is missing fro
 the table below.
 
 The 2026-07-02 fact-check (HEAD `168dcb5`) covered the first thirteen skills.
+project-map, server-feature-dev, ui-feature-dev and ear-test-scoresheet were
+re-checked against HEAD `dda5f6b6` on 2026-10-23.
 Line-number citations drift as code changes; trust the named
 file/function/string over the exact line.
 
@@ -47,10 +49,15 @@ maps each feature to its route, service, UI folder, and engine piece.
 \* `mm3-lm-adapter-training` (added 2026-08-24) records the 6-album,
 30,000-step sweep that produced the current training recipe.
 
+\* `mm3-backend` (added 2026-08-14) is a later addition outside the original
+thirteen's fact-check pass.
+
 \* `mm3-captioning` (added 2026-08-13) is a later addition outside the
-original thirteen's fact-check pass; its `upstream/` reference library
-(MiniMax's official caption-rewriter content) is **gitignored** — local
-installs fetch it per the skill's PROVENANCE.md instructions.
+original thirteen's fact-check pass. Its `upstream/` reference library, a
+verbatim copy of `skills/music-caption-rewriter/` from the
+`MiniMax-AI/MiniMax-Music3` repository, is **gitignored**, so a fresh clone
+does not have it; `upstream/PROVENANCE.md` (inside that folder) records the
+source, fetch method and licence note.
 
 ## The five rules that prevent the expensive disasters
 
@@ -64,5 +71,7 @@ Each skill restates the ones relevant to its domain; they are absolute:
    is silent (compiles clean, all solvers/schedulers/guidance dead).
 4. Never delete generated audio or experiment artifacts on your own quality
    judgment — the user verifies by ear.
-5. Never rebuild post-LM synth requests via a field whitelist — spread the
-   original `aceReq` and take only the 7 LM output fields.
+5. Never rebuild post-LM synth requests via a field whitelist. Spread the
+   original `aceReq` and take only the LM output fields (`audio_codes`,
+   caption, lyrics, bpm, duration, keyscale, timesignature and the per-output
+   `lm_seed`).

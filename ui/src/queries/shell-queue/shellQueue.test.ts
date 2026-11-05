@@ -8,10 +8,10 @@ import {
 } from './songs';
 import { readAudioQueue, readGenerationStatus } from './queue';
 import { queriedPresetsApi, queriedSettingsApi } from './preferences';
-import { gpusOptions } from './settings';
+import { ENGINE_WORKERS_POLL_MS, engineWorkersOptions, gpusOptions } from './settings';
 import { lrcOptions, lyricsJsonOptions, scoreAbcOptions } from './lyrics';
 import { fetchPeaks, forgetPeaks, peaksCached } from '../../audio/peaksClient';
-import { invalidateSidecars } from '../keys';
+import { queryManager } from '../invalidation';
 
 const clients: ReturnType<typeof createQueryClient>[] = [];
 const client = () => { const c = createQueryClient(); clients.push(c); return c; };
@@ -198,6 +198,28 @@ test("a shell write or delete invalidates Cover's cached feed as well as the lib
   assert.equal(c.getQueryState(cover)?.isInvalidated, true, 'delete: Cover feed refetches on next use');
 });
 
+test('engine worker status refreshes under one observer: idle, busy, idle', async () => {
+  const c = client();
+  const states = [false, true, false];
+  let calls = 0;
+  globalThis.fetch = async () => {
+    const busy = states[Math.min(calls++, states.length - 1)];
+    return json({ workers: [{ id: 'w0', busy: busy ? 1 : 0 }], busy });
+  };
+  const options = engineWorkersOptions();
+  const observer = new QueryObserver(c, options);
+  const seen: boolean[] = [];
+  const unsubscribe = observer.subscribe(r => { if (r.data && seen[seen.length - 1] !== r.data.busy) seen.push(r.data.busy); });
+  // Timers are off without a window (tanstack treats Node as a server), so each
+  // refetch below stands in for one interval tick on the same observer.
+  for (let i = 0; i < 2; i++) { await tick(); await observer.refetch(); }
+  await tick();
+  unsubscribe();
+  assert.deepEqual(seen, [false, true, false]);
+  const interval = options.refetchInterval as (q: { state: { data: unknown; status: string; errorUpdateCount: number } }) => number | false;
+  assert.equal(interval({ state: { data: { busy: false }, status: 'success', errorUpdateCount: 0 } }), ENGINE_WORKERS_POLL_MS, 'keeps polling while idle');
+});
+
 test('duplicated snapshots share one canonical key across areas', () => {
   assert.deepEqual(gpusOptions().queryKey, sharedKeys.gpus());
   assert.notDeepEqual(sharedKeys.workflowJob('j', 0), sharedKeys.workflowJob('j', 5), 'after filter stays in the key');
@@ -220,7 +242,7 @@ test('lyric sidecars: missing is cached as none, failures throw, crop/retranscri
   assert.equal(await c.query(lrcOptions('/audio/ok.wav')), '[00:01.00] Words');
   assert.deepEqual(await c.query(lyricsJsonOptions('/audio/ok.wav')), { version: 1, lines: [] });
   await assert.rejects(c.query({ ...lrcOptions('/audio/broken.wav'), retry: false }), /500/);
-  await invalidateSidecars(c);
+  await queryManager.sidecars.all(c);
   assert.equal(c.getQueryState(lrcOptions('/audio/ok.wav').queryKey)?.isInvalidated, true);
   assert.equal(c.getQueryState(lyricsJsonOptions('/audio/ok.wav').queryKey)?.isInvalidated, true);
 });

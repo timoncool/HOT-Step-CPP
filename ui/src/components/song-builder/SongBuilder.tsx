@@ -1,8 +1,7 @@
 import { getSessionEpoch } from '../../queries/keys';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { projectsOptions, projectOptions } from '../../queries/studios/resources';
 import { queryManager } from '../../queries/invalidation';
-import { keysPlan, writeAndInvalidate } from '../../queries/writes';
 // SongBuilder.tsx — Udio-style section-by-section song assembly
 //
 // Build a song one section at a time. Each section generates N candidate
@@ -25,7 +24,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useGlobalParamsStore } from '../../context/GlobalParamsContext';
 import { builderApi } from '../../services/api';
 import type { BuilderProject, BuilderSection, BuilderDirection } from '../../services/api';
-import { ApiError } from '../../services/apiError';
+import { ApiError, HttpStatus } from '../../services/apiError';
 import { followSection as followSectionJob } from './followSection';
 import { useBackendStore } from '../../stores/backendStore';
 import { getGenerationTimeoutMinutes } from '../../utils/generationTimer';
@@ -144,10 +143,24 @@ export const SongBuilder: React.FC = () => {
   };
   const setProject = (value: BuilderProject | null | ((previous: BuilderProject | null) => BuilderProject | null)) => {
     if (getSessionEpoch() !== sessionEpoch) return;
-    const next = typeof value === 'function' ? value(project) : value;
-    setActiveProjectId(next?.id ?? null);
-    if (next) client.setQueryData(projectOptions(next.id).queryKey,
-      (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => ({ project: next, sections: previous?.sections ?? [] }));
+    if (typeof value === 'function') {
+      // Functional edits read the live cache, never this render's `project`.
+      // Two quick edits (or a save landing between them) must compose, and a
+      // stale render must not resurrect an older snapshot.
+      const id = projectIdRef.current ?? project?.id ?? null;
+      if (!id) return;
+      setActiveProjectId(id);
+      client.setQueryData(projectOptions(id).queryKey,
+        (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => {
+          if (!previous) return previous;
+          const next = value(previous.project);
+          return next ? { ...previous, project: next } : previous;
+        });
+      return;
+    }
+    setActiveProjectId(value?.id ?? null);
+    if (value) client.setQueryData(projectOptions(value.id).queryKey,
+      (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => ({ project: value, sections: previous?.sections ?? [] }));
   };
   const setSections = (next: BuilderSection[]) => {
     if (getSessionEpoch() !== sessionEpoch) return;
@@ -262,58 +275,96 @@ export const SongBuilder: React.FC = () => {
     finally { setLoading(false); }
   }, [token, followSection]);
 
-  const createProject = useCallback(async () => {
-    if (!token) return;
-    try {
-      const { project: p } = await writeAndInvalidate(client, () => builderApi.createProject(
-        {
-          title: newTitle || 'Untitled Song', style: newStyle,
-          bpm: newBpm || 0, keyScale: newKey, timeSignature: newTimeSig,
-          variantCount: 4, sectionLength: 30,
-        }), keysPlan(projectsOptions().queryKey));
+  const createMut = useMutation({
+    mutationFn: () => builderApi.createProject({
+      title: newTitle || 'Untitled Song', style: newStyle,
+      bpm: newBpm || 0, keyScale: newKey, timeSignature: newTimeSig,
+      variantCount: 4, sectionLength: 30,
+    }),
+    onSuccess: ({ project: p }) => {
       projectIdRef.current = p.id;
       setProject(p); setSections([]); setNewTitle('');
       setProjects(prev => [p, ...prev]);
-    } catch { /* transport failure already toasted by the global handler */ }
-  }, [token, newTitle, newStyle, newBpm, newKey, newTimeSig]);
+      void queryManager.invalidate(client, projectsOptions().queryKey);
+    },
+  });
+  const createProject = () => { if (token) createMut.mutate(); };
 
   // Persist a project field change (optimistic local update + background PATCH).
-  const saveProjectFields = useCallback(async (patch: Record<string, any>) => {
+  // The snapshot comes from the cache, and both legs patch only the fields this
+  // mutation attempted, so overlapping saves cannot undo each other's edits.
+  const saveFieldsMut = useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: Record<string, unknown> }) => builderApi.updateProject(id, patch),
+    onMutate: async ({ id, patch }) => {
+      const key = projectOptions(id).queryKey;
+      await client.cancelQueries({ queryKey: key });
+      const cached = client.getQueryData<{ project: BuilderProject; sections: BuilderSection[] }>(key);
+      const previous = cached?.project ?? null;
+      const local: Partial<BuilderProject> = {};
+      if ('style' in patch) local.style = patch.style as string;
+      if ('bpm' in patch) local.bpm = patch.bpm as number;
+      if ('keyScale' in patch) local.key_scale = patch.keyScale as string;
+      if ('timeSignature' in patch) local.time_signature = patch.timeSignature as string;
+      setProject(prev => prev ? { ...prev, ...local } : prev);
+      return { id, previous, local };
+    },
+    onSuccess: ({ project: saved }, _vars, ctx) => {
+      if (getSessionEpoch() !== sessionEpoch || !ctx) return;
+      const key = projectOptions(ctx.id).queryKey;
+      client.setQueryData<{ project: BuilderProject; sections: BuilderSection[] }>(key, previous => {
+        if (!previous) return previous;
+        // A newer snapshot (another successful save, or a section edit) wins.
+        if (previous.project.revision > saved.revision) return previous;
+        const next = { ...previous.project };
+        for (const field of Object.keys(ctx.local) as (keyof BuilderProject)[]) {
+          // Only accept the server's value while the UI still shows the value
+          // this save optimistically wrote; a later edit stays put.
+          if (next[field] === ctx.local[field]) {
+            (next as Record<string, unknown>)[field] = saved[field];
+          }
+        }
+        next.revision = Math.max(next.revision, saved.revision);
+        return { ...previous, project: next };
+      });
+      void queryManager.invalidate(client, projectsOptions().queryKey);
+    },
+    onError: (_e, _vars, ctx) => {
+      // The server refused the value — revert only the fields this attempt
+      // wrote, and only if the user has not changed them since. The global
+      // handler already toasted the failure.
+      if (getSessionEpoch() !== sessionEpoch || !ctx?.previous) return;
+      if (projectIdRef.current !== ctx.id) return; // switched projects: leave the cache alone
+      const key = projectOptions(ctx.id).queryKey;
+      client.setQueryData<{ project: BuilderProject; sections: BuilderSection[] }>(key, current => {
+        if (!current) return current;
+        const next = { ...current.project };
+        for (const field of Object.keys(ctx.local) as (keyof BuilderProject)[]) {
+          if (next[field] === ctx.local[field]) {
+            (next as Record<string, unknown>)[field] = ctx.previous![field];
+          }
+        }
+        return { ...current, project: next };
+      });
+    },
+  });
+  const saveProjectFields = (patch: Record<string, unknown>) => {
     if (!project || !token) return;
-    const local: any = {};
-    if ('style' in patch) local.style = patch.style;
-    if ('bpm' in patch) local.bpm = patch.bpm;
-    if ('keyScale' in patch) local.key_scale = patch.keyScale;
-    if ('timeSignature' in patch) local.time_signature = patch.timeSignature;
-    setProject(prev => prev ? { ...prev, ...local } : prev);
-    try {
-      const { project: saved } = await builderApi.updateProject(project.id, patch);
-      if (getSessionEpoch() !== sessionEpoch) return;
-      client.setQueryData(projectOptions(saved.id).queryKey,
-        (previous: { project: BuilderProject; sections: BuilderSection[] } | undefined) => previous && ({ ...previous, project: saved }));
-      void queryManager.keys(client, projectsOptions().queryKey);
-    } catch { /* non-fatal — transport failure already toasted by the global handler */ }
-  }, [project, token]);
-
-  const deleteProject = async (id: string) => {
-    if (!token) return;
-    const listKey = projectsOptions().queryKey;
-    const detailKey = projectOptions(id).queryKey;
-    try {
-      await Promise.all([client.cancelQueries({ queryKey: listKey }), client.cancelQueries({ queryKey: detailKey })]);
-      await builderApi.deleteProject(id);
-      await Promise.all([client.cancelQueries({ queryKey: listKey }), client.cancelQueries({ queryKey: detailKey })]);
-      client.setQueryData(listKey, (previous: { projects: BuilderProject[] } | undefined) => previous && ({ projects: previous.projects.filter(project => project.id !== id) }));
-      client.removeQueries({ queryKey: detailKey });
-    } catch { /* transport failure already toasted by the global handler */ }
-    finally { await queryManager.keys(client, listKey); }
+    saveFieldsMut.mutate({ id: project.id, patch });
   };
+
+  const deleteProjectMut = useMutation({
+    mutationFn: (id: string) => builderApi.deleteProject(id),
+    // Invalidate on both legs: a failed delete must not leave the list stale.
+    onSuccess: () => { void queryManager.invalidate(client, projectsOptions().queryKey); },
+    onError: () => { void queryManager.invalidate(client, projectsOptions().queryKey); },
+  });
+  const deleteProject = (id: string) => { if (token) deleteProjectMut.mutate(id); };
 
   const backToList = useCallback(() => {
     followRef.current?.abort(); followRef.current = null;
     projectIdRef.current = null;
     setProject(null); setSections([]); setIsGenerating(false);
-    if (token) void queryManager.keys(client, projectsOptions().queryKey);
+    if (token) void queryManager.invalidate(client, projectsOptions().queryKey);
   }, [token]);
 
   const refresh = useCallback(async () => {
@@ -372,18 +423,21 @@ export const SongBuilder: React.FC = () => {
     setProject(v.project); setSections(v.sections);
   }, []);
 
-  /** Run a section edit. A 409 (changed in another tab, or a candidate that
-   *  is no longer there) reloads the project rather than overwriting it. */
-  const runOp = useCallback(async (op: () => Promise<{ project: BuilderProject; sections: BuilderSection[] }>, what: string) => {
-    try { applyView(await op()); return true; }
-    catch (e: any) {
-      if (e instanceof ApiError && e.status === 409) {
+  /** Shared by the section ops below. A 409 (changed in another tab, or a
+   *  candidate that is no longer there) reloads the project rather than
+   *  overwriting it. The calls are silent: this handler owns the failure
+   *  display — the 409 branch reports and reloads, everything else gets the
+   *  prefixed line — so a transport toast would be a second copy of the same
+   *  error. Each call site supplies its own onSuccess (applyView + side effect). */
+  const sectionOpMut = useMutation({
+    mutationFn: ({ op }: { op: () => Promise<{ project: BuilderProject; sections: BuilderSection[] }>; what: string }) => op(),
+    onError: async (e: any, { what }) => {
+      if (e instanceof ApiError && e.status === HttpStatus.conflict) {
         showToast(`${e.message} Reloaded.`);
         await refresh().catch(() => {});
       } else showToast(`${what}: ${e.message}`);
-      return false;
-    }
-  }, [applyView, refresh]);
+    },
+  });
 
   const stopFollowing = useCallback(() => {
     followRef.current?.abort(); followRef.current = null;
@@ -395,76 +449,83 @@ export const SongBuilder: React.FC = () => {
   // ── Generate the next section ──
   // Node works out the geometry, request and variants from the stored project
   // plus this captured composer state (server/src/services/songBuilder/sectionOps.ts).
-  const handleGenerate = useCallback(async () => {
-    if (!token || !project) return;
-    if (direction !== 'first' && !headSong) { showToast('Choose a section first to extend from'); return; }
-
-    setIsGenerating(true);
-    setGenProgress(0);
-    setGenStage('Queued…');
-    const engineParams: Record<string, unknown> = { ...gp.getGlobalParams() };
-    if (typeof engineParams.generationTimeoutMinutes !== 'number') engineParams.generationTimeoutMinutes = getGenerationTimeoutMinutes();
-    // "Keep Models in VRAM" is respected, never forced (see sectionOps.ts).
-    const coResident = (() => {
-      try { return JSON.parse(localStorage.getItem('ace-settings') || '{}').coResident === true; }
-      catch { return false; }
-    })();
-    try {
-      const v = await builderApi.generateSection(project.id, {
+  const generateMut = useMutation({
+    mutationFn: ({ projectId, revision }: { projectId: string; revision: number }) => {
+      const engineParams: Record<string, unknown> = { ...gp.getGlobalParams() };
+      if (typeof engineParams.generationTimeoutMinutes !== 'number') engineParams.generationTimeoutMinutes = getGenerationTimeoutMinutes();
+      // "Keep Models in VRAM" is respected, never forced (see sectionOps.ts).
+      const coResident = (() => {
+        try { return JSON.parse(localStorage.getItem('ace-settings') || '{}').coResident === true; }
+        catch { return false; }
+      })();
+      return builderApi.generateSection(projectId, {
         idempotencyKey: crypto.randomUUID(),
-        expectedRevision: project.revision,
+        expectedRevision: revision,
         expectedBackend: useBackendStore.getState().activeBackendId,
         direction, label: nextLabel, lyrics: nextLyrics,
         length: lengthMode === 'bars' && bpm > 0 ? { bars: nextBars } : { seconds: nextLength },
         overlap: transitionOverlap, clipPoint, seedSectionId, seedStrength, previewMastering, coResident,
         headDuration: effHeadDuration > 0 ? effHeadDuration : undefined,
         engineParams,
-      });
-      applyView(v);
-      followSection(project.id, v.jobId);
-    } catch (e: any) {
+      }, { silent: true });
+    },
+    onMutate: () => { setIsGenerating(true); setGenProgress(0); setGenStage('Queued…'); },
+    onSuccess: (v, { projectId }) => { applyView(v); followSection(projectId, v.jobId); },
+    onError: async (e: any) => {
       setIsGenerating(false); setGenStage('');
-      if (e instanceof ApiError && e.status === 409) {
+      if (e instanceof ApiError && e.status === HttpStatus.conflict) {
         showToast(`${e.message} Reloaded.`);
         await refresh().catch(() => {});
       } else showToast(`Generation failed: ${e.message}`);
-    }
-  }, [token, project, direction, headSong, effHeadDuration, gp, nextLabel, nextLyrics, lengthMode, bpm, nextBars, nextLength, previewMastering, transitionOverlap, clipPoint, seedSectionId, seedStrength, applyView, followSection, refresh]);
+    },
+  });
+  const handleGenerate = () => {
+    if (!token || !project) return;
+    if (direction !== 'first' && !headSong) { showToast('Choose a section first to extend from'); return; }
+    generateMut.mutate({ projectId: project.id, revision: project.revision });
+  };
 
   // ── Choose a variant for a section ──
   // The server stops the section's remaining variants and fills the project's
   // auto BPM/key from the pick, so later sections inherit a real tempo.
-  const chooseVariant = useCallback(async (sectionId: string, song: Song) => {
+  const chooseVariant = (sectionId: string, song: Song) => {
     if (!token || !project) return;
     if (sectionId === activeSection?.id) stopFollowing();
-    if (await runOp(() => builderApi.chooseCandidate(sectionId, song.id, project.revision), 'Could not select')) {
-      // Advance composer: default to appending the next section.
-      setDirection('append');
-      setNextLabel('Verse');
-      setNextLyrics('');
-    }
-  }, [token, project, activeSection, stopFollowing, runOp]);
+    sectionOpMut.mutate(
+      { op: () => builderApi.chooseCandidate(sectionId, song.id, project.revision, { silent: true }), what: 'Could not select' },
+      { onSuccess: v => {
+        applyView(v);
+        // Advance composer: default to appending the next section.
+        setDirection('append');
+        setNextLabel('Verse');
+        setNextLyrics('');
+      } });
+  };
 
-  const deleteSection = useCallback(async (sectionId: string) => {
+  const deleteSection = (sectionId: string) => {
     if (!token || !project) return;
     // Deleting the section mid-generation stops its renders too (server side).
     if (sectionId === activeSection?.id) stopFollowing();
-    await runOp(() => builderApi.deleteSection(sectionId, project.revision), 'Delete failed');
-  }, [token, project, activeSection, stopFollowing, runOp]);
+    sectionOpMut.mutate(
+      { op: () => builderApi.deleteSection(sectionId, project.revision, { silent: true }), what: 'Delete failed' },
+      { onSuccess: v => applyView(v) });
+  };
 
   // Stop the remaining variants but keep the options that already finished,
   // finalizing the section so the user can pick from what arrived.
-  const stopGenerating = useCallback(async (sectionId: string) => {
+  const stopGenerating = (sectionId: string) => {
     if (!token || !project) return;
     stopFollowing();
-    await runOp(() => builderApi.stopSection(sectionId, project.revision), 'Stop failed');
-  }, [token, project, stopFollowing, runOp]);
+    sectionOpMut.mutate(
+      { op: () => builderApi.stopSection(sectionId, project.revision, { silent: true }), what: 'Stop failed' },
+      { onSuccess: v => applyView(v) });
+  };
 
   // The composer's Cancel: the same as Stop on the section being generated.
-  const cancelGen = useCallback(() => {
-    if (activeSection?.status === 'generating') void stopGenerating(activeSection.id);
+  const cancelGen = () => {
+    if (activeSection?.status === 'generating') stopGenerating(activeSection.id);
     else stopFollowing();
-  }, [activeSection, stopGenerating, stopFollowing]);
+  };
 
   // ── Edit a committed section's lyrics (e.g. correct lines the DiT altered) ──
   const openLyricEditor = useCallback((s: BuilderSection) => {
@@ -472,12 +533,12 @@ export const SongBuilder: React.FC = () => {
     setEditLabel(s.label || '');
     setEditLyrics(s.lyrics || '');
   }, []);
-  const saveLyricEdit = useCallback(async () => {
+  const saveLyricEdit = () => {
     if (!token || !project || !editingSectionId) return;
-    if (await runOp(() => builderApi.editSection(editingSectionId, { label: editLabel, lyrics: editLyrics }, project.revision), 'Save failed')) {
-      setEditingSectionId(null);
-    }
-  }, [token, project, editingSectionId, editLabel, editLyrics, runOp]);
+    sectionOpMut.mutate(
+      { op: () => builderApi.editSection(editingSectionId, { label: editLabel, lyrics: editLyrics }, project.revision, { silent: true }), what: 'Save failed' },
+      { onSuccess: v => { applyView(v); setEditingSectionId(null); } });
+  };
 
   // ── Render: project list (no project open) ──
   if (!project) {
@@ -555,9 +616,10 @@ export const SongBuilder: React.FC = () => {
               </div>
               <button
                 onClick={createProject}
-                className="w-full px-3 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium flex items-center justify-center gap-2 transition-colors"
+                disabled={createMut.isPending}
+                className="w-full px-3 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
               >
-                <Plus size={16} /> Start building
+                {createMut.isPending ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} Start building
               </button>
             </div>
           </div>
@@ -581,8 +643,8 @@ export const SongBuilder: React.FC = () => {
                   </div>
                   <span className="text-[11px] text-zinc-600">{p.section_count ?? 0} section{(p.section_count ?? 0) === 1 ? '' : 's'}</span>
                   <Trash2
-                    size={14} className="text-zinc-600 hover:text-red-400"
-                    onClick={e => { e.stopPropagation(); void deleteProject(p.id); }}
+                    size={14} className={`text-zinc-600 hover:text-red-400${deleteProjectMut.isPending && deleteProjectMut.variables === p.id ? ' opacity-40' : ''}`}
+                    onClick={e => { e.stopPropagation(); if (deleteProjectMut.isPending) return; deleteProject(p.id); }}
                   />
                 </button>
               ))}
@@ -628,6 +690,7 @@ export const SongBuilder: React.FC = () => {
               />
               <input
                 value={project.style || ''}
+                disabled={saveFieldsMut.isPending}
                 onChange={e => setProject(prev => prev ? { ...prev, style: e.target.value } : prev)}
                 onBlur={e => saveProjectFields({ style: e.target.value })}
                 placeholder="Style / caption"
@@ -644,6 +707,7 @@ export const SongBuilder: React.FC = () => {
               <input
                 type="number" min={0} max={300}
                 value={project.bpm || ''} placeholder="Auto"
+                disabled={saveFieldsMut.isPending}
                 onChange={e => setProject(prev => prev ? { ...prev, bpm: parseInt(e.target.value, 10) || 0 } : prev)}
                 onBlur={e => saveProjectFields({ bpm: parseInt(e.target.value, 10) || 0 })}
                 className="w-full px-2 py-1.5 rounded-lg bg-black/20 border border-white/10 text-sm text-white placeholder-zinc-600 focus:outline-none focus:border-violet-500"
@@ -658,6 +722,7 @@ export const SongBuilder: React.FC = () => {
               <StyledSelect
                 accent="violet"
                 value={project.key_scale || ''}
+                disabled={saveFieldsMut.isPending}
                 onChange={v => saveProjectFields({ keyScale: v })}
                 options={KEY_SIGNATURES.map(k => ({ value: k, label: k || 'Auto' }))}
                 className="w-full"
@@ -672,6 +737,7 @@ export const SongBuilder: React.FC = () => {
               <StyledSelect
                 accent="violet"
                 value={project.time_signature || ''}
+                disabled={saveFieldsMut.isPending}
                 onChange={v => saveProjectFields({ timeSignature: v })}
                 options={TIME_SIGNATURES.map(t => ({ value: t, label: t || 'Auto' }))}
                 className="w-full"

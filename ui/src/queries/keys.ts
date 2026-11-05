@@ -21,7 +21,7 @@
 import type { QueryClient, QueryKey } from '@tanstack/react-query';
 import { apiClient } from '../services/httpClient';
 
-export type Area = 'training-data' | 'training-runs' | 'global-models' | 'cover-lyrics' | 'studios' | 'shell-queue';
+export type Area = 'training-data' | 'training-runs' | 'global-models' | 'cover-lyrics' | 'studios' | 'shell-queue' | 'compare';
 
 /** Resources more than one area reads. Any area may query one directly with
  *  its canonical key and canonical read below, so no area waits on another's
@@ -43,6 +43,8 @@ export const SHARED = {
   loadedModels: 'loaded-models',
   /** `settingsApi.getGpus()`: raw `GpusResponse`. Owner: shell-queue. */
   gpus: 'gpus',
+  /** `settingsApi.getEngineWorkers()`: raw `EngineWorkersResponse`. Owner: shell-queue. */
+  engineWorkers: 'engine-workers',
   /** `adapterApi.scan(folder)`, filters `{ folder }`: a read-only POST, raw
    *  response. Owner: global-models. */
   adapterScan: 'adapter-scan',
@@ -86,6 +88,8 @@ export interface KeyScope {
   worker?: string | null;
   backend?: string;
 }
+/** A training target captured in a key: a worker name, or null for this PC. */
+export type Worker = string | null;
 export type Filters = Record<string, unknown>;
 export type ServerKey = readonly ['hs', Resource, KeyScope, string | number | null, Filters];
 
@@ -155,6 +159,13 @@ export function scopeOf(key: QueryKey): KeyScope | undefined {
   return key[0] === 'hs' && key[2] && typeof key[2] === 'object' ? key[2] as KeyScope : undefined;
 }
 
+/** Re-point a key at another id while keeping its resource, scope and filters.
+ *  Used when a write returns a session/snapshot under a new id: the entry
+ *  belongs in the same scope, so callers never splice a tuple by position. */
+export function withKeyId(key: QueryKey, id: string | number | null): QueryKey {
+  return [key[0], key[1], key[2], id, key[4]];
+}
+
 // ── Shared resource keys ─────────────────────────────────────────────────
 
 export const sharedKeys = {
@@ -165,6 +176,7 @@ export const sharedKeys = {
   vram: () => serverKey(SHARED.vram),
   loadedModels: () => serverKey(SHARED.loadedModels),
   gpus: () => serverKey(SHARED.gpus),
+  engineWorkers: () => serverKey(SHARED.engineWorkers),
   adapterScan: (folder: string) => serverKey(SHARED.adapterScan, { filters: { folder } }),
   browse: (dir: string, filter?: string) => serverKey(SHARED.browse, { filters: { dir, filter } }),
   workflowJob: (id: string, after = 0) => serverKey(SHARED.workflowJob, { auth: true, id, filters: { after } }),
@@ -185,7 +197,3 @@ export const SONG_VIEWS: QueryKey[] = [
   resourceKey(SHARED.songs), resourceKey(SHARED.song), resourceKey('shell-queue/recent-songs'),
   resourceKey('studios/recent-songs'), resourceKey('cover-lyrics/cover-songs'),
 ];
-
-/** P2.4: invalidation moved to the one global manager (invalidation.ts);
- *  these re-exports keep existing importers compiling until P6 deletes them. */
-export { invalidateSidecars, invalidateSongViews } from './invalidation';

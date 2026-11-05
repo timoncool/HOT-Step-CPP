@@ -8,7 +8,7 @@
 
 import React, { useState, useRef } from 'react';
 import ReactDOM from 'react-dom';
-import { useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X, Image as ImageIcon, Loader2, Save } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { Song } from '../../types';
@@ -58,23 +58,13 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
 
   const queryClient = useQueryClient();
   const { mutate: uploadCover, isPending: uploading } = useUpload<{ cover_url?: string }>();
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const handleCoverFile = (file: File) => {
-    setError('');
-    uploadCover({
-      path: '/upload/cover-image',
-      files: [{ field: 'image', file }],
-      onSuccess: d => { if (d.cover_url) setCoverUrl(d.cover_url); },
-      onError: e => setError(e instanceof Error && e.message ? e.message : 'Cover upload failed'),
-    });
-  };
-
-  const handleSave = async () => {
-    setSaving(true); setError('');
-    try {
+  // Save and the cover upload both fail through the transport's one notifier
+  // (the interceptor toasts command failures), so the modal keeps no error
+  // state of its own — an inline copy of the same message was a double toast.
+  const saveMut = useMutation({
+    mutationFn: async () => {
       const payload: any = {
         title,
         caption: genre,
@@ -89,12 +79,20 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
           comment: comment.trim() || undefined,
         },
       };
-      const { song: updated } = await writeAndInvalidate(queryClient, () => songApi.update(song.id, payload), events('song:written'));
-      onSaved(updated);
-      onClose();
-    } catch (e: any) {
-      setError(e.message || 'Save failed');
-    } finally { setSaving(false); }
+      return writeAndInvalidate(queryClient, () => songApi.update(song.id, payload), events('song:written'));
+    },
+    onSuccess: ({ song: updated }) => { onSaved(updated); onClose(); },
+  });
+  // Named zero-arg handler so the button can pass it straight to onClick —
+  // mutate itself takes `void` variables, which a click event is not.
+  const save = () => saveMut.mutate();
+
+  const handleCoverFile = (file: File) => {
+    uploadCover({
+      path: '/upload/cover-image',
+      files: [{ field: 'image', file }],
+      onSuccess: d => { if (d.cover_url) setCoverUrl(d.cover_url); },
+    });
   };
 
   return ReactDOM.createPortal(
@@ -168,8 +166,6 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
               className="w-full text-sm rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-white/10 px-3 py-2 text-zinc-800 dark:text-zinc-200 outline-none focus:border-cyan-500 resize-y"
             />
           </div>
-
-          {error && <p className="text-xs text-red-400">{error}</p>}
         </div>
 
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-zinc-200 dark:border-white/10">
@@ -177,11 +173,11 @@ export const MetadataEditorModal: React.FC<MetadataEditorModalProps> = ({ song, 
             {t('common.cancel', 'Cancel')}
           </button>
           <button
-            onClick={handleSave}
-            disabled={saving || uploading}
+            onClick={save}
+            disabled={saveMut.isPending || uploading}
             className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold bg-cyan-500 hover:bg-cyan-400 text-white transition-colors disabled:opacity-50"
           >
-            {saving ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+            {saveMut.isPending ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
             {t('common.save', 'Save')}
           </button>
         </div>

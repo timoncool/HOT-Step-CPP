@@ -3,13 +3,11 @@
 // Pick a folder, name it, choose a trigger word. The scan preview is a
 // read-only look at what the server found on disk before anything is created.
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, FolderOpen, Info, Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { hashKey, type QueryKey } from '@tanstack/react-query';
-import type { ScanPreview } from '../../services/trainingApi';
-import { queryClient } from '../../queries/client';
+import { useQuery } from '@tanstack/react-query';
 import { trainingQueries as tq } from '../../queries/training-data/queries';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
@@ -40,6 +38,7 @@ const SCAN_DEBOUNCE_MS = 400;
 export const NewDatasetWizard: React.FC<NewDatasetWizardProps> = ({ open, onClose }) => {
   const { t } = useTranslation();
   const createDataset = useTrainingStore(s => s.createDataset);
+  const worker = useTrainingStore(s => s.trainingWorker);
 
   const [sourceDir, setSourceDir] = useState('');
   const [recursive, setRecursive] = useState(true);
@@ -49,52 +48,41 @@ export const NewDatasetWizard: React.FC<NewDatasetWizardProps> = ({ open, onClos
   const [customTag, setCustomTag] = useState('');
   const [language, setLanguage] = useState('en');
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [preview, setPreview] = useState<ScanPreview | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [scanError, setScanError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
-  // Reset each time the modal is opened fresh.
+  // Reset each time the modal is opened fresh. (The scan preview below is
+  // derived from sourceDir, so clearing it clears the preview too.)
   useEffect(() => {
     if (!open) return;
     setSourceDir(''); setRecursive(true); setName(''); setNameTouched(false); setTriggerTouched(false);
-    setCustomTag(''); setLanguage('en'); setPreview(null); setScanError(null); setCreateError(null);
+    setCustomTag(''); setLanguage('en'); setCreateError(null);
   }, [open]);
 
-  // Monotonic request id — a slow scan of an earlier prefix must never overwrite
-  // the preview for the path the user actually settled on.
-  // The superseded scan is cancelled as well as ignored.
-  const scanSeq = useRef(0);
-  const scanKey = useRef<QueryKey | null>(null);
-
-  const runScan = useCallback(async (dir: string, rec: boolean) => {
-    if (!dir) return;
-    const seq = ++scanSeq.current;
-    const options = tq.scanPreview(useTrainingStore.getState().trainingWorker, dir, rec);
-    // A repeat of the same request joins it instead.
-    if (scanKey.current && hashKey(scanKey.current) !== hashKey(options.queryKey)) void queryClient.cancelQueries({ queryKey: scanKey.current, exact: true });
-    scanKey.current = options.queryKey;
-    setScanning(true);
-    setScanError(null);
-    try {
-      const result = await queryClient.query(options);
-      if (seq !== scanSeq.current) return;
-      setPreview(result);
-    } catch (err) {
-      if (seq !== scanSeq.current) return;
-      setPreview(null);
-      setScanError(err instanceof Error ? err.message : 'Scan failed');
-    } finally {
-      if (seq === scanSeq.current) setScanning(false);
-    }
-  }, []);
-
+  // The path field is free text; scan only the settled value, not every
+  // keystroke. Debouncing here (not inside the query) keeps useQuery's key
+  // stable per edit-burst, so a slow scan of an earlier prefix can never land
+  // over the one the user stopped on — each dir is its own cache entry.
+  const [scanDir, setScanDir] = useState('');
   useEffect(() => {
-    if (!sourceDir) return;
-    const handle = window.setTimeout(() => void runScan(sourceDir, recursive), SCAN_DEBOUNCE_MS);
+    if (!sourceDir) return; // cleared path → the query disables via `enabled` below
+    const handle = window.setTimeout(() => setScanDir(sourceDir), SCAN_DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
-  }, [sourceDir, recursive, runScan]);
+  }, [sourceDir]);
+
+  const scanQuery = useQuery({
+    ...tq.scanPreview(worker, scanDir, recursive),
+    // Never scan an empty or not-yet-settled path; a cleared field disables it.
+    enabled: open && sourceDir !== '' && scanDir !== '',
+  });
+  const showScan = sourceDir !== '';
+  const preview = showScan ? (scanQuery.data ?? null) : null;
+  // Spinner only while a not-yet-cached path is scanning (a cached revisit
+  // shows instantly and refetches in the background).
+  const scanning = showScan && scanQuery.isFetching && !scanQuery.data;
+  const scanError = showScan && scanQuery.error
+    ? (scanQuery.error instanceof Error ? scanQuery.error.message : 'Scan failed')
+    : null;
 
   if (!open) return null;
 

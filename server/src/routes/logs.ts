@@ -4,9 +4,12 @@
 // SSE endpoint streams them to the UI in real time.
 // VRAM endpoint proxies to ace-server's GET /vram.
 
+import os from 'node:os';
 import { Router, Request, Response } from 'express';
 import { config } from '../config.js';
 import { countPresence } from './health.js';
+import type { ReportLogsResponse } from '../contracts/reportLogs.js';
+import { currentWorker } from '../services/engineWorkers.js';
 
 const router = Router();
 
@@ -17,6 +20,8 @@ export interface LogLine {
   ts: number;     // epoch ms
   text: string;
   source: 'engine' | 'server';
+  /** Engine worker that printed it; absent for the primary (w0) and the server. */
+  worker?: string;
 }
 
 const MAX_LINES = 2000;
@@ -32,11 +37,12 @@ const ENGINE_NOISE = [
 ];
 
 /** Push a log line into the buffer and notify SSE subscribers */
-export function pushLog(text: string, source: 'engine' | 'server' = 'server'): void {
+export function pushLog(text: string, source: 'engine' | 'server' = 'server', worker?: string): void {
   // Suppress repetitive engine noise
   if (source === 'engine' && ENGINE_NOISE.some(p => text.includes(p))) return;
 
   const line: LogLine = { id: nextId++, ts: Date.now(), text, source };
+  if (worker) line.worker = worker;
   lines.push(line);
   if (lines.length > MAX_LINES) {
     lines.splice(0, lines.length - MAX_LINES);
@@ -46,10 +52,18 @@ export function pushLog(text: string, source: 'engine' | 'server' = 'server'): v
   }
 }
 
-/** Subscribe to new log lines. Returns unsubscribe function. */
+/** Subscribe to new log lines. Returns unsubscribe function. Engine lines
+ *  arrive only from the worker the subscriber was bound to when it subscribed
+ *  (engineWorkers.runWithWorker), so a job's progress parser never reads
+ *  another card's job; server lines all arrive. */
 export function subscribeLines(cb: (line: LogLine) => void): () => void {
-  subscribers.add(cb);
-  return () => { subscribers.delete(cb); };
+  const worker = currentWorker();
+  const own = worker.primary ? undefined : worker.id;
+  const filtered = (line: LogLine) => {
+    if (line.source !== 'engine' || line.worker === own) cb(line);
+  };
+  subscribers.add(filtered);
+  return () => { subscribers.delete(filtered); };
 }
 
 // ── SSE endpoint: GET /api/logs ───────────────────────────────────────
@@ -98,6 +112,16 @@ router.get('/', (req: Request, res: Response) => {
     clearInterval(keepalive);
     subscribers.delete(onLine);
   });
+});
+
+// ── Snapshot for the issue reporter: GET /api/logs/snapshot ───────────
+// The ring buffer's lines split by source, plus the names the UI must redact.
+router.get('/snapshot', (_req: Request, res: Response) => {
+  const by = (source: LogLine['source']) => lines.filter(l => l.source === source).map(l => l.text);
+  let user = '';
+  try { user = os.userInfo().username; } catch { /* no passwd entry; the path rules still apply */ }
+  const body: ReportLogsResponse = { server: by('server'), engine: by('engine'), home: os.homedir(), user };
+  res.json(body);
 });
 
 // ── VRAM proxy: GET /api/logs/vram ────────────────────────────────────

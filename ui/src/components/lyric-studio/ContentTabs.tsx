@@ -1,7 +1,8 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { FileText, Users, Music2, Headphones } from 'lucide-react';
 
-export type TabId = 'source-lyrics' | 'profiles' | 'written-songs' | 'recordings';
+export type TabId = 'source-lyrics' | 'profiles' | 'write-lyrics' | 'written-songs' | 'recordings';
 
 interface Tab {
   id: TabId;
@@ -23,9 +24,11 @@ interface ContentTabsProps {
 export const ContentTabs: React.FC<ContentTabsProps> = ({
   activeTab, onTabChange, sourceLyricsCount, profilesCount, writtenSongsCount, recordingsCount, children,
 }) => {
+  const { t } = useTranslation();
   const tabs: Tab[] = [
     { id: 'source-lyrics', label: 'Source Lyrics', icon: <FileText className="w-4 h-4" />, badge: sourceLyricsCount },
     { id: 'profiles', label: 'Profiles', icon: <Users className="w-4 h-4" />, badge: profilesCount },
+    { id: 'write-lyrics', label: t('lyric.scratch.tab', 'Write Lyrics'), icon: <FileText className="w-4 h-4" /> },
     { id: 'written-songs', label: 'Generated Lyrics', icon: <Music2 className="w-4 h-4" />, badge: writtenSongsCount },
     { id: 'recordings', label: 'Generated Songs', icon: <Headphones className="w-4 h-4" />, badge: recordingsCount },
   ];
@@ -40,6 +43,8 @@ export const ContentTabs: React.FC<ContentTabsProps> = ({
             return (
               <button
                 key={tab.id}
+                title={tab.label}
+                aria-label={tab.label}
                 onClick={() => onTabChange(tab.id)}
                 className={`flex items-center gap-2 px-4 py-3 text-sm font-medium transition-all border-b-2 flex-shrink-0 ${
                   isActive

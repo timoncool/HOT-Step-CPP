@@ -1,5 +1,5 @@
-import { useQuery } from '@tanstack/react-query';
-import { modelsOptions } from '../../queries/studios/shared';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { modelsOptions, songsOptions } from '../../queries/studios/shared';
 // StemBuilder.tsx — Main Stem Builder orchestrator
 //
 // Lego mode UI: generates new instrument tracks layered over backing audio.
@@ -34,6 +34,7 @@ import { ParamLabel } from '../shared/ParamLabel';
 import { BackendCapabilityGate } from '../shared/BackendCapabilityGate';
 import { InlineAudioQueue } from '../lyric-studio/InlineAudioQueue';
 import { useAudioGenQueueSelector } from '../../stores/audioGenQueueStore';
+import { queryManager } from '../../queries/invalidation';
 
 /** Filter DiT model list to only pure base models (no merge/sft/turbo) */
 function getBaseModels(ditModels: string[]): string[] {
@@ -99,11 +100,16 @@ export const StemBuilder: React.FC = () => {
 
   // ── Sidebar ──
   const [sidebarWidth, setSidebarWidth] = usePersistedState('hs-activitySidebarWidth', 320);
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
   const queueCount = useAudioGenQueueSelector(s =>
     s.items.filter(i => i.status === 'pending' || i.status === 'loading-adapter' || i.status === 'generating').length
   );
   const completionCounter = useAudioGenQueueSelector(s => s.completionCounter);
+  const client = useQueryClient();
+  // Queue completions are written by the shell, not by this page; refresh the
+  // shared song feed when one lands so a finished layer appears in Recent.
+  useEffect(() => {
+    if (completionCounter) void queryManager.invalidate(client, songsOptions().queryKey);
+  }, [client, completionCounter]);
 
   // ── Toast ──
   const [toast, setToast] = useState('');
@@ -128,7 +134,7 @@ export const StemBuilder: React.FC = () => {
         if (!mounted) return;
         const captured = job.input as { source?: SourceRef; trackName?: string; caption?: string };
         const audioUrl = result.audio?.audioUrls?.[0];
-        setRefreshTrigger(p => p + 1);
+        void queryManager.invalidate(client, songsOptions().queryKey);
         if (audioUrl && captured.source?.expectedUrl === sourceUrlRef.current) {
           setLayers(prev => [...prev, { trackName: captured.trackName || 'stem', caption: captured.caption || '',
             audioUrl, songId: result.audio?.songIds?.[0], timestamp: Date.now() }]);
@@ -142,7 +148,7 @@ export const StemBuilder: React.FC = () => {
         if (mounted) { setIsGenerating(false); setActiveJobId(null); }
       });
     return () => { mounted = false; observation.abort(); };
-  }, [token]);
+  }, [token, client]);
 
   // ── Persist model ──
   useEffect(() => {
@@ -246,7 +252,7 @@ export const StemBuilder: React.FC = () => {
       const result = await followStudioRender(job.id, stage => setGenStage(stage));
       const audio = result.audio || {};
       setGenStage('Complete!');
-      setRefreshTrigger(p => p + 1);
+      void queryManager.invalidate(client, songsOptions().queryKey);
       const audioUrl = audio.audioUrls?.[0] || '';
       if (audioUrl && sourceUrlRef.current === sourceAudioUrl) {
         setLayers(prev => [...prev, {
@@ -318,7 +324,7 @@ export const StemBuilder: React.FC = () => {
       )}
 
       {/* Narrow/portrait pane switcher — rendered below 1024px and on portrait >= 1024px */}
-      <div className="max-[1023px]:flex min-[1024px]:hidden portrait-wide:flex flex-shrink-0 border-b border-zinc-200 dark:border-white/5">
+      <div className="max-[1279px]:flex min-[1280px]:hidden portrait-wide:flex flex-shrink-0 border-b border-zinc-200 dark:border-white/5">
         {(['source', 'build', 'recent'] as const).map(pane => (
           <button
             key={pane}
@@ -337,7 +343,7 @@ export const StemBuilder: React.FC = () => {
 
       <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Left — Source Audio + Track Picker */}
-        <div className={`flex flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-shrink-0 ${!isPortrait ? 'min-[1024px]:w-[300px] min-[1024px]:flex' : ''} ${narrowPane === 'source' ? 'flex w-full min-w-0' : 'hidden'}`}>
+        <div className={`flex flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-shrink-0 ${!isPortrait ? 'min-[1280px]:w-[280px] min-[1280px]:min-w-[200px] min-[1280px]:shrink min-[1280px]:flex' : ''} ${narrowPane === 'source' ? 'flex w-full min-w-0' : 'hidden'}`}>
           {/* Source Audio Upload */}
           <div>
             <div className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">
@@ -446,7 +452,7 @@ export const StemBuilder: React.FC = () => {
         </div>
 
         {/* Center — Generate Button + Progress + Layer Stack */}
-        <div className={`flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-1 min-w-0 ${!isPortrait ? 'min-[1024px]:flex' : ''} ${narrowPane === 'build' ? 'flex' : 'hidden'}`}>
+        <div className={`flex-col gap-4 p-4 overflow-y-auto border-r border-zinc-200 dark:border-white/5 flex-1 min-w-0 ${!isPortrait ? 'min-[1280px]:flex min-[1280px]:min-w-[220px]' : ''} ${narrowPane === 'build' ? 'flex' : 'hidden'}`}>
           {/* Generate / Cancel */}
           <div className="flex gap-2">
             <button
@@ -545,7 +551,7 @@ export const StemBuilder: React.FC = () => {
 
         {/* Resize handle — hidden on narrow screens */}
         <div
-          className={`${isPortrait ? 'hidden' : 'max-[1023px]:hidden'} flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-amber-500/20 active:bg-amber-500/30 transition-colors`}
+          className={`${isPortrait ? 'hidden' : 'max-[1279px]:hidden'} flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-amber-500/20 active:bg-amber-500/30 transition-colors`}
           onMouseDown={handleSidebarResize}
         >
           <div className="w-0.5 h-8 rounded-full bg-zinc-600 group-hover:bg-amber-400 transition-colors" />
@@ -553,7 +559,7 @@ export const StemBuilder: React.FC = () => {
 
         {/* Right — Recent Builds + Queue */}
         <div
-          className={`h-full flex-shrink-0 border-l border-zinc-200 dark:border-white/5 overflow-hidden flex-col ${!isPortrait ? 'min-[1024px]:flex' : ''} max-[1023px]:!w-full ${narrowPane === 'recent' ? 'flex' : 'hidden'}`}
+          className={`h-full flex-shrink-0 border-l border-zinc-200 dark:border-white/5 overflow-hidden flex-col ${!isPortrait ? 'min-[1280px]:flex min-[1280px]:max-w-[220px]' : ''} max-[1279px]:!w-full ${narrowPane === 'recent' ? 'flex' : 'hidden'}`}
           style={{ width: sidebarWidth }}
         >
           <Section
@@ -562,7 +568,6 @@ export const StemBuilder: React.FC = () => {
             defaultOpen={true}
           >
             <RecentBuilds
-              refreshTrigger={refreshTrigger + completionCounter}
               onPlay={handlePlayRecent}
               onUseAsSource={handleUseRecentAsSource}
             />

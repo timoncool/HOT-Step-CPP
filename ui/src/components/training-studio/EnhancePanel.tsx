@@ -4,9 +4,10 @@
 // when its capability is missing — nothing leaves the machine unless pressed.
 
 import React, { useState } from 'react';
-import { ChevronDown, ChevronRight, Cloud, Loader2, Sparkles } from 'lucide-react';
+import { ChevronDown, ChevronRight, Cloud, ListChecks, Loader2, Sparkles } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { StyledSelect } from '../shared/StyledSelect';
+import { Toggle } from '../shared/Toggle';
 import { useTrainingStore } from '../../stores/trainingStore';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
@@ -24,11 +25,15 @@ export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, d
   const { t } = useTranslation();
   const caps = useTrainingStore(s => s.capabilities);
   const startGenius = useTrainingStore(s => s.startGenius);
+  const startNormaliseLyrics = useTrainingStore(s => s.startNormaliseLyrics);
   const startCaption = useTrainingStore(s => s.startCaption);
   const startYue2Caption = useTrainingStore(s => s.startYue2Caption);
 
   const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState<'genius' | 'caption' | 'yue2' | null>(null);
+  const [busy, setBusy] = useState<'genius' | 'caption' | 'yue2' | 'normalise' | null>(null);
+  // Untagged lyrics get sections from the audio (Music Flamingo) — needs the card.
+  const [retag, setRetag] = useState(true);
+  const flamingoOk = !!caps?.flamingo?.available;
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
 
@@ -43,18 +48,29 @@ export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, d
   const mossProvider = caps?.moss.available
     ? { id: 'moss', name: 'MOSS-Music 8B — local, hears the audio', available: true, models: [] as string[], defaultModel: '' }
     : null;
+  const flamingoProvider = caps?.flamingo?.available
+    ? { id: 'flamingo', name: 'Music Flamingo — local, hears the audio', available: true, models: [] as string[], defaultModel: '' }
+    : null;
   const providers = [
     ...(mossProvider ? [mossProvider] : []),
+    ...(flamingoProvider ? [flamingoProvider] : []),
     ...(caps?.llm.providers.filter(p => p.available) ?? []),
   ];
   const activeProvider = providers.find(p => p.id === (provider || caps?.llm.defaultProvider)) ?? providers[0];
-  const isMoss = activeProvider?.id === 'moss';
+  // "Moss" here means any local audio model: same card needs, no model list,
+  // no text-only modes.
+  const isMoss = activeProvider?.id === 'moss' || activeProvider?.id === 'flamingo';
 
   const scoped = selectedSampleIds.length > 0 ? { sampleIds: selectedSampleIds } : {};
 
   const runGenius = async () => {
     setBusy('genius');
     try { await startGenius({ ...scoped }); } finally { setBusy(null); }
+  };
+
+  const runNormalise = async () => {
+    setBusy('normalise');
+    try { await startNormaliseLyrics({ ...scoped, retag: retag && flamingoOk }); } finally { setBusy(null); }
   };
 
   const runCaption = async () => {
@@ -97,6 +113,29 @@ export const EnhancePanel: React.FC<EnhancePanelProps> = ({ selectedSampleIds, d
       {open && (
         <div className="mt-3 flex flex-col gap-4">
           <p className="text-xs text-zinc-600 dark:text-zinc-400">{t('trainingStudio.enhance.subtitle')}</p>
+
+          {/* Lyric tags: one vocabulary for every source */}
+          <div className="flex flex-col gap-1.5">
+            <button
+              onClick={() => void runNormalise()}
+              disabled={disabled || busy !== null || (engineBusy && retag && flamingoOk)}
+              title={engineBusy && retag && flamingoOk ? t('trainingStudio.enhance.normaliseBlocked', 'Recovering sections from audio needs the card, which the running training job owns. Turn it off or wait.') : undefined}
+              className={`${btn} self-start bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 hover:bg-emerald-500/20`}
+            >
+              {busy === 'normalise' ? <Loader2 size={13} className="animate-spin" /> : <ListChecks size={13} />}
+              {t('trainingStudio.enhance.normaliseLyrics', 'Normalise lyric tags')}
+            </button>
+            <span className="text-[11px] text-zinc-500">{t('trainingStudio.enhance.normaliseLyricsHint', 'Rewrites every section tag to [Intro] [Verse] [Pre-Chorus] [Chorus] [Post-Chorus] [Bridge] [Breakdown] [Interlude] [Instrumental] [Outro], unnumbered. Speaker tags and stage directions go; the words stay. Each changed sidecar is backed up first.')}</span>
+            <Toggle
+              accent="amber"
+              checked={retag && flamingoOk}
+              disabled={!flamingoOk}
+              onChange={setRetag}
+              label={t('trainingStudio.enhance.retag', 'Recover missing sections from the audio (Music Flamingo)')}
+              info={t('trainingStudio.enhance.retagInfo', 'For lyrics with no section tags at all: Music Flamingo transcribes the track with tags, the transcript is lined up with your lyrics word by word, and the section starts are copied across. Your words are kept. About 5 seconds a track on the GPU.')}
+              defaultValue={true}
+            />
+          </div>
 
           {/* Genius */}
           <div className="flex flex-col gap-1.5">

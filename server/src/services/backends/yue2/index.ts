@@ -26,10 +26,12 @@ import { isEngineSuspended } from '../../aceEngineProcess.js';
 import { getSetting, setSetting } from '../../../db/lireekDb.js';
 import { listAllYue2Runs, readSafetensorsMeta, type Yue2AdapterMeta } from '../../training/yue2Runs.js';
 import { listAllYue2ArRuns } from '../../training/yue2ArRuns.js';
-import { listAllYue2AitkRuns } from '../../training/yue2AitkRuns.js';
+import { listAllYue2AitkRuns, onYue2AitkSnapshotChange, yue2AitkWeightStamp, type Yue2AitkRunRecord } from '../../training/yue2AitkRuns.js';
+import { listDatasets } from '../../training/datasetsRepo.js';
 import { yue2AdapterTrigger, setYue2ManualTrigger } from './jointAdapterContext.js';
 import { coverScoreChoices, transformCoverScore, type CoverScoreChoices } from './coverScoreTransform.js';
-import { EMPTY_COVER_SCORE_ERROR, hasSoundingVocalBar } from './scoreHealth.js';
+import { EMPTY_COVER_SCORE_ERROR, hasSoundingScore, hasSoundingVocalBar } from './scoreHealth.js';
+import { yue2CoverGuide, type Yue2CoverGuide } from './sourceGuide.js';
 import { runYue2Generation } from './generate.js';
 import {
   yue2Props, yue2PropsCached, yue2SelectModel, yue2Unload, TIMEOUT_DRAIN,
@@ -113,6 +115,30 @@ function yue2Dial(raw: unknown, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+/** The engine's default basin re-base beta (Yue2LmAdapterScales::rebase). */
+export const YUE2_REBASE_DEFAULT = 0.75;
+
+/** A re-base beta the engine accepts: a dial clamped to 0..1. */
+function yue2Rebase(raw: unknown): number {
+  return Math.min(1, yue2Dial(raw, YUE2_REBASE_DEFAULT));
+}
+
+/** A YuE2 LM variant: the LM file's type minus its quant, '' for the base model
+ *  ('q8_0' -> '', 'rs-4.0x0.7-Q6_K' -> 'rs-4.0x0.7'). Mirrors yue2_lm_variant
+ *  in engine/src/yue2/yue2-adapter.h, which decides whether to re-base. */
+export function yue2LmVariant(type: string): string {
+  const t = type.replace(/-imat$/i, '');
+  const dash = t.lastIndexOf('-');
+  return dash < 0 ? '' : t.slice(0, dash);
+}
+
+/** The variant an adapter was trained on, from its base_sha (the training LM's
+ *  path). An adapter recording none predates the variants: the base model. */
+export function yue2AdapterHome(baseSha: string | undefined): string {
+  const m = /^yue2-lm-(.+)\.gguf$/i.exec(path.basename(baseSha ?? ''));
+  return m ? yue2LmVariant(m[1]) : '';
+}
+
 function yue2ReadScales(key: string): Yue2AdapterScales {
   const base = yue2DefaultScales();
   const raw = getSetting(key, '');
@@ -127,6 +153,7 @@ function yue2ReadScales(key: string): Yue2AdapterScales {
       mid: yue2Dial(parsed.mid, base.mid),
       late: yue2Dial(parsed.late, base.late),
       ...(parsed.plan === undefined ? {} : { plan: yue2Dial(parsed.plan, base.global) }),
+      ...(parsed.rebase === undefined ? {} : { rebase: yue2Rebase(parsed.rebase) }),
     };
   } catch {
     return base;
@@ -238,7 +265,9 @@ function yue2AdapterKey(specs: ReadonlyArray<Yue2AdapterRef>, legacy = false): s
   }
   return specs.map(a => `${a.path}@${a.scales.global.toFixed(4)},a${a.scales.attn.toFixed(4)}`
     + `,m${a.scales.mlp.toFixed(4)},e${a.scales.early.toFixed(4)}`
-    + `,i${a.scales.mid.toFixed(4)},l${a.scales.late.toFixed(4)}`).join('; ');
+    + `,i${a.scales.mid.toFixed(4)},l${a.scales.late.toFixed(4)}`
+    // The engine writes re-base only off its default, so older keys stay as they were.
+    + (a.scales.rebase !== undefined && a.scales.rebase !== YUE2_REBASE_DEFAULT ? `,r${a.scales.rebase.toFixed(4)}` : '')).join('; ');
 }
 
 /** Is this engine old enough to predate the group dials?
@@ -320,6 +349,9 @@ export interface Yue2CoverSubmission extends Partial<CoverScoreChoices> {
   sourceLabel?: string;
   /** Reviewed full score, retained beside the score actually rendered. */
   fullScore?: string;
+  /** Follow source: steer the composer with the source recording itself
+   *  (sourceGuide.ts). Absent = the score alone, as before. */
+  guide?: Yue2CoverGuide;
 }
 
 /** Reads the same `yue2Cover` shape back out of envelope.options.yue2 (the
@@ -350,10 +382,13 @@ export function yue2CoverFromSubmission(submission: Readonly<Record<string, unkn
   // Validate marker fields even when this reads an older captured envelope.
   coverScoreChoices(rawChoices as Partial<CoverScoreChoices>);
   const fullScore = typeof r.fullScore === 'string' ? r.fullScore : undefined;
+  const guide = yue2CoverGuide(r.guide);
+  if (guide && sourceKind === 'musicxml') throw new Error('Follow source needs a source recording; a MusicXML cover has none.');
   return { ...(sourceId ? { sourceId } : {}), ...(sourceKind === 'musicxml' ? { sourceKind } : {}),
     ...(sourceLabel ? { sourceLabel } : {}),
     ...rawChoices as Partial<CoverScoreChoices>,
-    ...(fullScore !== undefined ? { fullScore } : {}) };
+    ...(fullScore !== undefined ? { fullScore } : {}),
+    ...(guide ? { guide } : {}) };
 }
 
 /** The persisted selection a cover job's pick is resolved against: same LM
@@ -369,6 +404,10 @@ export function yue2CoverPickBase(persisted: Yue2PersistedSelection): Yue2Persis
 function resolveRequest(submission: Readonly<Record<string, unknown>>): ResolvedRequest {
   const instrumental = typeof submission.instrumental === 'boolean'
     ? submission.instrumental : undefined;
+  // generate.ts renders instrumental when flagged or when there are no lyrics.
+  const instrumentalRender = instrumental === true
+    || !(typeof submission.lyrics === 'string' && submission.lyrics);
+  const soundingFor = (abc: string) => instrumentalRender ? hasSoundingScore(abc) : hasSoundingVocalBar(abc, true);
   const cover = yue2CoverFromSubmission(submission);
   if (cover?.sourceKind === 'musicxml' && submission.sourceAudioUrl) {
     throw new Error('MusicXML covers cannot also supply source audio.');
@@ -388,7 +427,7 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
     if (!abc) {
       throw new Error('A cover needs an approved lead sheet (yue2Abc) — none was supplied.');
     }
-    if (!hasSoundingVocalBar(abc, true)) throw new Error(EMPTY_COVER_SCORE_ERROR);
+    if (!soundingFor(abc)) throw new Error(EMPTY_COVER_SCORE_ERROR);
     coverAbc = abc;
   }
   const options: Record<string, unknown> = {};
@@ -399,11 +438,11 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
     const choices = coverScoreChoices(cover);
     const score = transformCoverScore(coverAbc, choices);
     // Dropping the instrumental voices can leave nothing to sing.
-    if (!hasSoundingVocalBar(score.renderedAbc, true)) throw new Error(EMPTY_COVER_SCORE_ERROR);
+    if (!soundingFor(score.renderedAbc)) throw new Error(EMPTY_COVER_SCORE_ERROR);
     options.yue2Cover = { ...(cover.sourceId ? { sourceId: cover.sourceId } : {}),
       ...(cover.sourceKind ? { sourceKind: cover.sourceKind } : {}),
       ...(cover.sourceLabel ? { sourceLabel: cover.sourceLabel } : {}),
-      ...choices, fullScore: score.fullScore } satisfies Yue2CoverSubmission;
+      ...choices, fullScore: score.fullScore, ...(cover.guide ? { guide: cover.guide } : {}) } satisfies Yue2CoverSubmission;
     options.yue2Abc = score.renderedAbc;
     options.yue2CfgScale = choices.cfgScale;
   }
@@ -444,6 +483,7 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
     pickedModels[`lm_adapter_${kind}_scale_mid`] = String(slot.scales.mid);
     pickedModels[`lm_adapter_${kind}_scale_late`] = String(slot.scales.late);
     if (slot.scales.plan !== undefined) pickedModels[`lm_adapter_${kind}_scale_plan`] = String(slot.scales.plan);
+    if (slot.scales.rebase !== undefined) pickedModels[`lm_adapter_${kind}_rebase`] = String(slot.scales.rebase);
   }
   return {
     operation: 'text2music',
@@ -669,6 +709,32 @@ async function capabilities(): Promise<BackendCapabilities> {
         hint: 'Cap on the song in codec frames (25 per second; 9000 = 6 min). A render that hits it '
             + `reports limit_hit. Checkpoint: ${sd('semantic', 'max_tokens', 9000)}.`,
         default: sd('semantic', 'max_tokens', 9000), min: 200, max: 9000, step: 100,
+      },
+      {
+        key: 'yue2SemMinP', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'Composer Min-P',
+        hint: 'After Top-P, drop every codec frame candidate whose probability is under this fraction of the '
+            + 'top candidate\'s. Trims the long tail that produces stray noises without flattening the '
+            + 'choice the way a lower Top-K does. 0 = off (the checkpoint has no min-p).',
+        default: 0, min: 0, max: 0.5, step: 0.01,
+      },
+      {
+        key: 'yue2CfgMinP', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'CFG Plausibility',
+        hint: 'Apply CFG only to candidates the conditioned pass itself gives at least this fraction of its '
+            + 'top probability; the rest keep their unguided value, so guidance cannot promote tokens the model '
+            + 'thinks are implausible. 0 = off. Only matters when CFG is not 1 (Chain of Thought off, or a set CFG Scale).',
+        default: 0, min: 0, max: 0.5, step: 0.01,
+      },
+      {
+        key: 'yue2CfgLogprob', group: 'lm', section: 'Composer (song)', type: 'toggle', label: 'CFG in Log-Probabilities',
+        hint: 'Blend the conditioned and unconditioned passes after normalising each to log-probabilities, '
+            + 'instead of on raw logits. Off = the reference blend.',
+        default: false,
+      },
+      {
+        key: 'yue2CfgRescale', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'CFG Rescale',
+        hint: 'Pull the guided distribution\'s spread back toward the conditioned pass\'s, so a high CFG Scale '
+            + 'changes which frames win without sharpening or flattening the whole distribution. 0 = off.',
+        default: 0, min: 0, max: 1, step: 0.05,
       },
       {
         key: 'yue2EndThreshold', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'End Threshold',
@@ -1081,6 +1147,9 @@ export type Yue2LmAdapterEntry = NonNullable<BackendModels['lmAdapterMeta']>[str
    *  composes with. */
   styleTemplate?: string;
   captionDropout?: number;
+  /** The YuE2 variant it was trained on, '' = the base model. When it differs
+   *  from the loaded LM's, the engine re-bases it (yue2AdapterHome). */
+  home: string;
 };
 
 /** What the catalogue needs from a run. Structural on purpose: the AR and NAR
@@ -1098,6 +1167,114 @@ interface Yue2CataloguedRun {
     step: number; path: string; bytes: number; final: boolean;
     loss?: number; valLoss?: number; meta?: Yue2AdapterMeta;
   }>;
+}
+
+/** Picker entries for joint weight files. Each costs two safetensors header
+ *  reads (~0.5 s for 830 files), so an entry is kept per file and the facts
+ *  it is built from (`key`), built ahead by warmJointEntries whenever the
+ *  joint catalogue changes, and only rebuilt on a request if the warm has not
+ *  reached it yet. A typed trigger clears them. */
+const jointEntries = new Map<string, { key: string; entry: Yue2LmAdapterEntry }>();
+type JointPickerFile = { abs: string; key: string; build: () => Yue2LmAdapterEntry };
+
+function jointEntry(f: JointPickerFile): Yue2LmAdapterEntry {
+  let hit = jointEntries.get(f.abs);
+  if (hit?.key !== f.key) jointEntries.set(f.abs, hit = { key: f.key, entry: f.build() });
+  return hit.entry;
+}
+
+let warming = false;
+let warmAgain = false;
+let warmWaiters: Array<() => void> = [];
+
+/** Resolves once no warm is running. models() waits here rather than build a
+ *  whole catalogue inline: just after boot the warm (~1.3 s for ~2000 files)
+ *  can still be under way when the reloaded UI asks for the picker. */
+function jointEntriesWarm(): Promise<void> {
+  return warming ? new Promise(resolve => warmWaiters.push(resolve)) : Promise.resolve();
+}
+
+/** Builds missing or stale entries in ~10 ms slices, so no tick holds the
+ *  event loop for the whole catalogue. */
+function warmJointEntries(): void {
+  if (warming) { warmAgain = true; return; }
+  let todo: JointPickerFile[];
+  try {
+    const files = jointPickerFiles(listAllYue2AitkRuns());
+    const live = new Set(files.map(f => f.abs));
+    for (const abs of jointEntries.keys()) if (!live.has(abs)) jointEntries.delete(abs);
+    todo = files.filter(f => jointEntries.get(f.abs)?.key !== f.key);
+  } catch { return; } // no database yet (tests, early boot): the picker builds on demand
+  warming = true;
+  let i = 0;
+  const slice = (): void => {
+    const until = performance.now() + 10;
+    try { while (i < todo.length && performance.now() < until) jointEntry(todo[i++]); }
+    catch (err) { i = todo.length; console.warn(`[YuE2] Adapter picker warm failed: ${String(err)}`); }
+    if (i < todo.length) { setImmediate(slice); return; }
+    warming = false;
+    if (warmAgain) { warmAgain = false; warmJointEntries(); }
+    if (!warming) { for (const resolve of warmWaiters) resolve(); warmWaiters = []; }
+  };
+  setImmediate(slice);
+}
+onYue2AitkSnapshotChange(warmJointEntries);
+
+/** A joint AITK checkpoint is one training result with two loadable files.
+ *  Trained checkpoints need complete pairs: selecting one half from an
+ *  incomplete training result would make the global picker look ready while
+ *  the other slot still has no matching result. Imports can hold one half.
+ *  The combined adapter.safetensors is an output/inspection artifact and is
+ *  intentionally not offered to either YuE2 slot. */
+function jointPickerFiles(jointRuns: Yue2AitkRunRecord[]): JointPickerFile[] {
+  const tags = new Map(listDatasets().map(ds => [ds.id, ds.customTag]));
+  const files: JointPickerFile[] = [];
+  for (const run of jointRuns) {
+    for (const ckpt of run.checkpoints) {
+      const imported = run.options.source === 'comfyui-import';
+      if (imported ? !ckpt.arPath && !ckpt.narPath : !ckpt.arPath || !ckpt.narPath) continue;
+      const configuredSteps = Number(run.options.steps);
+      const final = Number.isFinite(configuredSteps) && configuredSteps > 0 && ckpt.step === configuredSteps;
+      // Several runs of one dataset list the same steps: name the run by its
+      // start time (the output folder's suffix), schedule and refinement.
+      const started = /_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-\d{2}$/.exec(path.basename(run.output));
+      const runName = [imported ? `Imported · ${String(run.options.name ?? run.jobId)}` : `AITK · ${run.datasetSlug || run.datasetId || run.jobId}`,
+        started ? `${started[2]}-${started[3]} ${started[4]}:${started[5]}` : '',
+        typeof run.options.lrSchedule === 'string' ? run.options.lrSchedule : '',
+        run.options.refinePlanner === true || run.options.unfreezePlanner === true ? 'refine' : ''].filter(Boolean).join(' · ');
+      const add = (kind: Yue2LmAdapterKind, ref: string): void => {
+        const abs = path.resolve(ref);
+        const key = JSON.stringify([kind, runName, final, ckpt, yue2AitkWeightStamp(abs), run.jobId, run.datasetSlug, run.datasetId, tags.get(run.datasetId), run.options]);
+        files.push({ abs, key, build: () => {
+          const fileMeta = readSafetensorsMeta(abs);
+          const { trigger, inferred, manual } = yue2AdapterTrigger(abs, jointRuns);
+          const rank = fileMeta?.rank;
+          const steps = fileMeta?.steps ?? ckpt.step;
+          return {
+            label: [kind.toUpperCase(), runName, `step ${ckpt.step}`, trigger ? `"${trigger}"` : '']
+              .filter(Boolean).join(' · '),
+            kind,
+            runName,
+            trigger: trigger || undefined,
+            triggerInferred: inferred || undefined,
+            triggerManual: manual || undefined,
+            rank,
+            steps: Number.isFinite(steps) && steps > 0 && steps < Number.MAX_SAFE_INTEGER ? steps : undefined,
+            bytes: (() => { try { return fs.statSync(abs).size; } catch { return undefined; } })(),
+            dataset: run.datasetSlug || run.datasetId || undefined,
+            final,
+            loss: ckpt.loss,
+            styleTemplate: fileMeta?.styleTemplate,
+            captionDropout: fileMeta?.captionDropout,
+            home: yue2AdapterHome(fileMeta?.baseSha),
+          };
+        } });
+      };
+      if (ckpt.arPath) add('ar', ckpt.arPath);
+      if (ckpt.narPath) add('nar', ckpt.narPath);
+    }
+  }
+  return files;
 }
 
 /** Every trained adapter on disk, both halves, newest run first, each
@@ -1154,59 +1331,13 @@ function yue2LmAdapterCatalogue(): {
         valLoss: ckpt.valLoss,
         styleTemplate: ckpt.meta?.styleTemplate,
         captionDropout: ckpt.meta?.captionDropout,
+        home: yue2AdapterHome(ckpt.meta?.baseSha),
       };
     }
   }
 
-  // A joint AITK checkpoint is one training result with two loadable files.
-  // Trained checkpoints need complete pairs: selecting one half from an
-  // incomplete training result would make the global picker look ready while
-  // the other slot still has no matching result. Imports can hold one half.
-  // The combined adapter.safetensors is an output/inspection artifact and is
-  // intentionally not offered to either YuE2 slot.
   const jointRuns = listAllYue2AitkRuns();
-  for (const run of jointRuns) {
-    for (const ckpt of run.checkpoints) {
-      const imported = run.options.source === 'comfyui-import';
-      if (imported ? !ckpt.arPath && !ckpt.narPath : !ckpt.arPath || !ckpt.narPath) continue;
-      const configuredSteps = Number(run.options.steps);
-      const final = Number.isFinite(configuredSteps) && configuredSteps > 0 && ckpt.step === configuredSteps;
-      // Several runs of one dataset list the same steps: name the run by its
-      // start time (the output folder's suffix), schedule and refinement.
-      const started = /_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-\d{2}$/.exec(path.basename(run.output));
-      const runName = [imported ? `Imported · ${String(run.options.name ?? run.jobId)}` : `AITK · ${run.datasetSlug || run.datasetId || run.jobId}`,
-        started ? `${started[2]}-${started[3]} ${started[4]}:${started[5]}` : '',
-        typeof run.options.lrSchedule === 'string' ? run.options.lrSchedule : '',
-        run.options.refinePlanner === true || run.options.unfreezePlanner === true ? 'refine' : ''].filter(Boolean).join(' · ');
-      const add = (kind: Yue2LmAdapterKind, ref: string): void => {
-        const abs = path.resolve(ref);
-        const fileMeta = readSafetensorsMeta(abs);
-        const { trigger, inferred, manual } = yue2AdapterTrigger(abs, jointRuns);
-        const rank = fileMeta?.rank;
-        const steps = fileMeta?.steps ?? ckpt.step;
-        paths.push(abs);
-        meta[abs] = {
-          label: [kind.toUpperCase(), runName, `step ${ckpt.step}`, trigger ? `"${trigger}"` : '']
-            .filter(Boolean).join(' · '),
-          kind,
-          runName,
-          trigger: trigger || undefined,
-          triggerInferred: inferred || undefined,
-          triggerManual: manual || undefined,
-          rank,
-          steps: Number.isFinite(steps) && steps > 0 && steps < Number.MAX_SAFE_INTEGER ? steps : undefined,
-          bytes: (() => { try { return fs.statSync(abs).size; } catch { return undefined; } })(),
-          dataset: run.datasetSlug || run.datasetId || undefined,
-          final,
-          loss: ckpt.loss,
-          styleTemplate: fileMeta?.styleTemplate,
-          captionDropout: fileMeta?.captionDropout,
-        };
-      };
-      if (ckpt.arPath) add('ar', ckpt.arPath);
-      if (ckpt.narPath) add('nar', ckpt.narPath);
-    }
-  }
+  for (const f of jointPickerFiles(jointRuns)) { paths.push(f.abs); meta[f.abs] = { ...jointEntry(f) }; }
 
   // The user's adapter folder: anything the index above did not already list.
   // The half comes from the file's own `format`, the same field the engine
@@ -1235,6 +1366,7 @@ function yue2LmAdapterCatalogue(): {
       bytes: (() => { try { return fs.statSync(abs).size; } catch { return undefined; } })(),
       styleTemplate: fileMeta?.styleTemplate,
       captionDropout: fileMeta?.captionDropout,
+      home: yue2AdapterHome(fileMeta?.baseSha),
     };
   }
   return { paths, meta };
@@ -1274,6 +1406,7 @@ async function models(): Promise<BackendModels> {
     for (const f of v.lm.available) meta.lm[f.type] = { label: f.filename, bytes: f.bytes };
   }
 
+  await jointEntriesWarm();
   const adapters = yue2LmAdapterCatalogue();
   const persisted = yue2PersistedSelection();
 
@@ -1294,6 +1427,9 @@ async function models(): Promise<BackendModels> {
       lmAdapterMerged: props?.adapter?.merged ?? '',
       lmAdapterInForce: props?.adapter?.in_force === true,
       lmAdapterFolder: getSetting(ADAPTER_FOLDER_SETTING, ''),
+      // The picked LM's variant, against which each adapter's `home` decides
+      // whether it re-bases.
+      lmVariant: yue2LmVariant(yue2PickerLmVae(persisted, props ?? null).lm),
     },
     meta,
   };
@@ -1345,6 +1481,7 @@ function slotDefaults(
     out[`lmAdapter${Slot}ScaleMid`] = slot.scales.mid;
     out[`lmAdapter${Slot}ScaleLate`] = slot.scales.late;
     if (slot.scales.plan !== undefined) out[`lmAdapter${Slot}ScalePlan`] = slot.scales.plan;
+    out[`lmAdapter${Slot}Rebase`] = slot.scales.rebase ?? YUE2_REBASE_DEFAULT;
     out[`lmAdapter${Slot}InForce`] = !!slot.path && inForce;
   }
   return out;
@@ -1374,6 +1511,8 @@ function readSlotSelection(
   const planRaw = selection[`lmAdapter${Slot}ScalePlan`];
   const plan = planRaw === undefined ? persisted.scales.plan
     : String(planRaw).trim() === '' ? undefined : yue2Dial(planRaw, persisted.scales.global);
+  const rebaseRaw = selection[`lmAdapter${Slot}Rebase`];
+  const rebase = rebaseRaw === undefined ? persisted.scales.rebase : yue2Rebase(rebaseRaw);
   return {
     given,
     ref: given ? selection[pathKey].trim() : persisted.path,
@@ -1387,6 +1526,7 @@ function readSlotSelection(
       mid: dial('Mid', persisted.scales.mid),
       late: dial('Late', persisted.scales.late),
       ...(plan === undefined ? {} : { plan }),
+      ...(rebase === undefined ? {} : { rebase }),
     },
   };
 }
@@ -1488,6 +1628,7 @@ export function yue2PickFromModels(models: Readonly<Record<string, string>>): Yu
         mid: num(`${key}_scale_mid`, d.mid),
         late: num(`${key}_scale_late`, d.late),
         ...(models[`${key}_scale_plan`] === undefined ? {} : { plan: num(`${key}_scale_plan`, d.global) }),
+        ...(models[`${key}_rebase`] === undefined ? {} : { rebase: yue2Rebase(models[`${key}_rebase`]) }),
       },
     };
   };
@@ -1511,6 +1652,8 @@ async function selectModel(selection: Record<string, string>) {
     const ref = resolveYue2Adapter(selection.lmAdapterTriggerPath.trim());
     if (!ref) throw new Error(`YuE2 adapter not usable: ${selection.lmAdapterTriggerPath}`);
     setYue2ManualTrigger(ref, selection.lmAdapterTrigger);
+    jointEntries.clear();
+    warmJointEntries();
     if (Object.keys(selection).length === 2) return { changed: false };
   }
   const persisted = yue2PersistedSelection();
@@ -1676,6 +1819,7 @@ export const yue2Backend: EngineBackend = {
       releaseLane: ctx.releaseLane,
       nextLaneFamily: ctx.nextLaneFamily,
       runOnLane: ctx.runOnLane,
+      assignFollower: ctx.assignFollower,
     });
     return outcomeFromJob(job);
   },

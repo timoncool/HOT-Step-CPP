@@ -14,34 +14,40 @@ rather than a full re-generation.
 Sidebar: Repaint, between Cover Studio and Stem Separator.
 
 Repaint only runs on the ACE-Step 1.5 backend, so the sidebar lists it only while
-ACE-Step 1.5 is the active engine (see [Backends](../backends.md)).
+ACE-Step 1.5 is the active engine (see [Backends](../backends.md)). Switching to
+another backend while Repaint is open moves the app to Custom-Gen.
 
 A source track is required before the waveform and lyrics panels appear:
 either a song from the [Library](library.md) or an uploaded audio file.
 
+In a window narrower than 1024 px, or on a portrait screen, the two columns
+become **Source** and **Lyrics** tabs at the top of the studio.
+
 ## Workflow
 
 1. Load a source track: drag an audio file onto the drop zone or click it to
-   browse, or click Pick from Library and choose a song.
+   browse, or click Pick from Library and choose a song. The library list
+   searches titles, artists and styles. Picking a song also fills the lyrics
+   and the Style Description from it.
    The studio's fields also save to a server draft about a second after each
    change. This browser's copy is still the one you edit. The draft belongs
    to this browser: another browser or tool that edits the same draft never
    overwrites your fields. If that happens, your next change is saved as a
    new draft and a short note under the header says so. If a save fails, a
    note says the draft wasn't saved; your edits stay in this browser, and the
-   next change tries again. To go back to a saved draft, open **Load a saved
+   next change tries again. To go back to a saved draft, open **Load saved
    draft** under the header and pick one; if the form has edits not yet saved
    to a draft, you are asked first. A draft whose uploaded source has gone
    missing is reported as unavailable, so you can reupload it. Loading a
    draft never starts a job.
-2. Set the region to regenerate by dragging the waveform's two handles, the
-   range slider below it, or the Start/End fields directly. The region
+2. Set the region to regenerate by dragging the two handles of the range
+   slider under the waveform, or type the Start/End fields directly. The region
    defaults to the middle third of the track when a source first loads.
 3. Edit the lyrics for the region. If a synced lyrics file exists next to the
    source audio, lines inside the region are editable one at a time and lines
    outside are shown dimmed for context; otherwise a plain textarea covers
    the whole lyrics.
-4. Optionally enter a Style Description. Left blank, the source track's own
+4. Optionally edit the Style Description. Left blank, the source track's own
    style is reused.
 5. Choose a Repaint Mode and Boundary Crossfade, then click Repaint Region.
 6. Track the queued and generating stages in the settings panel; Cancel stops
@@ -54,7 +60,7 @@ either a song from the [Library](library.md) or an uploaded audio file.
 | Control | What it does |
 |---|---|
 | Source Track | Load the audio to repaint: drag-and-drop or click to upload a file, or Pick from Library to choose an existing song. Clearing the source resets the region. |
-| Waveform region | Play/Pause and Play Region buttons, a dual-handle range slider, and Start/End numeric fields (seconds) all edit the same region. The area outside it is dimmed on the waveform. Start cannot go below 0 in this studio. |
+| Waveform region | Play/Pause and a Region button that plays from the region start. The dual-handle range slider and the Start/End numeric fields (seconds) edit the same region. The area outside it is dimmed on the waveform. Start cannot go below 0 in this studio. When the track has a `.lrc` or Whisper lyrics file, a row of section labels sits above the waveform. |
 | Region Lyrics / Lyrics | Line-by-line editor synced to the region when a `.lrc` file exists next to the source audio (out-of-region lines are read-only context); a plain textarea otherwise. Either way, the edited text becomes the lyrics sent for the whole track, not only the region. |
 | Style Description | Caption used for the render. Left empty, the source track's own style/caption is reused. |
 | Repaint Mode | Conservative, Balanced (default) or Aggressive. The selected mode is captured as a repaint injection ratio in the generation request; its audible effect still needs listening verification. |

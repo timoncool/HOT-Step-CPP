@@ -10,8 +10,9 @@ import React, { useEffect, useState } from 'react';
 import { AlertTriangle, Database, Layers, Loader2, PauseCircle, XCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { PreprocessOptions } from '../../services/trainingApi';
-import { useBackendStore } from '../../stores/backendStore';
+import { useTrainingTarget } from './useTrainingTarget';
 import { useTrainingStore } from '../../stores/trainingStore';
+import { Yue2StageCard } from './Yue2StageCard';
 import { JobProgress } from './JobProgress';
 import { Mm3CodesCard } from './Mm3CodesCard';
 import {
@@ -21,7 +22,7 @@ import {
   type PreprocessFormState,
 } from './PreprocessOptionsForm';
 import { PreprocessVariantCard } from './PreprocessVariantCard';
-import { useTrainingStream } from './useTrainingStream';
+import { useActiveTrainingJob } from '../../queries/training-runs/hooks';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
 
@@ -31,13 +32,13 @@ export const PreprocessPanel: React.FC = () => {
   // it; MiniMax-Music3 has neither. Showing ACE's variant list while MM3 is
   // active offers caches an MM3 run can never consume — so the phase switches
   // wholesale, it does not merge.
-  const backendId = useBackendStore(s => s.activeBackendId);
-  const mm3Mode = backendId === 'minimax-m3';
+  // The studio's effective target, not the raw backend: a running job pins it.
+  const mm3Mode = useTrainingTarget().target === 'minimax-m3';
   const capabilities = useTrainingStore(s => s.capabilities);
   const datasets = useTrainingStore(s => s.datasets);
   const detail = useTrainingStore(s => s.detail);
   const selectedDatasetId = useTrainingStore(s => s.selectedDatasetId);
-  const activeJob = useTrainingStore(s => s.activeJob);
+  const activeJob = useActiveTrainingJob();
   const error = useTrainingStore(s => s.error);
   const preprocessStatus = useTrainingStore(s => s.preprocessStatus);
   const preprocessLoading = useTrainingStore(s => s.preprocessLoading);
@@ -57,10 +58,6 @@ export const PreprocessPanel: React.FC = () => {
   const jobId = activeJob?.id;
   const jobActive = jobStatus === 'queued' || jobStatus === 'running';
   const preprocessJobActive = jobKind === 'preprocess' && jobActive;
-
-  // The dataset phase mounts the stream inside DatasetDetail, which is not
-  // rendered here — without this the progress bar would never move.
-  useTrainingStream(jobActive && jobId ? jobId : null);
 
   // Seed the pickers from the server's recommendation once capabilities land.
   useEffect(() => {
@@ -265,7 +262,18 @@ export const PreprocessPanel: React.FC = () => {
             </div>
           )}
 
-          <div className={`${CARD} flex flex-col gap-4`}>
+          <Yue2StageCard icon={<Layers size={15} className="text-amber-500" />}
+            title={t('trainingStudio.assets.tensors')} done={variants.length > 0}
+            action={
+            <button
+              onClick={() => void handleStart()}
+              disabled={!form.ditModel || jobActive || starting || !pp.available}
+              className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              {starting ? <Loader2 size={15} className="animate-spin" /> : <Layers size={15} />}
+              {t('trainingStudio.preprocess.start')}
+            </button>
+            }>
             <PreprocessOptionsForm
               capabilities={capabilities}
               value={form}
@@ -280,15 +288,7 @@ export const PreprocessPanel: React.FC = () => {
               </div>
             )}
 
-            <button
-              onClick={() => void handleStart()}
-              disabled={!form.ditModel || jobActive || starting || !pp.available}
-              className="self-start flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-bold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {starting ? <Loader2 size={15} className="animate-spin" /> : <Layers size={15} />}
-              {t('trainingStudio.preprocess.start')}
-            </button>
-          </div>
+          </Yue2StageCard>
 
           {/* A finished/failed preprocess job stays visible until the next one
               starts; an active job of another kind gets its progress card too,

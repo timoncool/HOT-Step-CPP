@@ -1,4 +1,14 @@
 @echo off
+setlocal
+REM Serialize engine snapshots with rebuilds and updates in this checkout.
+if /i not "%HOTSTEP_ENGINE_LOCK_ROOT%\"=="%~dp0" (
+    pwsh -NoProfile -File "%~dp0tools\prod\engine-lock.ps1" -Script "%~f0" %*
+    goto :engine_lock_result
+)
+goto :engine_lock_held
+:engine_lock_result
+exit /b %errorlevel%
+:engine_lock_held
 REM Existing work-channel users reserve the app and GPU for this entire command.
 REM A guarded child inherits this marker; it is a recursion guard, not authentication.
 if "%HOTSTEP_WORK_GUARD_ACTIVE%"=="1" (
@@ -24,30 +34,27 @@ REM dev-rebuild.bat — Gracefully shut down the running app, rebuild the engine
 REM
 REM Usage: dev-rebuild.bat
 REM
-REM Sends a shutdown request to the Node server (port 3001), which kills
+REM Sends a shutdown request to this checkout's configured Node server, which kills
 REM ace-server and itself cleanly (no orphan restarting). Then rebuilds.
 
 echo [dev-rebuild] Requesting graceful shutdown...
-curl -s -X POST http://localhost:3001/api/shutdown >nul 2>&1
-
-REM Wait for ace-server to actually die (the shutdown route kills by port)
-echo [dev-rebuild] Waiting for ace-server to exit...
-set /A retries=0
-:wait_loop
-tasklist /FI "IMAGENAME eq ace-server.exe" 2>nul | find /I "ace-server.exe" >nul
-if %errorlevel% neq 0 goto :build
-timeout /t 1 /nobreak >nul
-set /A retries+=1
-if %retries% GEQ 10 (
-    echo [dev-rebuild] Force-killing ace-server after 10s timeout...
-    taskkill /F /IM ace-server.exe /T >nul 2>&1
-    timeout /t 2 /nobreak >nul
-)
-if %retries% GEQ 15 (
-    echo [dev-rebuild] FATAL: could not stop ace-server. Aborting.
+set "HOTSTEP_REPO_DIR=%~dp0"
+REM Read the same active .env as the server, including a moved data folder.
+set "HOTSTEP_SHUTDOWN_PORT="
+pushd "%HOTSTEP_REPO_DIR%server" || exit /b 1
+for /f "delims=" %%p in ('node --import tsx --input-type=module -e "import fs from 'node:fs'; import {parse} from 'dotenv'; import {locateData} from './src/dataroot/locate.ts'; const r=locateData(); if(r.pendingMove || r.pointerError) process.exit(1); const f=r.children.envFile; const e=fs.existsSync(f)?parse(fs.readFileSync(f)):{}; const p=Number(process.env.SERVER_PORT ?? e.SERVER_PORT ?? 3001); if(Number.isInteger(p)===false||p<1||p>65535) process.exit(1); console.log(p);"') do set "HOTSTEP_SHUTDOWN_PORT=%%p"
+popd
+if not defined HOTSTEP_SHUTDOWN_PORT (
+    echo [dev-rebuild] FATAL: could not resolve this checkout's server port.
     exit /b 1
 )
-goto :wait_loop
+REM A trailing directory separator excludes sibling checkouts with a shared prefix.
+if /i "%~1"=="--dry-run" (
+    pwsh -NoProfile -File "%HOTSTEP_REPO_DIR%tools\prod\stop-checkout.ps1" -Root "%HOTSTEP_REPO_DIR%." -Port %HOTSTEP_SHUTDOWN_PORT% -DryRun
+    goto :engine_lock_result
+)
+pwsh -NoProfile -File "%HOTSTEP_REPO_DIR%tools\prod\stop-checkout.ps1" -Root "%HOTSTEP_REPO_DIR%." -Port %HOTSTEP_SHUTDOWN_PORT%
+if errorlevel 1 exit /b 1
 
 :build
 echo [dev-rebuild] ace-server stopped. Building engine...
@@ -57,4 +64,4 @@ if errorlevel 1 (
     echo [dev-rebuild] Scroll up for the first 'error C' or 'error LNK' line.
     exit /b 1
 )
-echo [dev-rebuild] Done. Start the app with LAUNCH.bat to pick up changes.
+echo [dev-rebuild] Done. Start the app with dev.bat to pick up changes.

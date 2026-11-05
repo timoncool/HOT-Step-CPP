@@ -10,7 +10,10 @@ the Training Studio exposes it as **Train until: Target loss**. `--steps` stays
 the hard cap in that mode, so a target that never arrives still ends the run.
 
 **Defaults as of 2026-09-05: target loss 1.0 on the training metric, cap 1000
-steps.** It was 0.1 from 2026-08-27 until a blind depth ladder on albumA
+steps.** Since 2026-09-06 the default stop mode is steps (`stopMode: 'steps'`;
+HOT-PiZZA's training loss reads high by construction), so the 1.0 target only
+applies once Train until is set to Target loss, and the step count is then the
+cap. It was 0.1 from 2026-08-27 until a blind depth ladder on albumA
 (3 songs, base + checkpoints 100/250/500) showed the step-250 checkpoint
 (5-epoch mean ~1.06) beating step 500 (0.25 saved, 0.08 best) on every song,
 with the step-500 checkpoint emitting an empty plan on one of them. Below ~1
@@ -22,7 +25,7 @@ exactly as the AS1.5 planner does. Measured trajectories at the shipped recipe
 |---|---|---|---|---|
 | albumD | 3.14 | 2.50 | 1.43 | 0.59 |
 | albumE | 3.28 | 2.23 | 0.92 | 0.31 |
-| limbizkit_starfish | 3.62 | 2.72 | 2.03 | - |
+| a third album | 3.62 | 2.72 | 2.03 | - |
 
 So 0.1 binds past step 500 on albums that converge fast and never arrives on the
 slow ones. The cap is doing real work, not decoration.
@@ -54,14 +57,15 @@ correct - it is 5 passes either way - but it means a small dataset can stop
 sooner in wall-clock than a large one at the same target.
 
 The epoch history rides in the resume state (format v3). It has to: previews
-pause the trainer every 50 steps by default, which closes only ~4 epochs per
-segment on a 10-song album, so a window that restarted empty each segment would
+pause the trainer at every checkpoint (every 50 steps when this was written, 100
+since 2026-09-09), which closes only ~4 epochs per 50-step segment on a 10-song
+album, so a window that restarted empty each segment would
 never fill and the target would silently never fire. Pre-v3 state files load
 fine and simply refill the window over the next few epochs.
 
-The `eval` metric only fires on evaluation steps, so at the default
-`--eval-every 250` it can fire once in a 250-step run - lower it first or the
-target is decorative.
+The `eval` metric only fires on evaluation steps, so at the app's default
+`evalEvery` of 250 (the CLI default is 50) it can fire once in a 250-step run -
+lower it first or the target is decorative.
 
 **The LR schedule does not shorten with the run.** The cosine is laid out over
 `--steps`, so a run that stops at 300 of a 1000-step cap stops with the learning
@@ -90,5 +94,9 @@ Two things to know before using it:
 
 The engine refuses a resume whose rank, alpha, tensor count, optimizer or
 train/held-out split differs from the state file, so a mismatched continuation
-fails loudly rather than training on a half-restored adapter. Prodigy resumes
-too (state format v2), and its `x0` lives once in the run directory.
+fails loudly rather than training on a half-restored adapter. Format v4
+(2026-09-05) also records the parameterization and the rsLoRA bit and refuses a
+mismatch (`engine/src/train/mm3-lm-resume.h`). Prodigy resumes too (state format
+v2), and its `x0` lives once in the run directory. `--pissa`, and so the default
+HOT-PiZZA method, cannot resume at all: the state does not carry the frozen
+A0/B0 init, and both the engine and the resume route refuse it.

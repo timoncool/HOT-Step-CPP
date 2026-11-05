@@ -19,6 +19,7 @@
 
 // wav.h: WAV reader (returns interleaved, we deinterleave below)
 #include "wav.h"
+#include "hot-step-fsutf8.h"
 
 // audio-resample.h: sample rate conversion
 #include "audio-resample.h"
@@ -72,7 +73,9 @@ static bool audio_io_ends_with(const char * str, const char * suffix) {
 // Load entire file into memory. Caller must free() the returned pointer.
 static uint8_t * audio_io_load_file(const char * path, size_t * size_out) {
     *size_out = 0;
-    FILE * fp = fopen(path, "rb");
+    // HOT-Step: UTF-8 path (hot-step-fsutf8.h); a narrow fopen misses any
+    // non-ASCII filename on Windows.
+    FILE * fp = hs_fopen(path, "rb");
     if (!fp) {
         fprintf(stderr, "[Audio] Cannot open %s\n", path);
         return NULL;

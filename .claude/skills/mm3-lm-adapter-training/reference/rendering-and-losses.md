@@ -28,7 +28,11 @@ almost certainly never exercised because the app pins q8_0.
 
 ### What this means in practice
 
-- The app is unaffected — the Node server selects q8_0.
+- Training previews pin q8_0 (`PREVIEW_ADAPTER_BASE` in
+  `server/src/services/training/mm3Preview.ts`) and record `renderBase`.
+  Generation runs the LM quant chosen in the app, persisted as `mm3_lm_quant`;
+  empty means the engine's best-first pick, which is f16 when it is installed.
+  <!-- TODO(verify): whether the f16 adapter-apply fault below still reproduces on the current engine; nothing in the generation path pins q8_0 for adapters. -->
 - Any script that starts its own `ace-server` MUST pin the base first, because a
   bare engine picks the best-quality variant it can find, which is f16:
 
@@ -61,7 +65,7 @@ ear. RMS is only a rough guide: `BASE_no_adapter_f16` at 0.1213 was fine while
 
 > **NOT SUFFICIENT — re-opened 2026-08-25 evening.** Both album D adapters
 > trained post-fix with `acoustic loss: ON — weight 1, 128 frames/step`
-> (train-console.log verified) still render Charlie Simpson chipmunked at 1.0×,
+> (train-console.log verified) still render the album's singer chipmunked at 1.0×,
 > correct at ~0.9188×. The mechanism below is still the best-supported theory
 > (formant shift with pitch on-grid cannot be a resample error), but the
 > teacher-forced anchor did not stop the drift — likely because it constrains
@@ -166,16 +170,17 @@ The champion code encoder is balance-sensitive: on real dense mixes the vocal
 sinks out of the code targets, and the adapter clones the deficiency. The fix
 is `ace-train mm3-launder` — real audio -> rec7 states -> the flow DiT's own
 latents -> champion codes — which puts the vocal where the codes can carry it.
-**Ear-validated (Deftones White Pony A/B, identical recipes, only the training
-audio differed): the laundered arm won "on every metric I can hear".**
+**Ear-validated (an A/B on a dense-mix album, identical recipes, only the
+training audio differed): the laundered arm won "on every metric I can hear".**
 
-In the app: the codes card's "Cover-launder" checkbox exports into a SIBLING
-cache (`mm3-codes-laundered/`), and the train form offers "Train on
+In the app: the codes card's "Cover-launder the codes" toggle exports into a
+SIBLING cache (`mm3-codes-laundered/`), and the train card offers "Train on
 cover-laundered codes" only when that cache exists. Off = the standard
 pipeline, byte-identical. ~1.4x realtime per track, once per dataset, cached
 forever. Needs `mm3-rec7-*.gguf` installed (converted with
-`convert-rvq-encoder.py --head --m3` — the file carries the LM's semantic
-table slices, so laundering never runs the 8B's forward).
+`engine/tools/convert-rvq-encoder.py --head <head.pt> --m3 <checkpoint dir>` —
+the file carries the LM's semantic table slices, so laundering never runs the
+8B's forward).
 
 When to use it: albums where the vocal or lead lines bury in the mix
 (nu-metal, shoegaze, dense punk). Unmeasured on sparse/acoustic corpora — do

@@ -21,7 +21,7 @@ import readline from 'readline';
 import { spawn } from 'child_process';
 
 import { pushLog } from '../../routes/logs.js';
-import { restartAceServer, stopAceServer } from '../aceEngineProcess.js';
+import { resumeEngines, suspendEngines } from '../aceEngineProcess.js';
 import { restoreMm3Selection } from '../backends/minimax/index.js';
 import { aceTrainExe } from './aceTrain.js';
 import { getDataset } from './datasetsRepo.js';
@@ -310,9 +310,9 @@ async function runMm3AceTrain(
   emitProgress(job);
   log(job, 'info', 'Stopping the engine to free VRAM…');
   // Not gated on a live child: a crashed engine leaves a respawn scheduled, and
-  // stopAceServer is what cancels it. An engine spawning into the middle of an
+  // suspendEngines is what cancels it. An engine spawning into the middle of an
   // MM3 training run would compete for a card that is already at 97 %.
-  const engineExited = await stopAceServer(`Paused for ${kind}`);
+  const engineExited = await suspendEngines(`Paused for ${kind}`);
 
   try {
     if (!engineExited) {
@@ -403,7 +403,7 @@ async function runMm3AceTrain(
     emitProgress(job);
     log(job, 'info', 'Restarting the engine…');
     pushLog(`[Training] ${kind} job ${job.id}: restarting the engine…`);
-    const back = await restartAceServer();
+    const back = await resumeEngines();
     if (!back) {
       log(job, 'warn', 'Engine did not answer /health within 90 s — restart the app if generation fails');
     }

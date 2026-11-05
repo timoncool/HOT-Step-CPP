@@ -13,20 +13,22 @@ import { useTranslation } from 'react-i18next';
 import { ModelRow } from './ModelRow';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
-import { usePersistedState } from '../../hooks/usePersistedState';
+import { usePersistedState, writePersistedState } from '../../hooks/usePersistedState';
 import { useCapabilities } from '../../hooks/useCapabilities';
 import type { RegistryFile, DownloadJob } from '../../types';
 
-export type FamilyTab = 'as1.5' | 'mm3' | 'yue2' | 'shared';
+export type FamilyTab = 'as1.5' | 'mm3' | 'yue2' | 'sa3' | 'heartmula' | 'shared';
 
 export const FAMILY_TABS: { id: FamilyTab; label: string }[] = [
   { id: 'as1.5', label: 'ACE-Step 1.5' },
   { id: 'mm3', label: 'MiniMax-Music3' },
   { id: 'yue2', label: 'YuE2' },
+  { id: 'sa3', label: 'Stable Audio 3' },
+  { id: 'heartmula', label: 'HeartMuLa' },
   { id: 'shared', label: 'Shared' },
 ];
 
-type RoleTab = 'dit' | 'lm' | 'embedding' | 'vae' | 'pp-vae' | 'stablestep' | 'supersep' | 'whisper' | 'mm3' | 'moss' | 'yue2';
+type RoleTab = 'dit' | 'lm' | 'embedding' | 'vae' | 'pp-vae' | 'stablestep' | 'supersep' | 'whisper' | 'mm3' | 'moss' | 'yue2' | 'heartmula' | 'muscriptor';
 
 /** Role → family fallback, for entries with no `family` field of their own
  *  (a hand-edited catalogue, or one written before this field existed). Every
@@ -34,8 +36,8 @@ type RoleTab = 'dit' | 'lm' | 'embedding' | 'vae' | 'pp-vae' | 'stablestep' | 's
  *  matters as a safety net. */
 const ROLE_FAMILY_FALLBACK: Record<RoleTab, FamilyTab> = {
   dit: 'as1.5', lm: 'as1.5', embedding: 'as1.5', vae: 'as1.5', 'pp-vae': 'as1.5',
-  stablestep: 'shared', supersep: 'shared', whisper: 'shared', moss: 'shared',
-  mm3: 'mm3', yue2: 'yue2',
+  stablestep: 'sa3', supersep: 'shared', whisper: 'shared', moss: 'shared',
+  mm3: 'mm3', yue2: 'yue2', heartmula: 'heartmula', muscriptor: 'shared',
 };
 
 /** Family for one registry file, honoring an explicit `family` first. The
@@ -94,11 +96,13 @@ const FAMILY_SECTIONS: Record<FamilyTab, { id: RoleTab; label: string }[]> = {
   yue2: [
     { id: 'yue2', label: 'YuE2' },
   ],
+  sa3: [{ id: 'stablestep', label: 'Stable Audio 3' }],
+  heartmula: [{ id: 'heartmula', label: 'HeartMuLa' }],
   shared: [
-    { id: 'stablestep', label: 'StableStep' },
     { id: 'supersep', label: 'Stem Separation' },
     { id: 'whisper', label: 'Whisper' },
     { id: 'moss', label: 'Captioning (MOSS)' },
+    { id: 'muscriptor', label: 'MIDI Transcription' },
   ],
 };
 
@@ -120,8 +124,8 @@ const ROLE_INFO: Record<string, string> = {
   supersep: 'Native GGML stem separation models for Cover Studio. BS-Roformer splits audio into six stems, Mel-Band RoFormer separates lead and backing vocals, and MDX23C isolates drum components. Install the model files for the separation stages you use.',
   whisper: 'OpenAI Whisper models for transcribing actual sung lyrics with word-level timestamps. Enable Whisper Lyrics in Post-Processing to use.',
   moss: 'MOSS-Music-8B — the only model here that ANALYSES audio rather than generating it. It captions your own tracks locally in the Training Studio, writing what it actually hears instead of rewriting a text analysis, and emits both the ACE-Step caption format and MM3 Structured Captions from a single pass. Pick one LM (Q8_0 recommended) plus the audio tower, which is required and never quantised. Nothing else in the app depends on these — they are only used when you choose MOSS as the caption provider.',
-  mm3: 'MiniMax-Music3 — a separate generation backend with its own models: a language model plus a 5-way split flow stack (depth decoder, condition encoder, DiT, vocoder — the LM and DiT are the two you must pick; the rest default to auto). All required roles load together, needing ~24 GB of VRAM. Switch to it via the Backend toggle in the top bar. A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
-  yue2: 'YuE2 — a third generation backend: a language model plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt (no headed caption template). Pick the LM plus exactly one VAE (Standard or Legacy — not both). Switch to it via the Backend toggle in the top bar. YuE2 is licensed CC BY-NC 4.0, but its authors have clarified that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial licence (gezhang@umich.edu). A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
+  mm3: 'MiniMax-Music3 — a separate generation backend with its own models: a language model plus a 5-way split flow stack (depth decoder, condition encoder, DiT, vocoder — the LM and DiT are the two you must pick; the rest default to auto). All required roles load together, needing ~24 GB of VRAM. Switch to it with the engine picker at the top of the sidebar. A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
+  yue2: 'YuE2 — a third generation backend: a language model plus a VAE decoder, producing 48 kHz stereo audio from a freeform style + lyrics prompt (no headed caption template). Pick the LM plus exactly one VAE (Standard or Legacy — not both). Switch to it with the engine picker at the top of the sidebar. YuE2 is licensed CC BY-NC 4.0, but its authors have clarified that individuals — creators, musicians, researchers — may use the model and its outputs freely, including commercially; only companies need a commercial licence (gezhang@umich.edu). A LICENSE file is fetched alongside automatically once a GGUF finishes downloading.',
   // mm3Trt is NOT here — unlike every other entry in this record, it's new
   // text (the reviewer flagged it for i18n), so it's translated at its one
   // call site via t('models.mm3Trt.info') instead of joining this
@@ -525,13 +529,17 @@ const StableStepTab: React.FC<{
   onDelete: (filename: string) => void;
 }> = ({ files, downloadJobs, onDownload, onCancel, onResume, onDelete }) => {
   // License acceptance is persisted so it's asked once.
+  const { t } = useTranslation();
   const [licenseAccepted, setLicenseAccepted] = usePersistedState('hs-stablestepLicenseAccepted', false);
   // Optional Hugging Face token — forwarded as `Authorization: Bearer <token>`
   // on huggingface.co requests (only needed if the repo is gated).
   const [hfToken, setHfToken] = usePersistedState('hs-hfToken', '');
   const [licenseNudge, setLicenseNudge] = useState(false);
 
-  const missing = files.filter(f => !f.installed);
+  const generationIds = new Set(['stablestep-gguf-dit', 'stablestep-gguf-same-enc',
+    'stablestep-gguf-same-dec', 'stablestep-gguf-text-enc', 'stablestep-tokenizer',
+    'stablestep-tokenizer-config', 'stablestep-special-tokens']);
+  const missing = files.filter(f => generationIds.has(f.id) && !f.installed);
 
   // GGUF weights live at the models root; tokenizer files remain under onnx/sa3.
   const ggufFiles = files.filter(f => f.filename.endsWith('.gguf'));
@@ -575,7 +583,7 @@ const StableStepTab: React.FC<{
             <Toggle
               accent="pink"
               checked={licenseAccepted}
-              onChange={checked => { setLicenseAccepted(checked); setLicenseNudge(false); }}
+              onChange={checked => { setLicenseAccepted(checked); writePersistedState('hs-stablestepLicenseAccepted', checked); setLicenseNudge(false); }}
               label={STABLESTEP_LICENSE_TEXT}
               info="Confirms you accept the Stability AI Community License for these StableStep weights (free for individuals and organizations under $1M annual revenue; commercial use above that needs a license from Stability AI). Off: every download in this tab is blocked until you accept."
             />
@@ -622,7 +630,7 @@ const StableStepTab: React.FC<{
       {missing.length > 0 && (
         <div className="flex items-center justify-between px-1">
           <span className="text-[11px] text-zinc-500">
-            {files.length - missing.length}/{files.length} files installed &middot; GGML weights ~5.8 GB
+            {t('models.sa3.generationMissing', '{{count}} generation files missing. Alternative quants are optional.', { count: missing.length })}
           </span>
           <button
             onClick={handleDownloadAll}
@@ -632,10 +640,10 @@ const StableStepTab: React.FC<{
                 ? 'bg-gradient-to-r from-pink-500 to-pink-600 text-white hover:from-pink-400 hover:to-pink-500 shadow-lg shadow-pink-500/10'
                 : 'bg-zinc-200 dark:bg-zinc-800 text-zinc-500 cursor-not-allowed'
             }`}
-            title={licenseAccepted ? 'Download all missing StableStep files' : 'Accept the license first'}
+            title={licenseAccepted ? t('models.sa3.downloadGeneration', 'Download generation set') : 'Accept the license first'}
           >
             <Download size={12} />
-            Download all missing ({missing.length})
+            {t('models.sa3.downloadGeneration', 'Download generation set')} ({missing.length})
           </button>
         </div>
       )}
@@ -649,8 +657,10 @@ const StableStepTab: React.FC<{
                 GGML backend (universal — CUDA/Vulkan/CPU)
               </h4>
               <p className="text-[10px] text-zinc-500 leading-relaxed">
-                4 GGUF files (~5.8 GB). Runs on CUDA, Vulkan and CPU. Also
-                requires the tokenizer files below.
+                StableStep needs 4 of these GGUF files (~5.8 GB): SA3 DiT (GGML), SAME Encoder,
+                SAME Decoder and T5Gemma Text Encoder. The quantized SA3 DiT files are experimental
+                and used by the Stable Audio 3 backend; the SA3 Medium Base files are for adapter
+                training. Runs on CUDA, Vulkan and CPU. Also requires the tokenizer files below.
               </p>
             </div>
             {ggufFiles.map(f => (
@@ -697,6 +707,7 @@ const StableStepTab: React.FC<{
 // ── Main component ──────────────────────────────────────────
 
 export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDownload, onCancel, onResume, onDelete, activeFamily }) => {
+  const { t } = useTranslation();
   const sections = FAMILY_SECTIONS[activeFamily];
   const [activeSection, setActiveSection] = useState<RoleTab>(sections[0].id);
 
@@ -730,6 +741,7 @@ export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDown
   );
   const mossFiles = useMemo(() => files.filter(f => f.role === 'moss'), [files]);
   const yue2Files = useMemo(() => files.filter(f => f.role === 'yue2'), [files]);
+  const muscriptorFiles = useMemo(() => files.filter(f => f.role === 'muscriptor'), [files]);
 
   const renderSimpleGroup = (roleFiles: RegistryFile[], info?: string) => (
     <div className="space-y-3">
@@ -822,6 +834,8 @@ export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDown
         {activeSection === 'embedding' && renderSimpleGroup(embeddingFiles, ROLE_INFO.embedding)}
         {activeSection === 'vae' && renderSimpleGroup(vaeFiles, ROLE_INFO.vae)}
         {activeSection === 'pp-vae' && renderSimpleGroup(ppVaeFiles, ROLE_INFO['pp-vae'])}
+        {activeSection === 'heartmula' && renderSimpleGroup(files.filter(f => f.role === 'heartmula'),
+          t('models.heartmula.info', 'Choose matching global and local models from one variant, plus codec flow, waveform decoder, RVQ and tokenizer. Encoder files are optional. Global and local precision can differ, but their model variant must match.'))}
         {activeSection === 'stablestep' && (
           <StableStepTab
             files={stablestepFiles}
@@ -850,6 +864,8 @@ export const ModelCatalogueTab: React.FC<Props> = ({ files, downloadJobs, onDown
           </div>
         )}
         {activeSection === 'moss' && renderSimpleGroup(mossFiles, ROLE_INFO.moss)}
+        {activeSection === 'muscriptor' && renderSimpleGroup(muscriptorFiles,
+          t('models.muscriptor.info', 'MuScriptor turns audio into multi-instrument MIDI in MIDI Studio, and Beat This! gives it tempo and bar lines. Each model is its weights plus a config.json, and both must be present. The MuScriptor weights are gated on Hugging Face (CC BY-NC 4.0): open the model page, request access, then save a read token in MIDI Studio or on the StableStep tab before you download. Beat This! is not gated. The weights are not mirrored here, and a download you made before this release keeps working where it is.'))}
         {activeSection === 'yue2' && (
           <Yue2Tab
             files={yue2Files}

@@ -5,9 +5,12 @@ import path from 'node:path';
 import { config } from '../config.js';
 import { getDb } from '../db/database.js';
 import * as queue from './training/labelingQueue.js';
+import type { TrainingJob } from './training/labelingQueue.js';
+import { runYue2AceTrain } from './training/yue2TrainRunner.js';
 import { jobsDir } from './training/paths.js';
 import { readDuration } from './training/audioMeta.js';
-import { missingYue2SheetModels, readYue2CoverAbc, resolveYue2SheetModel } from './training/yue2Sheet.js';
+import { MISSING_REFINED, missingYue2SheetModels, readYue2CoverAbc, resolveYue2SheetModel, resolveYue2SheetRefinedModel,
+  sheetTranscriberSetting } from './training/yue2Sheet.js';
 import { runYue2CoverSheetJob } from './training/yue2ArTrainRunner.js';
 import { resolveCoverDatasetSource, type CoverDatasetSource } from './coverDatasetSource.js';
 import { getDataset } from './training/datasetsRepo.js';
@@ -22,9 +25,21 @@ import { matchSectionsToScore, planScoreFromLyrics, suggestionLyrics, suggestSec
 import { prepareV2Problem, structureHash, type PrepareV2 } from '../contracts/yue2Prepare.js';
 import { sidecarPathFor } from './training/paths.js';
 import { readAbcSidecar, writeAbcSidecar } from './training/abcSidecar.js';
-import { hasSoundingVocalBar } from './backends/yue2/scoreHealth.js';
+import { hasSoundingScore } from './backends/yue2/scoreHealth.js';
 import { lintScoreSections, scoreSections } from './backends/yue2/scoreSections.js';
 import { cachedMp3 } from './audioConvert.js';
+import { aceMidiExe, BEAT_MODEL, isModelDownloaded, MUSCRIPTOR_MODELS, type MuscriptorModel } from './muscriptor.js';
+
+export const LEAD_SHEET_SOURCES = ['sheetsage2', 'sheetsage2-refined', 'muscriptor', 'yourmt3-chordnet'] as const;
+export type LeadSheetSource = typeof LEAD_SHEET_SOURCES[number];
+export const YOURMT3_CHORDNET_MODEL_IDS = ['yourmt3-plus', 'chordnet'] as const;
+
+const muscriptorReadinessDeps = {
+  // MIDI Studio currently stores its choice in browser localStorage only.
+  modelChoice: (): MuscriptorModel | null => null,
+  installed: isModelDownloaded,
+  executable: aceMidiExe,
+};
 
 const MAX_AUDIO_BYTES = 100 * 1024 * 1024;
 const MAX_AUDIO_SECONDS = 10 * 60;
@@ -39,7 +54,20 @@ export class CoverRequestError extends Error {
 // models read, a cached MP3 when the file is over MAX_AUDIO_BYTES.
 export interface CoverSource { sourceId: string; sourceLabel: string; audioPath: string; workPath: string }
 type SavedSource = Pick<CoverSource, 'sourceId' | 'sourceLabel'> & { userId: string; name: string };
-type CoverInput = { sourceAudioUrl?: unknown; songId?: unknown; sourceLabel?: unknown; abc?: unknown; force?: unknown };
+type CoverInput = { sourceAudioUrl?: unknown; songId?: unknown; sourceLabel?: unknown; abc?: unknown; force?: unknown;
+  /** 'sheetsage2' (default) or 'sheetsage2-refined'. */
+  transcriber?: unknown;
+  /** With the refined transcriber: keys with modes. */
+  keyMode?: unknown };
+
+// The source's vocal stem, separated once per audio content: MMS_FA places
+// words reliably on a stem, not on the full mix, and a score with no sung
+// melody takes its vocal rhythm from it.
+const coverStems = createCoverStemCache({
+  root: path.join(config.data.dir, 'tmp', 'cover-vocals'),
+  level: YUE2_STEMS_DEFAULT_LEVEL,
+  separate: (src, out, level) => separateOne(src, out, level, () => {}),
+});
 
 export function createYue2CoverService(deps = {
   queue,
@@ -49,16 +77,14 @@ export function createYue2CoverService(deps = {
   duration: readDuration,
   missingModels: missingYue2SheetModels,
   model: resolveYue2SheetModel,
-  run: runYue2CoverSheetJob,
+  run: (job: TrainingJob, audioPath: string, dir: string, transcriber?: { refined: boolean; keyMode: boolean }) =>
+    runYue2CoverSheetJob(job, audioPath, dir,
+      { missingModels: missingYue2SheetModels, run: runYue2AceTrain, vocalStem: coverStems.vocalStem }, transcriber),
+  refinedModel: resolveYue2SheetRefinedModel,
+  transcriberSetting: sheetTranscriberSetting,
   datasetMatch: resolveCoverDatasetSource,
   toMp3: (file: string) => cachedMp3(file, path.join(config.data.dir, 'tmp', 'cover-mp3')),
-  // The source's vocal stem, separated once per audio content: MMS_FA places
-  // words reliably on a stem, not on the full mix.
-  vocalStem: createCoverStemCache({
-    root: path.join(config.data.dir, 'tmp', 'cover-vocals'),
-    level: YUE2_STEMS_DEFAULT_LEVEL,
-    separate: (src, out, level) => separateOne(src, out, level, () => {}),
-  }).vocalStem,
+  vocalStem: coverStems.vocalStem,
   align: (audio: Buffer, lyrics: string): Promise<{ words: Yue2AlignWord[] }> => yue2Align(audio, lyrics),
   // The same merged read as a sample edit, so split caption/lyrics files
   // are folded into <stem>.txt rather than shadowing the new lyrics. Like a
@@ -69,13 +95,42 @@ export function createYue2CoverService(deps = {
     if (slug) patchLabel(slug, matched.sampleId, { sources: Object.fromEntries(Object.keys(fields).map(field => [field, 'user' as const])) });
   },
   // Keeps the score it replaces, like saveDetails does for the .txt.
-  saveAbc: (matched: CoverDatasetSource, abc: string) => writeAbcSidecar(matched.audioPath, abc, { keepBackups: true }),
+  saveAbc: (matched: CoverDatasetSource, abc: string) => writeAbcSidecar(matched.audioPath, abc, { keepBackups: true, anySounding: true }),
   song: (id: string, userId: string) => getDb().prepare('SELECT audio_url, title FROM songs WHERE id = ? AND user_id = ?').get(id, userId) as { audio_url: string; title: string } | undefined,
-}) {
-  function readiness() {
-    const missing = deps.missingModels();
-    return { ready: missing.length === 0, model: missing.length ? null : path.basename(deps.model()),
-      message: missing.length ? 'SheetSage2 is missing. Download the SheetSage2 Lead-Sheet Transcriber (yue2-sheetsage2-f16) in Model Manager, or supply an approved ABC score.' : null };
+}, midi = muscriptorReadinessDeps) {
+  /** GET readiness accepts an optional lead-sheet source; omission uses the stored sheet preference. */
+  function readiness(requestedSource?: unknown) {
+    if (requestedSource !== undefined && !LEAD_SHEET_SOURCES.includes(requestedSource as LeadSheetSource)) {
+      throw new CoverRequestError(`source must be one of: ${LEAD_SHEET_SOURCES.join(', ')}`);
+    }
+    const source: LeadSheetSource = requestedSource as LeadSheetSource | undefined
+      ?? (deps.transcriberSetting().refined ? 'sheetsage2-refined' : 'sheetsage2');
+    if (source === 'yourmt3-chordnet') {
+      return { source, ready: false, model: null, refined: false,
+        message: `YourMT3+/ChordNet is not installed yet (${YOURMT3_CHORDNET_MODEL_IDS.join(', ')}).` };
+    }
+    if (source === 'muscriptor') {
+      const chosen = midi.modelChoice() ?? MUSCRIPTOR_MODELS.find(model => midi.installed(model)) ?? 'small';
+      const missing: string[] = [];
+      const modelReady = midi.installed(chosen);
+      if (!modelReady) missing.push(`MuScriptor (muscriptor-${chosen})`);
+      if (!midi.installed(BEAT_MODEL)) missing.push('Beat This! (muscriptor-beat-this)');
+      const executable = midi.executable();
+      return { source, ready: missing.length === 0 && !!executable,
+        model: modelReady ? `muscriptor-${chosen}` : null, refined: false,
+        message: missing.length ? `Download ${missing.join(' and ')} in Model Manager.${executable ? '' : ' The ace-midi executable is also missing.'}`
+          : executable ? null : 'The ace-midi executable is missing. Install a build that includes MIDI Studio.' };
+    }
+    const baseModel = deps.model();
+    const refinedModel = deps.refinedModel?.() ?? '';
+    const missing = requestedSource === undefined ? deps.missingModels()
+      : !baseModel ? ['SheetSage2'] : source === 'sheetsage2-refined' && !refinedModel ? [MISSING_REFINED] : [];
+    const refinedMissing = missing.length === 1 && missing[0] === MISSING_REFINED;
+    return { source, ready: missing.length === 0, model: missing.length ? null : path.basename(baseModel),
+      refined: !!baseModel && !!refinedModel,
+      message: !missing.length ? null : refinedMissing
+        ? 'SheetSage2-Refined is chosen in the YuE2 Models dropdown but not installed. Download it (yue2-sheetsage2-refined-f16) in Model Manager, or choose SheetSage2.'
+        : 'SheetSage2 is missing. Download the SheetSage2 Lead-Sheet Transcriber (yue2-sheetsage2-f16) in Model Manager, or supply an approved ABC score.' };
   }
 
   function reviewScore(input: { abc?: unknown; lyrics?: unknown }) {
@@ -150,8 +205,20 @@ export function createYue2CoverService(deps = {
       if (abc) return { status: 'done' as const, abc, sections: scoreSections(abc), sourceId: selected.sourceId,
         sourceLabel: selected.sourceLabel, scoreSource: 'dataset' as const };
     }
+    if (input.transcriber !== undefined && input.transcriber !== 'sheetsage2' && input.transcriber !== 'sheetsage2-refined') {
+      throw new CoverRequestError("transcriber must be 'sheetsage2' or 'sheetsage2-refined'.");
+    }
+    if (input.keyMode !== undefined && typeof input.keyMode !== 'boolean') throw new CoverRequestError('keyMode must be a boolean.');
+    // An explicit choice overrides the stored one (the YuE2 Models dropdown).
+    const stored = deps.transcriberSetting?.() ?? { refined: false, keyMode: false };
+    const refined = input.transcriber === undefined ? stored.refined : input.transcriber === 'sheetsage2-refined';
+    const keyMode = refined && (input.keyMode === undefined ? stored.keyMode : input.keyMode === true);
     const ready = readiness();
-    if (!ready.ready) throw new CoverRequestError(ready.message!, 400);
+    if (!deps.model()) throw new CoverRequestError(ready.message!, 400);
+    if (refined && !ready.refined) {
+      throw new CoverRequestError('SheetSage2-Refined is chosen but not installed. Download it (yue2-sheetsage2-refined-f16) in Model Manager, or choose SheetSage2.', 400);
+    }
+    const transcriber = { refined, keyMode };
     const job = deps.queue.createJob('yue2-sheet', `cover:${userId}`, [], { sourceId: selected.sourceId });
     const dir = path.join(deps.jobRoot, job.id);
     try {
@@ -164,7 +231,7 @@ export function createYue2CoverService(deps = {
     }
     deps.queue.enqueue(job, async j => {
       if (j.controller.signal.aborted) return;
-      try { await deps.run(j, selected.workPath, dir); } catch { /* runner records failed/cancelled status */ }
+      try { await deps.run(j, selected.workPath, dir, transcriber); } catch { /* runner records failed/cancelled status */ }
     });
     return { status: 'queued' as const, jobId: job.id, sourceId: selected.sourceId, sourceLabel: selected.sourceLabel };
   }
@@ -303,7 +370,7 @@ export function createYue2CoverService(deps = {
       }
       fields.lyrics = lyrics.replace(/\r\n?/g, '\n');
     }
-    if (abc !== undefined && (typeof abc !== 'string' || abc.length > MAX_ABC_LENGTH || !hasSoundingVocalBar(abc))) {
+    if (abc !== undefined && (typeof abc !== 'string' || abc.length > MAX_ABC_LENGTH || !hasSoundingScore(abc))) {
       throw new CoverRequestError('The score must be ABC of at most 64 KB with a sounding vocal bar.');
     }
     if (bpm !== undefined || key !== undefined) {

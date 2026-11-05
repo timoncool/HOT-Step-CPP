@@ -87,6 +87,12 @@ $familyHooks = @(
         Call    = 'yue2_register_routes\s*\('
         LostMsg = "Single hook for the whole YuE2 backend subsystem (engine/src/yue2/). Without the include, every /yue2/* route vanishes, including the production POST /yue2/synth (which rides the SHARED /job routes -- there is no separate /yue2/job route to lose). The include alone registers nothing - the call site is the other half."
     }
+    @{
+        Family  = "HeartMuLa"
+        Include = '#include\s+"heartmula/server\.h"'
+        Call    = 'heartmula_register_routes\s*\('
+        LostMsg = "Re-add heartmula/server.h after the shared job system and the MM3/YuE2 unload handlers it uses. Both the include and heartmula_register_routes call are required for /heartmula/* routes."
+    }
 )
 foreach ($hook in $familyHooks) {
     if ($content -match $hook.Include) {

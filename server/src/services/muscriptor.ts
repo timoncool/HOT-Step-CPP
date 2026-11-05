@@ -15,10 +15,8 @@
 
 import path from 'path';
 import fs from 'fs';
-import { Readable } from 'stream';
-import { pipeline } from 'stream/promises';
 import { config } from '../config.js';
-import { registerBusyCheck } from '../dataroot/pointer.js';
+import { muscriptorRoots, resolveModelDir, targetRoot } from './muscriptorPaths.js';
 
 export const MUSCRIPTOR_DIR = path.join(config.data.dir, 'muscriptor');
 
@@ -83,18 +81,20 @@ export function aceMidiExe(): string | null {
 
 // ── Model weights (gated on HF — downloaded with the user's read token) ──
 
-// MUSCRIPTOR_MODELS_DIR (Settings > Environment) mirrors ACESTEPCPP_MODELS so
-// the gated weights can live outside the install (#86). Read at import, so a
-// change needs a restart.
-export const MODELS_DIR = process.env.MUSCRIPTOR_MODELS_DIR || path.join(config.data.dir, 'models', 'muscriptor');
+// Weights live in <models>/muscriptor/<variant>; a complete pre-#228 download
+// under <library>/models/muscriptor is still used. MUSCRIPTOR_MODELS_DIR
+// (Settings > Environment) overrides both (#86). Rules: muscriptorPaths.ts.
+// Read at import, so a change needs a restart.
+export const MODEL_ROOTS = muscriptorRoots(process.env.MUSCRIPTOR_MODELS_DIR, config.aceServer.models, config.data.dir);
+/** Where downloads go and what Settings shows. */
+export const MODELS_DIR = targetRoot(MODEL_ROOTS);
 
 export function modelDir(m: DownloadableModel): string {
-  return path.join(MODELS_DIR, m);
+  return resolveModelDir(MODEL_ROOTS, m).dir;
 }
 
 export function isModelDownloaded(m: DownloadableModel): boolean {
-  return fs.existsSync(path.join(modelDir(m), 'model.safetensors'))
-      && fs.existsSync(path.join(modelDir(m), 'config.json'));
+  return resolveModelDir(MODEL_ROOTS, m).complete;
 }
 
 export interface ModelDownloadState {
@@ -105,12 +105,14 @@ export interface ModelDownloadState {
   gated?: boolean;
 }
 
-const downloads = new Map<DownloadableModel, ModelDownloadState>();
+/** Live download progress for one model, supplied by the caller so this module
+ *  holds no download state: the jobs live in the Model Manager's service. */
+export type ModelDownloadLookup = (m: DownloadableModel) => ModelDownloadState | undefined;
 
-export function getModelStates(): Record<string, ModelDownloadState & { downloaded: boolean; sizeBytes: number }> {
+export function getModelStates(lookup: ModelDownloadLookup): Record<string, ModelDownloadState & { downloaded: boolean; sizeBytes: number }> {
   const out: Record<string, any> = {};
   for (const m of [...MUSCRIPTOR_MODELS, BEAT_MODEL] as DownloadableModel[]) {
-    const dl = downloads.get(m);
+    const dl = lookup(m);
     let sizeBytes = 0;
     const downloaded = isModelDownloaded(m);
     if (downloaded) {
@@ -128,63 +130,6 @@ export function getModelStates(): Record<string, ModelDownloadState & { download
   }
   return out;
 }
-
-async function fetchToFile(url: string, token: string | null, dest: string,
-                           onProgress?: (received: number, total: number) => void): Promise<void> {
-  const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
-  const res = await fetch(url, { headers, redirect: 'follow' });
-  if (!res.ok || !res.body) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status} fetching ${url}: ${body.slice(0, 300)}`);
-  }
-  const total = parseInt(res.headers.get('content-length') || '0', 10);
-  let received = 0;
-  const src = Readable.fromWeb(res.body as any);
-  src.on('data', (chunk: Buffer) => {
-    received += chunk.length;
-    onProgress?.(received, total);
-  });
-  fs.mkdirSync(path.dirname(dest), { recursive: true });
-  const tmp = dest + '.part';
-  await pipeline(src, fs.createWriteStream(tmp));
-  fs.renameSync(tmp, dest);
-}
-
-/**
- * Begin downloading a model's config.json + model.safetensors from its gated
- * HF repo. Fire-and-poll: progress via getModelStates(). Single-flight.
- */
-export function startModelDownload(m: DownloadableModel): { started: boolean; error?: string } {
-  if (downloads.get(m)?.downloading) return { started: false, error: 'Download already in progress' };
-  if (isModelDownloaded(m)) return { started: false, error: 'Already downloaded' };
-
-  const state: ModelDownloadState = { downloading: true, receivedBytes: 0, totalBytes: 0 };
-  downloads.set(m, state);
-  const token = getHfToken();
-  const base = `https://huggingface.co/${HF_MODEL_REPOS[m]}/resolve/main`;
-
-  (async () => {
-    try {
-      console.log(`[MidiStudio] Downloading ${m} weights from ${HF_MODEL_REPOS[m]}`);
-      await fetchToFile(`${base}/config.json`, token, path.join(modelDir(m), 'config.json'));
-      await fetchToFile(`${base}/model.safetensors`, token, path.join(modelDir(m), 'model.safetensors'),
-        (received, total) => { state.receivedBytes = received; state.totalBytes = total; });
-      console.log(`[MidiStudio] ${m} weights downloaded (${(state.receivedBytes / 1e9).toFixed(2)} GB)`);
-    } catch (err: any) {
-      state.error = err.message || 'Download failed';
-      state.gated = looksLikeGatedError(state.error ?? '');
-      console.error(`[MidiStudio] ${m} download FAILED: ${state.error}`);
-    } finally {
-      state.downloading = false;
-    }
-  })();
-
-  return { started: true };
-}
-
-registerBusyCheck('muscriptor-downloads', () => [...downloads.entries()]
-  .filter(([, s]) => s.downloading)
-  .map(([m]) => `downloading MuScriptor ${m}`));
 
 // ── Beat grid (ace-midi --beats-out) ─────────────────────────────────────
 
@@ -237,6 +182,16 @@ export interface MidiExportOptions {
   strength?: number;
   fillGaps?: number;
   trimLeadingBars?: boolean;
+}
+
+/** ace-midi flags for speculative decoding (upstream MuScriptor PR #95): the
+ *  small model drafts four tokens at a time and the large one checks them in a
+ *  single pass, so the output is the large model's own. Only large gains:
+ *  measured on a 4 min track, CUDA, large 122 s -> 79 s; medium 61 s -> 60 s. */
+export function speculativeArgs(model: MuscriptorModel, enabled: boolean, smallReady: boolean): string[] {
+  return enabled && model === 'large' && smallReady
+    ? ['--draft-model', modelDir('small'), '--speculative-k', '4']
+    : [];
 }
 
 export function exportArgs(o: MidiExportOptions): string[] {

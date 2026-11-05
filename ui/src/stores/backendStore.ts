@@ -143,6 +143,8 @@ export interface BackendFeatureCapabilities {
    *  gp.yue2AlignLyrics. */
   forcedAlignment: boolean;
   cover: boolean;
+  /** Audio-to-audio transform without a lead sheet or vocal conditioning. */
+  coverAudioTransform?: boolean;
   repaint: boolean;
   lego: boolean;
   extract: boolean;
@@ -159,7 +161,7 @@ export interface BackendFeatureCapabilities {
 /** Which top-bar cluster a declared knob belongs in. Absent means
  *  'generation' — the behaviour before groups existed, and what a manifest
  *  cached from an older server will look like. */
-export type BackendExtensionGroup = 'generation' | 'lm';
+export type BackendExtensionGroup = 'generation' | 'lm' | 'adapter';
 
 export interface BackendExtensionParam {
   key: string;
@@ -219,6 +221,10 @@ export interface BackendModelCatalogue {
     rank?: number;
     steps?: number;
     bytes?: number;
+    /** HeartMuLa: the adapter carries MLP factors, so its MLP dial does something. */
+    mlp?: boolean;
+    /** HeartMuLa: the variant the adapter was trained on (its home base for re-base). */
+    variant?: string;
     dataset?: string;
     final?: boolean;
     /** Mean of the last 20 logged step losses up to this checkpoint. */
@@ -311,14 +317,18 @@ export const useBackendStore = create<BackendState>((set, get) => ({
     try {
       await queryClient.cancelQueries({ queryKey: backendModelsOptions(backendId).queryKey });
       // Re-read rather than trusting the request: the engine may fall back to
-      // a different quant if the requested file vanished.
+      // a different quant if the requested file vanished. Silent: every caller
+      // renders its own inline note on !ok (the adapter-dropdown legs, the
+      // backend-models dropdown, PresetSettingsModal) or swallows deliberately
+      // (yue2CaptionSource), so their line is the sole notifier.
       await writeAndInvalidate(queryClient,
-        () => apiClient.post('/backends/models', { backend: backendId, selection }),
+        () => apiClient.post('/backends/models', { backend: backendId, selection }, { silent: true }),
         keysPlan(backendModelsOptions(backendId).queryKey));
       await get().fetchModels(backendId);
       return true;
     } catch {
-      // Transport failure already toasted by the global handler.
+      // No global toast — the write is silent and every caller owns its own
+      // inline note (or swallows deliberately).
       return false;
     }
   },
@@ -327,7 +337,25 @@ export const useBackendStore = create<BackendState>((set, get) => ({
     set({ error: null });
     try {
       await queryClient.cancelQueries({ queryKey: backendsOptions().queryKey });
-      const data = await apiClient.post<{ activeId: string }>('/backends/active', { id });
+      // The plan depends on the write's RESULT (the server resolves the
+      // requested id to the active backend), so capture it in a holder: the
+      // fn runs first, and the plan reads what the write saw. Refetch on
+      // success — the new active backend's manifest may not be cached yet (or
+      // may be stale from a previous session). The manager still owns the
+      // invalidateQueries call.
+      let activeId = id;
+      const data = await writeAndInvalidate(queryClient,
+        async () => {
+          const res = await apiClient.post<{ activeId: string }>('/backends/active', { id });
+          activeId = res.activeId;
+          return res;
+        },
+        client => queryManager.invalidate(
+          client,
+          backendsOptions().queryKey,
+          capabilitiesOptions(activeId).queryKey,
+          backendModelsOptions(activeId).queryKey,
+        ));
       queryClient.setQueryData(backendsOptions().queryKey, old => old && ({
         ...old, activeId: data.activeId,
         backends: old.backends.map(b => ({ ...b, active: b.id === data.activeId })),
@@ -337,16 +365,6 @@ export const useBackendStore = create<BackendState>((set, get) => ({
         activeBackendId: data.activeId,
         backends: get().backends.map(b => ({ ...b, active: b.id === data.activeId })),
       });
-      // Refetch on success — the new active backend's manifest may not be
-      // cached yet (or may be stale from a previous session). The plan depends
-      // on the write's RESULT (data.activeId), so it is named here with the
-      // captured scope; the manager still owns the invalidateQueries call.
-      await queryManager.keys(
-        queryClient,
-        backendsOptions().queryKey,
-        capabilitiesOptions(data.activeId).queryKey,
-        backendModelsOptions(data.activeId).queryKey,
-      );
       await get().fetchCapabilities(data.activeId);
       await get().fetchModels(data.activeId);
     } catch {

@@ -14,7 +14,8 @@ export async function getYue2PreparationContext(datasetId: string, opts: ReadOpt
 }
 
 export async function startYue2Preparation(snapshot: Snapshot): Promise<Yue2PreparationSummary> {
-  return (await trainingOperation<{ pipeline: Yue2PreparationSummary }>(domain, '/', { body: snapshot })).pipeline;
+  // silent: Yue2AitkTrainCard's train error line is the sole notifier.
+  return (await trainingOperation<{ pipeline: Yue2PreparationSummary }>(domain, '/', { body: snapshot, silent: true })).pipeline;
 }
 
 export async function listYue2Preparations(datasetId?: string, opts: ReadOptions = {}): Promise<Yue2PreparationSummary[]> {
@@ -31,6 +32,8 @@ export async function getYue2PreparationJob<T>(id: string, opts: ReadOptions = {
 }
 
 export async function commandYue2Preparation(id: string, action: 'pause' | 'resume' | 'cancel' | 'retry'): Promise<Yue2PreparationSummary> {
+  // silent: Yue2TrainStages' capture-error banner and Yue2AitkTrainCard's
+  // stop error line are the sole notifiers.
   return (await trainingOperation<{ pipeline: Yue2PreparationSummary }>(domain,
-    `/${encodeURIComponent(id)}/${action}`, { method: 'POST' })).pipeline;
+    `/${encodeURIComponent(id)}/${action}`, { method: 'POST', silent: true })).pipeline;
 }

@@ -1,0 +1,10 @@
+HeartMuLa GGUF components
+
+Original models and implementation: HeartMuLa Team.
+Source: https://github.com/HeartMuLa/heartlib
+Models: https://huggingface.co/HeartMuLa
+License: Apache License, Version 2.0.
+
+Modified by the HOT-Step project: safetensors-to-GGUF conversion, component
+splitting, tensor layout changes, weight-norm folding and quantization.
+The converted files are derivatives, not official upstream checkpoints.

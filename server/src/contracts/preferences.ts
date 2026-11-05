@@ -106,6 +106,28 @@ export const stormTuningBodySchema = z.object({
 }).passthrough();
 export type StormTuningBody = z.infer<typeof stormTuningBodySchema>;
 
+/** The lead-sheet transcriber every SheetSage pass uses (YuE2 covers, the AR
+ *  sheet stage, labelling): SheetSage2 or SheetSage2-Refined, and Refined's
+ *  modal keys. Chosen in the YuE2 Models dropdown. */
+export const sheetTranscriberBodySchema = z.object({
+  transcriber: z.enum(['sheetsage2', 'sheetsage2-refined']),
+  keyMode: z.boolean(),
+});
+export type SheetTranscriberBody = z.infer<typeof sheetTranscriberBodySchema>;
+
+/** The real-audio tokenizer that turns audio into YuE2 semantic codes: v9
+ *  (Mothersuperior's head, the default) or ManyOtherFunctions' WannabeTokenizer
+ *  V1/V2. `training` makes a dataset's codes (the tokenize stage); `cover` makes
+ *  a cover's Follow-source guide. Chosen at the tokenize stage and in the YuE2
+ *  cover panel. */
+export const YUE2_TOKENIZER_IDS = ['v9', 'wannabe-v1', 'wannabe-v2'] as const;
+export type Yue2TokenizerId = typeof YUE2_TOKENIZER_IDS[number];
+export const yue2TokenizerBodySchema = z.object({
+  training: z.enum(YUE2_TOKENIZER_IDS),
+  cover: z.enum(YUE2_TOKENIZER_IDS),
+});
+export type Yue2TokenizerBody = z.infer<typeof yue2TokenizerBodySchema>;
+
 // ── Requests ─────────────────────────────────────────────────────────────
 
 /** POST /api/preferences/:family — create a new named preset. */

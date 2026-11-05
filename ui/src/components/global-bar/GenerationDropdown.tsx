@@ -1,10 +1,10 @@
-import { useReferences } from '../../queries/global-models/hooks';
+import { useReferenceTracks } from '../../queries/global-models/hooks';
 // GenerationDropdown.tsx — DiT generation settings for the global param bar
 //
 // Adapted from the DiT section of create/GenerationSettings.tsx.
 // Reads from GlobalParamsContext instead of props.
 
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo } from 'react';
 // Seed input uses local string state to avoid parseInt("-") → NaN → -1 snap-back
 import { useTranslation } from 'react-i18next';
 import { RotateCcw, ChevronDown, Music2, Upload, Trash2, Zap } from 'lucide-react';
@@ -15,7 +15,6 @@ import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
 import { formatScheduler, formatReferenceName } from './modelLabels';
 import { usePersistedState } from '../../hooks/usePersistedState';
-import { masteringApi } from '../../services/api';
 import { useAuth } from '../../context/AuthContext';
 import { usePluginRegistry } from '../../hooks/usePluginRegistry';
 import { PluginControls } from './PluginControls';
@@ -63,25 +62,15 @@ export const GenerationDropdown: React.FC = () => {
   const { token } = useAuth();
 
   // ── Timbre reference file management ──
-  const { references: timbreRefs, refresh: refreshReferences } = useReferences();
-  const [timbreUploading, setTimbreUploading] = useState(false);
+  const { references: timbreRefs, upload: timbreUploadMut } = useReferenceTracks();
+  const timbreUploading = timbreUploadMut.isPending;
 
-
-  const handleTimbreUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleTimbreUpload = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !token) return;
-    try {
-      setTimbreUploading(true);
-      const result = await masteringApi.uploadReference(file);
-      gp.setTimbreAudioPath(result.name);
-      await refreshReferences();
-    } catch (err) {
-      console.error('[Timbre] Upload failed:', err);
-    } finally {
-      setTimbreUploading(false);
-      e.target.value = '';
-    }
-  }, [token, gp, refreshReferences]);
+    timbreUploadMut.mutate(file, { onSuccess: result => gp.setTimbreAudioPath(result.name) });
+    e.target.value = '';
+  }, [token, gp, timbreUploadMut]);
 
   // Resolve scheduler dropdown value from the composite string representation
   const schedulerKey = gp.scheduler.startsWith('composite') ? 'composite'
@@ -847,7 +836,7 @@ export const GenerationDropdown: React.FC = () => {
         onChange={gp.setBatchSize} min={1} max={9} step={1}
         defaultValue={GLOBAL_PARAM_DEFAULTS.batchSize}
         infoMeta="default 1 · range 1-9"
-        info="How many takes to render from one request. The LM plans that many variations, then the DiT renders each in turn as its own song. With the LM off, or for cover and repaint tasks, extra takes reuse the same plan with a different random seed each." />
+        info="How many takes to render from one request. The LM plans once and every take reuses that plan with its own random DiT seed, the same as with the LM off or for cover and repaint tasks. The DiT renders the takes one after another as separate songs." />
     </div>
   );
 };

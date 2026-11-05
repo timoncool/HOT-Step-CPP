@@ -97,7 +97,7 @@ export function saveDatasetCoverAbc(
   let datasetSource: CoverDatasetSource | null;
   try { datasetSource = match(audioPath); }
   catch { return false; }
-  return datasetSource ? writeAbcSidecar(datasetSource.audioPath, abc) : false;
+  return datasetSource ? writeAbcSidecar(datasetSource.audioPath, abc, { anySounding: true }) : false;
 }
 
 /** Use stored musical details only for an unambiguous dataset source. */

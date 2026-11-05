@@ -38,7 +38,9 @@ import { runOnGpuLane } from '../generation/gpuLane.js';
 import { evictOtherFamilies } from '../generation/residency.js';
 import { saveDatasetCoverAbc } from '../coverDatasetSource.js';
 import { YUE2_LICENSE_NOTICE } from '../backends/yue2/index.js';
-import { EMPTY_COVER_SCORE_ERROR, hasSoundingVocalBar } from '../backends/yue2/scoreHealth.js';
+import { EMPTY_COVER_SCORE_ERROR, hasSoundingScore, hasSoundingVocalBar } from '../backends/yue2/scoreHealth.js';
+import { vocalCadenceAbc } from '../backends/yue2/vocalCadence.js';
+import { readWav } from '../generation/audioLevel.js';
 import { getDataset } from './datasetsRepo.js';
 import { refreshYue2PresetsForNewRun } from './lyricStudioExport.js';
 import { missingYue2TrainModels, readYue2PreprocessSummary } from './yue2Train.js';
@@ -53,7 +55,7 @@ import {
 } from './yue2Tokenize.js';
 import {
   buildYue2SheetArgs, missingYue2SheetModels, readYue2AbcStatus,
-  writeYue2CoverSheetManifest, readYue2CoverAbc,
+  writeYue2CoverSheetManifest, readYue2CoverAbc, listYue2SheetSources, readYue2SheetSource,
   seedAbcManifestFromSidecars, saveAbcManifestSidecars,
   type ResolvedYue2SheetOptions,
 } from './yue2Sheet.js';
@@ -63,6 +65,9 @@ import {
 } from './yue2Align.js';
 import { log, numOr, runYue2AceTrain, YUE2_IDLE_MS, type RelayState } from './yue2TrainRunner.js';
 import { yue2SeparateDataset } from './yue2Stems.js';
+import { readAbcSidecar, writeAbcSidecar } from './abcSidecar.js';
+import { aceTrainExe } from './aceTrain.js';
+import { jobsDir } from './paths.js';
 import { emitProgress, finishJob, isCancelled, pushEvent, type TrainingJob } from './labelingQueue.js';
 
 // ── yue2-ar-train: stderr -> events ─────────────────────────────────────────
@@ -525,7 +530,7 @@ export async function runYue2TokenizeJob(job: TrainingJob): Promise<void> {
   }
   // Re-checked here as well as at the route: the route's answer can be stale by
   // the time the job reaches the head of the GPU lane.
-  const missing = missingYue2TokenizeModels();
+  const missing = missingYue2TokenizeModels(opts.tokenizer ?? 'v9');
   if (missing.length) {
     finishJob(job, 'failed', `The YuE2 tokenizer is missing: ${missing.join(', ')}`);
     return;
@@ -643,7 +648,7 @@ function relaySheetLine(job: TrainingJob, line: string, st: SheetState): void {
 function fatalishSheet(line: string): string {
   const usage = /^ace-train yue2-sheet:\s+(.+)$/.exec(line);
   if (usage) return usage[1];
-  const m = /^\[yue2-sheet\]\s+(cannot .+|no sheetsage2-.+|sources\[\d+\] is missing.+|FATAL .+|manifest not found:.+|SheetSage2 load failed.+)$/.exec(line);
+  const m = /^\[yue2-sheet\]\s+(cannot .+|no sheetsage2-.+|sources\[\d+\] is missing.+|FATAL .+|manifest not found:.+|SheetSage2 load failed.+|SheetSage2-Refined is not installed.+)$/.exec(line);
   return m ? m[1] : '';
 }
 
@@ -706,17 +711,23 @@ export async function runYue2SheetJob(job: TrainingJob,
 
 /** Transcribe one cover source through the same queued job relay as dataset sheets. */
 export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, jobDir: string,
-  deps = { missingModels: missingYue2SheetModels, run: runYue2AceTrain }): Promise<string> {
+  deps: { missingModels: typeof missingYue2SheetModels; run: typeof runYue2AceTrain;
+    /** The source's vocal stem; with it, a silent Vocal line becomes the vocal's rhythm. */
+    vocalStem?: (audioPath: string) => Promise<string> } = { missingModels: missingYue2SheetModels, run: runYue2AceTrain },
+  /** SheetSage2-Refined, optionally with modal keys; SheetSage2 when absent. */
+  transcriber: { refined?: boolean; keyMode?: boolean } = {}): Promise<string> {
   try {
     const missing = deps.missingModels();
     if (missing.length) throw new Error(`The SheetSage2 transcriber is missing: ${missing.join(', ')}`);
     const { manifest, name } = writeYue2CoverSheetManifest(audioPath, jobDir);
     const opts: ResolvedYue2SheetOptions = {
       manifest, only: '', force: false, fast: false, datasetSlug: '', melodyOnly: false,
+      // Unset: the stored choice (buildYue2SheetArgs reads it).
+      refined: transcriber.refined, keyMode: transcriber.keyMode,
     };
     const st: SheetState = { fatalMessage: '', doneSeen: false, lastStep: 0, totalSteps: 0 };
     const verify = () => {
-      try { return hasSoundingVocalBar(readYue2CoverAbc(manifest, name)) ? null : EMPTY_COVER_SCORE_ERROR; }
+      try { return hasSoundingScore(readYue2CoverAbc(manifest, name)) || deps.vocalStem ? null : EMPTY_COVER_SCORE_ERROR; }
       catch (err) { return err instanceof Error ? err.message : String(err); }
     };
     let loadFailed = false;
@@ -742,8 +753,30 @@ export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, 
       }, { label: `${job.id} cover transcription fallback`, family: 'yue2' });
     }
     if (isCancelled(job)) throw new Error('Cover lead-sheet transcription was cancelled');
-    const abc = readYue2CoverAbc(manifest, name);
-    if (!hasSoundingVocalBar(abc)) throw new Error(EMPTY_COVER_SCORE_ERROR);
+    let abc = readYue2CoverAbc(manifest, name);
+    if (!hasSoundingVocalBar(abc) && deps.vocalStem) {
+      // Rap, screams: no pitched melody, but the chords, the Ins line and the
+      // vocal's rhythm are still worth a cover.
+      log(job, 'info', 'The transcriber heard no sung melody; writing the vocal rhythm from the vocal stem on one note.');
+      let recovered: string | undefined;
+      try { recovered = vocalCadenceAbc(abc, readWav(await deps.vocalStem(audioPath))); }
+      catch (err) {
+        const why = err instanceof Error ? err.message : String(err);
+        if (isCancelled(job)) throw err;
+        // A sounding Ins line is still a usable instrumental score.
+        if (!hasSoundingScore(abc)) throw new Error(`${EMPTY_COVER_SCORE_ERROR}, and its vocal rhythm could not be read: ${why}`);
+        log(job, 'warn', `The vocal rhythm could not be read (${why}); keeping the instrumental score.`);
+      }
+      if (recovered !== undefined) {
+        abc = recovered;
+        if (isCancelled(job)) throw new Error('Cover lead-sheet transcription was cancelled');
+        // The cover job's result is read back from this manifest; a write failure fails the job.
+        const data = JSON.parse(fs.readFileSync(manifest, 'utf8')) as { sources: { name: string; abc?: string }[] };
+        for (const row of data.sources) if (row.name === name) row.abc = abc;
+        fs.writeFileSync(manifest, JSON.stringify(data), { encoding: 'utf8', mode: 0o600 });
+      }
+    }
+    if (!hasSoundingScore(abc)) throw new Error(EMPTY_COVER_SCORE_ERROR);
     saveDatasetCoverAbc(audioPath, abc);
     finishJob(job, 'done');
     return abc;
@@ -751,6 +784,67 @@ export async function runYue2CoverSheetJob(job: TrainingJob, audioPath: string, 
     if (!isCancelled(job)) finishJob(job, 'failed', err instanceof Error ? err.message : String(err));
     throw err;
   }
+}
+
+/** A label job's key pass: SheetSage2 lead sheets for the files that have no
+ *  .abc sidecar yet, in one engine run. Each score is saved beside its audio
+ *  and handed to `onScore` as soon as that file is done, so the rest of the
+ *  label job runs alongside instead of waiting for the whole pass. Never fails
+ *  the label job: a file it cannot transcribe never reaches `onScore` and
+ *  keeps Essentia's key. Instrumentals reach `onScore` too, though their score
+ *  has no sung bar and so is not saved. */
+export async function transcribeLabelSheets(job: TrainingJob, audioPaths: string[],
+  onScore: (audioPath: string, abc: string) => void,
+  deps = { missingModels: missingYue2SheetModels, run: runYue2AceTrain, exe: aceTrainExe }): Promise<void> {
+  // The engine names a source by its basename, so two same-named files in
+  // different subfolders cannot share a manifest; the second keeps Essentia.
+  const byName = new Map<string, string>();
+  for (const p of audioPaths) if (!readAbcSidecar(p) && !byName.has(path.basename(p))) byName.set(path.basename(p), p);
+  if (!byName.size) return;
+  const missing = deps.missingModels();
+  if (missing.length || !deps.exe()) {
+    log(job, 'warn', `SheetSage2 key detection skipped (${missing.join(', ') || 'ace-train is not in this build'}); using Essentia's key.`);
+    return;
+  }
+  const dir = path.join(jobsDir(), job.id);
+  fs.mkdirSync(dir, { recursive: true });
+  const manifest = path.join(dir, 'label-sheets.json');
+  fs.writeFileSync(manifest, JSON.stringify({ sources: [...byName].map(([name, source]) => ({ name, source })) }), 'utf8');
+  log(job, 'info', `Transcribing ${byName.size} file(s) with SheetSage2 for their key; each lead sheet is saved beside the audio as it is done.`);
+  // The engine rewrites the manifest after every source; re-read it on each
+  // per-file line and pass on whatever is new.
+  const handed = new Set<string>();
+  const collect = () => {
+    for (const s of listYue2SheetSources(manifest)) {
+      const audio = byName.get(s.name);
+      if (!audio || handed.has(s.name) || !s.ok || s.error) continue;
+      const row = readYue2SheetSource(manifest, s.name);
+      if (!row) continue;
+      handed.add(s.name);
+      writeAbcSidecar(audio, row.abc);
+      onScore(audio, row.abc);
+    }
+  };
+  const st: SheetState = { fatalMessage: '', doneSeen: false, lastStep: 0, totalSteps: 0 };
+  try {
+    // Not relaySheetLine: that drives job.done/total, which here count the
+    // label job's own files while this pass runs beside it.
+    await deps.run(job, 'yue2-sheet', buildYue2SheetArgs({ manifest, only: '', force: false, fast: false, datasetSlug: '' }),
+      YUE2_IDLE_MS, () => null, (line, state) => {
+        const m = RE_SHEET_FILE.exec(line);
+        if (m) {
+          collect();
+          if (m[3] === 'FAIL') log(job, 'warn', `SheetSage2 FAIL: ${m[4].trim()}`);
+          if (Number(m[1]) % 10 === 0 || m[1] === m[2]) log(job, 'info', `SheetSage2: ${m[1]} of ${m[2]} transcribed`);
+          return;
+        }
+        const bad = fatalishSheet(line);
+        if (bad) state.fatalMessage = state.fatalMessage || bad;
+      }, st, undefined, false);
+  } catch (err) {
+    log(job, 'warn', `SheetSage2 stopped early (${err instanceof Error ? err.message : String(err)}); files it did not reach keep Essentia's key.`);
+  }
+  collect();
 }
 
 // ── yue2-align ──────────────────────────────────────────────────────────────

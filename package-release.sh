@@ -228,6 +228,9 @@ cp release/HOT-Step.sh release/profile-path.mjs release/README.txt "${STAGING_DI
 cp release/.env.example "${STAGING_DIR}/.env.example"
 printf '%s\n' "v${VERSION}" > "${STAGING_DIR}/VERSION"
 chmod +x "${STAGING_DIR}/HOT-Step.sh"
+# Exact package identity for the updater (docs/dev/releasing.md)
+"${STAGING_DIR}/runtime/bin/node" release/build-info.mjs "${STAGING_DIR}" --os macos --arch arm64 --variant metal --tag "v${VERSION}" || fail "build-info.mjs failed"
+"${STAGING_DIR}/runtime/bin/node" release/check-layout.mjs --package "${STAGING_DIR}" --os macos --variant metal || fail "build-info.json check failed"
 
 ok "Release assembled"
 

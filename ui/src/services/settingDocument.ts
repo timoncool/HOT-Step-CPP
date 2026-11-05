@@ -14,7 +14,7 @@
 import type { ImportPreferenceItem, SettingsFamily } from './preferencesApi';
 import { hashImportValue, preferencesApi } from './preferencesApi';
 import { queriedSettingsApi } from '../queries/shell-queue/preferences';
-import { ApiError } from './apiError';
+import { ApiError, HttpStatus } from './apiError';
 
 export type SettingStatus = 'loading' | 'idle' | 'saving' | 'conflict' | 'failed';
 
@@ -142,12 +142,12 @@ export class SettingDocument {
     } catch (err) {
       // What retry will send: the latest edit, never an older value over it.
       this.pending = undefined;
-      const is409 = err instanceof ApiError && err.status === 409;
+      const isConflict = err instanceof ApiError && err.status === HttpStatus.conflict;
       // Moved on elsewhere (or created by another client first): a conflict.
       let current: { revision: number; body: Record<string, unknown> } | null = null;
       let readBack = true;
       try { current = (await this.api.get<Record<string, unknown>>(this.opts.family)).document; } catch { readBack = false; }
-      if (is409 || (current && current.revision !== this.revision)) {
+      if (isConflict || (current && current.revision !== this.revision)) {
         if (current) this.revision = current.revision;
         this.set({ status: 'conflict', serverValue: current ? this.opts.read(current.body) : null,
           error: readBack ? 'This setting was changed elsewhere. Use theirs, or reapply yours over it.'

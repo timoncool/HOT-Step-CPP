@@ -1,5 +1,8 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { backendModelsOptions } from '../../queries/global-models/options';
+import { QueryError } from '../shared/QueryError';
+import { queryManager } from '../../queries/invalidation';
+import { apiClient } from '../../services/httpClient';
 // Yue2LmAdapterDropdown.tsx — Adapters cluster for a backend whose LM adapters
 // are ENGINE STATE rather than per-request parameters.
 //
@@ -65,9 +68,12 @@ interface Dials {
   /** Planner strength (AR only): the master while the score is written.
    *  null = follow `scale`. */
   plan: number | null;
+  /** Basin re-base beta, 0 to 1 (engine default 0.75): used only when the
+   *  adapter was trained on another YuE2 variant than the loaded LM. */
+  rebase: number;
 }
 
-const UNITY: Dials = { scale: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1, plan: null };
+const UNITY: Dials = { scale: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1, plan: null, rebase: 0.75 };
 
 /** Selection keys the server reads, per slot. Kept in one place because the
  *  spelling has to match backends/yue2/index.ts exactly — a typo here is a
@@ -83,6 +89,7 @@ function keysFor(kind: SlotKind) {
     mid: `lmAdapter${Slot}ScaleMid`,
     late: `lmAdapter${Slot}ScaleLate`,
     plan: `lmAdapter${Slot}ScalePlan`,
+    rebase: `lmAdapter${Slot}Rebase`,
     inForce: `lmAdapter${Slot}InForce`,
   };
 }
@@ -101,7 +108,7 @@ function shortName(p: string): string {
 
 function sameDials(a: Dials, b: Dials): boolean {
   return a.scale === b.scale && a.attn === b.attn && a.mlp === b.mlp
-    && a.early === b.early && a.mid === b.mid && a.late === b.late && a.plan === b.plan;
+    && a.early === b.early && a.mid === b.mid && a.late === b.late && a.plan === b.plan && a.rebase === b.rebase;
 }
 
 /** The catalogue rows the picker renders, plus what the engine says is
@@ -109,7 +116,7 @@ function sameDials(a: Dials, b: Dials): boolean {
  *  the store refetches after every successful selection. */
 function useYue2Adapters() {
   const activeBackendId = useBackendStore(s => s.activeBackendId);
-  const { data: catalogue } = useQuery(backendModelsOptions(activeBackendId));
+  const { data: catalogue, isError, error, refetch } = useQuery(backendModelsOptions(activeBackendId));
 
 
   const meta = catalogue?.lmAdapterMeta ?? {};
@@ -136,12 +143,17 @@ function useYue2Adapters() {
       scale: num(k.scale), attn: num(k.attn), mlp: num(k.mlp),
       early: num(k.early), mid: num(k.mid), late: num(k.late),
       plan: defaults[k.plan] === undefined ? null : num(k.plan),
+      rebase: Number.isFinite(Number(defaults[k.rebase])) && defaults[k.rebase] !== undefined
+        ? Math.min(1, Math.max(0, Number(defaults[k.rebase]))) : UNITY.rebase,
     };
   };
 
   return {
     activeBackendId,
     catalogue,
+    isError,
+    error,
+    refetch,
     meta,
     pathsFor,
     dialsFor,
@@ -149,6 +161,8 @@ function useYue2Adapters() {
     /** false until the next warm/synth after a pick — the merge happens at
      *  load, so "chosen" and "in force" genuinely differ for that window. */
     inForceFor: (kind: SlotKind) => defaults[keysFor(kind).inForce] === true,
+    /** The picked LM's variant ('' = base); an adapter whose `home` differs is re-based. */
+    loadedVariant: String(defaults.lmVariant ?? ''),
   };
 }
 
@@ -161,6 +175,7 @@ interface SlotPanelProps {
   selected: string;
   dials: Dials;
   inForce: boolean;
+  loadedVariant: string;
   disabled: boolean;
   onCommit: (kind: SlotKind, path: string | null, dials: Dials) => Promise<void>;
   /** Save a typed trigger word for an adapter file that carries none. */
@@ -168,7 +183,7 @@ interface SlotPanelProps {
 }
 
 const SlotPanel: React.FC<SlotPanelProps> = ({
-  kind, title, blurb, paths, meta, selected, dials, inForce, disabled, onCommit, onTrigger,
+  kind, title, blurb, paths, meta, selected, dials, inForce, loadedVariant, disabled, onCommit, onTrigger,
 }) => {
   const { t } = useTranslation();
   const [draft, setDraftState] = useState<Dials>(dials);
@@ -188,9 +203,12 @@ const SlotPanel: React.FC<SlotPanelProps> = ({
   // something different — another tab, a reconcile after an engine restart,
   // this panel's own successful commit — the draft is replaced rather than
   // merged: a half-dragged slider is not a change anyone asked to keep.
-  useEffect(() => { setDraft(dials); }, [dials.scale, dials.attn, dials.mlp, dials.early, dials.mid, dials.late, dials.plan]);
+  useEffect(() => { setDraft(dials); }, [dials.scale, dials.attn, dials.mlp, dials.early, dials.mid, dials.late, dials.plan, dials.rebase]);
 
   const entry = selected ? meta[selected] : undefined;
+  // Trained on another variant: the engine re-bases it onto the loaded LM.
+  const variantName = (v: string) => v || t('globalBar.yue2BaseVariant', 'YuE2 base');
+  const home = typeof entry?.home === 'string' && entry.home !== loadedVariant ? variantName(entry.home) : '';
   // A trigger the file itself (or its run/dataset) carries is shown as-is; one
   // the user typed, or none at all, is an editable LoRA trigger word field.
   const triggerEmbedded = !!entry?.trigger && !entry.triggerManual;
@@ -219,7 +237,11 @@ const SlotPanel: React.FC<SlotPanelProps> = ({
           placeholder={t('globalBar.yue2AdapterBase', 'None — base model') as string}
           options={[
             { value: '', label: t('globalBar.yue2AdapterBase', 'None — base model') },
-            ...paths.map(p => ({ value: p, label: meta[p]?.label || shortName(p) })),
+            ...paths.map(p => {
+              const label = meta[p]?.label || shortName(p);
+              const h = meta[p]?.home;
+              return { value: p, label: typeof h === 'string' && h !== loadedVariant ? `${label} · ${variantName(h)}` : label };
+            }),
             // A pick whose file has since moved or been deleted still has to be
             // visible: silently showing blank for a value that is not among
             // the options reads as "nothing is selected" when something very
@@ -312,6 +334,26 @@ const SlotPanel: React.FC<SlotPanelProps> = ({
                 : t('globalBar.yue2AdapterPending', 'Merges when the model next loads.')}
             </p>
           </div>
+
+          {home && (
+            <>
+              <p className="text-[11px] text-emerald-600 dark:text-emerald-400 leading-relaxed">
+                {t('globalBar.yue2AdapterRebased',
+                  'Trained on {{home}}: re-based onto {{loaded}}. The layers it targets move toward {{home}} before it merges, which needs a {{home}} LM installed.',
+                  { home, loaded: variantName(loadedVariant) })}
+              </p>
+              <Slider
+                label={t('globalBar.yue2AdapterRebase', 'Re-base strength (β)')}
+                info={t('globalBar.yue2AdapterRebaseHint',
+                  'How far the layers this adapter targets move toward the model it was trained on before it merges. 1 runs them as that model, 0 applies the adapter to the loaded model unchanged.')}
+                value={draft.rebase}
+                onChange={v => edit({ rebase: v })}
+                min={0} max={1} step={0.05} showInput
+                defaultValue={UNITY.rebase}
+                onCommit={requestCommit}
+              />
+            </>
+          )}
 
           {/* ── Strength dials ── */}
           {kind === 'ar' && (
@@ -436,7 +478,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
   const { capabilities } = useCapabilities();
   const selectModels = useBackendStore(s => s.selectModels);
   const {
-    activeBackendId, catalogue, meta, pathsFor, dialsFor, selectedFor, inForceFor,
+    activeBackendId, catalogue, isError, error, refetch, meta, pathsFor, dialsFor, selectedFor, inForceFor, loadedVariant,
   } = useYue2Adapters();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -445,6 +487,17 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
   const [browsing, setBrowsing] = useState(false);
   const [importing, setImporting] = useState(false);
   useEffect(() => { setFolder(savedFolder); }, [savedFolder]);
+  const queryClient = useQueryClient();
+
+  // Silent: a failure gets the localized note below, not the global toast.
+  const importMut = useMutation({
+    mutationFn: (file: string) => apiClient.post<{ arPath: string; narPath: string; name?: string }>(
+      '/yue2/import-adapter', { path: file }, { silent: true }),
+    // The imported adapter must appear in the lists below even when the
+    // selectModels leg fails — the "pick it by hand" note promises it is there,
+    // and only a successful selection refetches the catalogue.
+    onSuccess: () => { void queryManager.invalidate(queryClient, backendModelsOptions(activeBackendId).queryKey); },
+  });
 
   /** A ComfyUI / ai-toolkit YuE2 adapter is one file holding both halves in
    *  the upstream naming. The server splits it into our AR + NAR pair; both
@@ -453,13 +506,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
     setBusy(true);
     setNote(null);
     try {
-      const res = await fetch('/api/yue2/import-adapter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: file }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
+      const body = await importMut.mutateAsync(file);
       const ok = await selectModels({ lmAdapterAr: body.arPath, lmAdapterNar: body.narPath }, activeBackendId);
       setNote(ok
         ? t('globalBar.yue2AdapterImported',
@@ -519,6 +566,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
       [k.late]: String(dials.late),
       // '' = follow the master strength.
       [k.plan]: dials.plan === null ? '' : String(dials.plan),
+      [k.rebase]: String(dials.rebase),
     }, activeBackendId);
     setBusy(false);
     const half = kind.toUpperCase();
@@ -532,6 +580,10 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
           'Could not apply that {{half}} pick; the previous one is still in force.', { half }));
   };
 
+  if (isError && !catalogue) {
+    return <QueryError error={error} onRetry={() => void refetch()} />;
+  }
+
   if (!catalogue) {
     return <p className="text-[11px] text-zinc-500">{t('globalBar.yue2AdapterLoading', 'Loading adapters…')}</p>;
   }
@@ -541,6 +593,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
 
   return (
     <div className="space-y-4">
+      {isError && <QueryError error={error} onRetry={() => void refetch()} compact />}
       {nothingTrained && (
         <p className="text-[11px] text-zinc-500 leading-relaxed">
           {t('globalBar.yue2AdapterNone',
@@ -618,6 +671,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
         selected={selectedFor('nar')}
         dials={dialsFor('nar')}
         inForce={inForceFor('nar')}
+        loadedVariant={loadedVariant}
         disabled={locked}
         onCommit={onCommit}
         onTrigger={onTrigger}
@@ -635,6 +689,7 @@ export const Yue2LmAdapterDropdown: React.FC = () => {
         selected={selectedFor('ar')}
         dials={dialsFor('ar')}
         inForce={inForceFor('ar')}
+        loadedVariant={loadedVariant}
         disabled={locked}
         onCommit={onCommit}
         onTrigger={onTrigger}

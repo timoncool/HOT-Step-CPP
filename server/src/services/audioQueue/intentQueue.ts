@@ -20,12 +20,19 @@
 //     restart, an item caught submitting or submitted becomes `interrupted`:
 //     its job lived in the old process's memory, so whether it rendered is
 //     unknown here. Only an explicit retry renders it again.
+//   - Two copies of the app can share this table (services/instance.ts). An
+//     item belongs to the copy that queued it (owner_copy) and, once claimed,
+//     to the process that submitted it (owner_instance). Only that copy claims
+//     it, only that process follows its job, and an item whose process is
+//     still alive is never interrupted by the other copy. A cancel from the
+//     other copy only flags it; the owner acts on the flag.
 
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { AudioIntentItem, AudioIntentStatus, AudioQueueState } from '../../contracts/audioQueue.js';
 import type { ImportAudioQueue } from '../../contracts/audioQueue.js';
 import { requestVersion } from '../generation/resolve/resolveIntent.js';
+import { copyId, instanceAlive, instanceId } from '../instance.js';
 
 export const MAX_IN_FLIGHT = 4;
 const TERMINAL: AudioIntentStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted'];
@@ -63,7 +70,11 @@ interface Row {
   previous_job_ids: string; waiting: string | null; cancel_requested: number; error: string | null;
   result: string | null; created_at: number; updated_at: number;
   started_at: number | null; elapsed_seconds: number | null;
+  owner_copy: string | null; owner_instance: string | null;
 }
+
+/** Owned by a live process other than this one: hands off. */
+const foreignLive = (r: Pick<Row, 'owner_instance'>) => r.owner_instance !== instanceId() && instanceAlive(r.owner_instance);
 
 export function ensureAudioQueueSchema(db: Database.Database): void {
   db.exec(`
@@ -92,10 +103,10 @@ export function ensureAudioQueueSchema(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS audio_queue_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS audio_queue_imports (backup_id TEXT PRIMARY KEY, receipt TEXT NOT NULL);
   `);
-  // Migration for a database created before started_at/elapsed_seconds existed.
-  for (const name of ['started_at', 'elapsed_seconds']) {
+  // Migration for a database created before these columns existed.
+  for (const [name, type] of [['started_at', 'INTEGER'], ['elapsed_seconds', 'INTEGER'], ['owner_copy', 'TEXT'], ['owner_instance', 'TEXT']]) {
     const row = db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('audio_intents') WHERE name = ?`).get(name) as { c: number };
-    if (row.c === 0) db.exec(`ALTER TABLE audio_intents ADD COLUMN ${name} INTEGER`);
+    if (row.c === 0) db.exec(`ALTER TABLE audio_intents ADD COLUMN ${name} ${type}`);
   }
 }
 
@@ -230,10 +241,11 @@ export class AudioIntentQueue {
         const id = randomUUID();
         const t = this.now();
         this.db.prepare(`INSERT INTO audio_intents (id, idempotency_key, user_id, status, engine, request, request_hash, meta,
-          job_id, error, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+          job_id, error, result, created_at, updated_at, owner_copy, owner_instance) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
           id, key, userId, status, engine, JSON.stringify(request), requestVersion(request),
           JSON.stringify({ ...old.meta, legacyId: old.legacyId, backupId: input.backupId }),
           old.jobId ?? null, old.error ?? null, old.result ? JSON.stringify(old.result) : null, t, t,
+          copyId(), status === 'submitted' ? instanceId() : null,
         );
         receipt.imported++;
         receipt.items.push({ legacyId: old.legacyId, itemId: id, status });
@@ -246,8 +258,8 @@ export class AudioIntentQueue {
 
   resumeHeld(ids: string[]): AudioIntentItem[] {
     const change = this.db.transaction(() => ids.map(id => {
-      const done = this.db.prepare(`UPDATE audio_intents SET status = 'pending', waiting = NULL, updated_at = ? WHERE id = ? AND status = 'held'`)
-        .run(this.now(), id);
+      const done = this.db.prepare(`UPDATE audio_intents SET status = 'pending', waiting = NULL, owner_copy = ?, updated_at = ? WHERE id = ? AND status = 'held'`)
+        .run(copyId(), this.now(), id);
       if (done.changes !== 1) throw new AudioQueueError(409, `Queue item ${id} is not held`);
       return this.get(id);
     }));
@@ -272,10 +284,10 @@ export class AudioIntentQueue {
     const t = this.now();
     const id = randomUUID();
     try {
-      this.db.prepare(`INSERT INTO audio_intents (id, idempotency_key, user_id, status, engine, request, request_hash, meta, created_at, updated_at)
-        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`).run(
+      this.db.prepare(`INSERT INTO audio_intents (id, idempotency_key, user_id, status, engine, request, request_hash, meta, created_at, updated_at, owner_copy)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`).run(
         id, input.idempotencyKey, userId, engine, JSON.stringify(request), hash,
-        input.meta ? JSON.stringify(input.meta) : null, t, t);
+        input.meta ? JSON.stringify(input.meta) : null, t, t, copyId());
     } catch (err: any) {
       // Lost a race with another client using the same key.
       if (String(err?.code).startsWith('SQLITE_CONSTRAINT')) {
@@ -308,7 +320,8 @@ export class AudioIntentQueue {
     }
     this.db.prepare('UPDATE audio_intents SET cancel_requested = 1, updated_at = ? WHERE id = ?').run(t, id);
     const now = this.row(id)!;
-    if (now.status === 'submitted' && now.job_id) this.finishCancel(now);
+    // Another live process holds the job: its follow() sees the flag and cancels it.
+    if (now.status === 'submitted' && now.job_id && !foreignLive(now)) this.finishCancel(now);
     return this.get(id);
   }
 
@@ -338,7 +351,7 @@ export class AudioIntentQueue {
     if (r.job_id) previous.push(r.job_id);
     this.db.prepare(`UPDATE audio_intents SET status = 'pending', job_id = NULL, attempt = attempt + 1, previous_job_ids = ?,
       waiting = NULL, cancel_requested = 0, error = NULL, result = NULL, started_at = NULL, elapsed_seconds = NULL,
-      updated_at = ? WHERE id = ?`).run(JSON.stringify(previous), this.now(), id);
+      owner_copy = ?, owner_instance = NULL, updated_at = ? WHERE id = ?`).run(JSON.stringify(previous), copyId(), this.now(), id);
     return this.get(id);
   }
 
@@ -368,8 +381,17 @@ export class AudioIntentQueue {
   /** Run once at startup, before the executor. Never resubmits: an item that
    *  was submitting or submitted when the process stopped is surfaced as
    *  interrupted, because its job (and whether it rendered) died with the old
-   *  process. Pending items stay pending; they were never sent. */
+   *  process. Pending items stay pending; they were never sent. Items another
+   *  live process submitted are left alone. */
   reconcileAfterRestart(): number {
+    return this.interrupt(r => !foreignLive(r));
+  }
+
+  /** Interrupt the submitting/submitted items `which` picks. */
+  private interrupt(which: (r: Row) => boolean): number {
+    const ids = (this.db.prepare(`SELECT * FROM audio_intents WHERE status IN ('submitting','submitted')`).all() as Row[])
+      .filter(which).map(r => r.id);
+    if (!ids.length) return 0;
     const t = this.now();
     // The job itself died with the old process, so its attempt timestamps
     // are gone too — started_at (our own "first observed running" mark,
@@ -380,11 +402,12 @@ export class AudioIntentQueue {
     const freeze = `elapsed_seconds = CASE WHEN started_at IS NOT NULL THEN CAST(ROUND((? - started_at) / 1000.0) AS INTEGER) ELSE NULL END`;
     const a = this.db.prepare(`UPDATE audio_intents SET status = 'interrupted', updated_at = ?, ${freeze},
       error = 'The server stopped while this item was being submitted. It may or may not have reached the engine; retry it to render it again.'
-      WHERE status = 'submitting'`).run(t, t);
+      WHERE status = 'submitting' AND id IN (SELECT value FROM json_each(?))`);
     const b = this.db.prepare(`UPDATE audio_intents SET status = 'interrupted', updated_at = ?, ${freeze},
       error = 'The server stopped while job ' || job_id || ' was running, so its outcome is unknown here. Check the library before retrying.'
-      WHERE status = 'submitted'`).run(t, t);
-    return a.changes + b.changes;
+      WHERE status = 'submitted' AND id IN (SELECT value FROM json_each(?))`);
+    const list = JSON.stringify(ids);
+    return this.db.transaction(() => a.run(t, t, list).changes + b.run(t, t, list).changes)();
   }
 
   // ── Executor ──────────────────────────────────────────────────────────────
@@ -411,8 +434,12 @@ export class AudioIntentQueue {
   private async pass(): Promise<void> {
     this.follow();
     if (this.paused()) return;
-    const inFlight = () => (this.db.prepare(`SELECT COUNT(*) AS n FROM audio_intents WHERE status IN ('submitting','submitted')`).get() as { n: number }).n;
-    const pending = this.db.prepare(`SELECT * FROM audio_intents WHERE status = 'pending' ORDER BY created_at, rowid`).all() as Row[];
+    // Only this process's submissions count, and only this copy's (or legacy
+    // unowned) pending items are taken: the other copy runs its own queue.
+    const inFlight = () => (this.db.prepare(`SELECT COUNT(*) AS n FROM audio_intents WHERE status IN ('submitting','submitted') AND owner_instance = ?`)
+      .get(instanceId()) as { n: number }).n;
+    const pending = this.db.prepare(`SELECT * FROM audio_intents WHERE status = 'pending' AND (owner_copy IS NULL OR owner_copy = ?) ORDER BY created_at, rowid`)
+      .all(copyId()) as Row[];
     const active = this.deps.activeEngine();
     for (const r of pending) {
       if (inFlight() >= MAX_IN_FLIGHT) break;
@@ -435,9 +462,9 @@ export class AudioIntentQueue {
   private async submitOne(r: Row): Promise<boolean> {
     // The pause check is part of the claim itself: a pause that lands while
     // an earlier submit in this pass is awaiting stops every later claim.
-    const claim = this.db.prepare(`UPDATE audio_intents SET status = 'submitting', waiting = NULL, updated_at = ?
+    const claim = this.db.prepare(`UPDATE audio_intents SET status = 'submitting', waiting = NULL, owner_instance = ?, updated_at = ?
       WHERE id = ? AND status = 'pending' AND cancel_requested = 0
-        AND NOT EXISTS (SELECT 1 FROM audio_queue_state WHERE key = 'paused' AND value = '1')`).run(this.now(), r.id);
+        AND NOT EXISTS (SELECT 1 FROM audio_queue_state WHERE key = 'paused' AND value = '1')`).run(instanceId(), this.now(), r.id);
     if (claim.changes !== 1) return this.paused();
     let result: Awaited<ReturnType<AudioQueueDeps['submit']>>;
     try {
@@ -467,9 +494,12 @@ export class AudioIntentQueue {
     return false;
   }
 
-  /** Bring submitted items up to date with their jobs. */
+  /** Bring this process's submitted items up to date with their jobs, and
+   *  interrupt items whose submitting process has died (the other copy
+   *  crashed or stopped). Items a live process holds are its own business. */
   private follow(): void {
-    const rows = this.db.prepare(`SELECT * FROM audio_intents WHERE status = 'submitted'`).all() as Row[];
+    this.interrupt(r => r.owner_instance !== instanceId() && !instanceAlive(r.owner_instance));
+    const rows = this.db.prepare(`SELECT * FROM audio_intents WHERE status = 'submitted' AND owner_instance = ?`).all(instanceId()) as Row[];
     for (const r of rows) {
       const job = r.job_id ? this.deps.getJob(r.job_id) : undefined;
       const t = this.now();

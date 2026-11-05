@@ -56,5 +56,37 @@ int main(int argc, char ** argv) {
         !expect_reject("bad-nonfinite", [](auto & r) { r.items[0].latent_file = r.source_manifest.parent_path() / "bad.f32"; write_f32(r.items[0].latent_file, 4, false); }) ||
         !expect_reject("bad-codec", [](auto & r) { r.items[0].semantic_file = r.source_manifest.parent_path() / "bad.i32"; write_i32(r.items[0].semantic_file, 4, 40000); }) ||
         !expect_reject("bad-provenance", [](auto & r) { r.models.clear(); })) return 1;
+    {
+        // A prompt token fault names the song and the reason.
+        auto bad = req; bad.output_dir = root / "bad-token"; bad.items[0].prompt.abc_ids = {-1}; std::string why;
+        if (yue2_aitk::prepare_dataset(bad, &why) || why.rfind("song " + bad.items[0].id + ": ", 0) != 0 || !no_manifest(bad.output_dir)) {
+            std::cerr << "bad-token: " << why << "\n"; return 1;
+        }
+    }
+    // Over-context tracks: prefix 3 + sheet 2 + frames + 3 must fit 24576, as
+    // the planner trains on the whole song. At the limit stays; one over and
+    // far over are skipped by name, and the reader accepts what is left.
+    {
+        auto mixed = req; mixed.output_dir = root / "over-context"; mixed.items.clear();
+        const size_t at_limit = 24576 - 8;
+        const struct { const char * id; size_t frames; } tracks[] = {{"fits", 4}, {"at-limit", at_limit}, {"one-over", at_limit + 1}, {"far-over", 24576}};
+        for (const auto & t : tracks) {
+            auto it = item; it.id = t.id; it.frames = t.frames;
+            it.latent_file = input / (std::string(t.id) + ".f32"); it.semantic_file = input / (std::string(t.id) + ".i32");
+            // Zero codes: a counting fixture would leave the codec range on long tracks.
+            if (!write_f32(it.latent_file, t.frames, true) || !write_bytes(it.semantic_file, std::vector<uint8_t>(t.frames * sizeof(int32_t)))) return 1;
+            mixed.items.push_back(it);
+        }
+        if (yue2_aitk::dataset_detail::context_tokens(mixed.items[1].prompt, at_limit) != 24576) return 1;
+        if (!yue2_aitk::prepare_dataset(mixed, &error)) { std::cerr << "over-context: " << error << "\n"; return 1; }
+        yue2_aitk::Dataset kept;
+        if (!yue2_aitk::read_dataset((mixed.output_dir / "dataset.json").u8string(), &kept, &error) || kept.items.size() != 2 ||
+            kept.items[0].id != "fits" || kept.items[1].id != "at-limit" || kept.items[1].song.semantic_tokens.size() != at_limit) {
+            std::cerr << "over-context roundtrip: " << error << "\n"; return 1;
+        }
+        auto all_over = mixed; all_over.output_dir = root / "all-over"; all_over.items = {mixed.items[2], mixed.items[3]};
+        std::string why;
+        if (yue2_aitk::prepare_dataset(all_over, &why) || why.find("context") == std::string::npos || !no_manifest(all_over.output_dir)) return 1;
+    }
     std::cout << "prepare fixture accepted valid input and rejected malformed cases\n"; return 0;
 }

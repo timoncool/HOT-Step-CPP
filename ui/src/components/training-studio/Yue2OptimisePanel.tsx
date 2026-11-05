@@ -5,13 +5,13 @@
 //
 // First measurement: base loss, the base model's loss on every song before any
 // training (server/src/services/training/yue2Optimise.ts).
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Circle, Gauge, Loader2, XCircle } from 'lucide-react';
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { trainingQueries } from '../../queries/training-data/queries';
 import { useJobSelection, useReload } from '../../queries/training-runs/hooks';
-import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { runQueries, trainingWritePlan } from '../../queries/training-runs/queries';
 import { startYue2BaseLoss } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -29,13 +29,15 @@ export const Yue2OptimisePanel: React.FC<{ datasetId: string }> = ({ datasetId }
   const [commandError, setError] = useState('');
   const error = commandError || statusQuery.error?.message || (job?.status === 'failed' ? job.error : '') || '';
   useReload(runQueries.optimise(worker, datasetId).queryKey, job?.status === 'done' ? job.id : undefined);
-  const measure = async () => {
-    setError('');
-    try {
-      const { jobId } = await runCommand(client, worker, () => startYue2BaseLoss(datasetId, { worker }));
-      setJob(await client.query(trainingQueries.job(worker, jobId)));
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-  };
+  const measureMut = useMutation({
+    mutationFn: async () => {
+      const { jobId } = await startYue2BaseLoss(datasetId, { worker });
+      return client.query(trainingQueries.job(worker, jobId));
+    },
+    onSuccess: measured => { setJob(measured); void trainingWritePlan(client, worker); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const measure = () => { setError(''); measureMut.mutate(); };
 
   if (!status && error) return <p role="alert" className="text-sm text-red-500">{error}</p>;
   if (!status) return <div className="flex items-center justify-center py-20 text-zinc-500 text-sm"><Loader2 size={18} className="animate-spin mr-2" /> …</div>;
@@ -73,7 +75,7 @@ export const Yue2OptimisePanel: React.FC<{ datasetId: string }> = ({ datasetId }
             </div>
             {baseLoss && <p className="text-[11px] text-zinc-500 mt-1">{t('trainingStudio.yue2.optimise.measured', 'Measured {{when}} on {{base}}{{companion}}', { when: new Date(baseLoss.measuredAt).toLocaleString(), base: baseLoss.base, companion: baseLoss.companion ? t('trainingStudio.yue2.optimise.withCompanion', ' with the companion decoder') : '' })}</p>}
           </div>
-          <button type="button" onClick={() => void measure()} disabled={!ready || running}
+          <button type="button" onClick={measure} disabled={!ready || running || measureMut.isPending}
             className="shrink-0 rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-black hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5">
             {running && <Loader2 size={13} className="animate-spin" />}
             {running ? (job?.phase === 'measuring' ? t('trainingStudio.yue2.optimise.progress', 'Measuring {{done}} of {{total}}', { done: job.done, total: job.total }) : t('trainingStudio.yue2.optimise.preparing', 'Preparing…'))

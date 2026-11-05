@@ -42,17 +42,20 @@ function measure(target: string): { files: number; bytes: number } {
  *  (2026-09-30): what goes stale is rebuilt anyway, since the prepared set is
  *  fingerprinted and a loudness or caption change re-cuts the cache. */
 export const YUE2_CORE_CACHE = 'yue2-latents';
-export interface PreparedCacheScope { includeYue2Core?: boolean }
+export interface PreparedCacheScope { includeYue2Core?: boolean; target?: 'heartmula' }
 
 export function listPreparedCaches(slug: string, sourceDir: string, scope: PreparedCacheScope = {}): PreparedCache[] {
   const datasetRoot = datasetDir(slug);
   const tensorRoot = tensorsRoot(slug);
-  const roots = [datasetRoot, tensorRoot];
+  const roots = scope.target === 'heartmula' ? [datasetRoot, path.join(datasetRoot, 'heartmula')] : [datasetRoot, tensorRoot];
   for (const root of roots) {
     if (fs.existsSync(root) && fs.lstatSync(root).isSymbolicLink()) throw new Error(`Cache root is a link: ${root}`);
   }
   // Every path passes the safety walk, kept or not, before the scope filter.
-  return preparedCachePaths(slug).flatMap(item => {
+  const paths = scope.target === 'heartmula'
+    ? [{ name: 'HeartMuLa prepared audio', path: path.join(datasetRoot, 'heartmula', 'prepare') }]
+    : preparedCachePaths(slug);
+  return paths.flatMap(item => {
     const target = path.resolve(item.path);
     const owner = item.name === 'ACE tensor caches' ? path.dirname(tensorRoot) : datasetRoot;
     if (!isInside(owner, target) || isInside(target, sourceDir) || path.resolve(sourceDir) === target) {

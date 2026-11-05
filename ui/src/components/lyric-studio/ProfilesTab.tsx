@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Trash2, Loader2, Users, Sparkles, ChevronDown, ChevronRight } from 'lucide-react';
 import { lireekApi, skipThinking } from '../../services/lireekApi';
@@ -61,15 +62,14 @@ export const ProfilesTab: React.FC<ProfilesTabProps> = ({
     }
   }, [lyricsSetId, provider, model, onRefresh, showToast, token]);
 
-  const handleDelete = async (profile: Profile) => {
+  const deleteMut = useMutation({
+    mutationFn: (profile: Profile) => lireekApi.deleteProfile(profile.id),
+    onSuccess: () => { showToast('Profile deleted'); onRefresh(); },
+  });
+
+  const handleDelete = (profile: Profile) => {
     if (!confirm('Delete this profile?')) return;
-    try {
-      await lireekApi.deleteProfile(profile.id);
-      showToast('Profile deleted');
-      onRefresh();
-    } catch (err: any) {
-      showToast(`Failed: ${err.message}`);
-    }
+    deleteMut.mutate(profile);
   };
 
   const MetaBadge: React.FC<{ label: string; value: string; color: string }> = ({ label, value, color }) => {
@@ -175,6 +175,7 @@ export const ProfilesTab: React.FC<ProfilesTabProps> = ({
                   <div className="flex items-center gap-1" onClick={e => e.stopPropagation()}>
                     <button
                       onClick={() => handleDelete(profile)}
+                      disabled={deleteMut.isPending}
                       className="p-2 rounded-lg hover:bg-red-500/10 text-zinc-600 dark:text-zinc-400 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
                       title={t('lyric.deleteProfile')}
                     >

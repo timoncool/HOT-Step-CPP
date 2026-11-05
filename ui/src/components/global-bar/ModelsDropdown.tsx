@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { aceModelsOptions } from '../../queries/global-models/options';
+import { QueryError } from '../shared/QueryError';
 // ModelsDropdown.tsx — Model selection UI for the global param bar
 //
 // Uses custom ModelSelect dropdown to show GGUF/SafeTensors format badges.
@@ -10,7 +11,7 @@ import { Download } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
 import { formatDitModel, formatLmModel, formatVaeModel, formatEmbeddingModel, getDitModelDescription, getLmModelDescription, getVaeModelDescription } from './modelLabels';
 import { ModelManagerModal } from '../model-manager/ModelManagerModal';
-import { ModelSelect, getModelFormat } from './ModelSelect';
+import { VariantModelSelect, ModelSelect, getModelFormat } from './ModelSelect';
 import { ParamLabel } from '../shared/ParamLabel';
 
 type ModelFormat = 'gguf' | 'safetensors' | 'onnx';
@@ -37,7 +38,7 @@ function loadFormatFilter(): Record<ModelFormat, boolean> {
 export const ModelsDropdown: React.FC = () => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
-  const { data: models } = useQuery(aceModelsOptions());
+  const { data: models, isError, error, refetch } = useQuery(aceModelsOptions());
   const [showModelManager, setShowModelManager] = useState(false);
 
 
@@ -88,6 +89,7 @@ export const ModelsDropdown: React.FC = () => {
 
   return (
     <div className="space-y-3">
+      {isError && <QueryError error={error} onRetry={() => void refetch()} compact />}
       {/* Format-type filter — toggles which model formats appear in the dropdowns */}
       {chipFormats.length > 1 && (
         <div className="flex items-center gap-1.5 flex-wrap">
@@ -117,7 +119,7 @@ export const ModelsDropdown: React.FC = () => {
       <div>
         <ParamLabel label={t('models.ditModel')} info={getDitModelDescription(gp.ditModel)} rootClassName="flex mb-1.5"
           className="text-xs font-medium text-zinc-500 uppercase tracking-wider" />
-        <ModelSelect
+        <VariantModelSelect
           id="dit-model-select"
           value={gp.ditModel}
           onChange={gp.setDitModel}
@@ -131,7 +133,7 @@ export const ModelsDropdown: React.FC = () => {
       <div>
         <ParamLabel label={t('models.lmModel')} info={getLmModelDescription(gp.lmModel)} rootClassName="flex mb-1.5"
           className="text-xs font-medium text-zinc-500 uppercase tracking-wider" />
-        <ModelSelect
+        <VariantModelSelect
           id="lm-model-select"
           value={gp.lmModel}
           onChange={gp.setLmModel}
@@ -164,7 +166,7 @@ export const ModelsDropdown: React.FC = () => {
       {embeddingModels.length > 1 && (
         <div>
           <label className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5">{t('models.textEncoder')}</label>
-          <ModelSelect
+          <VariantModelSelect
             id="embedding-model-select"
             value={gp.embeddingModel}
             onChange={gp.setEmbeddingModel}

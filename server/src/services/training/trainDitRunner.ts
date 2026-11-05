@@ -20,7 +20,7 @@ import readline from 'readline';
 import { spawn } from 'child_process';
 import { config } from '../../config.js';
 import { pushLog } from '../../routes/logs.js';
-import { restartAceServer, stopAceServer } from '../aceEngineProcess.js';
+import { resumeEngines, suspendEngines } from '../aceEngineProcess.js';
 import { aceTrainExe, buildTrainDitArgs, type ResolvedTrainDitOptions } from './aceTrain.js';
 import { getDataset } from './datasetsRepo.js';
 import { refreshPresetsForNewRun } from './lyricStudioExport.js';
@@ -330,7 +330,7 @@ export async function runTrainDitJob(job: TrainingJob): Promise<void> {
     let stopped = false;
     let engineExited = true;
     // NOT gated on getAceProcess() being non-null: a crashed engine leaves a
-    // respawn scheduled 3 s out, and stopAceServer() is what cancels it. Skipping
+    // respawn scheduled 3 s out, and suspendEngines() is what cancels it. Skipping
     // the call would let that timer spawn an engine into the middle of the job
     // and compete for VRAM — which for DiT training is worse than for anything
     // else, because ace-train solves its crop length and trained depth against
@@ -340,7 +340,7 @@ export async function runTrainDitJob(job: TrainingJob): Promise<void> {
       job.phase = 'engine-stop';
       emitProgress(job);
       log(job, 'info', 'Stopping the engine to free VRAM…');
-      engineExited = await stopAceServer('Paused for DiT training');
+      engineExited = await suspendEngines('Paused for DiT training');
       stopped = true;
     }
 
@@ -446,7 +446,7 @@ export async function runTrainDitJob(job: TrainingJob): Promise<void> {
         // here on is written to a job nobody is listening to. Mirror it into the
         // app log or the up-to-90 s restart happens completely invisibly.
         pushLog(`[Training] train-dit job ${job.id}: restarting the engine…`);
-        const back = await restartAceServer();
+        const back = await resumeEngines();
         if (!back) {
           log(job, 'warn',
             'Engine did not answer /health within 90 s — restart the app if generation fails');

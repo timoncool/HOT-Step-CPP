@@ -10,7 +10,7 @@ import { getGenerationTimeoutMinutes } from '../utils/generationTimer';
 import type { ResolveIntent, ResolvePreviewResponse } from '../../../server/src/contracts/resolution';
 import type { DownloadStartResponse } from '../../../server/src/contracts/modelManager';
 import type { HealthResponse } from '../../../server/src/contracts/health';
-import type { ShutdownResponse } from '../../../server/src/contracts/shutdown';
+import type { RestartResponse, ShutdownResponse } from '../../../server/src/contracts/shutdown';
 import type {
   UploadReferenceResponse, ListReferencesResponse, DeleteReferenceResponse, RunMasteringResponse,
 } from '../../../server/src/contracts/mastering';
@@ -20,11 +20,12 @@ import type {
   GuiResponse, MonitorStartResponse, MonitorStopResponse, MonitorSwitchResponse,
   MonitorStatusResponse, MonitorSeekResponse,
 } from '../../../server/src/contracts/vst';
-import type { EnvResponse, EnvUpdateResponse, GpusResponse } from '../../../server/src/contracts/settings';
+import type { ReportLogsResponse } from '../../../server/src/contracts/reportLogs';
+import type { EngineWorkersResponse, EnvResponse, EnvUpdateResponse, GpusResponse } from '../../../server/src/contracts/settings';
 import type {
   ProfileFile, ListProfilesResponse, SaveProfileResponse, RenameProfileResponse, DeleteProfileResponse,
 } from '../../../server/src/contracts/profiles';
-import { apiClient, ApiError, type ClientOptions, type ReadOptions } from './httpClient';
+import { apiClient, ApiError, HttpStatus, type ClientOptions, type ReadOptions } from './httpClient';
 import { SLOW_ROUTE_TIMEOUT_MS } from './axiosClient';
 
 const BASE = '/api';
@@ -113,8 +114,10 @@ export const songApi = {
     post<{ success: boolean; songsDeleted: number; filesDeleted: number; lireekAudioGensDeleted: number }>(
       '/songs/nuke-generations', {}
     ),
+  // Trim mode's crop (player/TrimControls) renders its own inline error line, so
+  // it is silent — that line is the sole notifier on failure (R2). Sole consumer.
   crop: (id: string, inPoint: number, outPoint: number, audioUrl?: string) =>
-    post<{ cropped: boolean; newDuration: number }>(`/songs/${id}/crop`, { inPoint, outPoint, audioUrl }),
+    post<{ cropped: boolean; newDuration: number }>(`/songs/${id}/crop`, { inPoint, outPoint, audioUrl }, { silent: true }),
   listIds: (opts?: ReadOptions) => get<{ ids: string[] }>('/songs/ids', opts),
   getRecentSongs: (source?: string, limit = 50, opts?: ReadOptions) =>
     get<{ songs: UnifiedRecentSong[] }>(
@@ -187,7 +190,7 @@ export const generateApi = {
       return path === 'resolved' ? 'resolved' : 'old';
     } catch (err) {
       if (err instanceof ApiError) {
-        if (err.status === 404) return 'old';
+        if (err.status === HttpStatus.notFound) return 'old';
         throw new Error((err.body as { error?: string } | null)?.error || 'Cannot read generation path');
       }
       throw err;
@@ -297,8 +300,8 @@ type BuilderView = { project: BuilderProject; sections: BuilderSection[] };
 
 /** Section operations throw ApiError, so a stale revision (409 with
  *  currentRevision) can be told apart and the project reloaded. */
-async function builderOp<T extends { project: BuilderProject; sections: any[] }>(path: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown): Promise<T> {
-  const data = await apiClient.request<T>(method, `/builder${path}`, body);
+async function builderOp<T extends { project: BuilderProject; sections: any[] }>(path: string, method: 'POST' | 'PATCH' | 'DELETE', body?: unknown, opts?: ClientOptions): Promise<T> {
+  const data = await apiClient.request<T>(method, `/builder${path}`, body, opts);
   return { ...data, sections: data.sections.map(normalizeSection) };
 }
 
@@ -316,17 +319,19 @@ export const builderApi = {
   },
   deleteProject: (id: string) => del<{ ok: boolean }>(`/builder/projects/${id}`),
 
-  /** Start the next section; follow `jobId` with followJob. */
-  generateSection: (projectId: string, body: GenerateSectionInput) =>
-    builderOp<BuilderView & { jobId: string; sectionId: string }>(`/projects/${projectId}/sections/generate`, 'POST', body),
-  chooseCandidate: (sectionId: string, songId: string, expectedRevision: number) =>
-    builderOp<BuilderView>(`/sections/${sectionId}/choose`, 'POST', { songId, expectedRevision }),
-  stopSection: (sectionId: string, expectedRevision: number) =>
-    builderOp<BuilderView>(`/sections/${sectionId}/stop`, 'POST', { expectedRevision }),
-  editSection: (sectionId: string, edit: { label?: string; lyrics?: string }, expectedRevision: number) =>
-    builderOp<BuilderView>(`/sections/${sectionId}`, 'PATCH', { ...edit, expectedRevision }),
-  deleteSection: (sectionId: string, expectedRevision: number) =>
-    builderOp<BuilderView>(`/sections/${sectionId}?expectedRevision=${expectedRevision}`, 'DELETE'),
+  /** Start the next section; follow `jobId` with followJob. The section ops
+   *  take ClientOptions because SongBuilder displays their failures itself
+   *  (409 → reload, everything else a prefixed line) and passes { silent: true }. */
+  generateSection: (projectId: string, body: GenerateSectionInput, opts?: ClientOptions) =>
+    builderOp<BuilderView & { jobId: string; sectionId: string }>(`/projects/${projectId}/sections/generate`, 'POST', body, opts),
+  chooseCandidate: (sectionId: string, songId: string, expectedRevision: number, opts?: ClientOptions) =>
+    builderOp<BuilderView>(`/sections/${sectionId}/choose`, 'POST', { songId, expectedRevision }, opts),
+  stopSection: (sectionId: string, expectedRevision: number, opts?: ClientOptions) =>
+    builderOp<BuilderView>(`/sections/${sectionId}/stop`, 'POST', { expectedRevision }, opts),
+  editSection: (sectionId: string, edit: { label?: string; lyrics?: string }, expectedRevision: number, opts?: ClientOptions) =>
+    builderOp<BuilderView>(`/sections/${sectionId}`, 'PATCH', { ...edit, expectedRevision }, opts),
+  deleteSection: (sectionId: string, expectedRevision: number, opts?: ClientOptions) =>
+    builderOp<BuilderView>(`/sections/${sectionId}?expectedRevision=${expectedRevision}`, 'DELETE', undefined, opts),
 };
 
 // ── Models ──────────────────────────────────────────────────
@@ -342,7 +347,11 @@ export const healthApi = {
 
 // ── Shutdown ────────────────────────────────────────────────
 export const shutdownApi = {
-  quit: () => post<ShutdownResponse>('/shutdown'),
+  quit: () => post<ShutdownResponse>('/shutdown', {}, { silent: true }),
+  /** Ask the server to restart itself (applies restart-required .env keys).
+   *  The connection is torn down as the server goes, so a rejected promise is
+   *  the expected outcome — silent, and callers swallow it. */
+  restart: () => post<RestartResponse>('/shutdown/restart', {}, { silent: true }),
 };
 // ── Mastering ───────────────────────────────────────────────
 export const masteringApi = {
@@ -367,9 +376,11 @@ export const adapterApi = {
       { ...opts, timeout: SLOW_ROUTE_TIMEOUT_MS },
     ),
   /** Scan folder for .safetensors files. A POST, but a pure read; a recursive
-   *  scan of a large library can take minutes. */
+   *  scan of a large library can take minutes. Silent: AdaptersDropdown's scan
+   *  command renders the failure in its own inline line, so the transport must
+   *  not also toast. */
   scan: (folder: string, opts?: ReadOptions) =>
-    apiClient.post<ScanResponse>('/adapters/scan', { folder }, { signal: opts?.signal, timeout: SLOW_ROUTE_TIMEOUT_MS }),
+    apiClient.post<ScanResponse>('/adapters/scan', { folder }, { signal: opts?.signal, timeout: SLOW_ROUTE_TIMEOUT_MS, silent: true }),
   /** Planner-LM adapters (local HOT-Step feature). Scans `folder` when given,
    *  else every per-size root (lm-06b/lm-17b/lm-4b) plus the legacy flat lm/.
    *  `lmSize` comes from the parent folder (new layout) or the legacy -<size>
@@ -397,7 +408,7 @@ export const vstApi = {
   openGui: (pluginPath: string, uid?: string) =>
     post<GuiResponse>('/vst/gui', { pluginPath, uid }),
   /** Chain uids whose editor window process is still running */
-  openGuis: () => get<{ uids: string[] }>('/vst/gui/open'),
+  openGuis: (opts?: ReadOptions) => get<{ uids: string[] }>('/vst/gui/open', opts),
   /** Start real-time monitor */
   monitorStart: (trackPath: string) =>
     post<MonitorStartResponse>('/vst/monitor/start', { trackPath }),
@@ -419,13 +430,21 @@ export const vstApi = {
 export const settingsApi = {
   /** Read current .env values for exposed keys */
   getEnv: (opts?: ReadOptions) => get<EnvResponse>('/settings/env', opts),
-  /** Update .env values (partial — only send changed keys) */
+  /** Update .env values (partial — only send changed keys). Silent: the
+   *  settings env form renders this failure itself (its status line), so a
+   *  transport toast would be a second copy of the same error. */
   updateEnv: (values: Record<string, string>) =>
-    post<EnvUpdateResponse>('/settings/env', { values }),
+    post<EnvUpdateResponse>('/settings/env', { values }, { silent: true }),
   /** Detect available GPUs via nvidia-smi. `uuid` is what the picker stores in
    *  CUDA_VISIBLE_DEVICES — the index is display-only, because nvidia-smi and
    *  CUDA number GPUs differently (issue #153). */
   getGpus: (opts?: ReadOptions) => get<GpusResponse>('/settings/gpus', opts),
+  /** Per-worker engine status for the experimental multi-GPU section. */
+  getEngineWorkers: (opts?: ReadOptions) => get<EngineWorkersResponse>('/settings/engine-workers', opts),
+};
+
+export const reportLogsApi = {
+  snapshot: (opts?: ReadOptions) => get<ReportLogsResponse>('/logs/snapshot', opts),
 };
 
 // ── Parameter Profiles ──────────────────────────────────────
@@ -438,15 +457,16 @@ export const profileApi = {
   /** List one engine's saved profiles (full data inline) */
   list: (backend: string, opts?: ReadOptions) =>
     get<ListProfilesResponse>(`/profiles?backend=${encodeURIComponent(backend)}`, opts),
-  /** Save or overwrite a named profile */
+  /** Save or overwrite a named profile. Silent: ProfilesModal renders the
+   *  mutation failure in its own error line. */
   save: (backend: string, name: string, data: Record<string, unknown>) =>
-    post<SaveProfileResponse>('/profiles', { name, data, backend }),
-  /** Rename a profile (data unchanged) */
+    post<SaveProfileResponse>('/profiles', { name, data, backend }, { silent: true }),
+  /** Rename a profile (data unchanged). Silent: ProfilesModal's error line. */
   rename: (backend: string, name: string, newName: string) =>
-    patch<RenameProfileResponse>(`/profiles/${encodeURIComponent(name)}?backend=${encodeURIComponent(backend)}`, { newName }),
-  /** Delete a profile */
+    patch<RenameProfileResponse>(`/profiles/${encodeURIComponent(name)}?backend=${encodeURIComponent(backend)}`, { newName }, { silent: true }),
+  /** Delete a profile. Silent: ProfilesModal's error line. */
   remove: (backend: string, name: string) =>
-    del<DeleteProfileResponse>(`/profiles/${encodeURIComponent(name)}?backend=${encodeURIComponent(backend)}`),
+    del<DeleteProfileResponse>(`/profiles/${encodeURIComponent(name)}?backend=${encodeURIComponent(backend)}`, { silent: true }),
 };
 
 // ── Model Manager ───────────────────────────────────────────
@@ -494,7 +514,8 @@ export async function runSongPostProcessing(
   params: Record<string, any>
 ): Promise<{ jobId: string; status: string; stage: string; stages: string[] }> {
   try {
-    return await apiClient.post(`/songs/${songId}/postprocess`, params);
+    // Silent: the post-process dock mirror renders its own inline error line.
+    return await apiClient.post(`/songs/${songId}/postprocess`, params, { silent: true });
   } catch (err) {
     if (err instanceof ApiError) {
       const data = (err.body ?? {}) as { alreadyProcessed?: boolean; masteredAudioUrl?: string };
@@ -522,7 +543,7 @@ export async function getSongPostProcessingStatus(
   try {
     return await apiClient.get<PostProcessJobStatus>(`/songs/${songId}/postprocess${qs}`, { signal: opts?.signal });
   } catch (err) {
-    if (err instanceof ApiError && err.status === 404) return null; // nothing in flight
+    if (err instanceof ApiError && err.status === HttpStatus.notFound) return null; // nothing in flight
     throw err;
   }
 }
@@ -534,7 +555,8 @@ export async function getSongPostProcessingStatus(
  * right, but a track has to be able to get out of a bad first one.
  */
 export function revertSongPostProcessing(songId: string): Promise<{ removed: boolean; songId: string }> {
-  return apiClient.delete(`/songs/${songId}/postprocess`);
+  // Silent: same owner as runSongPostProcessing — the dock mirror's inline line.
+  return apiClient.delete(`/songs/${songId}/postprocess`, { silent: true });
 }
 
 /** Re-runs Whisper transcription — the server runs it inline, so a full track

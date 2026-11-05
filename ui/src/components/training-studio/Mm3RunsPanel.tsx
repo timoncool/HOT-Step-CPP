@@ -27,8 +27,10 @@ import { runQueries } from '../../queries/training-runs/queries';
 
 import { type Mm3RunSummary } from '../../services/trainingApi';
 import { useTrainingStore } from '../../stores/trainingStore';
+import { formatDateTime } from '../../utils/dateUtils';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
+import { useActiveTrainingJob } from '../../queries/training-runs/hooks';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
 const INPUT = 'w-full px-2.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 border border-zinc-300 '
@@ -48,16 +50,10 @@ function gb(bytes: number): string {
                              : `${Math.round(bytes / 1048576)} MB`;
 }
 
-function when(ms?: number): string {
-  if (!ms) return '';
-  const d = new Date(ms);
-  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
-
 export const Mm3RunsPanel: React.FC<{ datasetId: string }> = ({ datasetId }) => {
   const { t } = useTranslation();
   const resumeMm3TrainLm = useTrainingStore(s => s.resumeMm3TrainLm);
-  const activeJob = useTrainingStore(s => s.activeJob);
+  const activeJob = useActiveTrainingJob();
 
   const jobRunning = activeJob?.status === 'queued' || activeJob?.status === 'running';
   const query = useQuery(runQueries.mm3Runs(datasetId));
@@ -162,7 +158,7 @@ export const Mm3RunsPanel: React.FC<{ datasetId: string }> = ({ datasetId }) => 
                       </span>
                     )}
                     <span>{gb(run.sizeBytes)}</span>
-                    <span>{when(run.updatedAt)}</span>
+                    <span>{formatDateTime(run.updatedAt)}</span>
                     {run.launches > 1 && (
                       <span>
                         {t('trainingStudio.mm3.runsLaunches', 'continued {{n}}x',
@@ -201,7 +197,7 @@ export const Mm3RunsPanel: React.FC<{ datasetId: string }> = ({ datasetId }) => 
                     {t('trainingStudio.mm3.runsResumeFrom',
                       'Continuing from step {{step}}, saved {{when}}{{how}}.', {
                         step: run.resume.step,
-                        when: when(run.resume.savedAt),
+                        when: formatDateTime(run.resume.savedAt),
                         how: run.resume.reason === 'final'
                           ? ' on a clean exit' : ' at a preview pause',
                       })}

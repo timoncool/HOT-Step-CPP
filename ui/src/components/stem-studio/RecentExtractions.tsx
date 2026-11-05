@@ -1,9 +1,9 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { extractionsOptions } from '../../queries/studios/resources';
 import { resourceKey } from '../../queries/keys';
 import { queryManager } from '../../queries/invalidation';
 // RecentExtractions.tsx — List of past extraction jobs (right sidebar)
-import React, { useEffect } from 'react';
+import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Trash2, ChevronRight, Clock } from 'lucide-react';
 import { deleteJob, type ExtractJobSummary } from '../../services/stemStudioApi';
@@ -11,7 +11,6 @@ import { deleteJob, type ExtractJobSummary } from '../../services/stemStudioApi'
 interface RecentExtractionsProps {
   onSelectJob: (jobId: string) => void;
   activeJobId?: string;
-  refreshTrigger?: number;  // bump to force refresh
 }
 
 function timeAgo(dateStr: string): string {
@@ -27,34 +26,42 @@ function timeAgo(dateStr: string): string {
   return `${days}d ago`;
 }
 
-export const RecentExtractions: React.FC<RecentExtractionsProps> = ({ onSelectJob, activeJobId, refreshTrigger }) => {
+export const RecentExtractions: React.FC<RecentExtractionsProps> = ({ onSelectJob, activeJobId }) => {
   const client = useQueryClient();
   const jobsQuery = useQuery(extractionsOptions());
   const jobs = jobsQuery.data ?? [];
   const loading = jobsQuery.isPending;
   const { t } = useTranslation();
-  useEffect(() => {
-    if (refreshTrigger) void queryManager.keys(client, extractionsOptions().queryKey);
-  }, [client, refreshTrigger]);
 
-  const handleDelete = async (e: React.MouseEvent, jobId: string) => {
+  const deleteMut = useMutation({
+    mutationFn: (jobId: string) => deleteJob(jobId),
+    onMutate: async () => {
+      await client.cancelQueries({ queryKey: extractionsOptions().queryKey });
+    },
+    onSuccess: async (_data, jobId) => {
+      const key = extractionsOptions().queryKey;
+      await client.cancelQueries({ queryKey: key });
+      client.setQueryData<ExtractJobSummary[]>(key, jobs => jobs?.filter(job => job.id !== jobId));
+      client.removeQueries({ queryKey: resourceKey('studios/extract-result', undefined, jobId) });
+      await queryManager.invalidate(client, key);
+    },
+    // A failed delete may still have removed files server-side; refresh the
+    // list so the row is shown as the server now sees it.
+    onError: async () => {
+      await queryManager.invalidate(client, extractionsOptions().queryKey);
+    },
+  });
+
+  const handleDelete = (e: React.MouseEvent, jobId: string) => {
     e.stopPropagation();
     if (!confirm('Delete this extraction and all its stems?')) return;
-    try {
-      await client.cancelQueries({ queryKey: extractionsOptions().queryKey });
-      await deleteJob(jobId);
-      await client.cancelQueries({ queryKey: extractionsOptions().queryKey });
-      client.setQueryData<ExtractJobSummary[]>(extractionsOptions().queryKey, jobs => jobs?.filter(job => job.id !== jobId));
-      client.removeQueries({ queryKey: resourceKey('studios/extract-result', undefined, jobId) });
-      await queryManager.keys(client, extractionsOptions().queryKey);
-    } catch (err) {
-      console.error('Delete failed:', err);
-    }
+    deleteMut.mutate(jobId);
   };
 
   return (
     <div style={styles.container}>
       {jobsQuery.error && <div role="alert">{jobsQuery.error.message}</div>}
+      {deleteMut.error && <div role="alert">{deleteMut.error.message}</div>}
 
       {loading && jobs.length === 0 && (
         <div style={styles.emptyMsg}>Loading...</div>
@@ -98,7 +105,8 @@ export const RecentExtractions: React.FC<RecentExtractionsProps> = ({ onSelectJo
               </span>
               <button
                 onClick={(e) => handleDelete(e, job.id)}
-                style={styles.deleteBtn}
+                disabled={deleteMut.isPending}
+                style={{ ...styles.deleteBtn, opacity: deleteMut.isPending ? 0.45 : 1 }}
                 title={t('stem.deleteExtraction')}
               >
                 <Trash2 size={12} />

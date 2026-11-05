@@ -33,6 +33,7 @@ import crypto from 'node:crypto';
 import { config } from '../../config.js';
 import { yue2ModelDir } from './yue2Train.js';
 import { readAbcSidecar, writeAbcSidecar } from './abcSidecar.js';
+import { readYue2StagedSources } from './yue2AudioStaging.js';
 
 interface SheetManifestSource { name?: unknown; source?: unknown; abc?: unknown; abc_error?: unknown }
 
@@ -42,18 +43,24 @@ function manifestSources(manifestPath: string): { manifest: Record<string, unkno
   return { manifest, sources: manifest.sources as SheetManifestSource[] };
 }
 
-function sourceAudio(row: SheetManifestSource): string | null {
+/** The audio a row's lead-sheet sidecar belongs beside: the ORIGINAL file in the
+ *  dataset folder. Preprocess stages every track into the cache's _staged_audio/
+ *  and points `source` there, so without the staging map the .abc files the
+ *  Label step saved were never found (a dataset with 125 of 130 sheets had all
+ *  130 re-transcribed) and new sheets landed beside the staged copies. */
+function sourceAudio(row: SheetManifestSource, staged: Map<string, string>): string | null {
   if (typeof row.source !== 'string' || typeof row.name !== 'string'
       || path.basename(row.source) !== row.name) return null;
-  return row.source;
+  return staged.get(row.name) ?? row.source;
 }
 
 /** Restore scores from the source folder before the transcriber selects rows. */
 export function seedAbcManifestFromSidecars(manifestPath: string): number {
   const { manifest, sources } = manifestSources(manifestPath);
+  const staged = readYue2StagedSources(manifestPath);
   let count = 0;
   for (const row of sources) {
-    const audio = sourceAudio(row);
+    const audio = sourceAudio(row, staged);
     if (!audio || (typeof row.abc === 'string' && row.abc.trim())) continue;
     const abc = readAbcSidecar(audio);
     if (!abc) continue;
@@ -74,9 +81,10 @@ export function seedAbcManifestFromSidecars(manifestPath: string): number {
 /** Copy successful manifest scores to permanent per-track sidecars. */
 export function saveAbcManifestSidecars(manifestPath: string): number {
   const { sources } = manifestSources(manifestPath);
+  const staged = readYue2StagedSources(manifestPath);
   let count = 0;
   for (const row of sources) {
-    const audio = sourceAudio(row);
+    const audio = sourceAudio(row, staged);
     if (audio && typeof row.abc === 'string' && row.abc.trim()
         && !(typeof row.abc_error === 'string' && row.abc_error.trim())) {
       if (writeAbcSidecar(audio, row.abc)) count++;
@@ -105,7 +113,9 @@ export function resolveYue2SheetModel(): string {
   for (const dir of sheetModelSearchDirs()) {
     let hits: string[] = [];
     try {
-      hits = fs.readdirSync(dir).filter(f => f.startsWith('sheetsage2-') && f.endsWith('.gguf')).sort();
+      // sheetsage2-refined-*.gguf is an overlay on the base, never a base itself.
+      hits = fs.readdirSync(dir).filter(f => f.startsWith('sheetsage2-') && !f.startsWith('sheetsage2-refined-')
+        && f.endsWith('.gguf')).sort();
     } catch {
       continue;  // a missing models dir reads as a missing file, never a throw
     }
@@ -119,10 +129,38 @@ export function resolveYue2SheetModel(): string {
  *  One file, and it is optional to the rest of the app: nothing in generation
  *  needs the SheetSage2 transcriber, so a fresh install will not have it.
  *  Registry id `yue2-sheetsage2-f16`, which the Model Manager can download. */
+/** The SheetSage2-Refined overlay (`sheetsage2-refined-*.gguf`) the engine's
+ *  `--refined` discovery would pick, or '' when it is not installed. It only
+ *  replaces the decoder; the base file must be there too. Registry id
+ *  `yue2-sheetsage2-refined-f16`. */
+export function resolveYue2SheetRefinedModel(): string {
+  for (const dir of sheetModelSearchDirs()) {
+    let hits: string[] = [];
+    try {
+      hits = fs.readdirSync(dir).filter(f => f.startsWith('sheetsage2-refined-') && f.endsWith('.gguf')).sort();
+    } catch {
+      continue;
+    }
+    if (hits.length) return path.join(dir, hits[0]);
+  }
+  return '';
+}
+
+/** The transcriber the YuE2 Models dropdown chose (preferences family
+ *  `sheet-transcriber`). routes/preferences.ts registers the reader; until it
+ *  does, and on any read failure, SheetSage2. */
+export interface SheetTranscriberSetting { refined: boolean; keyMode: boolean }
+let transcriberSource: () => SheetTranscriberSetting = () => ({ refined: false, keyMode: false });
+export function setSheetTranscriberSource(read: () => SheetTranscriberSetting): void { transcriberSource = read; }
+export function sheetTranscriberSetting(): SheetTranscriberSetting {
+  try { return transcriberSource(); } catch { return { refined: false, keyMode: false }; }
+}
+
+export const MISSING_REFINED = 'SheetSage2-Refined (yue2-sheetsage2-refined-f16), chosen in the YuE2 Models dropdown';
+
 export function missingYue2SheetModels(): string[] {
-  return resolveYue2SheetModel()
-    ? []
-    : ['the SheetSage2 lead-sheet transcriber (sheetsage2-*.gguf)'];
+  if (!resolveYue2SheetModel()) return ['the SheetSage2 lead-sheet transcriber (sheetsage2-*.gguf)'];
+  return sheetTranscriberSetting().refined && !resolveYue2SheetRefinedModel() ? [MISSING_REFINED] : [];
 }
 
 // ── Defaults ────────────────────────────────────────────────────────────────
@@ -295,6 +333,11 @@ export interface ResolvedYue2SheetOptions {
   melodyOnly?: boolean;
   /** Carried for the runner's own log lines and the run record. */
   datasetSlug: string;
+  /** SheetSage2-Refined instead of SheetSage2 (`--refined`). Unset: the
+   *  stored choice (sheetTranscriberSetting). */
+  refined?: boolean;
+  /** With `refined`: keys with modes (`--key-mode`). */
+  keyMode?: boolean;
 }
 
 export function buildYue2SheetArgs(o: ResolvedYue2SheetOptions): string[] {
@@ -307,6 +350,11 @@ export function buildYue2SheetArgs(o: ResolvedYue2SheetOptions): string[] {
   if (o.force) args.push('--force');
   if (o.fast) args.push('--fast');
   if (o.melodyOnly) args.push('--melody-only');
+  const t = o.refined === undefined ? sheetTranscriberSetting() : { refined: o.refined, keyMode: !!o.keyMode };
+  if (t.refined) {
+    args.push('--refined');
+    if (t.keyMode) args.push('--key-mode');
+  }
   // Deliberately NOT emitted: --model, --threads. `--models` lets the
   // engine's quant ranking pick (and it prints which file it chose, same
   // reasoning as buildYue2TokenizeArgs skipping --tok); --threads has no

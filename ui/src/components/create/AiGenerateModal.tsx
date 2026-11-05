@@ -8,7 +8,7 @@
 // backend changes required.
 
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { X, Sparkles, Dice5, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -21,6 +21,7 @@ import { VOCAL_LANGUAGES } from '../../constants/languages';
 import { inspireProvidersOptions } from '../../queries/studios/resources';
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
+import { QueryError } from '../shared/QueryError';
 
 // ── Result type for the parent callback ──────────────────────────────────
 export interface AiGenerateResult {
@@ -71,10 +72,7 @@ export const AiGenerateModal: React.FC<AiGenerateModalProps> = ({ isOpen, onClos
   const [language, setLanguage] = useState('en');
 
   // ── Submission state ──
-  const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState('');
-  const [error, setError] = useState('');
-  const [randomLoading, setRandomLoading] = useState(false);
 
   // ── Auto-select the first provider if none persisted or it is unavailable ──
   useEffect(() => {
@@ -125,46 +123,33 @@ export const AiGenerateModal: React.FC<AiGenerateModalProps> = ({ isOpen, onClos
   }, [selectedProvider, subject, genreText]);
 
   // ── Random subject ──
-  const handleRandomSubject = useCallback(async () => {
-    if (!selectedProvider) return;
-    setRandomLoading(true);
-    try {
+  const randomSubjectMut = useMutation({
+    mutationFn: () => {
       const genres = parseGenres(genreText);
-      const result = await generateRandomSubject(
-        { provider: selectedProvider, model: selectedModel || undefined, genres: genres.length > 0 ? genres : undefined },
+      return generateRandomSubject(
+        { provider: selectedProvider!, model: selectedModel || undefined, genres: genres.length > 0 ? genres : undefined },
+        { silent: true },
       );
-      setSubject(result);
-    } catch (err: any) {
-      setError(err.message || 'Failed to generate subject');
-    } finally {
-      setRandomLoading(false);
-    }
-  }, [selectedProvider, selectedModel, genreText, parseGenres]);
+    },
+    onSuccess: result => setSubject(result),
+  });
+  const randomLoading = randomSubjectMut.isPending;
 
   // ── Submit ──
-  const handleSubmit = useCallback(async () => {
-    if (!canSubmit || loading) return;
-    setError('');
-    setLoading(true);
-    setLoadingStage('Generating song with AI…');
-
-    try {
+  const generateMut = useMutation({
+    mutationFn: () => {
       const genres = parseGenres(genreText);
-      // If no genres provided, use a neutral default so the LLM has context
       const effectiveGenres = genres.length > 0 ? genres : ['any genre'];
       const effectiveSubject = subject.trim() || 'a creative and interesting topic of your choice';
-
-      const result = await runLlmInspire(
-        {
-          provider: selectedProvider,
-          model: selectedModel || undefined,
-          genres: effectiveGenres,
-          subject: effectiveSubject,
-          language,
-        },
-      );
-
-      // Build the result for the parent
+      return runLlmInspire({
+        provider: selectedProvider!,
+        model: selectedModel || undefined,
+        genres: effectiveGenres,
+        subject: effectiveSubject,
+        language,
+      }, { silent: true }).then(result => ({ result, effectiveGenres, effectiveSubject }));
+    },
+    onSuccess: ({ result, effectiveGenres, effectiveSubject }) => {
       const aiResult: AiGenerateResult = {
         caption: result.caption || effectiveGenres.join(', '),
         lyrics: result.lyrics || '',
@@ -176,21 +161,23 @@ export const AiGenerateModal: React.FC<AiGenerateModalProps> = ({ isOpen, onClos
         duration: result.duration || 0,
         vocalLanguage: language,
       };
-
       onResult(aiResult);
       onClose();
-
       // Reset form for next use (keep provider/model persisted)
       setSubject('');
       setGenreText('');
-      setError('');
-    } catch (err: any) {
-      setError(err.message || 'AI generation failed');
-    } finally {
-      setLoading(false);
-      setLoadingStage('');
-    }
-  }, [canSubmit, loading, parseGenres, genreText, subject, selectedProvider, selectedModel, language, onResult, onClose]);
+    },
+  });
+  const loading = generateMut.isPending;
+  const error = randomSubjectMut.error?.message || generateMut.error?.message || '';
+
+  const handleSubmit = useCallback(() => {
+    if (!canSubmit || loading) return;
+    setLoadingStage('Generating song with AI…');
+    generateMut.mutate(undefined, {
+      onSettled: () => setLoadingStage(''),
+    });
+  }, [canSubmit, loading, generateMut]);
 
   // ── Keyboard shortcuts ──
   useEffect(() => {
@@ -251,7 +238,9 @@ export const AiGenerateModal: React.FC<AiGenerateModalProps> = ({ isOpen, onClos
                 className={labelClass}
                 info="Which configured LLM writes the caption, lyrics, title and metadata. Model picks which of that provider's models does the writing. Switching either changes the writing style and quality of what comes back, not what it is asked to write about."
               />
-              {providersLoading ? (
+              {providersQuery.isError && providers.length === 0 ? (
+                <QueryError error={providersQuery.error} onRetry={() => void providersQuery.refetch()} compact />
+              ) : providersLoading ? (
                 <div className="flex items-center gap-2 text-xs text-zinc-500 py-2">
                   <Loader2 size={14} className="animate-spin" />
                   Loading providers…
@@ -311,7 +300,7 @@ export const AiGenerateModal: React.FC<AiGenerateModalProps> = ({ isOpen, onClos
                   info="What the song should be about, given to the LLM as the writing prompt for the lyrics and caption. Leave it empty and the AI picks its own topic; Random asks the LLM to invent one that fits the genres above."
                 />
                 <button
-                  onClick={handleRandomSubject}
+                  onClick={() => randomSubjectMut.mutate()}
                   disabled={loading || randomLoading || !selectedProvider}
                   className="flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-medium text-violet-400 hover:text-violet-300 hover:bg-violet-400/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   title="Generate a random subject"

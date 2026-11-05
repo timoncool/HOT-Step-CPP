@@ -7,6 +7,40 @@ import { clearPreparedCaches, listPreparedCaches } from './preparedDataReset.js'
 import { datasetDir } from './paths.js';
 import { tensorsRoot } from './aceTrain.js';
 
+test('HeartMuLa reset measures and deletes only its prepare folder', () => {
+  const slug = `heartmula-reset-${process.pid}-${Date.now()}`;
+  const root = datasetDir(slug);
+  const source = path.join(root, 'source');
+  const owned = path.join(root, 'heartmula', 'prepare');
+  const kept = [path.join(root, 'yue2-latents'), path.join(root, 'mm3-codes'), tensorsRoot(slug), source,
+    path.join(root, 'heartmula', 'other')];
+  try {
+    for (const folder of [owned, ...kept]) {
+      fs.mkdirSync(folder, { recursive: true }); fs.writeFileSync(path.join(folder, 'sample.bin'), 'four');
+    }
+    const caches = listPreparedCaches(slug, source, { target: 'heartmula' });
+    assert.equal(caches.length, 1);
+    assert.equal(caches[0].path, owned);
+    assert.equal(caches[0].files, 1); assert.equal(caches[0].bytes, 4);
+    assert.deepEqual(clearPreparedCaches(slug, source, { target: 'heartmula', includeYue2Core: true }), caches);
+    assert.equal(fs.existsSync(owned), false);
+    for (const folder of kept) assert.equal(fs.readFileSync(path.join(folder, 'sample.bin'), 'utf8'), 'four');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(tensorsRoot(slug), { recursive: true, force: true });
+  }
+});
+
+test('HeartMuLa reset refuses source audio inside its preparation folder', () => {
+  const slug = `heartmula-reset-guard-${process.pid}-${Date.now()}`;
+  const root = datasetDir(slug);
+  const source = path.join(root, 'heartmula', 'prepare', 'source');
+  try {
+    fs.mkdirSync(source, { recursive: true }); fs.writeFileSync(path.join(source, 'song.wav'), 'source');
+    assert.throws(() => clearPreparedCaches(slug, source, { target: 'heartmula' }), /source files/);
+    assert.equal(fs.readFileSync(path.join(source, 'song.wav'), 'utf8'), 'source');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('prepared-data reset removes generated caches but preserves labels and source files', () => {
   const slug = `reset-fixture-${process.pid}-${Date.now()}`;
   const root = datasetDir(slug);

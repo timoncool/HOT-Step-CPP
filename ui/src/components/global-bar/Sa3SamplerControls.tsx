@@ -12,9 +12,10 @@
 // pingpong path, bit-identical.
 //
 // DIFFERENCES FROM SamplerPluginControls (the MM3 one) — both are real:
-//   • owns_loop solvers ARE offered here. MM3 refuses them because a full-loop
-//     solver bypasses its per-step window-overlap blend and breaks the seams;
-//     SA3 refines the clip in a single pass, so there is no seam to break.
+//   • owns_loop solvers are still listed here, unlike MM3, but they never run:
+//     sa3-refine.h swaps them for native pingpong on the refine's pingpong
+//     path, because a full-loop solver skips the per-step re-noise the
+//     distilled SA3 model needs.
 //   • Guidance is close to decorative. SA3 was trained at cfg=1 and has no
 //     unconditional branch, so the engine passes the cond velocity as both
 //     predictions. APG-family modes see diff = 0 and pass through unchanged;

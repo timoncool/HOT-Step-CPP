@@ -255,6 +255,7 @@ static Yue2SamplingParams yue2_stage_params(const Yue2LmConfig::Stage & st, cons
     sp.penalty_window     = o.penalty_window >= 0 ? o.penalty_window : (int) st.penalty_window;
     sp.min_tokens          = o.min_tokens >= 0 ? o.min_tokens : (int) st.min_tokens;
     sp.max_tokens          = o.max_tokens > 0 ? o.max_tokens : (int) st.max_tokens;
+    sp.min_p               = o.min_p > 0.0f ? o.min_p : 0.0f;  // not a checkpoint field
     return sp;
 }
 
@@ -666,8 +667,7 @@ static bool yue2_stream_clean(const std::string & reason) {
 }
 
 // Why a lyric_schedule run can't go ahead on these songs, or nullptr.
-static const char * yue2_lyric_schedule_refusal(bool use_cfg, bool have_abc, const std::vector<Yue2SongState> & songs) {
-    if (use_cfg) return "needs cfg_scale 1 (no rule for the guidance set)";
+static const char * yue2_lyric_schedule_refusal(bool have_abc, const std::vector<Yue2SongState> & songs) {
     if (!have_abc || !songs[0].abc_given) return "needs a supplied score (abc)";
     for (size_t b = 1; b < songs.size(); b++) {
         if (songs[b].prefix_ids != songs[0].prefix_ids) return "needs every song of the batch to share one prompt";
@@ -736,18 +736,28 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
     const Yue2LyricSchedule & lsched = req.lyric_schedule;
     Yue2ScheduleRows          lsched_rows;
     if (lsched.on) {
-        if (const char * why = yue2_lyric_schedule_refusal(use_cfg, have_abc, songs)) {
+        if (const char * why = yue2_lyric_schedule_refusal(have_abc, songs)) {
             if (err) *err = std::string("lyric_schedule ") + why;
             return false;
         }
         const Yue2SongState & s0 = songs[0];
-        if (!yue2_schedule_rows(&tok, lsched, s0.style, s0.lyrics, req.cot, s0.abc_text, s0.abc_ids, &lsched_rows, err)) {
+        // Under guidance the negative prompt carries the same score after the
+        // bare instruction (yue2_negative_prefix): [EOD] + instruction + [ABC_START].
+        const int64_t neg_abc_base = use_cfg && req.cot != YUE2_COT_OFF
+            ? 1 + (int64_t) yue2_bpe_encode(&tok, yue2_instruction(req.cot)).size() + 1 : -1;
+        if (!yue2_schedule_rows(&tok, lsched, s0.style, s0.lyrics, req.cot, s0.abc_text, s0.abc_ids, &lsched_rows, err,
+                                neg_abc_base)) {
             return false;
         }
         for (size_t k = 0; k < lsched.sections.size(); k++) {
             std::string r;
             for (const auto & x : lsched_rows.rows[k]) r += " [" + std::to_string(x.first) + "," + std::to_string(x.second) + ")";
             fprintf(stderr, "[YuE2-C6] section %zu first note %.3fs rows%s\n", k, lsched.sections[k].start_sec, r.c_str());
+        }
+        for (size_t k = 0; k < lsched.blind.size(); k++) {
+            std::string r;
+            for (const auto & x : lsched_rows.blind[k]) r += " [" + std::to_string(x.first) + "," + std::to_string(x.second) + ")";
+            fprintf(stderr, "[YuE2-C6] blind %.3fs..%.3fs rows%s\n", lsched.blind[k].from_sec, lsched.blind[k].to_sec, r.c_str());
         }
         fprintf(stderr, "[YuE2-C6] bias %g, abc %s, lead %.3fs, behind %d, prefix %zu\n", (double) lsched.bias,
                 lsched.abc ? "on" : "off", lsched.lead_sec, lsched.behind, s0.prefix_ids.size());
@@ -859,13 +869,13 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
         // every song of a resumed batch starts from the same prefix.
         supplied_ids.reserve((size_t) supplied_n);
         for (int32_t c : req.codec_ids) supplied_ids.push_back(c + YUE2_CODEC_OFFSET);
-        if (resume && lsched.on) {
+        if (resume && lsched.on && yue2_schedule_touches_prefix(lsched, lsched_rows, supplied_n)) {
             // A C6 schedule changes the attention of every codec row, so the
             // prefix is replayed through the scheduled decode one frame at a
             // time, as sampling would have run it: token i under the spans
             // due at frame i + 1. A plain prefill would build unmasked rows.
-            // The schedule needs one shared prompt and no guidance (checked
-            // above), so every set replays the same frame under the same spans.
+            // The schedule needs one shared prompt (checked above), so every
+            // set replays the same frame, a negative set under its own spans.
             std::vector<int32_t> frame_ids((size_t) S);
             for (int64_t i = 0; i < supplied_n; i++) {
                 if (cancel && cancel->load()) {
@@ -877,6 +887,8 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
                 for (const Yue2SongState & sg : songs) {
                     yue2_schedule_spans(lsched, lsched_rows, (double) (i + 1) * 0.04,
                                         &cache.prompt_bias[(size_t) sg.cond_set]);
+                    if (use_cfg) yue2_schedule_spans(lsched, lsched_rows, (double) (i + 1) * 0.04,
+                                                     &cache.prompt_bias[(size_t) sg.neg_set], true);
                 }
                 std::fill(frame_ids.begin(), frame_ids.end(), supplied_ids[(size_t) i]);
                 if (!yue2_ar_decode_batch(m, cache, frame_ids.data(), &logits, err, S)) {
@@ -938,6 +950,21 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
         return true;
     }
 
+    // Source guide (yue2-guide.h): read once, shared by every song in the batch.
+    Yue2Guide  guide;
+    const bool guide_on = !req.guide.path.empty();
+    if (guide_on) {
+        if (!yue2_guide_read(req.guide.path, &guide, err)) {
+            yue2_ar_kv_cache_free(&cache);
+            return false;
+        }
+        fprintf(stderr,
+                "[YuE2-Guide] %lld frames x top-%lld | k %d scale %.2f outside %.1f offset %.2fs%s%s%s\n",
+                (long long) guide.T, (long long) guide.K, req.guide.k, req.guide.scale, req.guide.outside,
+                req.guide.offset_sec, req.guide.allow_end ? " allow_end" : "",
+                req.guide.schedule.empty() ? "" : (" schedule " + req.guide.schedule).c_str(),
+                req.guide.lfo.empty() ? "" : (" lfo " + req.guide.lfo).c_str());
+    }
     std::vector<std::vector<int32_t>> history((size_t) B);
     std::vector<bool>    done((size_t) B, false), by_threshold((size_t) B, false), dropped((size_t) B, false),
                          capped((size_t) B, false), abandoned((size_t) B, false);
@@ -982,8 +1009,12 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
             }
             float * row = logits.data() + (size_t) sg.cond_set * (size_t) W;
             if (use_cfg) {
-                yue2_cfg_blend_into(row, logits.data() + (size_t) sg.neg_set * (size_t) W, (size_t) W, req.cfg_scale,
-                                    scratch.data());
+                const float * neg = logits.data() + (size_t) sg.neg_set * (size_t) W;
+                if (req.cfg_x.any()) {
+                    lm_cfg_blend_extras(row, neg, (size_t) W, req.cfg_scale, req.cfg_x, scratch.data());
+                } else {
+                    yue2_cfg_blend_into(row, neg, (size_t) W, req.cfg_scale, scratch.data());
+                }
                 row = scratch.data();
             }
             // Ending controls (yue2-request.h). The bias lands on the raw logit
@@ -1001,6 +1032,9 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
                 if (w > 0.0f && std::isfinite(row[end_rel])) {
                     row[end_rel] += w * req.end_bias;
                 }
+            }
+            if (guide_on) {
+                yue2_guide_apply(row, W, base, legal_lo, legal_hi, YUE2_MUSIC_END, guide, req.guide, step);
             }
             // YUE2_END_TRACE=<path>: per-step record of MUSIC_END's probability
             // and rank BEFORE the sampler chain (softmax over the legal ids +
@@ -1137,6 +1171,8 @@ static bool yue2_run_semantic_stage(Yue2Model & m, const BPETokenizer & tok, con
                 const Yue2SongState & sg = songs[(size_t) slot_song[(size_t) i]];
                 yue2_schedule_spans(lsched, lsched_rows, (double) sg.codec_ids.size() * 0.04,
                                     &cache.prompt_bias[(size_t) sg.cond_set]);
+                if (use_cfg) yue2_schedule_spans(lsched, lsched_rows, (double) sg.codec_ids.size() * 0.04,
+                                                 &cache.prompt_bias[(size_t) sg.neg_set], true);
             }
         }
         // The last content token is forwarded even on the final step so the

@@ -15,6 +15,54 @@ import { describeDownloadError, modelDownloadService } from './modelDownloadServ
 
 const svc = modelDownloadService as any;
 
+const catalogue = JSON.parse(fs.readFileSync(new URL('../data/model-registry.json', import.meta.url), 'utf8'));
+
+test('all five generation backends have complete packs referencing real catalogue entries', () => {
+  const ids = catalogue.files.map((f: any) => f.id);
+  assert.equal(new Set(ids).size, ids.length, 'file ids must be unique');
+  for (const family of ['as1.5', 'mm3', 'yue2', 'sa3', 'heartmula']) {
+    assert.ok(catalogue.files.some((f: any) => f.family === family), family);
+    assert.ok(catalogue.packs.some((p: any) => p.family === family && p.fileIds.length > 0), family);
+  }
+  for (const pack of catalogue.packs) {
+    for (const id of pack.fileIds) assert.ok(ids.includes(id), `${pack.id}: ${id}`);
+  }
+  const sa3 = catalogue.packs.find((p: any) => p.id === 'sa3-generation');
+  assert.equal(sa3.fileIds.length, 7, 'generation needs one DiT, not every alternative quant');
+  assert.ok(sa3.fileIds.includes('stablestep-gguf-dit'));
+  assert.ok(sa3.fileIds.includes('stablestep-tokenizer'));
+  assert.ok(!sa3.fileIds.some((id: string) => id.startsWith('sa3-training')));
+});
+
+test('every HeartMuLa download agrees with the measured publication inventory', () => {
+  const manifest = JSON.parse(fs.readFileSync(new URL('../../../docs/dev/heartmula-hf-manifest.json', import.meta.url), 'utf8'));
+  const weights = manifest.files.filter((f: any) => f.upload && f.path.endsWith('.gguf'));
+  const entries = catalogue.files.filter((f: any) => f.family === 'heartmula');
+  assert.equal(entries.length, weights.length);
+  for (const file of weights) {
+    const entry = entries.find((f: any) => f.filename === file.path);
+    assert.ok(entry, file.path);
+    assert.equal(entry.repo, manifest.repo);
+    assert.equal(entry.repoPath, file.path);
+    assert.equal(entry.subdir, 'heartmula');
+    assert.equal(entry.sizeBytes, file.sizeBytes);
+    assert.equal(entry.sha256, file.sha256);
+    assert.match(entry.sha256, /^[a-f0-9]{64}$/);
+  }
+});
+
+test('each HeartMuLa variant offers the same full ladder for both LM parts', () => {
+  const ladder = ['F16', 'Q8_0', 'Q6_K', 'Q5_K_M', 'Q5_K_S', 'Q4_K_M', 'Q4_K_S',
+    'Q3_K_L', 'Q3_K_M', 'Q3_K_S', 'Q2_K', 'IQ4_XS', 'IQ3_XXS', 'IQ2_XS',
+    'IQ2_XXS', 'IQ1_M', 'IQ1_S', 'MXFP4', 'NVFP4'].sort();
+  for (const variant of ['heartmula-3b', 'heartmula-3b-happy-new-year', 'heartmula-3b-rl']) {
+    for (const part of ['global', 'local']) {
+      const files = catalogue.files.filter((f: any) => f.variant === `${variant}-${part}`);
+      assert.deepEqual(files.map((f: any) => f.quant).sort(), ladder, `${variant}-${part}`);
+    }
+  }
+});
+
 function tmpFile(contents: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-sha-'));
   const p = path.join(dir, 'model.gguf');
@@ -95,4 +143,28 @@ test('an HTTP status error says which host answered', () => {
 test('nothing usable still produces something to read', () => {
   assert.equal(describeDownloadError(undefined), 'unknown error');
   assert.equal(describeDownloadError({}), '[object Object]');
+});
+
+test('a model already on disk still gets its missing companion files, side by side', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'companions-'));
+  fs.writeFileSync(path.join(dir, 'model.gguf'), 'weights');
+  const fetched: string[] = [];
+  const realTarget = svc.getTargetDir, realSimple = svc._downloadSimple;
+  svc.getTargetDir = () => dir;
+  svc._downloadSimple = async (url: string, dest: string) => { fetched.push(url); fs.writeFileSync(dest, url); };
+  try {
+    const job = { status: 'queued', bytesDownloaded: 0, totalBytes: 0 } as any;
+    for (const name of ['LICENSE', 'LICENSE-YuE2-RS-4.0x0.7']) {
+      await svc._executeDownload(job, {
+        filename: 'model.gguf', sizeBytes: 0, repo: 'o/r',
+        companions: [{ filename: name, repoPath: 'LICENSE' }],
+      });
+    }
+    await new Promise(r => setTimeout(r, 20)); // companions are fire-and-forget
+    assert.equal(job.status, 'completed');
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['LICENSE', 'LICENSE-YuE2-RS-4.0x0.7', 'model.gguf']);
+    assert.ok(fetched.every(u => u.endsWith('/o/r/resolve/main/LICENSE')));
+  } finally {
+    svc.getTargetDir = realTarget; svc._downloadSimple = realSimple;
+  }
 });

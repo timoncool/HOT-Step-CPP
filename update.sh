@@ -16,7 +16,7 @@
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 cd "$SCRIPT_DIR"
 
 # ── Colors ────────────────────────────────────────────────────────────
@@ -262,30 +262,66 @@ if [ -e engine/ggml/.git ]; then
     fi
 fi
 
-# Shut down running server (if any)
+# Resolve the active .env without starting the server or applying a data move.
+SHUTDOWN_PORT=$(cd server && node --import tsx --input-type=module -e "import fs from 'node:fs'; import {parse} from 'dotenv'; import {locateData} from './src/dataroot/locate.ts'; const r=locateData(); if(r.pendingMove || r.pointerError || r.children === null) process.exit(1); const f=r.children.envFile; const e=fs.existsSync(f)?parse(fs.readFileSync(f)):{}; const p=Number(process.env.SERVER_PORT ?? e.SERVER_PORT ?? 3001); if(Number.isInteger(p)===false||p<1||p>65535) process.exit(1); console.log(p);" 2>/dev/null) || {
+    SHUTDOWN_PORT=${SERVER_PORT:-3001}
+    echo "  WARNING: cannot resolve this checkout server port; using $SHUTDOWN_PORT."
+}
+
+# Resolve executable paths, not process names or command-line arguments.
+own_engine_pids() {
+    local engine_pid engine_path
+    for engine_pid in $(pgrep -x ace-server 2>/dev/null || true); do
+        if [ "$(uname -s)" = "Darwin" ]; then
+            engine_path=$(lsof -a -p "$engine_pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)
+        else
+            engine_path=$(readlink "/proc/$engine_pid/exe" 2>/dev/null || true)
+        fi
+        case "$engine_path" in
+            "$SCRIPT_DIR"/*) printf '%s\n' "$engine_pid" ;;
+        esac
+    done
+}
+
+# Shut down this checkout's server, then wait only for its engines.
 echo "  Checking for running server..."
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/api/status 2>/dev/null || echo "000")
+STATUS_CODE=$(curl --max-time 10 -s -o /dev/null -w "%{http_code}" "http://localhost:$SHUTDOWN_PORT/api/status" 2>/dev/null || true)
 
 if [ "$STATUS_CODE" = "200" ]; then
-    echo "  Server is running — requesting graceful shutdown..."
-    curl -s -X POST http://localhost:3001/api/shutdown >/dev/null 2>&1 || true
-
-    # Wait for ace-server to exit
-    retries=0
-    while pgrep -x "ace-server" >/dev/null 2>&1; do
-        sleep 1
-        retries=$((retries + 1))
-        if [ "$retries" -ge 10 ]; then
-            echo "  Force-killing ace-server after 10s timeout..."
-            pkill -9 -x "ace-server" 2>/dev/null || true
-            sleep 2
-            break
-        fi
+    # A configured port alone does not establish process ownership.
+    listener_pids=$(lsof -nP -t -iTCP:"$SHUTDOWN_PORT" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -z "$listener_pids" ]; then
+        echo "  ERROR: cannot verify listener ownership (lsof required)."
+        exit 1
+    fi
+    for listener_pid in $listener_pids; do
+        listener_cwd=$(lsof -a -p "$listener_pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+        case "$listener_cwd" in
+            "$SCRIPT_DIR"|"$SCRIPT_DIR"/*) ;;
+            *) echo "  ERROR: configured server port belongs to another checkout."; exit 1 ;;
+        esac
     done
-    echo "  Server stopped."
-else
-    echo "  No running server detected."
+    echo "  Server is running — requesting graceful shutdown..."
+    curl --max-time 10 -s -X POST "http://localhost:$SHUTDOWN_PORT/api/shutdown" >/dev/null 2>&1 || true
 fi
+
+# Also handle an orphan engine when the Node server is already gone.
+retries=0
+while [ -n "$(own_engine_pids)" ]; do
+    sleep 1
+    retries=$((retries + 1))
+    if [ "$retries" -eq 10 ]; then
+        echo "  Force-killing ace-server after 10s timeout..."
+        for engine_pid in $(own_engine_pids); do
+            kill -9 "$engine_pid" 2>/dev/null || true
+        done
+    fi
+    if [ "$retries" -ge 15 ]; then
+        echo "  ERROR: could not stop this checkout's ace-server. Nothing was built."
+        exit 1
+    fi
+done
+echo "  Server stopped."
 
 # ── Phase 2: Code sync ──────────────────────────────────────────────
 echo ""

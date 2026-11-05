@@ -207,6 +207,16 @@ static bool is_important_l(const char * name) {
     return is_important_sm(name) || strstr(name, "o_proj.weight") || strstr(name, "attn_output.weight");
 }
 
+// HeartMuLa LM tensors on a table or logit boundary (get_rows inputs, the
+// codebook heads and the global->local projection). Floored at the embedding
+// type like the MM3 boundary tensors; the 1-column unconditional-text row and
+// the MuQ projection (zero-fed, 512 wide) stay at their stored precision.
+static bool is_heartmula_boundary(const char * name) {
+    return name_is(name, "text_embeddings.weight") || name_is(name, "audio_embeddings.weight")
+        || name_is(name, "codebook0_head.weight") || name_is(name, "projection.weight")
+        || strncmp(name, "audio_head.", 11) == 0;
+}
+
 static bool is_embed(const char * name) {
     return strstr(name, "embed_tokens.weight") != nullptr   // ACE / HF
         || name_is(name, "token_embd.weight")               // MM3 LM input embedding
@@ -232,6 +242,26 @@ static bool should_quantize(const char * name, int n_dims, const char * arch) {
         return false;
     }
     if (n_dims < 2) {
+        return false;
+    }
+    // HeartCodec: Weights::load (heartmula/rvq.h) keeps only 2-D ".weight"
+    // matrices in a quantized type; conv kernels (3-D), tables and the RVQ
+    // codebooks must stay float or the loader refuses the file.
+    if (strncmp(arch, "heartcodec-", 11) == 0) {
+        const size_t n = strlen(name);
+        return strcmp(arch, "heartcodec-rvq") != 0 && n_dims == 2 && n > 7 && strcmp(name + n - 7, ".weight") == 0;
+    }
+    if (strncmp(arch, "heartmula-", 10) == 0 &&
+        (name_is(name, "unconditional_text_embedding.weight") || name_is(name, "muq_linear.weight"))) {
+        return false;
+    }
+    // SA3 concatenates these learned tokens with F32 activations. Its loader
+    // can promote BF16/F16 tokens to F32, but cannot dequantize them.
+    if (strcmp(arch, "sa3-dit") == 0 && name_is(name, "model.transformer.memory_tokens")) {
+        return false;
+    }
+    // The CPU conditioner loader accepts only BF16, F16 and F32 weights.
+    if (strcmp(arch, "sa3-dit") == 0 && strncmp(name, "conditioner.", 12) == 0) {
         return false;
     }
     if (strstr(arch, "text-enc") && strstr(name, "embed_tokens")) {
@@ -277,6 +307,10 @@ static enum ggml_type pick_type(const char *         name,
     if (is_embed(name) && !strstr(arch, "text-enc")) {
         return embed_type;
     }
+    const bool is_hm = strncmp(arch, "heartmula-", 10) == 0;
+    if (is_hm && is_heartmula_boundary(name)) {
+        return embed_type;
+    }
 
     // MM3 logit/latent boundary tensors: never below the embedding type.
     if (is_mm3 && is_mm3_boundary(name)) {
@@ -285,6 +319,11 @@ static enum ggml_type pick_type(const char *         name,
 
     // Important tensor bump logic
     bool important = (v.bump_mode == 3) ? is_important_l(name) : is_important_sm(name);
+    // HeartMuLa names the down projection mlp.w2 and the attention output
+    // output_proj, which none of the substrings above match.
+    if (is_hm && (strstr(name, "mlp.w2.weight") || (v.bump_mode == 3 && strstr(name, "attn.output_proj.weight")))) {
+        important = true;
+    }
 
     if (important && v.bump != GGML_TYPE_COUNT) {
         int  layer  = extract_layer(name);

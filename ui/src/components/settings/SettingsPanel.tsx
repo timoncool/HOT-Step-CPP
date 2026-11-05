@@ -3,23 +3,24 @@
 // All settings use localStorage via usePersistedState and survive page refreshes.
 // Environment settings read from / write to the server's .env file.
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import React, { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
-  Zap, Download, Tag, AlertTriangle, Loader2, Settings2,
-  ChevronRight, Save, Scissors,
-  Key, Database, Globe, Gauge, Image as ImageIcon
+  Zap, Download, Tag, Loader2, Settings2,
+  ChevronRight, Save,
+  Key, Database, Globe, Gauge, Bug, Image as ImageIcon
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { FALLBACK_LANGUAGE, SUPPORTED_LANGUAGES } from '../../i18n';
-import { deleteAllJobs, formatBytes, type StemStats } from '../../services/stemStudioApi';
-import { useAuth } from '../../context/AuthContext';
-import { songApi, settingsApi } from '../../services/api';
-import { envOptions, gpusOptions, healthOptions, stemStatsOptions } from '../../queries/shell-queue/settings';
-import { queryManager } from '../../queries/invalidation';
+import { engineWorkersOptions, healthOptions } from '../../queries/shell-queue/settings';
+import { useEnvSettingsForm } from './useEnvSettingsForm';
 import { DataFolderPanel } from './DataFolderPanel';
+import { SettingsBackupPanel } from './SettingsBackupPanel';
+import { UpdatesPanel } from './UpdatesPanel';
+import { ReportIssuePanel } from './ReportIssuePanel';
+import { StemStorage } from './StemStorage';
+import { DangerZone } from './DangerZone';
 import { AdapterReferencesAction } from './AdapterReferencesAction';
-import { lireekApi } from '../../services/lireekApi';
 import { FileBrowserModal } from '../shared/FileBrowserModal';
 import { StyledSelect } from '../shared/StyledSelect';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -82,107 +83,34 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   onNukeComplete,
 }) => {
   const { t, i18n } = useTranslation();
-  const { token } = useAuth();
-  const queryClient = useQueryClient();
   const [coverSet, setCoverSetState] = useState<CoverSet>(getCoverSet);
-  const [nukeConfirm, setNukeConfirm] = useState(false);
   // The release tag the server reports; a git checkout says "dev" (#185).
   const appVersion = String(useQuery(healthOptions()).data?.version || '');
-  const [nukeRunning, setNukeRunning] = useState(false);
-  const [nukeResult, setNukeResult] = useState<string | null>(null);
-  const [nukeLyricsConfirm, setNukeLyricsConfirm] = useState(false);
-  const [nukeLyricsRunning, setNukeLyricsRunning] = useState(false);
-  const [nukeProfilesConfirm, setNukeProfilesConfirm] = useState(false);
-  const [nukeProfilesRunning, setNukeProfilesRunning] = useState(false);
-
-  // Stem storage state
-  const stemStats = useQuery(stemStatsOptions()).data ?? null;
-  const [stemClearConfirm, setStemClearConfirm] = useState(false);
-  const [stemClearing, setStemClearing] = useState(false);
-  const [stemClearError, setStemClearError] = useState<string | null>(null);
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     onSettingsChange({ ...settings, [key]: value });
   };
 
-  const handleNuke = async () => {
-    if (!token) return;
-    setNukeRunning(true);
-    setNukeResult(null);
-    try {
-      const res = await songApi.nukeGenerations();
-      setNukeResult(
-        `Nuked ${res.songsDeleted} songs, ${res.filesDeleted} audio files, ${res.lireekAudioGensDeleted} Lyric Studio entries.`
-      );
-      setNukeConfirm(false);
-      onNukeComplete?.();
-    } catch (err: any) {
-      setNukeResult(`Failed: ${err.message}`);
-    } finally {
-      setNukeRunning(false);
-    }
-  };
+  // ── Environment (.env) form ─────────────────────────────────────
+  // The hook owns the draft/seed/save lifecycle over envOptions(); this panel
+  // only renders values and calls its handlers.
+  const {
+    values: envValues,
+    loading: envLoading,
+    status: envStatus,
+    dirty: envDirty,
+    saving: envSaving,
+    restarting,
+    pendingRestartKeys,
+    gpus: detectedGpus,
+    change: handleEnvChange,
+    save: handleEnvSave,
+    restartNow: handleRestartNow,
+  } = useEnvSettingsForm();
 
-  const handleNukeLyrics = async () => {
-    setNukeLyricsRunning(true);
-    setNukeResult(null);
-    try {
-      const res = await lireekApi.purgeGenerations();
-      setNukeResult(`Deleted ${res.generations_deleted} generated lyrics.`);
-      setNukeLyricsConfirm(false);
-    } catch (err: any) {
-      setNukeResult(`Failed: ${err.message}`);
-    } finally {
-      setNukeLyricsRunning(false);
-    }
-  };
-
-  const handleNukeProfiles = async () => {
-    setNukeProfilesRunning(true);
-    setNukeResult(null);
-    try {
-      const res = await lireekApi.purgeProfiles();
-      setNukeResult(`Deleted ${res.profiles_deleted} profiles and ${res.generations_deleted} dependent lyrics.`);
-      setNukeProfilesConfirm(false);
-    } catch (err: any) {
-      setNukeResult(`Failed: ${err.message}`);
-    } finally {
-      setNukeProfilesRunning(false);
-    }
-  };
-
-  const handleClearStems = async () => {
-    setStemClearing(true);
-    setStemClearError(null);
-    try {
-      await deleteAllJobs();
-      queryClient.setQueryData<StemStats>(stemStatsOptions().queryKey, { totalBytes: 0, jobCount: 0, stemCount: 0 });
-      void queryManager.keys(queryClient, stemStatsOptions().queryKey);
-      setStemClearConfirm(false);
-    } catch (err: any) {
-      console.error('[Settings] Clear stems failed:', err);
-      setStemClearError(err?.message || 'Clear failed');
-    } finally {
-      setStemClearing(false);
-    }
-  };
-
-  // ── Environment (.env) state ────────────────────────────────────
-  const [envValues, setEnvValues] = useState<Record<string, string>>({});
-  const [envOriginal, setEnvOriginal] = useState<Record<string, string>>({});
-  const [envLoading, setEnvLoading] = useState(true);
-  const [envSaving, setEnvSaving] = useState(false);
-  const [envStatus, setEnvStatus] = useState<{ type: 'success' | 'error' | 'warning'; text: string } | null>(null);
-  // Keys saved to .env that the running engine will not pick up until it is
-  // restarted. Non-empty means the value shown above is NOT the value in use
-  // (issue #99), and the Restart now button below is the way to reconcile them.
-  const [pendingRestartKeys, setPendingRestartKeys] = useState<string[]>([]);
-  const [restarting, setRestarting] = useState(false);
-  /** Keys the server marks as restart-required (RESTART_REQUIRED_KEYS). */
-  const [restartKeys, setRestartKeys] = useState<string[]>([]);
-
-  // Detected GPUs for the GPU selector dropdown
-  const [detectedGpus, setDetectedGpus] = useState<Array<{ index: number; uuid: string; name: string; memoryMB: number }>>([]);
+  // Engine workers for the experimental multi-GPU section: observed and polled
+  // while mounted, separate from the editable env form (read-only status).
+  const engineWorkers = useQuery(engineWorkersOptions()).data ?? null;
 
   // Subsection open/close state
   const [openSections, setOpenSections] = useState<Record<string, boolean>>({
@@ -194,30 +122,6 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
   // File browser modal state
   const [browseKey, setBrowseKey] = useState<string | null>(null);
-
-  // Load env settings on mount
-  const loadEnvSettings = useCallback(async () => {
-    try {
-      setEnvLoading(true);
-      const [data, gpuData] = await Promise.all([
-        queryClient.query(envOptions()),
-        queryClient.query(gpusOptions()).catch(() => ({ gpus: [] })),
-      ]);
-      setEnvValues(data.values);
-      setEnvOriginal(data.values);
-      setRestartKeys(data.restartKeys || []);
-      setDetectedGpus(gpuData.gpus);
-    } catch (err: any) {
-      console.error('[Settings] Failed to load .env:', err.message);
-    } finally {
-      setEnvLoading(false);
-    }
-  }, [queryClient]);
-
-  useEffect(() => { loadEnvSettings(); }, [loadEnvSettings]);
-
-  // Track which keys have changed
-  const envDirty = Object.keys(envValues).some((k) => envValues[k] !== envOriginal[k]);
 
   // The GPU picker stores a GPU UUID, not an index (issue #153 — nvidia-smi
   // and CUDA number GPUs differently, so an index could select the other card).
@@ -232,69 +136,12 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const gpuSelectValue = gpuRaw ? (gpuMatch ? (gpuMatch.uuid || String(gpuMatch.index)) : gpuRaw) : '';
   const gpuSelectUnknown = !!gpuRaw && !gpuMatch;
 
-  const handleEnvChange = (key: string, value: string) => {
-    setEnvValues((prev) => ({ ...prev, [key]: value }));
-    setEnvStatus(null);
-  };
-
-  const handleEnvSave = async () => {
-    // Build diff — only send changed keys
-    const diff: Record<string, string> = {};
-    for (const [key, value] of Object.entries(envValues)) {
-      if (value !== envOriginal[key]) {
-        diff[key] = value;
-      }
-    }
-    if (Object.keys(diff).length === 0) return;
-
-    setEnvSaving(true);
-    setEnvStatus(null);
-    try {
-      const res = await settingsApi.updateEnv(diff);
-      setEnvOriginal({ ...envValues });
-      void queryManager.keys(queryClient, envOptions().queryKey);
-      if (res.restartRequired) {
-        // Name them. "Some changes require a restart" left the user to work out
-        // which value on screen is a lie about what the engine is running.
-        const stale = res.updated.filter(k => restartKeys.includes(k));
-        setPendingRestartKeys(stale);
-        setEnvStatus({
-          type: 'warning',
-          text: stale.length
-            ? `Saved. The engine is still running the old ${stale.join(', ')} until you restart.`
-            : `Saved ${res.updated.length} setting(s). Some changes require a restart.`,
-        });
-      } else {
-        setPendingRestartKeys([]);
-        setEnvStatus({ type: 'success', text: `Saved ${res.updated.length} setting(s). Changes are live.` });
-      }
-    } catch (err: any) {
-      setEnvStatus({ type: 'error', text: `Failed to save: ${err.message}` });
-    } finally {
-      setEnvSaving(false);
-    }
-  };
-
-  /** Apply restart-required settings by restarting, from where they were saved.
-   *  The restart control already existed in the sidebar, but nothing in the
-   *  Save Environment flow pointed at it, so a saved value could sit on screen
-   *  looking active while the engine ran on the old one indefinitely (#99).
-   *
-   *  The app-level restarting overlay has to be raised too. Without it the
-   *  Settings page stayed on screen against a server that was going away: the
-   *  button read "Restarting…" forever, nothing reloaded when the server came
-   *  back, and every panel that probes the engine (post-processing among them)
-   *  quietly degraded to "unavailable" (issue #153). */
-  const handleRestartNow = async () => {
-    setRestarting(true);
-    setEnvStatus({ type: 'warning', text: 'Restarting…' });
-    window.dispatchEvent(new CustomEvent('hotstep:restarting'));
-    try {
-      await fetch('/api/shutdown/restart', { method: 'POST' });
-    } catch {
-      // The server tears the connection down as it goes, so a rejected fetch
-      // here is the expected outcome and not an error worth reporting.
-    }
+  // Multi-GPU opt-in: comma-separated UUIDs, same stable ids as the picker above.
+  const workerGpuSet = new Set((envValues.ACESTEPCPP_WORKER_GPUS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
+  const toggleWorkerGpu = (uuid: string) => {
+    const key = uuid.toLowerCase();
+    const chosen = detectedGpus.filter(g => g.uuid && (g.uuid.toLowerCase() === key ? !workerGpuSet.has(key) : workerGpuSet.has(g.uuid.toLowerCase())));
+    handleEnvChange('ACESTEPCPP_WORKER_GPUS', chosen.map(g => g.uuid).join(','));
   };
 
   const handleBrowse = (key: string) => {
@@ -308,7 +155,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     setBrowseKey(null);
   };
 
-  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance';
+  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance' | 'report';
   const [activeTab, setActiveTab] = useState<TabId>('general');
 
   const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
@@ -317,6 +164,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     { id: 'ai',          label: t('settings.tabs.ai'),     icon: <Key size={15} className="settings-tab-icon" /> },
     { id: 'storage',     label: t('settings.tabs.storage'),  icon: <Database size={15} className="settings-tab-icon" /> },
     { id: 'performance', label: 'Performance', icon: <Gauge size={15} className="settings-tab-icon" /> },
+    { id: 'report',      label: t('settings.tabs.report', 'Report an issue'), icon: <Bug size={15} className="settings-tab-icon" /> },
   ];
 
   return (
@@ -409,6 +257,57 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   />
                 )}
               </div>
+
+              {/* Multi-GPU (experimental) — one engine per ticked card. Only shown with 2+ detected
+                  cards. With two or more ticked cards, jobs run in parallel, one per card. */}
+              {detectedGpus.length > 1 && (
+                <div className="setting-row">
+                  <div className="setting-info">
+                    <ParamLabel
+                      label="Multi-GPU workers"
+                      className="setting-label"
+                      meta="experimental · off by default"
+                      info="Starts one engine per ticked card instead of one engine in total. Each model must fit in a single card's VRAM; a model is never split across cards. CUDA-only: Vulkan, CPU and Apple Silicon keep the single engine. With two or more cards ticked, jobs run in parallel, one per card; training, post-processing and previews still take every card. Leave all unticked for the normal single engine, which still uses the GPU Device pick above. Requires a restart to take effect."
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    {detectedGpus.map((gpu) => (
+                      <label key={gpu.uuid || gpu.index} className="flex items-center gap-2">
+                        <Toggle
+                          id={`env-worker-gpu-${gpu.index}`}
+                          disabled={!gpu.uuid}
+                          checked={!!gpu.uuid && workerGpuSet.has(gpu.uuid.toLowerCase())}
+                          onChange={() => toggleWorkerGpu(gpu.uuid)}
+                        />
+                        <span>{`GPU ${gpu.index}: ${gpu.name} (${Math.round(gpu.memoryMB / 1024)} GB)`}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Per-worker engine status: shown once a second worker exists (after a restart with the opt-in set) */}
+              {engineWorkers && engineWorkers.workers.length > 1 && (
+                <div className="setting-row">
+                  <div className="setting-info">
+                    <ParamLabel
+                      label="Engine workers"
+                      className="setting-label"
+                      info="One row per running engine. w0 is the primary. “busy” means a job is running on that worker; a worker is only restarted while idle."
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1 text-sm">
+                    {engineWorkers.workers.map((w) => {
+                      const card = detectedGpus.find(g => g.uuid && g.uuid === w.gpuUuid);
+                      return (
+                        <div key={w.id}>
+                          {`${w.id}${w.primary ? ' (primary)' : ''} · ${card ? `GPU ${card.index}` : 'auto'} · port ${w.port} · ${w.ready ? 'ready' : w.status}${w.busy > 0 ? ' · busy' : ''}`}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Keep models in VRAM — passes --keep-loaded to the engine.
                   Restart-required (spawn-time flag). Default off (VRAM cost). */}
@@ -577,7 +476,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
         <EnvTextRow envKey="OPENAI_MODEL" label={t('settings.ai.openaiModel')} description={t('settings.ai.openaiModelDesc')}
           value={envValues.OPENAI_MODEL || ''} onChange={handleEnvChange} placeholder="gpt-4o-mini" />
         <EnvTextRow envKey="ANTHROPIC_MODEL" label={t('settings.ai.anthropicModel')} description={t('settings.ai.anthropicModelDesc')}
-          value={envValues.ANTHROPIC_MODEL || ''} onChange={handleEnvChange} placeholder="claude-3-5-haiku-20241022" />
+          value={envValues.ANTHROPIC_MODEL || ''} onChange={handleEnvChange} placeholder="claude-haiku-4-5-20251001" />
         <EnvTextRow envKey="OLLAMA_MODEL" label={t('settings.ai.ollamaModel')} description={t('settings.ai.ollamaModelDesc')}
           value={envValues.OLLAMA_MODEL || ''} onChange={handleEnvChange} placeholder="llama3" />
         <EnvTextRow envKey="LMSTUDIO_MODEL" label={t('settings.ai.lmstudioModel')} description={t('settings.ai.lmstudioModelDesc')}
@@ -780,6 +679,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {/* ═══════════════ GENERAL TAB ═══════════════ */}
       {activeTab === 'general' && (
       <>
+      <UpdatesPanel />
       {/* Language Section */}
       <div className="settings-section">
         <div className="settings-section-header">
@@ -965,301 +865,16 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       </>
       )}
 
+      {activeTab === 'report' && <ReportIssuePanel />}
+
       {/* ═══════════════ STORAGE & DATA TAB ═══════════════ */}
       {activeTab === 'storage' && (
       <>
       <DataFolderPanel />
-      {/* Stem Storage Section */}
-      <div className="settings-section">
-        <div className="settings-section-header">
-          <Scissors size={16} className="settings-section-icon" />
-          <span className="settings-section-title">{t('settings.storage.stemStorage')}</span>
-        </div>
+      <SettingsBackupPanel settings={settings} onSettingsChange={onSettingsChange} />
+      <StemStorage />
 
-        <div className="setting-row">
-          <div className="setting-info">
-            <div className="setting-label">{t('settings.storage.extractedStems')}</div>
-            <div className="setting-description">
-              {stemStats ? (
-                <>
-                  {stemStats.jobCount} extraction{stemStats.jobCount !== 1 ? 's' : ''} · {stemStats.stemCount} stem{stemStats.stemCount !== 1 ? 's' : ''} · {formatBytes(stemStats.totalBytes)}
-                </>
-              ) : (
-                t('settings.storage.loading')
-              )}
-            </div>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
-            {!stemClearConfirm ? (
-              <button
-                id="clear-stems-btn"
-                onClick={() => setStemClearConfirm(true)}
-                disabled={stemClearing || !stemStats || stemStats.jobCount === 0}
-                className="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
-                style={{
-                  background: 'rgba(239, 68, 68, 0.15)',
-                  border: '1px solid rgba(239, 68, 68, 0.3)',
-                  color: '#fca5a5',
-                  cursor: (!stemStats || stemStats.jobCount === 0) ? 'not-allowed' : 'pointer',
-                  opacity: (!stemStats || stemStats.jobCount === 0) ? 0.5 : 1,
-                }}
-              >
-                🗑️ {t('settings.storage.clearAllStems')}
-              </button>
-            ) : (
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <span className="text-xs text-red-400" style={{ whiteSpace: 'nowrap' }}>{t('settings.storage.deleteAllStems')}</span>
-                <button
-                  id="clear-stems-confirm-btn"
-                  onClick={handleClearStems}
-                  disabled={stemClearing}
-                  className="px-4 py-2 rounded-lg text-sm font-bold transition-all duration-200"
-                  style={{
-                    background: '#dc2626',
-                    border: '1px solid #ef4444',
-                    color: 'white',
-                    cursor: stemClearing ? 'wait' : 'pointer',
-                    opacity: stemClearing ? 0.6 : 1,
-                  }}
-                >
-                  {stemClearing ? (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Loader2 size={14} className="animate-spin" /> {t('settings.storage.clearing')}
-                    </span>
-                  ) : (
-                    '🗑️ ' + t('settings.storage.confirm')
-                  )}
-                </button>
-                <button
-                  onClick={() => setStemClearConfirm(false)}
-                  disabled={stemClearing}
-                  className="px-3 py-2 rounded-lg text-sm text-zinc-600 dark:text-zinc-400 hover:text-white transition-colors"
-                  style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer' }}
-                >
-                  {t('settings.storage.cancel')}
-                </button>
-              </div>
-            )}
-            {stemClearError && (
-              <span className="text-xs text-red-400" style={{ whiteSpace: 'nowrap' }}>{stemClearError}</span>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* Danger Zone */}
-      <div className="settings-section" style={{ borderColor: 'rgba(239, 68, 68, 0.2)' }}>
-        <div className="settings-section-header">
-          <AlertTriangle size={16} style={{ color: '#ef4444' }} />
-          <span className="settings-section-title" style={{ color: '#ef4444' }}>{t('settings.storage.dangerZone')}</span>
-        </div>
-
-        <div className="setting-row">
-          <div className="setting-info">
-            <div className="setting-label" style={{ color: '#fca5a5' }}>{t('settings.storage.nukeGenerations')}</div>
-            <div className="setting-description">
-              Permanently delete <strong>all</strong> generated audio — songs from the library, audio files from disk,
-              and all Lyric Studio audio generation entries. Lyrics, profiles, and artist data are preserved.
-            </div>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
-            {!nukeConfirm ? (
-              <button
-                id="nuke-generations-btn"
-                onClick={() => setNukeConfirm(true)}
-                disabled={nukeRunning}
-                className="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
-                style={{
-                  background: 'rgba(239, 68, 68, 0.15)',
-                  border: '1px solid rgba(239, 68, 68, 0.3)',
-                  color: '#fca5a5',
-                  cursor: 'pointer',
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.25)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)'; }}
-              >
-                ☢️ {t('settings.storage.nukeGenerations')}
-              </button>
-            ) : (
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <span className="text-xs text-red-400" style={{ whiteSpace: 'nowrap' }}>{t('settings.storage.areYouSure')}</span>
-                <button
-                  id="nuke-confirm-btn"
-                  onClick={handleNuke}
-                  disabled={nukeRunning}
-                  className="px-4 py-2 rounded-lg text-sm font-bold transition-all duration-200"
-                  style={{
-                    background: '#dc2626',
-                    border: '1px solid #ef4444',
-                    color: 'white',
-                    cursor: nukeRunning ? 'wait' : 'pointer',
-                    opacity: nukeRunning ? 0.6 : 1,
-                  }}
-                >
-                  {nukeRunning ? (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Loader2 size={14} className="animate-spin" /> {t('settings.storage.nuking')}
-                    </span>
-                  ) : (
-                    t('settings.storage.confirmNuke')
-                  )}
-                </button>
-                <button
-                  onClick={() => setNukeConfirm(false)}
-                  disabled={nukeRunning}
-                  className="px-3 py-2 rounded-lg text-sm text-zinc-600 dark:text-zinc-400 hover:text-white transition-colors"
-                  style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Nuke Lyrics */}
-        <div className="setting-row">
-          <div className="setting-info">
-            <div className="setting-label" style={{ color: '#fca5a5' }}>{t('settings.storage.nukeLyrics')}</div>
-            <div className="setting-description">
-              Permanently delete <strong>all</strong> generated/written song lyrics across all artists.
-              Profiles and source lyrics are preserved.
-            </div>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
-            {!nukeLyricsConfirm ? (
-              <button
-                id="nuke-lyrics-btn"
-                onClick={() => setNukeLyricsConfirm(true)}
-                disabled={nukeLyricsRunning}
-                className="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
-                style={{
-                  background: 'rgba(239, 68, 68, 0.15)',
-                  border: '1px solid rgba(239, 68, 68, 0.3)',
-                  color: '#fca5a5',
-                  cursor: 'pointer',
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.25)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)'; }}
-              >
-                🗑️ {t('settings.storage.nukeLyrics')}
-              </button>
-            ) : (
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <span className="text-xs text-red-400" style={{ whiteSpace: 'nowrap' }}>{t('settings.storage.areYouSure')}</span>
-                <button
-                  id="nuke-lyrics-confirm-btn"
-                  onClick={handleNukeLyrics}
-                  disabled={nukeLyricsRunning}
-                  className="px-4 py-2 rounded-lg text-sm font-bold transition-all duration-200"
-                  style={{
-                    background: '#dc2626',
-                    border: '1px solid #ef4444',
-                    color: 'white',
-                    cursor: nukeLyricsRunning ? 'wait' : 'pointer',
-                    opacity: nukeLyricsRunning ? 0.6 : 1,
-                  }}
-                >
-                  {nukeLyricsRunning ? (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Loader2 size={14} className="animate-spin" /> {t('settings.storage.nuking')}
-                    </span>
-                  ) : (
-                    t('settings.storage.confirmNukeLyrics')
-                  )}
-                </button>
-                <button
-                  onClick={() => setNukeLyricsConfirm(false)}
-                  disabled={nukeLyricsRunning}
-                  className="px-3 py-2 rounded-lg text-sm text-zinc-600 dark:text-zinc-400 hover:text-white transition-colors"
-                  style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Nuke Profiles */}
-        <div className="setting-row">
-          <div className="setting-info">
-            <div className="setting-label" style={{ color: '#fca5a5' }}>{t('settings.storage.nukeProfiles')}</div>
-            <div className="setting-description">
-              Permanently delete <strong>all</strong> artist profiles and their dependent written lyrics.
-              Source lyrics and artist data are preserved.
-            </div>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flexShrink: 0 }}>
-            {!nukeProfilesConfirm ? (
-              <button
-                id="nuke-profiles-btn"
-                onClick={() => setNukeProfilesConfirm(true)}
-                disabled={nukeProfilesRunning}
-                className="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200"
-                style={{
-                  background: 'rgba(239, 68, 68, 0.15)',
-                  border: '1px solid rgba(239, 68, 68, 0.3)',
-                  color: '#fca5a5',
-                  cursor: 'pointer',
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.25)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(239, 68, 68, 0.15)'; e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)'; }}
-              >
-                🧬 {t('settings.storage.nukeProfiles')}
-              </button>
-            ) : (
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                <span className="text-xs text-red-400" style={{ whiteSpace: 'nowrap' }}>{t('settings.storage.lyricsAlsoDeleted')}</span>
-                <button
-                  id="nuke-profiles-confirm-btn"
-                  onClick={handleNukeProfiles}
-                  disabled={nukeProfilesRunning}
-                  className="px-4 py-2 rounded-lg text-sm font-bold transition-all duration-200"
-                  style={{
-                    background: '#dc2626',
-                    border: '1px solid #ef4444',
-                    color: 'white',
-                    cursor: nukeProfilesRunning ? 'wait' : 'pointer',
-                    opacity: nukeProfilesRunning ? 0.6 : 1,
-                  }}
-                >
-                  {nukeProfilesRunning ? (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                      <Loader2 size={14} className="animate-spin" /> {t('settings.storage.nuking')}
-                    </span>
-                  ) : (
-                    t('settings.storage.confirmNukeProfiles')
-                  )}
-                </button>
-                <button
-                  onClick={() => setNukeProfilesConfirm(false)}
-                  disabled={nukeProfilesRunning}
-                  className="px-3 py-2 rounded-lg text-sm text-zinc-600 dark:text-zinc-400 hover:text-white transition-colors"
-                  style={{ background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', cursor: 'pointer' }}
-                >
-                  Cancel
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-        {nukeResult && (
-          <div
-            className="text-sm px-4 py-3 rounded-lg"
-            style={{
-              background: nukeResult.startsWith('Failed')
-                ? 'rgba(239, 68, 68, 0.1)' : 'rgba(34, 197, 94, 0.1)',
-              border: `1px solid ${nukeResult.startsWith('Failed')
-                ? 'rgba(239, 68, 68, 0.2)' : 'rgba(34, 197, 94, 0.2)'}`,
-              color: nukeResult.startsWith('Failed') ? '#fca5a5' : '#86efac',
-              marginTop: '8px',
-            }}
-          >
-            {nukeResult}
-          </div>
-        )}
-      </div>
+      <DangerZone onNukeComplete={onNukeComplete} />
       </>
       )}
     </div>

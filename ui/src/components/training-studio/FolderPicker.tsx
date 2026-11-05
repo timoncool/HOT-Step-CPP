@@ -4,14 +4,12 @@
 // `trainingAudio` filter so audio files show up as context while the user
 // picks the containing directory. The last-visited dir is remembered.
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { hashKey, type QueryKey } from '@tanstack/react-query';
+import React, { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { createPortal } from 'react-dom';
 import { ChevronUp, Folder, FileAudio, Loader2, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { queryClient } from '../../queries/client';
 import { trainingQueries as tq } from '../../queries/training-data/queries';
-import type { BrowseEntry } from '../../types';
 
 const LAST_DIR_KEY = 'hs-training-lastDir';
 
@@ -30,40 +28,38 @@ interface FolderPickerProps {
 
 export const FolderPicker: React.FC<FolderPickerProps> = ({ open, onClose, onSelect }) => {
   const { t } = useTranslation();
-  const [currentDir, setCurrentDir] = useState('');
-  const [entries, setEntries] = useState<BrowseEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [pathInput, setPathInput] = useState('');
+  // The directory the listing is for. It starts at the last-visited dir
+  // (remembered in localStorage) and changes as you navigate — which changes
+  // the query key, so useQuery fetches the new dir and shows a cached result
+  // instantly when you revisit one (no hand-rolled loading/error/cancel).
+  const [currentDir, setCurrentDir] = useState(getLastDir);
+  const [pathInput, setPathInput] = useState(getLastDir);
 
-  // Only the newest navigation lands; the one it replaces is cancelled.
-  const lastKey = useRef<QueryKey | null>(null);
-  const loadDir = useCallback(async (dir: string) => {
-    const options = tq.browse(dir, 'trainingAudio');
-    // A repeat of the same request joins it instead.
-    if (lastKey.current && hashKey(lastKey.current) !== hashKey(options.queryKey)) void queryClient.cancelQueries({ queryKey: lastKey.current, exact: true });
-    lastKey.current = options.queryKey;
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await queryClient.query(options);
-      if (lastKey.current !== options.queryKey) return;
-      setCurrentDir(result.current);
-      setPathInput(result.current);
-      setEntries(result.entries);
-      saveLastDir(result.current);
-    } catch (err) {
-      if (lastKey.current !== options.queryKey) return;
-      setError(err instanceof Error ? err.message : 'Failed to list directory');
-    }
-    setLoading(false);
-  }, []);
+  // An empty dir asks the server for its default folder, so a first open with
+  // nothing remembered still lists something.
+  const browseQuery = useQuery({
+    ...tq.browse(currentDir, 'trainingAudio'),
+    enabled: open,
+  });
 
+  // Remember where the user was once a listing lands (localStorage is an
+  // external system — the sanctioned use of an effect).
   useEffect(() => {
-    if (open) loadDir(getLastDir());
-  }, [open, loadDir]);
+    const cur = browseQuery.data?.current;
+    if (cur) saveLastDir(cur);
+  }, [browseQuery.data]);
 
   if (!open) return null;
+
+  const navigate = (dir: string) => { setCurrentDir(dir); setPathInput(dir); };
+  const resolvedDir = browseQuery.data?.current ?? currentDir;
+  const entries = browseQuery.data?.entries ?? [];
+  // Spinner only while a not-yet-cached dir is loading (a cached revisit shows
+  // instantly and refetches in the background).
+  const loading = browseQuery.isFetching && !browseQuery.data;
+  const error = browseQuery.error
+    ? (browseQuery.error instanceof Error ? browseQuery.error.message : 'Failed to list directory')
+    : null;
 
   const dirs = entries.filter(e => e.type === 'dir');
   const files = entries.filter(e => e.type === 'file');
@@ -82,7 +78,7 @@ export const FolderPicker: React.FC<FolderPickerProps> = ({ open, onClose, onSel
         </div>
 
         <form
-          onSubmit={(e) => { e.preventDefault(); if (pathInput.trim()) loadDir(pathInput.trim()); }}
+          onSubmit={(e) => { e.preventDefault(); if (pathInput.trim()) navigate(pathInput.trim()); }}
           className="px-4 py-2 border-b border-zinc-200 dark:border-white/5"
         >
           <div className="flex gap-2">
@@ -114,7 +110,7 @@ export const FolderPicker: React.FC<FolderPickerProps> = ({ open, onClose, onSel
               {dirs.map(entry => (
                 <button
                   key={entry.path}
-                  onClick={() => loadDir(entry.path)}
+                  onClick={() => navigate(entry.path)}
                   className="w-full flex items-center gap-3 px-4 py-2 text-left hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
                 >
                   {entry.name === '..'
@@ -137,11 +133,11 @@ export const FolderPicker: React.FC<FolderPickerProps> = ({ open, onClose, onSel
         </div>
 
         <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-zinc-200 dark:border-white/5 bg-zinc-50 dark:bg-black/20">
-          <span className="text-[10px] font-mono text-zinc-500 truncate max-w-[55%]" title={currentDir}>{currentDir}</span>
+          <span className="text-[10px] font-mono text-zinc-500 truncate max-w-[55%]" title={resolvedDir}>{resolvedDir}</span>
           <div className="flex gap-2">
             <button
-              onClick={() => currentDir && onSelect(currentDir)}
-              disabled={!currentDir}
+              onClick={() => resolvedDir && onSelect(resolvedDir)}
+              disabled={!resolvedDir}
               className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 transition-colors"
             >
               {t('trainingStudio.wizard.useFolder')}

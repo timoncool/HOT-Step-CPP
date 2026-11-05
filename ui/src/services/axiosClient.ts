@@ -20,7 +20,8 @@
 
 import axios, { AxiosError, CanceledError, type AxiosResponse, type InternalAxiosRequestConfig } from 'axios';
 import { toast } from 'react-toastify';
-import { ApiError } from './apiError';
+import i18n from '../i18n';
+import { ApiError, HttpStatus } from './apiError';
 
 /** Default per-request timeout. Known-slow routes pass SLOW_ROUTE_TIMEOUT_MS
  *  instead — a blanket short timeout would break them. */
@@ -28,7 +29,7 @@ export const DEFAULT_TIMEOUT_MS = 60_000;
 
 /** For routes that block server-side for minutes (adapter scans, folder
  *  browse, Whisper retranscribe, mastering runs, external LLM calls): without
- *  the override they die at the default and toast "Server unreachable". */
+ *  the override they die at the default and report an unreachable server. */
 export const SLOW_ROUTE_TIMEOUT_MS = 300_000;
 
 // ---------------------------------------------------------------------------
@@ -65,16 +66,23 @@ export const IGNORED_URL_PATTERNS: RegExp[] = [
 const UNAUTHORIZED_COOLDOWN_MS = 30_000;
 let lastUnauthorizedAt = 0;
 
+/** One translation key per status the app branches on; any other status gets
+ *  the generic line. The keys are flat `api.error.*` names in the locale
+ *  files (i18n/locales/*.json) — non-English locales fall back to English
+ *  until they are translated. Status codes stay out of the text: end users
+ *  are not developers, a number tells them nothing they can act on. */
+const STATUS_MESSAGE_KEYS: Partial<Record<number, string>> = {
+  [HttpStatus.unauthorized]: 'api.error.sessionExpired',
+  [HttpStatus.forbidden]: 'api.error.refused',
+  [HttpStatus.notFound]: 'api.error.notFound',
+};
+
 function messageFor(status: number, body: any): string {
-  if (!status) return 'Server unreachable';
+  if (!status) return i18n.t('api.error.unreachable');
   const server = typeof body?.error === 'string' ? body.error : undefined;
   if (server) return server;
-  switch (status) {
-    case 401: return 'Session expired — signing you back in';
-    case 403: return 'The server refused this action (403)';
-    case 404: return 'Not found on the server (404)';
-    default: return `Server error (HTTP ${status})`;
-  }
+  const key = STATUS_MESSAGE_KEYS[status];
+  return key ? i18n.t(key) : i18n.t('api.error.serverError');
 }
 
 function toastIfWindow(fn: () => void): void {
@@ -108,7 +116,7 @@ export function handleFailure(info: FailureInfo): never {
     body?.reason,
   );
 
-  if (info.status === 401) {
+  if (info.status === HttpStatus.unauthorized) {
     const now = Date.now();
     if (now - lastUnauthorizedAt >= UNAUTHORIZED_COOLDOWN_MS) {
       lastUnauthorizedAt = now;

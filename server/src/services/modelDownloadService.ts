@@ -16,6 +16,8 @@ import { fileURLToPath } from 'url';
 import { config, PORTABLE_MODE, PROJECT_ROOT, RUNTIME_LIB_DIR } from '../config.js';
 import { registerBusyCheck } from '../dataroot/pointer.js';
 import type { RegistryFileEntry as RegistryFile, ModelRegistryResponse, DownloadStatus, DownloadJob } from '../contracts/modelManager.js';
+import { MODEL_ROOTS, getHfToken, looksLikeGatedError, type DownloadableModel, type ModelDownloadState } from './muscriptor.js';
+import { MODEL_FILES, resolveModelDir, targetRoot } from './muscriptorPaths.js';
 
 // Load registry - resolve path based on mode:
 // - Dev mode: relative to source file (../data/model-registry.json from services/)
@@ -77,6 +79,15 @@ export function describeDownloadError(err: any): string {
   return parts.join(' ');
 }
 
+/** The Authorization header for one hop, or nothing. The token goes only to
+ *  huggingface.co over https; a redirect to a CDN or any other host gets none,
+ *  so a pre-signed URL is never sent a credential it would reject or log. */
+export function hfAuthHeader(url: URL, token?: string): Record<string, string> {
+  return token && url.protocol === 'https:' && /(^|\.)huggingface\.co$/.test(url.hostname)
+    ? { Authorization: `Bearer ${token}` }
+    : {};
+}
+
 // Detect CUDA major version for runtime DLL selection
 function detectCudaMajorVersion(): number {
   try {
@@ -129,6 +140,9 @@ interface InternalJob extends DownloadJob {
 
 // ── Service ─────────────────────────────────────────────────
 
+/** A required companion fetched to `tmp`, waiting to be renamed to `dest`. */
+interface Staged { tmp: string; dest: string }
+
 class ModelDownloadService extends EventEmitter {
   private jobs = new Map<string, InternalJob>();
 
@@ -145,6 +159,7 @@ class ModelDownloadService extends EventEmitter {
 
   /** Resolve the target directory for a registry file */
   private getTargetDir(file: RegistryFile): string {
+    if (file.muscriptorModel) return path.join(targetRoot(this._muscriptorRoots()), file.muscriptorModel);
     if (file.role === 'runtime') {
       // Runtime DLLs go alongside ace-server.exe
       return this.engineDir;
@@ -152,6 +167,25 @@ class ModelDownloadService extends EventEmitter {
     return file.subdir
       ? path.join(this.modelsDir, file.subdir)
       : this.modelsDir;
+  }
+
+  /** MuScriptor folders as the runtime reads them (a seam for tests). */
+  private _muscriptorRoots() { return MODEL_ROOTS; }
+
+  /** Where an installed copy of this entry actually is. Differs from the
+   *  download target for a MuScriptor model still in its pre-#228 folder. */
+  private _installedDir(file: RegistryFile): string {
+    return file.muscriptorModel
+      ? resolveModelDir(this._muscriptorRoots(), file.muscriptorModel).dir
+      : this.getTargetDir(file);
+  }
+
+  /** Installed means this entry's own files, by exact path. Matching on the
+   *  basename would show every MuScriptor variant installed as soon as one
+   *  held a model.safetensors. Weights and required companions are one group. */
+  private _isInstalled(file: RegistryFile, byName: Set<string>): boolean {
+    if (!file.muscriptorModel) return byName.has(file.filename);
+    return resolveModelDir(this._muscriptorRoots(), file.muscriptorModel).complete;
   }
 
   /** Get all files in the registry, enriched with installed status.
@@ -169,8 +203,8 @@ class ModelDownloadService extends EventEmitter {
       .filter((f: RegistryFile) => !f.tags?.includes(wrongCudaTag))
       .map((f: RegistryFile) => ({
         ...f,
-        installed: installed.has(f.filename),
-        outdated: installed.has(f.filename) && this._isKnownStale(f),
+        installed: this._isInstalled(f, installed),
+        outdated: this._isInstalled(f, installed) && this._isKnownStale(f),
       }));
 
     /** Ids of the files a client on THIS platform can actually see. */
@@ -361,12 +395,50 @@ class ModelDownloadService extends EventEmitter {
       totalBytes: file.sizeBytes,
       speed: 0,
       speedSamples: [],
-      hfToken: hfToken?.trim() || undefined,
+      // MIDI Studio keeps its own token; use it when the request carries none.
+      hfToken: hfToken?.trim() || (file.muscriptorModel ? getHfToken() ?? undefined : undefined),
     };
 
     this.jobs.set(jobId, job);
     this._executeDownload(job, file);
     return jobId;
+  }
+
+  private _muscriptorEntry(m: DownloadableModel): RegistryFile | undefined {
+    return registry.files.find((f: RegistryFile) => f.muscriptorModel === m);
+  }
+
+  /** MIDI Studio's download button: the same job, token and busy gate as the
+   *  Model Manager's, so the two can never download one model twice. */
+  startMuscriptorDownload(m: DownloadableModel): { started: boolean; error?: string } {
+    const file = this._muscriptorEntry(m);
+    if (!file) return { started: false, error: `Unknown model '${m}'` };
+    if (this._activeJob(file.id)) return { started: false, error: 'Download already in progress' };
+    if (resolveModelDir(this._muscriptorRoots(), m).complete) return { started: false, error: 'Already downloaded' };
+    this.startDownload(file.id);
+    return { started: true };
+  }
+
+  /** The newest job for a MuScriptor model, in MIDI Studio's progress shape. */
+  muscriptorState(m: DownloadableModel): ModelDownloadState | undefined {
+    const file = this._muscriptorEntry(m);
+    const job = file && [...this.jobs.values()].reverse().find(j => j.fileId === file.id);
+    if (!job || job.status === 'completed' || job.status === 'cancelled') return undefined;
+    const active = job.status === 'downloading' || job.status === 'queued';
+    return {
+      downloading: active,
+      receivedBytes: job.bytesDownloaded,
+      totalBytes: job.totalBytes,
+      error: active ? undefined : job.error,
+      gated: !active && !!job.error && looksLikeGatedError(job.error),
+    };
+  }
+
+  private _activeJob(fileId: string): InternalJob | undefined {
+    for (const job of this.jobs.values()) {
+      if (job.fileId === fileId && (job.status === 'downloading' || job.status === 'queued')) return job;
+    }
+    return undefined;
   }
 
   /** Cancel an active download */
@@ -383,6 +455,9 @@ class ModelDownloadService extends EventEmitter {
     const targetDir = file ? this.getTargetDir(file) : this.modelsDir;
     const partPath = path.join(targetDir, `${job.filename}.part`);
     try { fs.unlinkSync(partPath); } catch {}
+    for (const c of file?.companions ?? []) {
+      if (c.required) try { fs.unlinkSync(path.join(targetDir, `${c.filename}.part`)); } catch {}
+    }
 
     this.emit('progress');
     return true;
@@ -417,6 +492,11 @@ class ModelDownloadService extends EventEmitter {
 
   /** Delete a model/runtime file from disk */
   deleteFile(filename: string): boolean {
+    // A MuScriptor entry is addressed by its id: several of them share the
+    // name model.safetensors, so a filename cannot say which one to remove.
+    const managed = registry.files.find((f: RegistryFile) => f.id === filename && f.muscriptorModel);
+    if (managed) return this._deleteMuscriptor(managed);
+
     // Safety: only known model/runtime extensions.
     // .json covers StableStep tokenizer files under onnx/sa3; .i32 is the YuE2 minted
     // regulariser's codes blob under yue2/, which is a catalogue download and
@@ -462,6 +542,33 @@ class ModelDownloadService extends EventEmitter {
     return false;
   }
 
+  /** Remove one MuScriptor model: its weights, config and leftovers, in the
+   *  folders the runtime would read it from (shared and pre-#228 legacy, or
+   *  just the override). Nothing else in those folders is touched, and the
+   *  folder itself goes only if that left it empty. */
+  private _deleteMuscriptor(file: RegistryFile): boolean {
+    const variant = file.muscriptorModel!;
+    for (const j of this.jobs.values()) {
+      if (j.fileId === file.id && (j.status === 'downloading' || j.status === 'queued')) {
+        throw new Error(`${file.displayName} is downloading; cancel it first`);
+      }
+    }
+    const r = this._muscriptorRoots();
+    // A folder the user pointed MUSCRIPTOR_MODELS_DIR at is theirs: never deleted from.
+    if (r.override) return false;
+    const dirs = [r.shared, r.legacy].map(root => path.join(root, variant));
+    let removed = false;
+    for (const dir of dirs) {
+      for (const name of MODEL_FILES) {
+        for (const suffix of ['', '.part', '.sha256']) {
+          try { fs.unlinkSync(path.join(dir, name + suffix)); if (!suffix) removed = true; } catch { /* not there */ }
+        }
+      }
+      try { fs.rmdirSync(dir); } catch { /* holds other files, or gone */ }
+    }
+    return removed;
+  }
+
   /** Clean up completed/cancelled/failed jobs older than 60s */
   cleanupJobs(): void {
     for (const [id, job] of this.jobs) {
@@ -477,6 +584,18 @@ class ModelDownloadService extends EventEmitter {
   private static readonly RETRY_DELAYS = [0, 2000, 5000];
 
   private async _executeDownload(job: InternalJob, file: RegistryFile): Promise<void> {
+    // A complete pre-#228 MuScriptor copy is already installed; downloading
+    // the same gigabytes into the shared folder would just duplicate it.
+    if (file.muscriptorModel) {
+      const found = resolveModelDir(this._muscriptorRoots(), file.muscriptorModel);
+      if (found.complete && found.source === 'legacy' && await this._matchesRegistry(path.join(found.dir, file.filename), file)) {
+        job.status = 'completed';
+        job.bytesDownloaded = job.totalBytes;
+        this.emit('progress');
+        return;
+      }
+    }
+
     // Determine target directory based on file role
     const targetDir = this.getTargetDir(file);
     if (!fs.existsSync(targetDir)) {
@@ -490,9 +609,24 @@ class ModelDownloadService extends EventEmitter {
     // sha256, that what is on disk is still what the registry describes.
     if (fs.existsSync(finalPath)) {
       if (await this._matchesRegistry(finalPath, file)) {
+        // A required companion missing beside good weights is fetched now.
+        const staged: Staged[] = [];
+        try {
+          await this._fetchRequired(file, targetDir, job, staged);
+          // A cancel during the config fetch stands; it must not become "completed".
+          if ((job.status as DownloadStatus) === 'cancelled') { this._discardStaged(staged); return; }
+          this._publishStaged(staged);
+        } catch (err: any) {
+          this._discardStaged(staged);
+          if ((job.status as DownloadStatus) !== 'cancelled') this._failJob(job, file, err);
+          return;
+        }
         job.status = 'completed';
         job.bytesDownloaded = job.totalBytes;
         this.emit('progress');
+        // Installs that predate a companion (or got the weights placed by
+        // hand) would otherwise never receive it.
+        this._fetchCompanions(file, targetDir).catch(() => {});
         return;
       }
       console.log(`[ModelManager] ${file.filename} on disk does not match the registry sha256 — re-downloading`);
@@ -534,16 +668,33 @@ class ModelDownloadService extends EventEmitter {
       }
       const url = `https://huggingface.co/${file.repo}/resolve/main/${repoPath}`;
 
+      // Required files are staged as .part first (a denied or gated repo
+      // fails here, in a second, not after the weights have come down) but
+      // published only once the weights are in place: a cancelled or failed
+      // job must not leave a config beside missing weights.
+      const staged: Staged[] = [];
       try {
+        await this._fetchRequired(file, targetDir, job, staged);
+        if ((job.status as DownloadStatus) === 'cancelled') { this._discardStaged(staged); return; }
+
         await this._downloadWithRedirects(url, partPath, job, startByte);
 
-        if ((job.status as DownloadStatus) === 'cancelled') return;
+        if ((job.status as DownloadStatus) === 'cancelled') { this._discardStaged(staged); return; }
 
         // Validate downloaded file before finalising
         this._validateDownload(partPath, file);
+        if (file.sha256) {
+          const got = await this._hashFile(partPath);
+          if (got !== file.sha256) {
+            try { fs.unlinkSync(partPath); } catch {}
+            throw new Error(`sha256 mismatch for ${file.filename}: expected ${file.sha256}, got ${got}`);
+          }
+        }
 
         // Rename .part to final
         fs.renameSync(partPath, finalPath);
+        if (file.sha256) this._writeSidecar(finalPath, file.sha256);
+        this._publishStaged(staged);
         job.status = 'completed';
         job.speed = 0;
         this.emit('progress');
@@ -556,10 +707,11 @@ class ModelDownloadService extends EventEmitter {
 
         return; // Success — exit retry loop
       } catch (err: any) {
+        this._discardStaged(staged);
         if ((job.status as DownloadStatus) === 'cancelled') return;
 
         const isLastAttempt = attempt === ModelDownloadService.RETRY_DELAYS.length - 1;
-        const why = describeDownloadError(err);
+        const why = this._describeFailure(err, file);
         if (isLastAttempt) {
           job.status = 'failed';
           job.error = why;
@@ -586,7 +738,7 @@ class ModelDownloadService extends EventEmitter {
    *  refreshes on the 'progress' event this emits when it lands. */
   private _isKnownStale(file: RegistryFile): boolean {
     if (!file.sha256) return false;
-    const filePath = path.join(this.getTargetDir(file), file.filename);
+    const filePath = path.join(this._installedDir(file), file.filename);
     if (!fs.existsSync(filePath)) return false;
     const cached = this._cachedSha(filePath);
     if (cached) return cached !== file.sha256;
@@ -600,6 +752,22 @@ class ModelDownloadService extends EventEmitter {
         });
     }
     return false;
+  }
+
+  /** describeDownloadError, plus what to do about it for a gated MuScriptor repo. */
+  private _describeFailure(err: any, file: RegistryFile): string {
+    const why = describeDownloadError(err);
+    return file.muscriptorModel && looksLikeGatedError(why)
+      ? `${why}. Request access on the model's Hugging Face page, then save a read token (MIDI Studio, or the token field on the StableStep tab).`
+      : why;
+  }
+
+  private _failJob(job: InternalJob, file: RegistryFile, err: any): void {
+    job.status = 'failed';
+    job.error = this._describeFailure(err, file);
+    job.speed = 0;
+    this.emit('progress');
+    console.error(`[ModelManager] ${file.filename} failed — ${job.error}`);
   }
 
   /** sha256 of a file, streamed so a multi-GB model never lands in memory. */
@@ -643,11 +811,15 @@ class ModelDownloadService extends EventEmitter {
     const cached = this._cachedSha(filePath);
     if (cached) return cached === file.sha256;
     const sha = await this._hashFile(filePath);
+    this._writeSidecar(filePath, sha);
+    return sha === file.sha256;
+  }
+
+  private _writeSidecar(filePath: string, sha: string): void {
     try {
       const stat = fs.statSync(filePath);
       fs.writeFileSync(`${filePath}.sha256`, `${sha} ${stat.size}:${Math.floor(stat.mtimeMs)}\n`);
     } catch { /* the cache is an optimisation, not a requirement */ }
-    return sha === file.sha256;
   }
 
   /** Validate a downloaded file is a real binary (not an HTML error page) */
@@ -717,18 +889,72 @@ class ModelDownloadService extends EventEmitter {
     }
   }
 
+  /** Fetch the companions marked `required`. Unlike _fetchCompanions this
+   *  sends the HF token, validates what arrived, installs it atomically and
+   *  throws on any failure, so the job fails instead of reporting a model
+   *  that cannot load. A copy already on disk is kept if it still validates.
+   *  Fetched files stay as validated `.part` files in `staged`; the caller
+   *  publishes them (_publishStaged) or drops them (_discardStaged). */
+  private async _fetchRequired(file: RegistryFile, targetDir: string, job: InternalJob, staged: Staged[]): Promise<void> {
+    // cancelDownload aborts job.abortController; every request below carries
+    // its signal, and nothing is published once it has fired.
+    const signal = (job.abortController ??= new AbortController()).signal;
+    const cancelled = () => signal.aborted || (job.status as DownloadStatus) === 'cancelled';
+    for (const c of file.companions ?? []) {
+      if (!c.required) continue;
+      if (cancelled()) return;
+      const dest = path.join(targetDir, c.filename);
+      if (this._validRequired(dest)) continue;
+      const tmp = `${dest}.part`;
+      try {
+        await this._downloadSimple(`https://huggingface.co/${file.repo}/resolve/main/${c.repoPath || c.filename}`, tmp, job.hfToken, signal);
+        if (cancelled()) throw new Error('Download cancelled');
+        if (!this._validRequired(tmp)) throw new Error(`${c.filename} from ${file.repo} is not valid`);
+        staged.push({ tmp, dest });
+      } catch (err) {
+        try { fs.unlinkSync(tmp); } catch {}
+        throw err;
+      }
+    }
+  }
+
+  private _publishStaged(staged: Staged[]): void {
+    while (staged.length) {
+      fs.renameSync(staged[0].tmp, staged[0].dest);
+      staged.shift(); // an entry leaves the list only once published, so a throw leaves it for _discardStaged
+    }
+  }
+
+  private _discardStaged(staged: Staged[]): void {
+    for (const { tmp } of staged.splice(0)) try { fs.unlinkSync(tmp); } catch {}
+  }
+
+  /** A required companion is usable: present, non-empty, and for JSON, an object. */
+  private _validRequired(p: string): boolean {
+    try {
+      const text = fs.readFileSync(p, 'utf8');
+      if (!text.trim()) return false;
+      if (!p.replace(/\.part$/, '').endsWith('.json')) return true;
+      const v = JSON.parse(text);
+      return !!v && typeof v === 'object' && !Array.isArray(v);
+    } catch {
+      return false;
+    }
+  }
+
   /** Minimal one-shot download (redirects, no Range/resume, no progress
-   *  events) for small companion files. */
-  private _downloadSimple(url: string, destPath: string, redirectCount = 0): Promise<void> {
+   *  events) for small companion files. The token, if any, follows
+   *  hfAuthHeader's rule on every hop. */
+  private _downloadSimple(url: string, destPath: string, token?: string, signal?: AbortSignal, redirectCount = 0): Promise<void> {
     if (redirectCount > 5) return Promise.reject(new Error('Too many redirects'));
     return new Promise((resolve, reject) => {
       const parsedUrl = new URL(url);
       const transport = parsedUrl.protocol === 'https:' ? https : http;
-      const req = transport.get(parsedUrl, { headers: { 'User-Agent': 'HOT-Step-CPP/1.0' } }, (res) => {
+      const req = transport.get(parsedUrl, { headers: { 'User-Agent': 'HOT-Step-CPP/1.0', ...hfAuthHeader(parsedUrl, token) }, signal }, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           const redirectUrl = new URL(res.headers.location, parsedUrl).href;
-          this._downloadSimple(redirectUrl, destPath, redirectCount + 1).then(resolve).catch(reject);
+          this._downloadSimple(redirectUrl, destPath, token, signal, redirectCount + 1).then(resolve).catch(reject);
           return;
         }
         if (res.statusCode && res.statusCode >= 400) {
@@ -740,7 +966,9 @@ class ModelDownloadService extends EventEmitter {
         res.pipe(writeStream);
         writeStream.on('finish', () => writeStream.close(() => resolve()));
         writeStream.on('error', reject);
-        res.on('error', reject);
+        // An aborted response never ends the pipe: close the file and settle.
+        res.on('error', err => { writeStream.destroy(); reject(err); });
+        res.on('close', () => { if (!res.complete) { writeStream.destroy(); reject(new Error('Download interrupted')); } });
       });
       req.on('error', reject);
     });
@@ -762,9 +990,7 @@ class ModelDownloadService extends EventEmitter {
       // Hugging Face token for gated repos — only sent to huggingface.co
       // itself. CDN redirect targets (cdn-lfs / xethub) use pre-signed URLs
       // and reject requests carrying an extra Authorization header.
-      if (job.hfToken && /(^|\.)huggingface\.co$/.test(parsedUrl.hostname)) {
-        headers['Authorization'] = `Bearer ${job.hfToken}`;
-      }
+      Object.assign(headers, hfAuthHeader(parsedUrl, job.hfToken));
 
       // Which host the failure was actually against. After a redirect this is
       // the CDN, not huggingface.co — see describeDownloadError.

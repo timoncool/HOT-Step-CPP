@@ -40,6 +40,9 @@ test('typed documents: a user reads only their own; installation scope is one sh
   assert.equal(shared.owner('anyone'), INSTALLATION_OWNER);
   // The same id through the wrong kind is not found, not misread.
   failsWith(() => mine.get(setting.id, INSTALLATION_OWNER), 404);
+  // The 404 names what is missing in words a user can act on.
+  assert.throws(() => mine.get(setting.id, INSTALLATION_OWNER), /This saved t user no longer exists\. .*\(id /);
+  assert.throws(() => mine.get('gone', 'alice'), /This saved t user no longer exists/);
 });
 
 test('typed documents: of two writes from one revision exactly one lands; the other gets the current revision', () => {

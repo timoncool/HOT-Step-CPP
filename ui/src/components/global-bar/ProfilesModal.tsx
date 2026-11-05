@@ -1,5 +1,5 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { localOptions } from '../../queries/global-models/options';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { profilesOptions } from '../../queries/shell-queue/settings';
 import { queryManager } from '../../queries/invalidation';
 // ProfilesModal.tsx — named parameter-profile manager
 //
@@ -8,7 +8,7 @@ import { queryManager } from '../../queries/invalidation';
 // current config under a name, apply, overwrite, or delete. Applying is
 // live: no page reload, CreatePanel content included.
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Bookmark, Check, ChevronDown, ChevronRight, Download, Pencil, RefreshCw, Save, Trash2, Upload, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -32,11 +32,10 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
   // edits the active engine's only.
   const backend = useBackendStore(s => s.activeBackendId) || 'ace';
   const engineName = useBackendStore(s => s.backends.find(b => b.id === backend)?.displayName) || backend;
-  const options = localOptions<{ profiles: ParamProfile[] }>('profiles', `/profiles?backend=${encodeURIComponent(backend)}`, { backend });
+  const options = profilesOptions(backend);
   const query = useQuery(options);
   const profiles = query.data?.profiles ?? [];
   const loading = query.isPending;
-  const [error, setError] = useState('');
   const [newName, setNewName] = useState('');
   const [includeContent, setIncludeContent] = useState(true);
   const [appliedName, setAppliedName] = useState('');
@@ -44,16 +43,35 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
   const [expandedName, setExpandedName] = useState('');
   const [renamingName, setRenamingName] = useState('');
   const [renameValue, setRenameValue] = useState('');
+  const [importError, setImportError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const refresh = useCallback(() => { void queryManager.keys(client, options.queryKey); }, [client, backend]);
-  useEffect(() => { if (query.error) setError(query.error.message); }, [query.error]);
+  const invalidateProfiles = useCallback(() => void queryManager.invalidate(client, options.queryKey), [client, backend]);
 
-  const saveAs = useCallback((name: string) => {
-    profileApi.save(backend, name, collectProfileData(includeContent, backend === 'ace'))
-      .then(() => { setNewName(''); refresh(); })
-      .catch(e => setError(e.message));
-  }, [refresh, includeContent, backend]);
+  // ── Mutations ───────────────────────────────────────────────────────────────
+
+  const saveMut = useMutation({
+    mutationFn: ({ name, data }: { name: string; data?: Record<string, unknown> }) =>
+      profileApi.save(backend, name, data ?? collectProfileData(includeContent, backend === 'ace')),
+    onSuccess: () => { setNewName(''); invalidateProfiles(); },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (name: string) => profileApi.remove(backend, name),
+    onSuccess: invalidateProfiles,
+  });
+
+  const renameMut = useMutation({
+    mutationFn: ({ from, to }: { from: string; to: string }) => profileApi.rename(backend, from, to),
+    onSuccess: (_, { from, to }) => {
+      if (appliedName === from) setAppliedName(to);
+      if (expandedName === from) setExpandedName(to);
+      setRenamingName('');
+      invalidateProfiles();
+    },
+  });
+
+  // ── Handlers ────────────────────────────────────────────────────────────────
 
   const handleSaveNew = useCallback(() => {
     const name = newName.trim();
@@ -61,25 +79,18 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
     if (profiles.some(p => p.name.toLowerCase() === name.toLowerCase())) {
       setConfirmAction({ kind: 'overwrite', name });
     } else {
-      saveAs(name);
+      saveMut.mutate({ name });
     }
-  }, [newName, profiles, saveAs]);
+  }, [newName, profiles, saveMut]);
 
   const handleApply = useCallback((p: ParamProfile) => {
     applyProfileData(p.data);
     setAppliedName(p.name);
   }, []);
 
-  const handleDelete = useCallback((name: string) => {
-    profileApi.remove(backend, name)
-      .then(() => refresh())
-      .catch(e => setError(e.message));
-  }, [refresh, backend]);
-
   const startRename = useCallback((p: ParamProfile) => {
     setRenamingName(p.name);
     setRenameValue(p.name);
-    setError('');
   }, []);
 
   const commitRename = useCallback(() => {
@@ -87,18 +98,11 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
     const to = renameValue.trim();
     if (!to || to === from) { setRenamingName(''); return; }
     if (profiles.some(p => p.name.toLowerCase() === to.toLowerCase() && p.name !== from)) {
-      setError(t('profiles.renameCollision', { name: to }));
+      renameMut.mutate({ from, to }); // collision handled by server error
       return;
     }
-    profileApi.rename(backend, from, to)
-      .then(() => {
-        if (appliedName === from) setAppliedName(to);
-        if (expandedName === from) setExpandedName(to);
-        setRenamingName('');
-        refresh();
-      })
-      .catch(e => setError(e.message));
-  }, [renamingName, renameValue, profiles, appliedName, expandedName, refresh, t, backend]);
+    renameMut.mutate({ from, to });
+  }, [renamingName, renameValue, profiles, renameMut]);
 
   // ── JSON export/import (same preset format as saved profiles) ──
 
@@ -112,37 +116,38 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
     URL.revokeObjectURL(url);
   }, []);
 
-  const importAs = useCallback((name: string, data: Record<string, unknown>) => {
-    profileApi.save(backend, name, data)
-      .then(() => refresh())
-      .catch(e => setError(e.message));
-  }, [refresh, backend]);
-
   const handleImportFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !token) return;
+    setImportError('');
     const reader = new FileReader();
     reader.onload = async () => {
       try {
         const parsed = JSON.parse(reader.result as string);
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          setError(t('profiles.importInvalid'));
+          setImportError(t('profiles.importInvalid'));
           return;
         }
-        // The server unwraps a full profile wrapper ({ name, saved_at, data }) and checks the shape
         const { name, data } = await validateProfileImport(file.name, parsed);
         if (profiles.some(p => p.name.toLowerCase() === name.toLowerCase())) {
           setConfirmAction({ kind: 'import', name, data });
         } else {
-          importAs(name, data);
+          saveMut.mutate({ name, data });
         }
       } catch {
-        setError(t('profiles.importInvalid'));
+        setImportError(t('profiles.importInvalid'));
       }
     };
     reader.readAsText(file);
     e.target.value = '';
-  }, [profiles, importAs, t, token]);
+  }, [profiles, saveMut, t, token]);
+
+  // Combined error for the list: query errors + mutation errors
+  const error = query.error?.message
+    ?? saveMut.error?.message
+    ?? deleteMut.error?.message
+    ?? renameMut.error?.message
+    ?? importError;
 
   // Portal to body: the global bar's backdrop-filter makes it the containing
   // block for fixed descendants, which would pin this overlay to the bar.
@@ -307,9 +312,9 @@ export const ProfilesModal: React.FC<ProfilesModalProps> = ({ onClose }) => {
         danger={confirmAction?.kind === 'delete'}
         onConfirm={() => {
           if (!confirmAction) return;
-          if (confirmAction.kind === 'delete') handleDelete(confirmAction.name);
-          else if (confirmAction.kind === 'import' && confirmAction.data) importAs(confirmAction.name, confirmAction.data);
-          else saveAs(confirmAction.name);
+          if (confirmAction.kind === 'delete') deleteMut.mutate(confirmAction.name);
+          else if (confirmAction.kind === 'import' && confirmAction.data) saveMut.mutate({ name: confirmAction.name, data: confirmAction.data });
+          else saveMut.mutate({ name: confirmAction.name });
           setConfirmAction(null);
         }}
         onCancel={() => setConfirmAction(null)}

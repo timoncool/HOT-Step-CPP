@@ -54,6 +54,10 @@ export function computeLmCacheKey(req: AceRequest): string {
     lm_rep_mode: req.lm_rep_mode,
     lm_dry_base: req.lm_dry_base,
     lm_dry_min_len: req.lm_dry_min_len,
+    lm_min_p: req.lm_min_p,
+    lm_cfg_min_p: req.lm_cfg_min_p,
+    lm_cfg_logprob: req.lm_cfg_logprob,
+    lm_cfg_rescale: req.lm_cfg_rescale,
     // Same reasoning for the LM adapter: it changes the code distribution as
     // surely as lm_model does.
     lm_adapter: req.lm_adapter,

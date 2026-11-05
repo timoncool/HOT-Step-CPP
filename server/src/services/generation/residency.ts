@@ -35,7 +35,8 @@ export function familyDemand(family: Family): number {
 // require the real GPU lane and registry injection.
 
 /** Free every other family's VRAM and wait until each one confirms, before
- *  `family` loads weights on the lane. Run on every lane task that loads a
+ *  `family` loads weights on the lane. Both run on the caller's engine worker
+ *  (backendRelease.ts), so a job on one card never evicts or waits on another. Run on every lane task that loads a
  *  family, not only on a family change: a per-job backendOverride switches
  *  family without a selector change, and a YuE2 score preview under
  *  keep-loaded leaves its LM resident without being a generation. Releasing a

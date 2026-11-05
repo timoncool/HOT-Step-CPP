@@ -67,6 +67,8 @@
 #include "yue2/sheetsage-decoder.h"
 #include "yue2/sheetsage-encoder.h"
 #include "yue2/sheetsage-events.h"
+#include "yue2/sheetsage-heads.h"
+#include "yue2/sheetsage-refined.h"
 #include "yue2/sheetsage-model.h"
 #include "yue2/sheetsage-pipeline.h"
 #include "yue2/yue2-lm-graph.h"
@@ -137,6 +139,11 @@ static void usage() {
             "        the cost); exit 0 iff 06_memory rel-L2 < 1e-2 on every window; --exact forces every\n"
             "        weight-bearing matmul in the encoder to F32 at load time (doc 23's precision fix, not\n"
             "        an attention-path change -- this encoder never used flash attention))\n"
+            "       yue2-probe --sheetsage-refined-heads <oracle_dir> [--model <sheetsage2-*.gguf>] "
+            "[--refined <sheetsage2-refined-*.gguf>]\n"
+            "       (SheetSage2-Refined frame heads vs engine/tools/sheetsage2-refined-oracle.py dumps)\n"
+            "       yue2-probe --sheetsage-refined-transcribe <dir> [--model ..] [--refined ..] [--key-mode]\n"
+            "       (SheetSage2-Refined decode of <dir>/00_song_mono24.f32, one window; writes the token ids)\n"
             "       yue2-probe --sheetsage-decoder-parity <fixture_dir> [--model <sheetsage2-*.gguf>]\n"
             "       (SheetSage2's decoder: teacher-forced replay of every window-XXXX/ under <fixture_dir>\n"
             "        against 07_prompt_prefix_ids+08_generated_ids, gated on the oracle's own\n"
@@ -4257,6 +4264,277 @@ static int run_sheetsage_encoder_parity(const std::string & fixture_dir, const s
     return (n_memory_pass == n_windows) ? 0 : 1;
 }
 
+// ── --sheetsage-refined-heads: SheetSage2-Refined frame heads ───────────────
+//
+// Oracle: engine/tools/sheetsage2-refined-oracle.py (fp32, TF32 off, one clip
+// encoded at its own length). Two stages:
+//   A. isolated: the oracle's own layer mixes -> our heads. Decisive gate,
+//      rel-L2 <= 1e-4 on every output, the bar facts and memory + bar features.
+//   B. end to end: the oracle's clip -> our encoder (unpadded, extra mixes in
+//      graph) -> our heads. Our base GGUF's encoder is the bf16 repack of the
+//      reference's fp32 weights, so this stage is reported, not gated; argmax
+//      agreement on the softmax outputs is the number that matters.
+
+static double ss2r_argmax_agree(const std::vector<float> & a, const std::vector<float> & b, int n) {
+    const size_t T    = a.size() / (size_t) n;
+    size_t       same = 0;
+    for (size_t t = 0; t < T; t++) {
+        const float * x = a.data() + t * n;
+        const float * y = b.data() + t * n;
+        same += (std::max_element(x, x + n) - x) == (std::max_element(y, y + n) - y);
+    }
+    return T ? 100.0 * (double) same / (double) T : 0.0;
+}
+
+static int run_sheetsage_refined_heads(const std::string & dir, const std::string & model_path,
+                                       const std::string & refined_path) {
+    std::string           err;
+    SheetSageRefinedHeads rh;
+    if (!sheetsage_refined_heads_load(refined_path, &rh, &err)) {
+        fprintf(stderr, "FATAL: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> mem_base, mem_want, facts_want;
+    if (!yue2_read_f32_bin(dir + "/memory_base.f32", &mem_base) || !yue2_read_f32_bin(dir + "/memory.f32", &mem_want) ||
+        !yue2_read_f32_bin(dir + "/bar_facts.f32", &facts_want)) {
+        fprintf(stderr, "FATAL: %s lacks memory_base/memory/bar_facts.f32\n", dir.c_str());
+        return 1;
+    }
+    const int64_t T = (int64_t) mem_base.size() / 512;
+    printf("=== SheetSage2-Refined heads: %s (T=%lld, %d threads) ===\n", dir.c_str(), (long long) T, ss2r_threads());
+
+    static const char * const softmax_outs[] = { "root", "bass", "key", "detail", "bar_beats", "beats_left", "bar_groups" };
+    auto compare = [&](const SheetSageRefinedHeadOutputs & got, const char * stage, bool gated) {
+        const double gate  = 1e-4;
+        int          fails = 0;
+        double       worst = 0.0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (const auto & hk : pass ? got.chunked : got.full) {
+                for (const auto & o : hk.second) {
+                    std::vector<float> want;
+                    const std::string  f = dir + "/" + (pass ? "outc_" : "out_") + hk.first + "_" + o.first + ".f32";
+                    if (!yue2_read_f32_bin(f, &want) || want.size() != o.second.size()) {
+                        printf("FAIL %s %s missing or wrong size\n", stage, f.c_str());
+                        fails++;
+                        continue;
+                    }
+                    const double rl = yue2_rel_l2(o.second.data(), want.data(), (int64_t) want.size());
+                    worst           = std::max(worst, rl);
+                    char agree[48]  = "";
+                    for (const char * sm : softmax_outs) {
+                        if (o.first == sm) {
+                            snprintf(agree, sizeof(agree), "  argmax %.1f%%",
+                                     ss2r_argmax_agree(o.second, want, (int) (want.size() / (size_t) T)));
+                        }
+                    }
+                    const bool ok = !gated || rl <= gate;
+                    fails += !ok;
+                    printf("%s %s %-6s %-16s%s rel_l2=%.3e%s\n", ok ? (gated ? "PASS" : "INFO") : "FAIL", stage,
+                           hk.first.c_str(), o.first.c_str(), pass ? " (chunked)" : "", rl, agree);
+                }
+            }
+        }
+        const double       rf  = yue2_rel_l2(got.bar_facts.data(), facts_want.data(), (int64_t) facts_want.size());
+        std::vector<float> mem = mem_base;
+        sheetsage_refined_add_bar_features(rh, got.bar_facts, T, mem.data(), T);
+        const double rm  = yue2_rel_l2(mem.data(), mem_want.data(), (int64_t) mem_want.size());
+        const bool   okf = !gated || rf <= gate;
+        const bool   okm = !gated || rm <= gate;
+        fails += !okf + !okm;
+        printf("%s %s bar_facts rel_l2=%.3e\n", okf ? (gated ? "PASS" : "INFO") : "FAIL", stage, rf);
+        printf("%s %s memory+bar (oracle base memory) rel_l2=%.3e\n", okm ? (gated ? "PASS" : "INFO") : "FAIL", stage, rm);
+        printf("%s worst head rel_l2=%.3e\n", stage, worst);
+        return fails;
+    };
+
+    // Stage A: the oracle's mixes.
+    std::vector<std::vector<float>> mix_store;
+    for (const SheetSageHead & h : rh.heads) {
+        for (int j = 0; j < h.mixes; j++) {
+            mix_store.emplace_back();
+            if (!yue2_read_f32_bin(dir + "/mix_" + h.key + "_" + std::to_string(j) + ".f32", &mix_store.back()) ||
+                (int64_t) mix_store.back().size() != T * 1024) {
+                fprintf(stderr, "FATAL: mix_%s_%d.f32 missing or wrong size\n", h.key.c_str(), j);
+                return 1;
+            }
+        }
+    }
+    std::vector<const float *> mixes;
+    for (const auto & v : mix_store) {
+        mixes.push_back(v.data());
+    }
+    SheetSageRefinedHeadOutputs got;
+    auto                        t0 = std::chrono::steady_clock::now();
+    sheetsage_refined_run_heads(rh, mixes, T, &got);
+    const double heads_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    printf("\n-- A: oracle mixes -> heads (%.0f ms) --\n", heads_ms);
+    const int fails_a = compare(got, "A", true);
+
+    // Stage B: our encoder, end to end.
+    yue2_tok_disable_tf32();
+    SheetSageModel m;
+    if (!sheetsage_model_load(&m, model_path, &err)) {
+        fprintf(stderr, "FATAL: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> wave;
+    if (!yue2_read_f32_bin(dir + "/wave.f32", &wave)) {
+        fprintf(stderr, "FATAL: wave.f32 missing\n");
+        return 1;
+    }
+    SheetSageEncoderGraph  g;
+    SheetSageEncodeOptions opt;
+    opt.pad_to_window     = false;
+    opt.extra_mix_weights = sheetsage_refined_mix_weights(rh);
+    SheetSageEncodeResult res;
+    if (!sheetsage_encode_window(m, &g, wave.data(), (int64_t) wave.size(), opt, &res, &err)) {
+        fprintf(stderr, "FATAL: encode: %s\n", err.c_str());
+        return 1;
+    }
+    printf("\n-- B: wave -> our encoder (T_sub=%lld, unpadded) -> heads --\n", (long long) res.T_sub);
+    int fails_b = 0;
+    std::vector<float> mem_pad;
+    if (yue2_read_f32_bin(dir + "/memory_base_pad.f32", &mem_pad)) {  // optional: padded 300 s reference
+        SheetSageEncodeOptions popt;
+        SheetSageEncodeResult  pres;
+        if (sheetsage_encode_window(m, &g, wave.data(), (int64_t) wave.size(), popt, &pres, &err) &&
+            pres.memory.size() == mem_pad.size()) {
+            printf("INFO B memory_base padded-to-window rel_l2=%.3e\n",
+                   yue2_rel_l2(pres.memory.data(), mem_pad.data(), (int64_t) mem_pad.size()));
+        }
+        if (!sheetsage_encode_window(m, &g, wave.data(), (int64_t) wave.size(), opt, &res, &err)) {
+            fprintf(stderr, "FATAL: encode: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    if (res.T_sub != T) {
+        printf("FAIL B T_sub %lld != oracle %lld\n", (long long) res.T_sub, (long long) T);
+        fails_b++;
+    } else {
+        printf("INFO B memory_base rel_l2=%.3e\n", yue2_rel_l2(res.memory.data(), mem_base.data(), (int64_t) mem_base.size()));
+        if (!g_yue2_dump_dir.empty()) {
+            FILE * f = fopen((g_yue2_dump_dir + "/ours_memory_base.f32").c_str(), "wb");
+            if (f) {
+                fwrite(res.memory.data(), sizeof(float), res.memory.size(), f);
+                fclose(f);
+            }
+        }
+        for (size_t i = 0; i < res.extra_mixes.size(); i++) {
+            printf("INFO B mix %zu rel_l2=%.3e\n", i,
+                   yue2_rel_l2(res.extra_mixes[i].data(), mix_store[i].data(), (int64_t) mix_store[i].size()));
+        }
+        mixes.clear();
+        for (const auto & v : res.extra_mixes) {
+            mixes.push_back(v.data());
+        }
+        sheetsage_refined_run_heads(rh, mixes, T, &got);
+        compare(got, "B", false);
+    }
+    sheetsage_enc_graph_free(&g);
+    sheetsage_model_free(&m);
+    printf("\nRESULT (sheetsage-refined-heads): stage A %s (%d failures), stage B %s\n", fails_a ? "FAIL" : "PASS",
+           fails_a, fails_b ? "FAIL" : "reported");
+    return (fails_a || fails_b) ? 1 : 0;
+}
+
+// ── --sheetsage-refined-transcribe: SheetSage2-Refined, one window ─────────
+//
+// Decodes <dir>/00_song_mono24.f32 (at most one 300 s window) with the
+// refined decoder, heads and rescoring, and writes the token ids to
+// <dir>/ours_refined_<default|keymode>_window-0000_ids.i32 for comparison
+// with a reference decode of the same audio.
+
+static int run_sheetsage_refined_transcribe(const std::string & dir, const std::string & model_path,
+                                            const std::string & refined_path, bool key_mode) {
+    yue2_tok_disable_tf32();
+    std::string               err;
+    SheetSageModel            m;
+    SheetSageModelLoadOptions lo;
+    lo.refined_path = refined_path;
+    if (!sheetsage_model_load(&m, model_path, &err, lo)) {
+        fprintf(stderr, "FATAL: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> song;
+    if (!yue2_read_f32_bin(dir + "/00_song_mono24.f32", &song)) {
+        fprintf(stderr, "FATAL: %s/00_song_mono24.f32 not found\n", dir.c_str());
+        return 1;
+    }
+    const double  sr  = (double) m.mert.cfg.sample_rate;
+    const int64_t win = sheetsage_window_samples(m);
+    if ((int64_t) song.size() > win) {
+        fprintf(stderr, "FATAL: song is longer than one window (multi-window stitching is not in this mode)\n");
+        return 1;
+    }
+    SheetSageEncoderGraph        g;
+    SheetSageRefinedWindowResult r;
+    const double                 stop = std::min((double) song.size() / sr, (double) m.cfg.window_seconds);
+    const bool ok = sheetsage_refined_decode_window(m, &g, song.data(), (int64_t) song.size(),
+                                                    sheetsage_refined_prompt_prefix(key_mode), stop, key_mode, &r, &err);
+    sheetsage_enc_graph_free(&g);
+    sheetsage_model_free(&m);
+    if (!ok) {
+        fprintf(stderr, "FATAL: %s\n", err.c_str());
+        return 1;
+    }
+    const std::string tag  = key_mode ? "keymode" : "default";
+    const std::string path = dir + "/ours_refined_" + tag + "_window-0000_ids.i32";
+    FILE *            f    = fopen(path.c_str(), "wb");
+    if (f) {
+        fwrite(r.tokens.data(), sizeof(int32_t), r.tokens.size(), f);
+        fclose(f);
+    }
+    printf("refined %s: frames=%lld tokens=%zu ended=%s encode=%.0f ms heads=%.0f ms decode=%.0f ms -> %s\n",
+           tag.c_str(), (long long) r.frames, r.tokens.size(), r.ended, r.ms_encode, r.ms_heads, r.ms_decode,
+           path.c_str());
+    return 0;
+}
+
+// ── --sheetsage-refined-labels: every refined chord/key through the ABC path ─
+//
+// All 745 chord_detail offsets x 12 bass notes and all 109 key_mode offsets:
+// label (events.h) -> chord/key spelling under a key (correct_chord) -> ABC
+// chord symbol / key signature (notation.h). Exit 0 iff nothing is rejected.
+
+static int run_sheetsage_refined_labels() {
+    int         fails = 0, chords = 0, keys = 0;
+    std::string err;
+    for (int32_t k = 0; k <= 108; k++) {
+        const std::string key = yue2_sheet_key_mode_label(k);
+        if (key == "N") continue;
+        std::string abc;
+        std::array<int, 7> acc;
+        err.clear();
+        if (!yue2_sheet_notation_detail::key_symbol_to_abc(key, abc, &err) ||
+            !yue2_sheet_notation_detail::get_key_accidentals(abc, acc, &err)) {
+            printf("FAIL key %s: %s\n", key.c_str(), err.c_str());
+            fails++;
+        } else if (k % 12 == 2) {
+            printf("key %-22s -> K:%s\n", key.c_str(), abc.c_str());
+        }
+        keys++;
+        for (int32_t d = 0; d < 744; d += 1) {
+            for (int32_t b = -1; b < 12; b++) {
+                if (k % 12 != 0 && b != -1) continue;  // bass sweep under C-tonic modes only
+                const std::string label = yue2_sheet_detail_chord_label(d, b);
+                const std::string spelled = yue2_sheet_spelling::correct_chord(label, key);
+                bool has = false;
+                std::string text;
+                err.clear();
+                if (!yue2_sheet_notation_detail::chord_symbol_to_abc(spelled, has, text, &err) || !has) {
+                    if (fails < 40) printf("FAIL chord %s (%s under %s): %s\n", spelled.c_str(), label.c_str(), key.c_str(), err.c_str());
+                    fails++;
+                } else if (k == 0 && b == 4 && d % 12 == 0) {
+                    printf("chord %-22s -> \"%s\"\n", label.c_str(), text.c_str());
+                }
+                chords++;
+            }
+        }
+    }
+    printf("RESULT (sheetsage-refined-labels): %d keys, %d chord spellings, %d failures\n", keys, chords, fails);
+    return fails ? 1 : 0;
+}
+
 // ── --sheetsage-decoder-parity: SheetSage2's decoder, teacher-forced ───────
 //
 // AUTHORITY: docs/plans/yue2/20-sheetsage2-model-pin.md §3 (decoder math),
@@ -4527,11 +4805,13 @@ static int run_sheetsage_decoder_parity(const std::string & fixture_dir, const s
 // pass/fail is the final ABC/error match, per doc 19's own G4/G5/G6 rows
 // ("ABC byte-identical" / "matching abc_error").
 static int run_sheetsage_transcribe(const std::string & fixture_dir, const std::string & model_path, bool exact,
-                                     int threads, bool repair) {
+                                     int threads, bool repair, bool exact_rope, const std::string & refined_path,
+                                     bool key_mode) {
     SheetSageModel            m;
     std::string               err;
     SheetSageModelLoadOptions load_opt;
-    load_opt.exact = exact;
+    load_opt.exact        = exact;
+    load_opt.refined_path = refined_path;  // empty: SheetSage2; set: SheetSage2-Refined
     if (!sheetsage_model_load(&m, model_path, &err, load_opt)) {
         fprintf(stderr, "FATAL: SheetSage2 load failed (%s): %s\n", model_path.c_str(), err.c_str());
         return 1;
@@ -4557,7 +4837,9 @@ static int run_sheetsage_transcribe(const std::string & fixture_dir, const std::
     // against the ORACLE fixtures (doc 19 G4/G5/G6), which never repaired
     // anything — pass --repair explicitly to exercise sheetsage-repair.h
     // against a fixture instead.
-    opt.repair  = repair;
+    opt.repair     = repair;
+    opt.exact_rope = exact_rope;
+    opt.key_mode   = key_mode;
     SheetSageTranscribeResult res;
     const auto t0   = std::chrono::steady_clock::now();
     const bool call_ok = sheetsage_transcribe(m, song.data(), (int64_t) song.size(), opt, &res, &err);
@@ -4570,6 +4852,23 @@ static int run_sheetsage_transcribe(const std::string & fixture_dir, const std::
     }
     printf("windows=%d  ms_encode=%.0f ms_decode=%.0f ms_notation=%.0f wall=%.0f\n", res.windows, res.ms_encode,
            res.ms_decode, res.ms_notation, wall_ms);
+    if (!g_yue2_dump_dir.empty()) {  // full token ids per window and the ABC, for A/B against a reference decode
+        if (FILE * af = fopen((g_yue2_dump_dir + "/song.abc").c_str(), "wb")) {
+            fwrite(res.abc.data(), 1, res.abc.size(), af);
+            fclose(af);
+        }
+        printf("abc: ok=%d %zu bytes%s%s\n", (int) res.ok, res.abc.size(), res.error.empty() ? "" : " error: ",
+               res.error.c_str());
+        for (size_t wi = 0; wi < res.window_ids.size(); wi++) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "/window-%04d_ids.i32", (int) wi);
+            FILE * f = fopen((g_yue2_dump_dir + nm).c_str(), "wb");
+            if (f) {
+                fwrite(res.window_ids[wi].data(), sizeof(int32_t), res.window_ids[wi].size(), f);
+                fclose(f);
+            }
+        }
+    }
 
     // ── per-window generated-id agreement vs 08_generated_ids.i32 (informational: free-running) ──
     for (int wi = 0; wi < res.windows; wi++) {
@@ -5454,11 +5753,16 @@ int main(int argc, char ** argv) {
     std::string     mert_block_parity_dir;
     std::string     mert_gelu_mode = "both";
     std::string     sheetsage_encoder_parity_dir;
+    std::string     sheetsage_refined_heads_dir;
+    std::string     sheetsage_refined_path;
+    std::string     sheetsage_refined_transcribe_dir;
+    bool            sheetsage_key_mode = false;
     std::string     sheetsage_decoder_parity_dir;
     std::string     sheetsage_transcribe_dir;
     std::string     sheetsage_model_path;
     bool            sheetsage_encoder_exact = false;  // doc 23: --exact, encoder matmul weights forced F32
     int             sheetsage_threads       = 0;      // --threads, sheetsage-pipeline.h's SheetSageTranscribeOptions
+    bool            sheetsage_exact_rope        = false;  // --exact-rope: A/B only (sheetsage-encoder.h)
     bool            sheetsage_transcribe_repair = false;  // --repair, opt-in (see run_sheetsage_transcribe's note)
     bool            do_generate      = false;
     bool            do_batch_parity  = false;  // --batch-parity [--steps n]: multi-set decode vs single-set logits
@@ -5523,6 +5827,16 @@ int main(int argc, char ** argv) {
             mert_block_parity_dir = argv[++i];
         } else if (!strcmp(argv[i], "--sheetsage-encoder-parity") && i + 1 < argc) {
             sheetsage_encoder_parity_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--sheetsage-refined-heads") && i + 1 < argc) {
+            sheetsage_refined_heads_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--sheetsage-refined-transcribe") && i + 1 < argc) {
+            sheetsage_refined_transcribe_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--sheetsage-refined-labels")) {
+            return run_sheetsage_refined_labels();
+        } else if (!strcmp(argv[i], "--key-mode")) {
+            sheetsage_key_mode = true;
+        } else if (!strcmp(argv[i], "--refined") && i + 1 < argc) {
+            sheetsage_refined_path = argv[++i];
         } else if (!strcmp(argv[i], "--sheetsage-decoder-parity") && i + 1 < argc) {
             sheetsage_decoder_parity_dir = argv[++i];
         } else if (!strcmp(argv[i], "--sheetsage-transcribe") && i + 1 < argc) {
@@ -5537,6 +5851,8 @@ int main(int argc, char ** argv) {
             sheetsage_encoder_exact = true;
         } else if (!strcmp(argv[i], "--repair")) {
             sheetsage_transcribe_repair = true;
+        } else if (!strcmp(argv[i], "--exact-rope")) {
+            sheetsage_exact_rope = true;
         } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             sheetsage_threads = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--variant") && i + 1 < argc) {
@@ -5571,8 +5887,8 @@ int main(int argc, char ** argv) {
             }
         } else if (!strcmp(argv[i], "--adapter") && i + 1 < argc) {
             // "<path>", "<path>@<scale>", or the full
-            // "<path>@<scale>,a<attn>,m<mlp>,e<early>,i<mid>,l<late>" that
-            // yue2_adapter_key() renders — so a /yue2/props string pastes
+            // "<path>@<scale>,a<attn>,m<mlp>,e<early>,i<mid>,l<late>[,r<rebase>]"
+            // that yue2_adapter_key() renders — so a /yue2/props string pastes
             // straight back in, dials and all. Every dial is optional and
             // defaults to 1.0; an unparseable tail leaves the path alone
             // (a real filename may contain '@').
@@ -5602,6 +5918,7 @@ int main(int argc, char ** argv) {
                             case 'e': dst = &sc.early; break;
                             case 'i': dst = &sc.mid;   break;
                             case 'l': dst = &sc.late;  break;
+                            case 'r': dst = &sc.rebase; break;
                             default:  ok  = false;     break;
                         }
                         part = part.substr(1);
@@ -5777,6 +6094,19 @@ int main(int argc, char ** argv) {
         }
         return run_mert_block_parity(models_dir, mert_block_parity_dir, tok_head_gguf, mert_gelu_mode);
     }
+    if (!sheetsage_refined_transcribe_dir.empty()) {
+        return run_sheetsage_refined_transcribe(
+            sheetsage_refined_transcribe_dir,
+            sheetsage_model_path.empty() ? "models/yue2/sheetsage2-f16.gguf" : sheetsage_model_path,
+            sheetsage_refined_path.empty() ? "models/yue2/sheetsage2-refined-f16.gguf" : sheetsage_refined_path,
+            sheetsage_key_mode);
+    }
+    if (!sheetsage_refined_heads_dir.empty()) {
+        return run_sheetsage_refined_heads(
+            sheetsage_refined_heads_dir,
+            sheetsage_model_path.empty() ? "models/yue2/sheetsage2-f16.gguf" : sheetsage_model_path,
+            sheetsage_refined_path.empty() ? "models/yue2/sheetsage2-refined-f16.gguf" : sheetsage_refined_path);
+    }
     if (!sheetsage_encoder_parity_dir.empty()) {
         // TF32 OFF before the first CUDA context, same reasoning and the same
         // hard ordering constraint as --mert-block-parity above: SheetSage2's
@@ -5811,7 +6141,8 @@ int main(int argc, char ** argv) {
         const std::string model_path =
             sheetsage_model_path.empty() ? "models/yue2/sheetsage2-f16.gguf" : sheetsage_model_path;
         return run_sheetsage_transcribe(sheetsage_transcribe_dir, model_path, sheetsage_encoder_exact,
-                                        sheetsage_threads, sheetsage_transcribe_repair);
+                                        sheetsage_threads, sheetsage_transcribe_repair, sheetsage_exact_rope,
+                                        sheetsage_refined_path, sheetsage_key_mode);
     }
     if (do_generate) {
         if (models_dir.empty()) {

@@ -40,7 +40,8 @@ import {
   yue2TrackBpm,
   type Yue2CaptionSelection, type Yue2SourceTrack,
 } from '../../utils/yue2CaptionSource';
-import { getTrainingWorker, type TrainingDatasetSummary } from '../../services/trainingApi';
+import { type TrainingDatasetSummary } from '../../services/trainingApi';
+import { useTrainingStore } from '../../stores/trainingStore';
 // training-data's worker-scoped dataset list, read through its options so
 // Create and Training Studio share one cache entry per worker.
 import { trainingQueries } from '../../queries/training-data/queries';
@@ -158,8 +159,10 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   const [yue2Ds, setYue2Ds] = useState<{ datasetId: string; datasetName: string; tracks: Yue2SourceTrack[] }>(
     { datasetId: '', datasetName: '', tracks: [] });
   const [yue2SourcePending, setYue2SourcePending] = useState(false);
+  const [yue2SourceError, setYue2SourceError] = useState('');
   const [yue2DatasetChoice, setYue2DatasetChoice] = useState<string>(() => readYue2CaptionDataset());
-  const yue2DatasetsQuery = useQuery({ ...trainingQueries.datasets(getTrainingWorker()), enabled: yue2Mode });
+  const trainingWorker = useTrainingStore(s => s.trainingWorker);
+  const yue2DatasetsQuery = useQuery({ ...trainingQueries.datasets(trainingWorker), enabled: yue2Mode });
   const yue2DatasetOptions: TrainingDatasetSummary[] = yue2DatasetsQuery.data ?? NO_DATASETS;
   const [yue2Selection, setYue2Selection] = useState<Yue2CaptionSelection>({ mode: 'custom' });
   const yue2ResolveSeq = useRef(0);
@@ -184,10 +187,12 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     const seq = ++yue2ResolveSeq.current;
     if (!yue2Mode) {
       setYue2SourcePending(false);
+      setYue2SourceError('');
       setYue2Ds({ datasetId: '', datasetName: '', tracks: [] });
       return;
     }
     setYue2SourcePending(true);
+    setYue2SourceError('');
     const explicit = readYue2CaptionDataset();
     setYue2DatasetChoice(explicit);
     const src = explicit
@@ -197,6 +202,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
         : { datasetId: '', datasetName: '', tracks: [] };
     if (seq === yue2ResolveSeq.current) {
       setYue2Ds(src);
+      setYue2SourceError(src.error || '');
       setYue2SourcePending(false);
     }
   }, [yue2Mode, yue2AdapterPath]);
@@ -451,7 +457,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   // YuE2 hides auto-expand, the LoRA trigger and Beat I/O (its adapters
   // carry their trigger), so stored values must not ride along unseen.
   const yue2Ui = activeBackendId === YUE2_BACKEND_ID;
-  const compose = yue2Ui
+  const compose = yue2Ui || activeBackendId === 'heartmula'
     ? { autoExpand: false, loraTrigger: '', beatIntro: false, introBars }
     : { autoExpand, loraTrigger, beatIntro, introBars };
 
@@ -467,7 +473,9 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     const params = createContentParams({
       caption, lyrics, negativePrompt, instrumental, loraTrigger: compose.loraTrigger, beatIntro: compose.beatIntro, introBars,
       title, artist, subject, bpm, keyScale, timeSignature, duration, vocalLanguage, sourceLatentUrl,
-    }, { mm3Mode, yue2Active: activeBackendId === YUE2_BACKEND_ID, resolvedCaption, resolvedLyrics });
+    }, { mm3Mode, yue2Active: activeBackendId === YUE2_BACKEND_ID,
+      durationMax: useBackendStore.getState().capabilities[activeBackendId]?.core.duration.max,
+      resolvedCaption, resolvedLyrics });
     // A pasted lead sheet (#181) is the score; previewing would plan a new one
     // and throw it away.
     if (yue2Mode && yue2PreviewScore && !yue2AbcSupplied) {
@@ -518,7 +526,13 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
           ]}
         />
 
-        {!!yue2AdapterPath && !yue2Ds.datasetId && !yue2SourcePending && (
+        {!!yue2SourceError && !yue2SourcePending && (
+          <p className="text-[11px] text-red-400">
+            {t('createPanel.yue2SourceError', 'Could not load the dataset captions: {{error}}', { error: yue2SourceError })}
+          </p>
+        )}
+
+        {!!yue2AdapterPath && !yue2Ds.datasetId && !yue2SourcePending && !yue2SourceError && (
           <p className="text-[11px] text-zinc-500">
             {t('createPanel.yue2NoLinkedCaptions', 'This adapter has no linked training captions.')}
           </p>

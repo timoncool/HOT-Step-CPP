@@ -1,4 +1,5 @@
 import React from 'react';
+import { useMutation } from '@tanstack/react-query';
 import type { Song } from '../../types';
 import { useAuth } from '../../context/AuthContext';
 import { yue2CoverApi, type Yue2CoverDriftResult } from '../../services/yue2CoverApi';
@@ -36,32 +37,28 @@ const Yue2CoverDriftBody: React.FC<{ song: Song }> = ({ song }) => {
   const session = measuredThisSession.get(song.id);
   const [result, setResult] = React.useState<Yue2CoverDriftResult | null>(
     (session?.metricVersion === 5 ? session : undefined) ?? saved ?? null);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState('');
-
-  if (!params.yue2Cover || !params.yue2Abc) return null;
 
   const skipped = (section: Yue2CoverDriftResult['sections'][number]) =>
     section.unscoredReason === 'no_vocal_note' || section.unscoredReason === 'no_matching_lyric_tag';
   const skippedCount = result?.sections.filter(skipped).length ?? 0;
 
-  const measure = async () => {
-    if (!token) return;
-    setBusy(true);
-    setError('');
-    try {
-      const measured = await yue2CoverApi.measureDrift(song.id);
+  const { mutate: measure, isPending: busy, error: measureError } = useMutation({
+    mutationFn: () => yue2CoverApi.measureDrift(song.id),
+    onSuccess: (measured) => {
       measuredThisSession.set(song.id, measured);
       setResult(measured);
-    }
-    catch (err) { setError(err instanceof Error ? err.message : 'Could not measure drift.'); }
-    finally { setBusy(false); }
-  };
+    },
+  });
+  const error = measureError?.message ?? '';
+
+  // Hook order must not depend on the song's params: a generation finishing
+  // while this card is mounted can flip these on the same instance.
+  if (!params.yue2Cover || !params.yue2Abc) return null;
 
   return <section className="space-y-2 rounded-xl border border-zinc-200 dark:border-white/10 p-3 text-xs">
     <div className="flex items-center justify-between gap-2">
       <h4 className="font-semibold text-zinc-800 dark:text-zinc-200">Lyric drift</h4>
-      <button type="button" onClick={() => void measure()} disabled={busy || !token}
+      <button type="button" onClick={() => measure()} disabled={busy || !token}
         className="text-cyan-700 dark:text-cyan-300 disabled:opacity-40">
         {busy ? 'Aligning words…' : result ? 'Refresh drift' : 'Measure drift'}
       </button>

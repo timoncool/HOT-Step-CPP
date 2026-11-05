@@ -1,5 +1,6 @@
 import { queryOptions } from '@tanstack/react-query';
 import { serverKey } from '../keys';
+import { apiClient } from '../../services/httpClient';
 import { getProviders } from '../../services/assistantApi';
 import { fetchInspireProviders, fetchInstagenPrompt } from '../../services/inspireApi';
 import { listJobs, getExtractResult, getExtractProgress } from '../../services/stemStudioApi';
@@ -35,6 +36,31 @@ export const separationResultOptions = (id: string) => queryOptions({
 });
 export const streamSessionOptions = (id: string) => queryOptions({
   queryKey: serverKey('studios/stream-session', { id }), queryFn: ({ signal }) => getStreamSession(id, { signal }),
+});
+/** The raw row shape the stem-studio source picker renders. */
+export interface StudioRecentSong {
+  id: string;
+  title: string;
+  audio_url: string;
+  mastered_audio_url?: string;
+  source: string;
+  created_at: string;
+  artist_name?: string;
+  style?: string;
+  lyrics?: string;
+  caption?: string;
+}
+/** Recent songs for the stem-studio source picker. A distinct resource from the
+ *  shell feed (`SONG_VIEWS` invalidates both); its rows are never edited here. */
+export const studioRecentSongsOptions = (source = 'all') => queryOptions({
+  queryKey: serverKey('studios/recent-songs', {
+    auth: true,
+    filters: { source: source === 'all' ? undefined : source, limit: 50 },
+  }),
+  queryFn: ({ signal }) => apiClient.get<{ songs: StudioRecentSong[] }>(
+    `/songs/recent?limit=50${source === 'all' ? '' : `&source=${encodeURIComponent(source)}`}`,
+    { signal },
+  ),
 });
 export const projectsOptions = () => queryOptions({
   queryKey: serverKey('studios/projects', { auth: true }), queryFn: ({ signal }) => builderApi.listProjects({ signal }),

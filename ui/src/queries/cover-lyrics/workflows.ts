@@ -3,8 +3,9 @@ import { apiClient, type ReadOptions } from '../../services/httpClient';
 import { followJob, workflowApi } from '../../services/workflowApi';
 import type { WorkflowDocument, WorkflowReplay } from '../../../../server/src/contracts/workflow';
 import { queryClient } from '../client';
-import { resourceKey, sharedKeys, getSessionEpoch, SHARED } from '../keys';
+import { resourceKey, sharedKeys } from '../keys';
 import { queryManager } from '../invalidation';
+import { followWorkflowJob } from '../workflowFollow';
 
 export const workflowOptions = (id: string, after = 0, options: ReadOptions = {}) => {
   return queryOptions({
@@ -30,48 +31,16 @@ export const coverLyricWorkflowApi = {
     await queryClient.cancelQueries({ queryKey: key });
     const result = await workflowApi.updateDocument(...args);
     queryClient.setQueryData(key, result);
-    await queryManager.keys(queryClient, key);
+    await queryManager.invalidate(queryClient, key);
     return result;
   },
 };
 
 /** Streaming reducers retain sequencing; events invalidate captured snapshots.
- *  Reconnects always reconcile, including when the replay history has a gap. */
-export const followCoverLyricJob: typeof followJob = (id, handlers, opts) => {
-  const jobScope = sharedKeys.workflowJob(id)[2];
-  const jobKey = resourceKey(SHARED.workflowJob, jobScope, id);
-  const epoch = getSessionEpoch();
-  const controller = new AbortController();
-  const abort = () => controller.abort();
-  opts?.signal?.addEventListener('abort', abort, { once: true });
-  if (opts?.signal?.aborted) controller.abort();
-  const current = () => {
-    if (getSessionEpoch() === epoch) return true;
-    controller.abort();
-    return false;
-  };
-  const documentsKey = resourceKey(SHARED.workflowDocument, jobScope);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const flush = () => {
-    clearTimeout(timer);
-    timer = undefined;
-    if (getSessionEpoch() !== epoch) return;
-    void queryManager.keys(queryClient, jobKey);
-    void queryManager.keys(queryClient, documentsKey);
-    void queryManager.songs.views(queryClient);
-    void queryManager.keys(queryClient, resourceKey('cover-lyrics/lireek'));
-    void queryManager.keys(queryClient, resourceKey('cover-lyrics/drafts', jobScope));
-  };
-  const invalidate = () => { timer ??= setTimeout(flush, 50); };
-  return followJob(id, {
-    ...handlers,
-    onSnapshot: (job, gap) => { if (current()) { invalidate(); handlers.onSnapshot?.(job, gap); } },
-    onEvent: event => { if (current()) { invalidate(); handlers.onEvent(event); } },
-  }, { ...opts, signal: controller.signal }).then(status => {
-    if (!current()) throw new DOMException('Auth session changed', 'AbortError');
-    return status;
-  }).finally(() => {
-    opts?.signal?.removeEventListener('abort', abort);
-    flush();
-  });
-};
+ *  Reconnects always reconcile, including when the replay history has a gap.
+ *  A cover job also dirties every lireek read and the drafts of its scope. */
+export const followCoverLyricJob: typeof followJob = (id, handlers, opts) =>
+  followWorkflowJob(id, handlers, opts, scope => [
+    resourceKey('cover-lyrics/lireek'),
+    resourceKey('cover-lyrics/drafts', scope),
+  ]);

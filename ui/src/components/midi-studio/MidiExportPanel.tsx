@@ -8,13 +8,14 @@
 import React, { useState } from 'react';
 import { Copy, Download, Loader2, RotateCcw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { midiJobsOptions, midiNotesOptions } from '../../queries/studios/midi';
 import { queryManager } from '../../queries/invalidation';
 import { channelLabel, exportMidi, getMidiAbc, type MidiExportOptions } from '../../services/midiStudioApi';
 import { ParamLabel } from '../shared/ParamLabel';
 import { StyledSelect } from '../shared/StyledSelect';
 import { Toggle } from '../shared/Toggle';
+import { QueryError } from '../shared/QueryError';
 
 interface Props {
   jobId: string;
@@ -27,29 +28,28 @@ const input = 'w-full px-2.5 py-1.5 rounded-lg text-xs bg-zinc-100 dark:bg-black
 export const MidiExportPanel: React.FC<Props> = ({ jobId, initial }) => {
   const { t } = useTranslation();
   const client = useQueryClient();
-  const grid = useQuery(midiNotesOptions(jobId)).data?.grid;
+  const gridQuery = useQuery(midiNotesOptions(jobId));
+  const grid = gridQuery.data?.grid;
   const [opts, setOpts] = useState<MidiExportOptions>(initial ?? {});
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  if (!grid) return null;
 
+  const { mutate: apply, isPending: busy, error: applyError } = useMutation({
+    mutationFn: (next: MidiExportOptions) => exportMidi(jobId, next),
+    onSuccess: (__, next) => {
+      setOpts(next);
+      void queryManager.invalidate(client, midiNotesOptions(jobId).queryKey);
+      void queryManager.invalidate(client, midiJobsOptions().queryKey);
+    },
+  });
+
+  if (!grid) {
+    return gridQuery.isError
+      ? <QueryError error={gridQuery.error} onRetry={() => void gridQuery.refetch()} />
+      : null;
+  }
+
+  const error = applyError?.message ?? '';
   const set = (patch: MidiExportOptions) => setOpts(o => ({ ...o, ...patch }));
   const num = (v: string) => (v.trim() === '' ? undefined : Number(v));
-
-  const apply = async (next: MidiExportOptions) => {
-    setBusy(true);
-    setError('');
-    try {
-      await exportMidi(jobId, next);
-      setOpts(next);
-      queryManager.keys(client, midiNotesOptions(jobId).queryKey);
-      queryManager.keys(client, midiJobsOptions().queryKey);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const summary = [
     t('midiStudio.export.bpm', { bpm: grid.bpm.toFixed(1) }),
@@ -152,19 +152,15 @@ export const MidiExportPanel: React.FC<Props> = ({ jobId, initial }) => {
 // box, or save it. Uses the grid the MIDI was last written on.
 const AbcRow: React.FC<{ jobId: string }> = ({ jobId }) => {
   const { t } = useTranslation();
-  const channels = useQuery(midiNotesOptions(jobId)).data?.channels ?? [];
+  const channelsQuery = useQuery(midiNotesOptions(jobId));
+  const channels = channelsQuery.data?.channels ?? [];
   const [ins, setIns] = useState(-1);
   const [chords, setChords] = useState(true);
-  const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
-  const [error, setError] = useState('');
   const programs = [...new Set(channels.filter(c => !c.isDrums && c.program !== 52).map(c => c.program))];
 
-  const make = async (action: 'copy' | 'save') => {
-    setBusy(true);
-    setError('');
-    setNote('');
-    try {
+  const { mutate: makeAbc, isPending: busy, error: abcError } = useMutation({
+    mutationFn: async (action: 'copy' | 'save') => {
       const r = await getMidiAbc(jobId, { ins: ins >= 0 ? ins : undefined, melodyOnly: !chords });
       if (action === 'copy') await navigator.clipboard.writeText(r.abc);
       else {
@@ -175,19 +171,21 @@ const AbcRow: React.FC<{ jobId: string }> = ({ jobId }) => {
         a.click();
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
-      const s = r.summary;
+      return { action, summary: r.summary };
+    },
+    onSuccess: ({ action, summary }) => {
       setNote(t(action === 'copy' ? 'midiStudio.abc.copied' : 'midiStudio.abc.saved', {
-        vocal: s.vocal_notes, ins: s.ins.replace(/_/g, ' '), insNotes: s.ins_notes, key: s.key.replace(':', ' '), chords: s.chords,
-      }) + (s.vocal_notes < 40 ? ' ' + t('midiStudio.abc.fewVocal') : ''));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
+        vocal: summary.vocal_notes, ins: summary.ins.replace(/_/g, ' '), insNotes: summary.ins_notes, key: summary.key.replace(':', ' '), chords: summary.chords,
+      }) + (summary.vocal_notes < 40 ? ' ' + t('midiStudio.abc.fewVocal') : ''));
+    },
+  });
+  const error = abcError?.message ?? '';
 
   return (
     <div className="mt-3 pt-3 border-t border-zinc-200 dark:border-white/5 flex flex-wrap items-center gap-x-4 gap-y-2">
+      {channelsQuery.isError && (
+        <QueryError error={channelsQuery.error} onRetry={() => void channelsQuery.refetch()} compact className="basis-full" />
+      )}
       <ParamLabel label={t('midiStudio.abc.title')} info={t('midiStudio.abc.info')} />
       <div className="flex items-center gap-2">
         <ParamLabel label={t('midiStudio.abc.ins')} info={t('midiStudio.abc.insInfo')} />
@@ -197,11 +195,11 @@ const AbcRow: React.FC<{ jobId: string }> = ({ jobId }) => {
       </div>
       <Toggle size="sm" accent="purple" checked={chords} onChange={setChords}
         label={t('midiStudio.abc.chords')} info={t('midiStudio.abc.chordsInfo')} />
-      <button onClick={() => make('copy')} disabled={busy}
+      <button onClick={() => makeAbc('copy')} disabled={busy}
         className="px-3 py-1.5 rounded-lg text-xs font-medium text-purple-600 dark:text-purple-300 border border-purple-500/40 hover:bg-purple-500/10 disabled:opacity-50 transition-colors flex items-center gap-1.5">
         {busy ? <Loader2 size={11} className="animate-spin" /> : <Copy size={11} />} {t('midiStudio.abc.copy')}
       </button>
-      <button onClick={() => make('save')} disabled={busy}
+      <button onClick={() => makeAbc('save')} disabled={busy}
         className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-purple-600 dark:hover:text-purple-400 hover:underline flex items-center gap-1">
         <Download size={11} /> {t('midiStudio.abc.save')}
       </button>

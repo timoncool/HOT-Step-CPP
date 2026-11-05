@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Trash2, Pencil, Music2, Wand2, Play, Loader2, ChevronDown, ChevronRight, Send, FileText, Headphones, Sparkles, Zap, Download, Shuffle } from 'lucide-react';
 import { lireekApi, skipThinking } from '../../services/lireekApi';
@@ -524,24 +525,24 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
     }
   };
 
-  const handleDelete = async (gen: Generation) => {
+  const deleteMut = useMutation({
+    mutationFn: (gen: Generation) => lireekApi.deleteGeneration(gen.id),
+    onSuccess: () => { showToast('Deleted'); onRefresh(); },
+  });
+
+  const metadataMut = useMutation({
+    mutationFn: ({ genId, field, value }: { genId: number; field: string; value: any }) =>
+      lireekApi.updateMetadata(genId, { [field]: value }),
+    onSuccess: () => onRefresh(),
+  });
+
+  const handleDelete = (gen: Generation) => {
     if (!confirm(`Delete "${gen.title || 'Untitled'}"?`)) return;
-    try {
-      await lireekApi.deleteGeneration(gen.id);
-      showToast('Deleted');
-      onRefresh();
-    } catch (err: any) {
-      showToast(`Failed: ${err.message}`);
-    }
+    deleteMut.mutate(gen);
   };
 
-  const handleSaveField = async (genId: number, field: string, value: any) => {
-    try {
-      await lireekApi.updateMetadata(genId, { [field]: value });
-      onRefresh();
-    } catch (err: any) {
-      showToast(`Failed to save: ${err.message}`);
-    }
+  const handleSaveField = (genId: number, field: string, value: any) => {
+    metadataMut.mutate({ genId, field, value });
   };
 
   // Show streaming panel if either generation or refinement is active

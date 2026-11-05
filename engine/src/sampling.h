@@ -27,7 +27,8 @@ struct TokenProb {
 // cumulative sum, mask tokens beyond the nucleus threshold.
 // This matches nano-vLLM: apply_top_k_top_p sorts the full vocab when
 // k is None, so we must not inject an artificial cap.
-static int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng) {
+static int sample_top_k_p(float * logits, int V, float temperature, float top_p, int top_k, std::mt19937 & rng,
+                          float min_p = 0.0f) {
     if (temperature <= 0.0f) {
         // greedy
         return (int) (std::max_element(logits, logits + V) - logits);
@@ -104,6 +105,17 @@ static int sample_top_k_p(float * logits, int V, float temperature, float top_p,
                 }
                 cum += sorted_buf[i].prob;
             }
+        }
+    }
+
+    // 3b. min_p (HOT-Step addition, 0 = off): drop tokens under min_p times the
+    // top token's probability, i.e. logit < max + log(min_p). Top-1 survives.
+    if (min_p > 0.0f) {
+        float mx = -INFINITY;
+        for (int i = 0; i < V; i++) mx = std::max(mx, logits[i]);
+        const float floor = mx + logf(min_p);
+        for (int i = 0; i < V; i++) {
+            if (logits[i] < floor) logits[i] = -INFINITY;
         }
     }
 

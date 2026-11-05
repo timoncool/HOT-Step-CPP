@@ -41,8 +41,9 @@ import { spawn } from 'child_process';
 import { pushLog } from '../../routes/logs.js';
 import { buildGpuEnv } from '../gpuDevices.js';
 import { withFfmpegOnPath } from '../../config.js';
-import { restartAceServer, stopAceServer } from '../aceEngineProcess.js';
+import { resumeEngines, suspendEngines } from '../aceEngineProcess.js';
 import { YUE2_LICENSE_NOTICE } from '../backends/yue2/index.js';
+import type { HeartmulaJobKind } from '../../contracts/heartmulaTraining.js';
 import { aceTrainExe } from './aceTrain.js';
 import { getDataset } from './datasetsRepo.js';
 import { buildSamples } from './datasetScan.js';
@@ -72,6 +73,8 @@ export function numOr(v: string | undefined, d?: number): number | undefined {
 // ── stderr -> events ────────────────────────────────────────────────────────
 
 export interface RelayState {
+  /** The child's exit code, set once it has exited (null = killed). */
+  exitCode?: number | null;
   /** Set when the joint trainer reports the planner frozen (KL stop). */
   frozenAt?: number;
   fatalMessage: string;
@@ -348,7 +351,7 @@ export type Yue2Kind =
 /** Which kinds keep a machine-readable train-log.jsonl beside their output.
  *  The two trainers do, because yue2Runs/yue2ArRuns read it back to reconstruct
  *  a run; the three cache stages have no run directory to put one in. */
-function wantsJsonl(kind: Yue2Kind): boolean {
+function wantsJsonl(kind: string): boolean {
   return kind === 'yue2-nar-train' || kind === 'yue2-ar-train' || kind === 'yue2-joint-train';
 }
 
@@ -371,7 +374,7 @@ export const YUE2_IDLE_MS = 60 * 60 * 1000;
 
 export async function runYue2AceTrain<S extends RelayState>(
   job: TrainingJob,
-  kind: Yue2Kind,
+  kind: Yue2Kind | HeartmulaJobKind,
   args: string[],
   idleMs: number,
   verifyOutput: () => string | null,
@@ -381,6 +384,8 @@ export async function runYue2AceTrain<S extends RelayState>(
   // false keeps the engine up (generation stays available and shares the GPU),
   // the mirror of the DiT trainer's stopEngine. Default: stop it.
   stopEngine = true,
+  // Exit codes that are not a failure (HeartMuLa: 3 = paused at a checkpoint).
+  okCodes: readonly number[] = [0],
 ): Promise<S> {
   const exe = aceTrainExe();
   if (!exe) {
@@ -399,15 +404,15 @@ export async function runYue2AceTrain<S extends RelayState>(
     emitProgress(job);
     log(job, 'info', 'Stopping the engine to free VRAM…');
     // Not gated on a live child: a crashed engine leaves a respawn scheduled and
-    // stopAceServer is what cancels it.
-    engineExited = await stopAceServer(`Paused for ${kind}`);
+    // suspendEngines is what cancels it.
+    engineExited = await suspendEngines(`Paused for ${kind}`);
   } else {
     log(job, 'info', 'Keeping the engine running: generation stays available and shares the GPU with training.');
   }
 
   try {
     if (!engineExited) {
-      throw new Error('The engine did not shut down — YuE2 training needs its VRAM. '
+      throw new Error(`The engine did not shut down — ${kind.startsWith('heartmula') ? 'HeartMuLa' : 'YuE2'} training needs its VRAM. `
         + 'Restart the app and try again.');
     }
     if (isCancelled(job)) return st;
@@ -478,7 +483,8 @@ export async function runYue2AceTrain<S extends RelayState>(
       throw new Error(`${kind} printed nothing for ${Math.round(idleMs / 60000)} min and was stopped as hung`
         + (stderrTail.length ? `: ${stderrTail.slice(-3).join(' | ')}` : ''));
     }
-    if (code !== 0) {
+    st.exitCode = code;
+    if (code === null || !okCodes.includes(code)) {
       // The child's OWN last lines, not a generic message: these tools report
       // a real sentence ("no yue2-vae-standard-*.gguf under …", "--decode
       // ffmpeg needs --ffmpeg <path>") and throwing it away would leave the
@@ -502,7 +508,7 @@ export async function runYue2AceTrain<S extends RelayState>(
     emitProgress(job);
     log(job, 'info', 'Restarting the engine…');
     pushLog(`[Training] ${kind} job ${job.id}: restarting the engine…`);
-    const back = await restartAceServer();
+    const back = await resumeEngines();
     if (!back) {
       log(job, 'warn', 'Engine did not answer /health within 90 s — restart the app if generation fails');
     }

@@ -31,9 +31,12 @@
 #include "ggml.h"
 #include "moss/moss-model.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <vector>
 
 namespace moss {
@@ -338,12 +341,16 @@ struct SamplerParams {
     float temperature        = 0.0f;   // 0 = greedy
     float repetition_penalty = 1.05f;
     float frequency_penalty  = 0.30f;
+    float top_p              = 1.0f;   // nucleus, only when temperature > 0
+    uint32_t seed            = 0;      // the caller reseeds `rng` per generation
+    std::mt19937 rng{ 0 };
 };
 
 // Applies the penalties in place and returns the chosen token. `counts` maps
-// token id -> how many times it has already been emitted.
+// token id -> how many times it has already been emitted. Greedy unless
+// temperature > 0, then nucleus sampling (top_p) from the seeded rng.
 inline int32_t moss_sample(std::vector<float> & logits, const std::vector<int32_t> & counts,
-                           const SamplerParams & sp) {
+                           SamplerParams & sp) {
     const size_t n = logits.size();
     for (size_t i = 0; i < n && i < counts.size(); ++i) {
         const int32_t c = counts[i];
@@ -356,6 +363,30 @@ inline int32_t moss_sample(std::vector<float> & logits, const std::vector<int32_
                                            : logits[i] * sp.repetition_penalty;
         }
         logits[i] -= sp.frequency_penalty * (float) c;
+    }
+    if (sp.temperature > 0.0f) {
+        // Top 256 candidates hold all the nucleus mass in practice; sorting the
+        // whole 150k vocabulary every token would cost more than the decode.
+        const size_t k = std::min<size_t>(256, n);
+        std::vector<int32_t> idx(n);
+        for (size_t i = 0; i < n; ++i) idx[i] = (int32_t) i;
+        std::partial_sort(idx.begin(), idx.begin() + (long) k, idx.end(),
+                          [&](int32_t a, int32_t b) { return logits[(size_t) a] > logits[(size_t) b]; });
+        std::vector<double> p(k);
+        const double mx = logits[(size_t) idx[0]];
+        double sum = 0.0;
+        for (size_t i = 0; i < k; ++i) {
+            p[i] = std::exp(((double) logits[(size_t) idx[i]] - mx) / sp.temperature);
+            sum += p[i];
+        }
+        size_t keep = k;
+        double acc = 0.0;
+        for (size_t i = 0; i < k; ++i) {
+            acc += p[i] / sum;
+            if (acc >= sp.top_p) { keep = i + 1; break; }
+        }
+        std::discrete_distribution<size_t> pick(p.begin(), p.begin() + (long) keep);
+        return idx[pick(sp.rng)];
     }
     size_t best = 0;
     for (size_t i = 1; i < n; ++i) {

@@ -9,7 +9,7 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { resolveRuntime } from './bootstrap.js';
-import { dataLayout, devPointerFile, initLayout, isInside, otherPointerRoots, newPending, readPointer, rewritePath, writePointer, BUNDLED_DATA_NAMES, POINTER_FILE, LOCK_FILE } from './paths.js';
+import { dataLayout, devPointerFile, initLayout, profileDir, isInside, otherPointerRoots, newPending, readPointer, rewritePath, writePointer, BUNDLED_DATA_NAMES, POINTER_FILE, LOCK_FILE } from './paths.js';
 import { locateData } from './locate.js';
 import { hooks, planOperation, rewriteDb, runPending, sharedRoot } from './transfer.js';
 
@@ -928,4 +928,128 @@ test('locateData: an empty process variable beats the .env file, like dotenv', (
   const r = locateData({ env: { HOT_STEP_PROFILE_DIR: f.prof, ACESTEPCPP_ADAPTERS: '' } as NodeJS.ProcessEnv, checkoutRoot: checkout });
   assert.equal(r.children!.adapters, dataLayout(root).adapters);
   assert.deepEqual(r.overrides, []);
+});
+
+// ── Upgrade fixtures (GH #228): one profile, several unpacked releases ──
+
+/** A second unpacked release folder (spaces in the name) sharing the fixture's profile. */
+function secondRelease(f: ReturnType<typeof fixture>, name = 'HOT-Step v3 (new)') {
+  // A different parent folder, so its sibling default differs from the first release's.
+  const app = path.join(f.base, 'second parent', name);
+  fs.mkdirSync(path.join(app, 'server', 'data'), { recursive: true });
+  for (const n of BUNDLED_DATA_NAMES) fs.writeFileSync(path.join(app, 'server', 'data', n), 'bundled');
+  return { app, env: { ...f.env, HOT_STEP_ROOT: app } as NodeJS.ProcessEnv };
+}
+
+test('two unpacked releases sharing one profile use one data folder, with its settings and tokens', async () => {
+  const f = fixture();
+  const first = await resolveRuntime({ env: f.env, log: quiet, skipEngineProbe: true });
+  assert.ok(first.ok);
+  const layout = dataLayout(f.sibling);
+  write(layout.envPath, 'GEMINI_API_KEY=abc\n');
+  write(path.join(layout.library, 'muscriptor', 'hf_token'), 'hf_secret');
+
+  const v3 = secondRelease(f);
+  const logs: string[] = [];
+  const second = await resolveRuntime({ env: v3.env, log: m => logs.push(m), skipEngineProbe: true });
+  assert.ok(second.ok, !second.ok ? second.error : '');
+  // The pointer, not the new app folder's own sibling, decides.
+  assert.equal(second.runtime.dataRoot, f.sibling);
+  assert.equal(second.runtime.appRoot, v3.app);
+  assert.equal(second.runtime.envPath, layout.envPath);
+  assert.equal(fs.readFileSync(second.runtime.envPath!, 'utf-8'), 'GEMINI_API_KEY=abc\n');
+  assert.equal(fs.readFileSync(path.join(second.runtime.libraryDir!, 'muscriptor', 'hf_token'), 'utf-8'), 'hf_secret');
+  assert.equal(second.runtime.restartMarkerPath, path.join(f.prof, 'restart-requested'));
+  assert.deepEqual(logs, []);
+  assert.equal(readPointer(f.ptrFile)!.root, f.sibling);
+});
+
+test('a release with a saved pointer ignores its own sibling default and creates nothing', async () => {
+  const f = fixture();
+  const elsewhere = path.join(f.base, 'My Music Drive', 'HOT-Step Data');
+  initLayout(dataLayout(elsewhere));
+  writePointer(f.ptrFile, { version: 1, root: elsewhere, pending: null });
+  const v3 = secondRelease(f);
+  const r = await resolveRuntime({ env: v3.env, log: quiet, skipEngineProbe: true });
+  assert.ok(r.ok);
+  assert.equal(r.runtime.dataRoot, elsewhere);
+  assert.ok(!fs.existsSync(f.sibling));
+  assert.ok(!fs.existsSync(path.join(f.base, 'second parent', 'HOT-Step-Data')));
+});
+
+test('HOT_STEP_DATA_ROOT beats a healthy pointer without rewriting it; unset, the pointer wins again', async () => {
+  const f = fixture();
+  const saved = path.join(f.base, 'saved');
+  const override = path.join(f.base, 'with space', 'override');
+  initLayout(dataLayout(saved));
+  initLayout(dataLayout(override));
+  writePointer(f.ptrFile, { version: 1, root: saved, pending: null });
+  const before = fs.readFileSync(f.ptrFile, 'utf-8');
+  const over = await resolveRuntime({ env: { ...f.env, HOT_STEP_DATA_ROOT: override }, log: quiet, skipEngineProbe: true });
+  assert.ok(over.ok);
+  assert.equal(over.runtime.dataRoot, override);
+  assert.equal(over.runtime.override, override);
+  assert.equal(over.runtime.envPath, dataLayout(override).envPath);
+  assert.equal(fs.readFileSync(f.ptrFile, 'utf-8'), before);
+  const plain = await resolveRuntime({ env: f.env, log: quiet, skipEngineProbe: true });
+  assert.ok(plain.ok);
+  assert.equal(plain.runtime.dataRoot, saved);
+  assert.equal(plain.runtime.override, null);
+});
+
+test('restart after a move: later starts use the new folder, with settings and token, and change nothing', async () => {
+  const f = fixture();
+  const first = await resolveRuntime({ env: f.env, log: quiet, skipEngineProbe: true });
+  assert.ok(first.ok);
+  const src = dataLayout(f.sibling);
+  write(src.envPath, 'OPENAI_API_KEY=k\n');
+  write(path.join(src.library, 'muscriptor', 'hf_token'), 'hf_secret');
+  const dest = path.join(f.base, 'Moved Data');
+  const { op, errors } = planOperation('move', dest, { appRoot: f.app, currentRoot: f.sibling, currentDb: null });
+  assert.deepEqual(errors, []);
+  writePointer(f.ptrFile, { version: 1, root: f.sibling, pending: op });
+  const moved = await resolveRuntime({ env: f.env, log: quiet, skipEngineProbe: true });
+  assert.ok(moved.ok, !moved.ok ? moved.error : '');
+  assert.equal(moved.runtime.dataRoot, dest);
+  const ptr = fs.readFileSync(f.ptrFile, 'utf-8');
+  for (let i = 0; i < 2; i++) {
+    const again = await resolveRuntime({ env: f.env, log: quiet, skipEngineProbe: true });
+    assert.ok(again.ok);
+    assert.equal(again.runtime.dataRoot, dest);
+    assert.equal(fs.readFileSync(dataLayout(dest).envPath, 'utf-8'), 'OPENAI_API_KEY=k\n');
+    assert.equal(fs.readFileSync(path.join(dataLayout(dest).library, 'muscriptor', 'hf_token'), 'utf-8'), 'hf_secret');
+  }
+  assert.equal(fs.readFileSync(f.ptrFile, 'utf-8'), ptr);
+});
+
+test('stale drive: a second app folder falls back, then returns to the saved drive once it is back', async () => {
+  const f = fixture();
+  const drive = path.join(f.base, 'E drive', 'HOT-Step Data');
+  writePointer(f.ptrFile, { version: 1, root: drive, pending: null });
+  const v3 = secondRelease(f);
+  const logs: string[] = [];
+  const away = await resolveRuntime({ env: v3.env, log: m => logs.push(m), skipEngineProbe: true });
+  assert.ok(away.ok);
+  assert.equal(away.runtime.dataRoot, path.join(f.base, 'second parent', 'HOT-Step-Data'));
+  assert.equal(logs.length, 1);
+  assert.ok(logs[0].includes(drive));
+  assert.equal(readPointer(f.ptrFile)!.root, drive);
+  initLayout(dataLayout(drive));
+  logs.length = 0;
+  const back = await resolveRuntime({ env: v3.env, log: m => logs.push(m), skipEngineProbe: true });
+  assert.ok(back.ok);
+  assert.equal(back.runtime.dataRoot, drive);
+  assert.deepEqual(logs, []);
+});
+
+test('profile folder per platform, including macOS and Windows paths with spaces', () => {
+  const mac = '/Users/Jo Bloggs';
+  assert.equal(profileDir({}, 'darwin', mac), path.join(mac, 'Library', 'Application Support', 'HOT-Step'));
+  assert.equal(profileDir({ XDG_CONFIG_HOME: '/cfg dir' }, 'linux', mac), path.join('/cfg dir', 'hot-step'));
+  assert.equal(profileDir({}, 'linux', mac), path.join(mac, '.config', 'hot-step'));
+  const local = path.join('C:', 'Users', 'Jo Bloggs', 'AppData', 'Local');
+  assert.equal(profileDir({ LOCALAPPDATA: local }, 'win32', 'C:'), path.join(local, 'HOT-Step'));
+  assert.equal(profileDir({}, 'win32', path.join('C:', 'Users', 'Jo Bloggs')), path.join('C:', 'Users', 'Jo Bloggs', 'AppData', 'Local', 'HOT-Step'));
+  // The fixture override beats every platform default.
+  assert.equal(profileDir({ HOT_STEP_PROFILE_DIR: path.resolve('p q') }, 'darwin', mac), path.resolve('p q'));
 });

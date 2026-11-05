@@ -8,6 +8,7 @@
 #include "../hot-step-fsutf8.h"
 #include "yyjson.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -43,6 +44,16 @@ constexpr size_t kMaxPayloadBytes = 512u * 1024u * 1024u;
 constexpr const char * kRecipe = "aitk-yue2-2026-09-16";
 
 inline bool bad(std::string * e, const char * msg) { if (e) *e = msg; return false; }
+
+// Longest sequence the trainer builds from one item. The planner takes the
+// whole song (prefix + sheet + ABC_END + MUSIC_START + frames + MUSIC_END,
+// yue2-aitk-batch.h build), the decoder a 1500-frame window written twice.
+// Prepare and the reader share this rule, so prepare never writes an item
+// the reader rejects.
+inline size_t context_tokens(const PromptInput & p, size_t frames) {
+    const size_t head = std::max(p.retained_prefix_ids.size(), p.dropped_prefix_ids.size()) + p.abc_ids.size();
+    return head + std::max(frames + 3, 2 * std::min(frames, size_t(1500)) + 5);
+}
 
 inline bool string_value(yyjson_val * v, std::string * out, bool nonempty = false) {
     if (!yyjson_is_str(v) || yyjson_get_len(v) != std::strlen(yyjson_get_str(v))) return false;
@@ -342,11 +353,10 @@ inline bool read_dataset(const std::string & manifest_path, Dataset * out, std::
         if (!read_bytes(payload, payload_bytes, &bytes, error) || bytes.size() != payload_bytes)
             return bad(error, "latent payload size mismatch");
         if (fnv1a(bytes) != std::stoull(fnv_s, nullptr, 16)) return bad(error, "latent FNV-1a corruption check failed");
-        if (result.prompt.retained_prefix_ids.size() + result.prompt.abc_ids.size() + n + 3 > kMaxFrames ||
-            result.prompt.dropped_prefix_ids.size() + result.prompt.abc_ids.size() + n + 3 > kMaxFrames ||
-            result.prompt.retained_prefix_ids.size() + result.prompt.abc_ids.size() + 2 * std::min(n, size_t(1500)) + 5 > kMaxFrames ||
-            result.prompt.dropped_prefix_ids.size() + 2 * std::min(n, size_t(1500)) + 5 > kMaxFrames)
-            return bad(error, "prefix context exceeds YuE2 sequence limit");
+        if (const size_t need = context_tokens(result.prompt, n); need > kMaxFrames) {
+            if (error) *error = result.id + ": " + std::to_string(need) + " tokens exceed the YuE2 context of " + std::to_string(kMaxFrames);
+            return false;
+        }
         result.song.latents.resize(n * kLatentChannels);
         for (size_t p = 0; p < result.song.latents.size(); ++p) {
             float value; std::memcpy(&value, bytes.data() + p * sizeof(float), sizeof(value));

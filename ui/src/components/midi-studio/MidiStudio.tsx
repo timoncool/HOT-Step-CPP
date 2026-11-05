@@ -29,6 +29,7 @@ import {
 import { MidiPlayer } from './MidiPlayer';
 import { MidiExportPanel } from './MidiExportPanel';
 import { ParamLabel } from '../shared/ParamLabel';
+import { Toggle } from '../shared/Toggle';
 import { useUpload } from '../../queries/writes';
 
 const MODEL_INFO: Array<{ id: MuscriptorModel; params: string }> = [
@@ -46,14 +47,14 @@ export const MidiStudio: React.FC = () => {
   const jobsQuery = useQuery(midiJobsOptions());
   const status = statusQuery.data;
   const jobs = jobsQuery.data ?? [];
-  const refreshStatus = () => queryManager.keys(client, midiStatusOptions().queryKey);
-  const refreshJobs = () => queryManager.keys(client, midiJobsOptions().queryKey);
-  const deletion = useMutation({ mutationFn: (id: string) => removeMidiJob(client, id), retry: false });
+  const refreshStatus = () => queryManager.invalidate(client, midiStatusOptions().queryKey);
+  const refreshJobs = () => queryManager.invalidate(client, midiJobsOptions().queryKey);
+  // No per-mutation retry: the client default is already off (queries/client.ts).
+  const deletion = useMutation({ mutationFn: (id: string) => removeMidiJob(client, id) });
 
 
   // ── HF access token (gated weights) ──
   const [hfTokenInput, setHfTokenInput] = useState('');
-  const [hfTokenBusy, setHfTokenBusy] = useState(false);
   const [hfTokenError, setHfTokenError] = useState('');
   // Once a token is saved the card collapses to a slim row; "Change" reopens it
   const [showTokenEditor, setShowTokenEditor] = useState(false);
@@ -68,6 +69,7 @@ export const MidiStudio: React.FC = () => {
   const [sourceSongId, setSourceSongId] = useState<string | undefined>(undefined);
   const [model, setModel] = useState<MuscriptorModel>(() =>
     (localStorage.getItem('hs-midi-model') as MuscriptorModel) || 'small');
+  const [speculative, setSpeculative] = useState(() => localStorage.getItem('hs-midi-speculative') !== '0');
 
   // ── Jobs ──
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
@@ -98,6 +100,8 @@ export const MidiStudio: React.FC = () => {
     uploadAudio({
       path: '/upload/audio',
       files: [{ field: 'audio', file }],
+      // The inline submitError line below is the sole notifier for this upload.
+      silent: true,
       onSuccess: data => {
         if (!data.audio_url) return;
         setSourceAudioUrl(data.audio_url);
@@ -118,31 +122,42 @@ export const MidiStudio: React.FC = () => {
     setModel(m);
     try { localStorage.setItem('hs-midi-model', m); } catch { /* ignore */ }
   };
-
-  const handleTranscribe = async () => {
-    if (!sourceAudioUrl) return;
-    setSubmitError('');
-    try {
-      await submitTranscription({ sourceAudioUrl, sourceFileName: sourceName, songId: sourceSongId, model });
-      refreshJobs();
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : String(err));
-    }
+  const handleSpeculativeChange = (v: boolean) => {
+    setSpeculative(v);
+    try { localStorage.setItem('hs-midi-speculative', v ? '1' : '0'); } catch { /* ignore */ }
   };
 
-  const handleSaveHfToken = async (tok: string) => {
-    setHfTokenError('');
-    setHfTokenBusy(true);
-    try {
-      await saveHfToken(tok);
+  // All three model-download buttons share this mutation: the inline
+  // submitError line is the sole notifier (startModelDownload is silent).
+  const downloadMut = useMutation({
+    mutationFn: (m: MuscriptorModel | typeof BEAT_MODEL) => startModelDownload(m),
+    onSuccess: () => refreshStatus(),
+    onError: err => setSubmitError(err instanceof Error ? err.message : String(err)),
+  });
+
+  const transcribeMut = useMutation({
+    mutationFn: () => submitTranscription({ sourceAudioUrl, sourceFileName: sourceName, songId: sourceSongId, model, speculative }),
+    onSuccess: () => refreshJobs(),
+    onError: err => setSubmitError(err instanceof Error ? err.message : String(err)),
+  });
+  const handleTranscribe = () => {
+    if (!sourceAudioUrl) return;
+    setSubmitError('');
+    transcribeMut.mutate();
+  };
+
+  const hfTokenMut = useMutation({
+    mutationFn: (tok: string) => saveHfToken(tok),
+    onSuccess: (_data, tok) => {
       setHfTokenInput('');
       if (tok.trim()) setShowTokenEditor(false);
       refreshStatus();
-    } catch (err) {
-      setHfTokenError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setHfTokenBusy(false);
-    }
+    },
+    onError: err => setHfTokenError(err instanceof Error ? err.message : String(err)),
+  });
+  const handleSaveHfToken = (tok: string) => {
+    setHfTokenError('');
+    hfTokenMut.mutate(tok);
   };
 
   const handleDelete = async (jobId: string) => {
@@ -155,7 +170,9 @@ export const MidiStudio: React.FC = () => {
   const engineMissing = !!status && !status.engineAvailable;
   const modelState = status?.models?.[model];
   const beatState = status?.models?.[BEAT_MODEL];
-  const canTranscribe = !!status?.engineAvailable && !!modelState?.downloaded && !!sourceAudioUrl && !isUploading;
+  // The transcribe in flight is a duplicate-job guard: the job list only shows
+  // it after the status refresh, so the mutation's own pending covers the gap.
+  const canTranscribe = !!status?.engineAvailable && !!modelState?.downloaded && !!sourceAudioUrl && !isUploading && !transcribeMut.isPending;
 
   const fmtGB = (b: number) => `${(b / 1e9).toFixed(2)} GB`;
 
@@ -237,15 +254,15 @@ export const MidiStudio: React.FC = () => {
               />
               <button
                 onClick={() => handleSaveHfToken(hfTokenInput)}
-                disabled={hfTokenBusy || !hfTokenInput.trim()}
+                disabled={hfTokenMut.isPending || !hfTokenInput.trim()}
                 className="px-4 py-2 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               >
-                {hfTokenBusy ? <Loader2 size={13} className="animate-spin" /> : t('midiStudio.hfTokenSave')}
+                {hfTokenMut.isPending ? <Loader2 size={13} className="animate-spin" /> : t('midiStudio.hfTokenSave')}
               </button>
               {status.hfTokenSet && (
                 <button
                   onClick={() => handleSaveHfToken('')}
-                  disabled={hfTokenBusy}
+                  disabled={hfTokenMut.isPending}
                   className="px-3 py-2 rounded-lg text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-red-500 border border-zinc-200 dark:border-white/10 transition-colors"
                 >
                   {t('midiStudio.hfTokenClear')}
@@ -284,7 +301,7 @@ export const MidiStudio: React.FC = () => {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".wav,.mp3,audio/wav,audio/mpeg"
+              accept=".wav,.mp3,.flac,audio/wav,audio/mpeg,audio/flac"
               className="hidden"
               onChange={e => { const f = e.target.files?.[0]; if (f) handleFileUpload(f); e.target.value = ''; }}
             />
@@ -371,11 +388,7 @@ export const MidiStudio: React.FC = () => {
                       </span>
                     ) : (
                       <button
-                        onClick={e => {
-                          e.stopPropagation();
-                          startModelDownload(mi.id).then(refreshStatus).catch(err =>
-                            setSubmitError(err instanceof Error ? err.message : String(err)));
-                        }}
+                        onClick={e => { e.stopPropagation(); downloadMut.mutate(mi.id); }}
                         className="flex items-center gap-1 text-[10px] text-purple-600 dark:text-purple-400 hover:underline mt-1"
                       >
                         <Download size={10} /> {t('midiStudio.downloadModel')}
@@ -406,8 +419,7 @@ export const MidiStudio: React.FC = () => {
                 </span>
               ) : (
                 <button
-                  onClick={() => startModelDownload(BEAT_MODEL).then(refreshStatus).catch(err =>
-                    setSubmitError(err instanceof Error ? err.message : String(err)))}
+                  onClick={() => downloadMut.mutate(BEAT_MODEL)}
                   className="flex items-center gap-1 text-[11px] text-purple-600 dark:text-purple-400 hover:underline"
                 >
                   <Download size={11} /> {t('midiStudio.tempoModelDownload')}
@@ -417,6 +429,17 @@ export const MidiStudio: React.FC = () => {
                 <span className="text-[11px] text-red-500 dark:text-red-400">{beatState.error.slice(0, 120)}</span>
               )}
             </div>
+
+            {/* Speculative decoding: only the large model gains from it */}
+            {model === 'large' && (
+              <div className="mt-3 flex items-center gap-2 flex-wrap text-xs">
+                <Toggle size="sm" accent="purple" checked={speculative} onChange={handleSpeculativeChange}
+                  label={t('midiStudio.speculative')} info={t('midiStudio.speculativeInfo')} />
+                {speculative && !status?.models?.small?.downloaded && (
+                  <span className="text-[11px] text-zinc-400 dark:text-zinc-500">{t('midiStudio.speculativeNeedsSmall')}</span>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Primary action morphs with the selected model's state:
@@ -424,12 +447,7 @@ export const MidiStudio: React.FC = () => {
           <div className="mt-4 flex items-center gap-3 flex-wrap">
             {modelState && !modelState.downloaded ? (
               <button
-                onClick={() => {
-                  if (modelState.downloading) return;
-                  setSubmitError('');
-                  startModelDownload(model).then(refreshStatus).catch(err =>
-                    setSubmitError(err instanceof Error ? err.message : String(err)));
-                }}
+                onClick={() => { if (modelState.downloading) return; setSubmitError(''); downloadMut.mutate(model); }}
                 disabled={modelState.downloading || engineMissing}
                 className="px-5 py-2.5 rounded-lg text-sm font-semibold bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-60 disabled:cursor-wait transition-colors flex items-center gap-2"
               >

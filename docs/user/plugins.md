@@ -16,9 +16,9 @@ covered in [plugin authoring](../dev/plugins-authoring.md).
 
 On ACE-Step 1.5 the pickers are in the **Generation** section of the generation bar:
 
-- **Solver**, grouped into "Single Evaluation (1 NFE)", "Multi Evaluation" and, when any
-  are installed, "Adaptive (Variable NFE)". Multi-evaluation entries show their NFE in the
-  name. The default is Euler.
+- **Solver**. One-evaluation solvers come first, then multi-evaluation solvers with their
+  NFE added to the name, then adaptive solvers that choose their own count. The default is
+  Euler.
 - **Schedule**. Besides the scheduler plugins, the list has three entries built into the
   app that are not plugins: **Beta (Custom)**, **Power** and **Composite (2-Stage)**, each
   with its own sliders. The default is Linear.
@@ -41,37 +41,57 @@ solvers can disturb the seams between the windows MiniMax-Music3 renders. Solver
 take over the whole sampling loop, and the Beta, Power and Composite schedules, are not
 offered there.
 
-YuE2 does not use these plugins.
+On Stable Audio 3 the Generation section has its own **Sampler** choice. Its default, MD
+Pingpong Blend, is itself a solver plugin and needs nothing else switched on. The shared
+pickers work as on MiniMax-Music3: turn on **Sampler Plugins**, and each picker has a
+**Native** option. Full-loop solvers and the Beta, Power and Composite schedules are not
+offered there either. Guidance does little, because Stable Audio 3 has no unconditional
+prediction to steer against.
+
+YuE2 does not offer these pickers. Its Generation section has its own **NAR Solver** and
+**NAR Scheduler** choices instead. The defaults, Midpoint and Uniform, are YuE2's own
+sampling; the experimental choices run the YuE2 plugins in the tables below, plus MD HT
+Scheduler V3. Most of them show their settings as YuE2 controls under the choice.
+Ancestral Euler, Plan-Aware and Plan-Loose have none and run on their plugin defaults
+unless a profile sets them, as the [Plan Play presets](presets/yue2-plan-play/README.md)
+do for Ancestral Euler and Plan-Loose.
 
 The StableStep refine in the **Post-processing** section has its own Solver, Schedule and
-Guidance pickers, separate from the generation ones. Guidance does little there, because
-that model has no unconditional prediction to steer against.
+Guidance pickers, separate from the generation ones. Guidance does little there, for the
+same reason. Solvers that take over the whole sampling loop are listed there too, but the
+refine runs its native ping-pong step in their place and says so in the engine log.
 
-A fourth plugin type, post-process, hooks the ACE-Step VAE decode. Those plugins appear
-in the Post-processing section and are not listed on this page.
+A fourth plugin type, post-process, replaces the ACE-Step VAE decode. Those plugins appear
+in the Post-processing section as the Tiled Decoder and are listed at the end of this
+page.
 
 ## Adding a plugin
 
-Plugins are single `.lua` files, and the engine looks in two places, each with one
+Plugins are `.lua` files, and the engine looks in up to three places, each with one
 subfolder per type (`solvers`, `schedulers`, `guidance`, `postprocess`):
 
 | Folder | What goes there |
 |---|---|
 | `engine/plugins/<type>/` | The built-in set that ships with the app |
-| `plugins/<type>/` at the top of the install folder | Community plugins. The app ships a few third-party ones here (the `md_*` files), with user manuals for two of them in `plugins/docs/` |
+| `plugins/<type>/` at the top of the install folder | Community plugins. The app ships its third-party plugins here (the `md_*` files and STORM), with user manuals for two of them in `plugins/docs/` |
+| `plugins/<type>/` in the data folder | Your own plugins in a release build. The data folder stays put when the app is upgraded, and a plugin here replaces a shipped one of the same name |
 
 To add one, copy the `.lua` file into the right subfolder and restart the app. The engine
-reads both folders once at startup, built-in first, and the new plugin appears in its
-dropdown with its settings. Nothing needs rebuilding. Keep your own plugins in `plugins/`
-so they stay apart from the built-in set.
+reads the folders once at startup, in the order above, and the new plugin appears in its
+dropdown with its settings. Nothing needs rebuilding. Some plugins load a companion file
+from their own folder with `require`: the shipped `md_*` solvers share
+`md_solver_commons.lua`, for example. Copy any companion file into the same subfolder. Keep
+your own plugins in the data folder's `plugins/` in a release build, or in `plugins/` in a
+source checkout, so they stay apart from the built-in set.
 
 If a plugin does not show up, check the newest `logs/<session>/ace_engine.log`. The
-engine logs a `[Plugins] Loaded ...` count at startup and a warning for each file it
-skips: a file that declares the wrong type for its folder, or a name that is already
-taken. When two plugins share a name the first one loaded wins, so a community plugin
-in the app's `plugins/` folder cannot replace a built-in one of the same name. The
-exception is the data folder's `plugins/` in release builds: a plugin there replaces
-the built-in of the same name, and the log says which file won.
+engine logs a `[Plugins] Loaded ...` count at startup, an error with the Lua message for a
+file that fails to load, and a warning for each file it skips: a file that declares the
+wrong type for its folder, or a name that is already taken. When two plugins share a
+name the first one loaded wins, so a community plugin in the app's `plugins/` folder
+cannot replace a built-in one of the same name. The exception is the data folder's
+`plugins/` in release builds: a plugin there replaces the built-in of the same name, and
+the log says which file won.
 
 Plugins run in a sandbox with no access to files or the operating system. They can still
 produce bad audio if they are wrong, so treat a new one like any other setting and compare
@@ -141,6 +161,10 @@ counts the settings the plugin adds to the UI. Source says which folder the file
 
 ## Schedulers
 
+MD HT Scheduler v5.1 ships twice, built in and as a community copy with the same name.
+The engine keeps the first one it loads, the built-in copy, and logs the other as a
+duplicate.
+
 <!-- generated:start schedulers -->
 <!-- generated by tools/docs/build-docs.mjs, do not edit by hand -->
 | Scheduler | Id | Params | Description | Source |
@@ -193,7 +217,9 @@ counts the settings the plugin adds to the UI. Source says which folder the file
 
 ## Post-process plugins
 
-Run on the decoded audio after the VAE. Only community plugins exist for this type so far.
+Replace the VAE decode: the plugin receives the DiT's latents, decodes them itself (in
+tiles, for the ones below) and can process the audio before handing it back. Only
+community plugins exist for this type so far.
 
 <!-- generated:start postprocess -->
 <!-- generated by tools/docs/build-docs.mjs, do not edit by hand -->

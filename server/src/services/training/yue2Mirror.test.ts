@@ -327,3 +327,39 @@ test('the worker manifest lists weights, meters, logs and previews but never the
     assert.equal((await fetch(base + encodeURIComponent('../album/../album_worker_side/train.jsonl'))).status, 404);
   } finally { server.close(); }
 });
+
+test('a done worker run is linked here once mirrored, so it is offered as an adapter after the worker copy is gone', async () => {
+  const { readYue2Linked } = await import('./lyricStudioExport.js');
+  const fake = await fakeWorker([ladder('job-link', 'album_link', 'done')]);
+  try {
+    await sync('LinkW', fake);
+    assert.deepEqual(fake.deletes, ['job-link']);
+    const run = localRun('LinkW', 'job-link')!;
+    const ckpt = run.checkpoints.find(c => c.step === 10)!;
+    const linked = readYue2Linked().album;
+    assert.equal(linked?.arPath, ckpt.arPath);
+    assert.equal(linked?.narPath, ckpt.narPath);
+  } finally { fake.close(); }
+});
+
+test('the worker copy is not deleted until the link is recorded; the next pass retries and then deletes', async () => {
+  const linkedFile = path.join(process.env.TRAINING_DIR!, 'yue2-linked.json');
+  const fake = await fakeWorker([ladder('job-retry', 'album_retry', 'done')]);
+  const saved = fs.existsSync(linkedFile) ? fs.readFileSync(linkedFile) : null;
+  try {
+    // A directory where the file belongs makes the atomic rename fail.
+    fs.rmSync(linkedFile, { force: true }); fs.mkdirSync(linkedFile);
+    const failed = await sync('RetryW', fake);
+    assert.match(failed.lastError ?? '', /could not link/);
+    assert.deepEqual(fake.deletes, [], 'no DELETE while the link is unrecorded');
+    fs.rmSync(linkedFile, { recursive: true });
+    await sync('RetryW', fake);
+    assert.deepEqual(fake.deletes, ['job-retry']);
+    const { readYue2Linked } = await import('./lyricStudioExport.js');
+    assert.ok(readYue2Linked().album?.arPath.includes('album_retry'));
+  } finally {
+    fake.close();
+    fs.rmSync(linkedFile, { recursive: true, force: true });
+    if (saved) fs.writeFileSync(linkedFile, saved);
+  }
+});

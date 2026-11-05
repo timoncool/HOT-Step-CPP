@@ -17,6 +17,11 @@ export interface GenerationJob {
   stage?: string;
   progress?: number;
   aceJobId?: string;  // Current ace-server job ID (LM or synth)
+  /** Engine worker (engineWorkers.ts) the engine job ids belong to. Ids are
+   *  per process, so two workers can hand out the same one: cancel, streams and
+   *  downloads issued outside the job's own scope must go to this worker
+   *  (workerForJob). Absent means the primary. */
+  workerId?: string;
   /** Fine-grained engine phase pulled from GET /job (e.g. "adapter_precompute").
    *  Surfaces "stuck in the ~17 s adapter precompute" vs. "actually failed". */
   acePhase?: string;

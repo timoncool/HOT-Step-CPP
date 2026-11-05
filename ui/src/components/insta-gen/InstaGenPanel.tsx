@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { inspireProvidersOptions, inspirePromptOptions } from '../../queries/studios/resources';
-import { sharedKeys } from '../../queries/keys';
+import { readSong } from '../../queries/shell-queue/queue';
 import { queryManager } from '../../queries/invalidation';
 // InstaGenPanel.tsx — Main Insta-Gen studio container
 //
@@ -27,7 +27,6 @@ import {
   type InstaWorkflowInput,
   type InspireResult,
 } from '../../services/inspireApi';
-import { songApi } from '../../services/api';
 import {
   addManualQueueItem,
   updateManualQueueItem,
@@ -209,7 +208,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
         audioDuration: audio.duration,
       });
       if (songId) {
-        try { const { song } = await client.query({ queryKey: sharedKeys.song(songId), queryFn: ({ signal }) => songApi.get(songId, { signal }) }); onSongCreated?.(song); } catch { /* library refresh still runs */ }
+        try { const { song } = await readSong(songId); onSongCreated?.(song); } catch { /* library refresh still runs */ }
       }
     } catch (err: any) {
       failManualQueueItem(queueId, err.message || 'Generation failed');
@@ -250,9 +249,11 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
       if (editedLyrics !== previewDocument.lyrics || editedCaption !== previewDocument.caption) {
         const current = await instaWorkflowApi.getDocument(previewDocument.id);
         if (current.document.revision !== revision) throw new Error('Preview changed elsewhere; reopen it before generating');
+        // Silent: this handler owns the failure display (the panel's error line),
+        // so a transport toast would be a second copy of the same error.
         const { document } = await instaWorkflowApi.updateDocument(previewDocument.id, revision, {
           ...current.document.data, edits: { lyrics: editedLyrics, caption: editedCaption },
-        });
+        }, { silent: true });
         revision = document.revision;
       }
       const { job } = await instaWorkflowApi.approve(previewDocument.id, revision);
@@ -426,7 +427,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
                           if (!confirm('Reset to default prompt? Your customizations will be lost.')) return;
                           try {
                             await resetInstagenPrompt();
-                            await queryManager.keys(client, inspirePromptOptions().queryKey);
+                            await queryManager.invalidate(client, inspirePromptOptions().queryKey);
                             setPromptContent(promptDefault);
                             setPromptIsCustom(false);
                             setPromptDirty(false);
@@ -444,7 +445,7 @@ export const InstaGenPanel: React.FC<InstaGenPanelProps> = ({ onSongCreated, act
                       setPromptSaving(true);
                       try {
                         await saveInstagenPrompt(promptContent);
-                        await queryManager.keys(client, inspirePromptOptions().queryKey);
+                        await queryManager.invalidate(client, inspirePromptOptions().queryKey);
                         setPromptDirty(false);
                         setPromptIsCustom(true);
                       } catch { /* ignore */ }

@@ -10,7 +10,7 @@
 // the server no longer holds the events in between.
 
 import { getAuthToken } from './axiosClient';
-import { ApiError } from './apiError';
+import { ApiError, HttpStatus } from './apiError';
 import { apiClient, type ClientOptions } from './httpClient';
 import type {
   WorkflowDocument, WorkflowEvent, WorkflowJob, WorkflowJobStatus, WorkflowReplay,
@@ -35,8 +35,8 @@ const id = (v: string) => encodeURIComponent(v);
 const FINAL = new Set<WorkflowJobStatus>(['succeeded', 'failed', 'cancelled', 'interrupted']);
 
 export const workflowApi = {
-  submit: (kind: string, idempotencyKey: string, input: Record<string, unknown>) =>
-    call<{ job: WorkflowJob; created: boolean }>('/jobs', 'POST', { kind, idempotencyKey, input }),
+  submit: (kind: string, idempotencyKey: string, input: Record<string, unknown>, opts?: ClientOptions) =>
+    call<{ job: WorkflowJob; created: boolean }>('/jobs', 'POST', { kind, idempotencyKey, input }, opts),
   list: (filter: { kind?: string; status?: WorkflowJobStatus } = {}) =>
     call<{ jobs: WorkflowJob[] }>(`/jobs?${new URLSearchParams(filter as Record<string, string>)}`),
   get: (jobId: string, after = 0, opts?: ClientOptions) =>
@@ -49,8 +49,8 @@ export const workflowApi = {
   listDocuments: (kind: string) => call<{ documents: WorkflowDocument[] }>(`/documents?kind=${id(kind)}`),
   getDocument: (docId: string) => call<{ document: WorkflowDocument }>(`/documents/${id(docId)}`),
   /** Throws ApiError with status 409 and currentRevision when stale. */
-  updateDocument: (docId: string, expectedRevision: number, data: Record<string, unknown>) =>
-    call<{ document: WorkflowDocument }>(`/documents/${id(docId)}`, 'PUT', { expectedRevision, data }),
+  updateDocument: (docId: string, expectedRevision: number, data: Record<string, unknown>, opts?: ClientOptions) =>
+    call<{ document: WorkflowDocument }>(`/documents/${id(docId)}`, 'PUT', { expectedRevision, data }, opts),
   removeDocument: (docId: string, expectedRevision: number) =>
     call<{ removed: true }>(`/documents/${id(docId)}?expectedRevision=${expectedRevision}`, 'DELETE'),
 };
@@ -80,7 +80,7 @@ export async function followJob(jobId: string, handlers: FollowHandlers,
       if (!response.ok || !response.body) {
         const value = await response.json().catch(() => ({}));
         // A missing job or a bad request will not fix itself by retrying.
-        if (response.status === 404 || response.status === 401 || response.status === 400) {
+        if (response.status === HttpStatus.notFound || response.status === HttpStatus.unauthorized || response.status === HttpStatus.badRequest) {
           throw new ApiError(response.status, value.error || `Cannot follow job (${response.status})`, value);
         }
         throw new Error(value.error || `Cannot follow job (${response.status})`);

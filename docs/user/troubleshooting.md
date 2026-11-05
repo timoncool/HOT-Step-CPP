@@ -7,8 +7,11 @@ put in a bug report.
 
 ## Where the logs are
 
-The app writes one folder per session into `logs/`, next to the launcher. Folder names are the
-start time, so the last one alphabetically is the newest.
+The app writes one folder per session into `logs/` in the data folder, which is
+`HOT-Step-Data/logs/` beside the app folder unless you moved it (see
+[Data folder and upgrades](data-folder.md)). A git checkout without a data folder writes to
+`logs/` in the checkout. Folder names are the start time, so the last one alphabetically is
+the newest.
 
 ```
 logs/2026-09-25_14-03-12/
@@ -31,8 +34,8 @@ logs/2026-09-25_14-03-12/
 - A training log is written live while the job runs, so it is there to read (or send) mid-run.
   It starts with the exact trainer command line (every setting the run used), then holds the
   job's own messages, the trainer's raw output (loss and step lines), and the end state:
-  `END | done`, `END | failed: <reason>` or `END | cancelled`. Training that runs on another PC
-  through a training worker writes its log on that PC.
+  `END   | done`, `END   | failed: <reason>` or `END   | cancelled`. Training that runs on
+  another PC through a training worker writes its log on that PC.
 - Only the gen and training logs have timestamps. To line up a job with engine output, search
   `node_console.log` for the job id from the gen log file name.
 - Every restart starts a new folder. When you look into a failure, take all three files from
@@ -51,7 +54,10 @@ the number says a lot:
 | `3221226505` (0xC0000409) | The engine crashed. The lines just before it say where. |
 | `3221225477` (0xC0000005) | Access violation. Seen right after a failed GPU memory allocation. |
 | `3221225786` (0xC000013A) | The console window was closed or Ctrl+C was pressed. |
-| `1`, right after `[Server] Shutting down...` | Normal shutdown, not a crash. |
+
+A deliberate stop logs no exit code. **Quit**, **Restart**, a training job taking the GPU and
+the server shutting down all show `[Server] Stopping ace-server (pid N)` and the reason
+instead.
 
 ## The engine will not start
 
@@ -64,9 +70,11 @@ it, usually because the archive was only partly extracted or files were moved ou
 `Process exited with code 3221225781`. Windows could not find a DLL. On the CUDA builds this is
 almost always the CUDA runtime (`cublas64_13.dll`, `cublasLt64_13.dll`, `cudart64_13.dll`, or
 the `_12` versions on the `cuda12.8` and `cuda12-volta` builds), which the first launch
-downloads into `engine/`. See [The GPU is not used](#the-gpu-is-not-used) for how to get them.
-To make Windows name the missing file, open a command prompt in `engine/` and run
-`ace-server.exe --models ..\models --port 8085` directly; the error dialog names the DLL.
+downloads into the data folder's `tools/runtime/`. See [The GPU is not used](#the-gpu-is-not-used)
+for how to get them. To make Windows name the missing file, quit HOT-Step, open a command
+prompt in `engine/`, run `set PATH=<data folder>\tools\runtime;%PATH%`, then run
+`ace-server.exe --models <data folder>\models --port 8085` directly; the error dialog names
+the DLL.
 
 `[Server] ERROR: no models found in <path>`. There are no model files yet. See
 [No models found](#no-models-found).
@@ -83,11 +91,14 @@ and it stops trying: `Crashed 3 times within 30s` and generation requests are re
 `Engine not ready`. Crashes spaced further apart than 30 seconds, such as a crash on every
 generation, keep restarting indefinitely.
 
+After giving up, the engine starts again by itself once a model download in the Model Manager
+finishes. An empty models folder does not count as a crash at all; see
+[No models found](#no-models-found).
+
 The restarting is not the problem, the crash is. Read the engine lines just before the first
 `Process exited with code`. The usual causes:
 
 - A missing DLL, covered above.
-- No models installed, covered [below](#no-models-found).
 - A broken model file. `[GGUF] FATAL: '<file>' is truncated or corrupt` means an interrupted
   download; `[GGUF] FATAL: tensor '<name>' not found` means the file is not what its name
   claims. Delete that file in the Model Manager and download it again.
@@ -104,23 +115,28 @@ listens on 127.0.0.1.
 If something else holds port 3001, `node_console.log` shows
 `[Server] Uncaught exception: Error: listen EADDRINUSE`, and the browser shows whatever that
 other program serves. One user saw an "Upgrade Required" page this way. Close the other program,
-or set a different port in `.env` (`SERVER_PORT=3002`) and open that address yourself; the
+or set a different port in `settings/.env` in the data folder (`SERVER_PORT=3002`; a git
+checkout without a data folder uses `.env` at its root) and open that address yourself; the
 launcher always opens 3001.
 
 If port 8085 is taken, `ace_engine.log` shows `[Server] FATAL: cannot bind 127.0.0.1:8085` and
 the engine exits without the usual restart messages. The most likely holder is an `ace-server`
 left over from an earlier session. Quit HOT-Step, end any remaining `ace-server` process, and
 start again. To use another port, change **Engine port** on the Environment tab of Settings
-(`ACESTEPCPP_PORT` in `.env`) and restart.
+(`ACESTEPCPP_PORT` in `settings/.env`) and restart.
 
 ## No models found
 
-`[Server] ERROR: no models found in <path>` on a fresh install is expected: download a starter
-pack in the [Model Manager](studios/model-manager.md), then click **Restart**. The engine only
-scans for models when it starts. See [Getting started](getting-started.md#download-your-first-models).
+`[Server] ERROR: no models found in <path>` on a fresh install is expected. The server does not
+count it as a crash: it logs `[ace-server] No models installed` and waits, and a banner under
+the top bar offers **Open Model Manager**. Download a starter pack in the
+[Model Manager](studios/model-manager.md) and the engine starts by itself once the downloads
+finish. A `.gguf` file you copy straight into the models folder also starts it, a few seconds
+after the copy completes. See [Getting started](getting-started.md#download-your-first-models).
 
 If you have models and still see it, check **Models directory** on the Environment tab of
-Settings points at the right folder.
+Settings points at the right folder. In a release the models folder is `models/` in the data
+folder (`HOT-Step-Data/models/` by default), not a `models/` folder inside the app.
 
 Other model messages in `ace_engine.log`:
 
@@ -128,7 +144,7 @@ Other model messages in `ace_engine.log`:
 |---|---|---|
 | `WARNING: /synth unavailable, missing: VAE` (or DiT, Text-Enc) | ACE-Step 1.5 needs a DiT, a text encoder and a VAE together. One is missing. | Download the missing one. The Quick Start pack has all three. |
 | `[Registry] WARNING: skipping <file> (unknown architecture)` | The file is not an ACE-Step model the engine recognises. | Remove it from the models folder. |
-| `No ACE-Step models in <path>`, then `continuing without ACE` | Only MiniMax-Music3 or YuE2 files are installed. | Nothing, if that is what you want. |
+| `No ACE-Step models in <path>`, then `continuing without ACE` | Only MiniMax-Music3, YuE2 or Stable Audio 3 files are installed. | Nothing, if that is what you want. |
 
 A file that shows as installed in the Model Manager but is missing from the model dropdowns
 is usually in a subfolder. ACE-Step 1.5 files must sit directly in `models/`; the engine does
@@ -149,9 +165,11 @@ huggingface.co.
 - `Size mismatch` means the file arrived incomplete. Download it again.
 
 If Hugging Face is unreachable from your network, you can download the files another way and
-place them by hand. Model files go in `models/` (or `models/mm3/`, `models/yue2/` for those
-backends); the CUDA runtime DLLs go in `engine/`, next to `ace-server`. [Model files](models.md)
-lists every file and its source repo.
+place them by hand. Model files go in the models folder (`models/` in the data folder), and
+those for MiniMax-Music3, YuE2, MOSS, stem separation and Whisper go in its `mm3/`, `yue2/`,
+`moss/`, `supersep/` and `whisper/` subfolders. The CUDA runtime DLLs go in the data folder's
+`tools/runtime/`; next to `ace-server` in `engine/` also works. [Model files](models.md) lists
+every file and its source repo.
 
 ## Out of VRAM
 
@@ -162,16 +180,15 @@ Try these in order.
 1. Lower **VAE chunk size** on the Environment tab of Settings, then restart. The default is
    1024. 512 fixed decode crashes on 8 GB cards; 256 was needed on a 4 GB card. Decoding gets
    somewhat slower (one report went from about 4 to 7 seconds). The VAE only splits a track
-   into chunks when it is longer than the chunk size (1024 is about 41 seconds of audio), so a
-   short track can fail at the default while a long one works.
+   into chunks when it is longer than the chunk size (1024 is about 41 seconds of audio). Since
+   v1.3.5 a shorter track that would not fit in free VRAM in one piece is split into chunks of
+   256 by itself, and the engine log says `[VAE] Untiled decode of ... tiling at 256`.
 2. Turn off **Keep DiT & VAE loaded** (Performance tab) and **Keep Models in VRAM**
    (Environment tab).
 3. Use a smaller quant or pack. See the pack table in
    [Getting started](getting-started.md#which-pack-fits-your-gpu).
 4. With two GPUs, check which one the engine picked. The console's `[Server] GPU:` line names
    it. **GPU Device** on the Environment tab chooses; Auto picks the card with the most VRAM.
-
-<!-- TODO(verify): a37a1572 (on master after v1.3.4) makes the engine tile automatically when an untiled VAE decode would not fit. Once released, step 1 can say which version no longer needs the manual setting. -->
 
 If VRAM stays full after one render and the next fails straight away, **Restart** frees it.
 Please report it with the logs from that session, since the cause is not yet known.
@@ -180,12 +197,15 @@ Please report it with the logs from that session, since the cause is not yet kno
 
 Generation that is far slower than expected usually means the engine fell back to CPU. The
 engine log says which device each model loaded on, for example `[Load] LM backend: CUDA0`.
+Once a model has loaded, `http://localhost:3001/api/health` reports the same device under
+`engine.device`.
 
 - Windows CUDA builds, first launch: if the CUDA runtime download failed, the console shows a
-  `GPU Runtime Download Failed` box and the engine starts on CPU only. Open the Model
-  Manager, go to the **Shared** tab and download the **CUDA 13 Runtime** pack (**CUDA 12
-  Runtime** on the `cuda12.8` and `cuda12-volta` builds), or restart with a working internet
-  connection. Then restart.
+  `GPU Runtime Download Failed` box and the engine starts on CPU only. If the missing file is
+  `cudart64_13.dll` (or `cudart64_12.dll`), the engine exits with `3221225781` instead. Open
+  the Model Manager, go to the **Shared** tab and download the **CUDA 13 Runtime** pack
+  (**CUDA 12 Runtime** on the `cuda12.8` and `cuda12-volta` builds), or restart with a working
+  internet connection. Then restart.
 - `[Load] WARNING: ggml-cuda.dll found but CUDA backend did not load.` The lines after it test
   each DLL and mark the missing one with `NOT FOUND in engine dir`. If every DLL loads, the
   engine suggests checking the driver with `nvidia-smi`.
@@ -209,10 +229,18 @@ engine log says which device each model loaded on, for example `[Load] LM backen
 
 Read the reason at the end of the job's gen log.
 
-`Generation stalled`, with the seconds and the last stage. The server cancels a job that shows
-no progress for two minutes (fifteen during VAE decode). The quoted stage says where it stopped;
-the end of `ace_engine.log` says what the engine was doing. While the engine is computing it
-cannot answer web requests, so an unresponsive engine is not necessarily a dead one.
+`Generation stalled`, with the seconds and the last stage. A stage that counts steps gets two
+minutes without a new step. The server then asks the engine, and keeps waiting while the
+engine says the job is still running, until fifteen minutes have passed with no progress.
+Stages that report only once, such as model loading, adapter merging and VAE decode, get the
+same fifteen minutes. YuE2's NAR stage gets longer on long renders. The quoted stage says
+where it stopped; the end of `ace_engine.log` says what the engine was doing. While the engine
+is computing it cannot answer web requests, so an unresponsive engine is not necessarily a
+dead one.
+
+`Generation lost: the engine crashed mid-render`. The engine process died during the job. The
+lines before `Process exited with code` in `node_console.log` say why; see
+[The engine keeps restarting](#the-engine-keeps-restarting).
 
 `Generation timed out`, with the limit in minutes. The whole job took longer than
 **Generation Timeout** on the Performance tab of Settings (default 30 minutes, up to 6 hours).
@@ -222,15 +250,19 @@ with the TensorRT renderer also builds its engine once, which takes a few minute
 `Generation failed on ace-server`. The engine rejected or failed the job without saying why to
 the server. The reason is in `ace_engine.log`; look for `FATAL` or `failed` near the end.
 
-`Engine not ready`. The engine is still starting, still downloading the CUDA runtime, or has
-stopped after repeated crashes. See [The engine keeps restarting](#the-engine-keeps-restarting).
+`Engine not ready`. The engine is still starting, still downloading the CUDA runtime, is
+waiting because no models are installed (see [No models found](#no-models-found)), or has
+stopped after repeated crashes (see [The engine keeps restarting](#the-engine-keeps-restarting)).
 
-If the queue stays stuck after you cancel, **Restart** clears it. Without restarting, this
-request cancels every unfinished job:
+If the queue stays stuck after you cancel, click **Reset** at the top of the Queue section in
+the right-hand column and confirm. It cancels every active and pending generation. The same
+reset is available as a request:
 
 ```
 curl -X POST http://localhost:3001/api/generate/reset-queue
 ```
+
+**Restart** also ends every job the server is running.
 
 ## Node.js version
 
@@ -246,8 +278,9 @@ Security software can quarantine unsigned programs and scripts, and nothing in H
 signed. It has happened to a `.bat` file in the HOT-Step folder under Bitdefender. The signs
 are a launcher or DLL that disappears, or the engine exiting with `3221225781`. Check the
 antivirus history (on Windows: Windows Security, Virus & threat protection, Protection history),
-restore the file, and add the HOT-Step folder as an exclusion. Extracting the archive again also
-restores anything that went missing.
+restore the file, and add the HOT-Step app folder and its data folder (which holds the
+downloaded runtime DLLs) as exclusions. Extracting the archive again also restores anything
+that went missing from the app folder.
 
 ## macOS blocks the app
 
@@ -255,7 +288,7 @@ The release binaries are unsigned, so macOS may quarantine them. Remove the quar
 once after extracting:
 
 ```bash
-xattr -cr /path/to/HOT-Step-CPP-v1.3.4-macOS-arm64/
+xattr -cr /path/to/HOT-Step-CPP-v1.4.2-macOS-arm64/
 ```
 
 ## After upgrading
@@ -263,12 +296,25 @@ xattr -cr /path/to/HOT-Step-CPP-v1.3.4-macOS-arm64/
 - The Model Manager shows **Update** on a file when a newer version of it has been published.
   It compares the file on disk against the catalogue's checksum. Download it to replace the old
   copy.
-- To reuse models from an older install, point **Models directory** on the Environment tab of
-  Settings at the old `models/` folder and restart, or move the folder across.
+- From v1.4.1 the library, models, adapters and settings live in the data folder, and a new
+  release finds it through the saved location. To bring in an install from before v1.4.1, use
+  **Import previous install** in Settings; see [Data folder and upgrades](data-folder.md). To
+  reuse only its models, point **Models directory** on the Environment tab of Settings at the
+  old `models/` folder and restart.
 - On macOS before v1.3.4, **Restart** stopped the app and never brought it back. The launcher
   has a restart loop from v1.3.4.
 
-<!-- TODO(verify): whether copying server/data/ and .env from an old release folder into a new one is the supported way to keep the library and settings. -->
+## The app shows a data folder page
+
+If the browser shows "HOT-Step cannot open its data folder" instead of the app, the server
+could not open the data folder, or finish moving it, at startup. The page and the launch
+console give the reason. Keep the profile pointer (`data-location.json`), fix the reported
+path or reconnect the drive, then restart. An interrupted transfer resumes on the next start.
+
+A saved folder that is only missing does not stop startup: the app falls back to
+`HOT-Step-Data` beside the app folder, warns in the console, and may show an empty library
+until you reconnect the drive and restart.
+See [Data folder and upgrades](data-folder.md#recover-a-missing-drive-or-interrupted-transfer).
 
 ## A sidechain VST does nothing
 
@@ -302,7 +348,4 @@ maintainer is most active.
 - [Model Manager](studios/model-manager.md)
 - [Settings](studios/settings.md)
 - [Model files](models.md)
-
-## Release data location
-
-In a release, session logs live under the shared data folder's `logs/`, and settings under `settings/.env`. If startup shows a data-folder explanation page, retain the profile pointer, fix the reported path or reconnect the drive, then restart. See [Data folder and upgrades](data-folder.md). Development checkouts keep their existing log and settings paths.
+- [Data folder and upgrades](data-folder.md)

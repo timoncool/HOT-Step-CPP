@@ -9,6 +9,21 @@
 // ─── Core enums ────────────────────────────────────────────────────────────
 export type TagPosition = 'prepend' | 'append' | 'replace';
 
+/** SA3 Medium DoRA-rows. Resume uses the saved recipe and prepared snapshot;
+ * only the total step target may be increased. */
+export interface StartSa3TrainingRequest {
+  adapterName?: string;
+  steps?: number;
+  rank?: number;
+  alpha?: number;
+  learningRate?: number;
+  duration?: number;
+  seed?: number;
+  checkpointEvery?: number;
+  exportEvery?: number;
+  resumeRun?: string;
+}
+
 export type MergePolicy =
   | 'fill_missing'        // default: only write fields currently empty
   | 'overwrite_caption'
@@ -16,8 +31,10 @@ export type MergePolicy =
   | 'overwrite_all';
 
 export type TrainingJobKind =
-  | 'label' | 'enhance-genius' | 'enhance-caption' | 'enhance-yue2-caption' | 'build'
-  | 'preprocess' | 'train-lm' | 'train-dit'
+  | 'label' | 'enhance-genius' | 'enhance-caption' | 'enhance-yue2-caption' | 'normalise-lyrics' | 'build'
+  | 'preprocess' | 'train-lm' | 'train-dit' | 'sa3-train'
+  // HeartMuLa backbone LoRA (contracts/heartmulaTraining.ts); GPU-lane.
+  | 'heartmula-prepare' | 'heartmula-train'
   | 'audition' | 'lm-calibrate' | 'dit-calibrate'
   // MiniMax-Music3 (docs/plans/2026-08-20-mm3-training-server-design.md §2.1).
   // Both are GPU-lane and both stop the engine: an MM3 training step peaks at
@@ -285,7 +302,7 @@ export type SampleLabelStatus =
   | 'processing'  // currently being labeled
   | 'error';      // last label attempt failed (see `error`)
 
-export type FieldSource = 'sidecar' | 'understand' | 'essentia' | 'genius' | 'llm' | 'tags' | 'filename' | 'user';
+export type FieldSource = 'sidecar' | 'understand' | 'essentia' | 'beat_this' | 'sheetsage' | 'genius' | 'flamingo' | 'llm' | 'tags' | 'filename' | 'user';
 
 // ─── Dataset ──────────────────────────────────────────────────────────────
 export interface TrainingDatasetSummary {
@@ -456,6 +473,9 @@ export interface TrainingCapabilities {
    * and `missing` says which so the UI can tell the user the right thing.
    */
   moss: { available: boolean; missing: string };
+  /** Music Flamingo: the second local audio model (captions, and the lyric
+   *  transcriber behind LabelOptions.localLyrics). Same probe as `moss`. */
+  flamingo: { available: boolean; missing: string };
   llm: {
     configured: boolean;
     defaultProvider: string;
@@ -521,6 +541,8 @@ export interface TrainingMetricEvent {
   trainMs?: number;
   /** eval: how many fixed held-out crops the number averages. */
   crops?: number;
+  /** YuE2 joint, on `eval`: one planner-gate reading (held-out CE). */
+  plannerGate?: { ce: number; best: number; bestStep: number; stale: number; patience: number; armed: boolean; epoch: number; items: number };
   etaMs?: number;
   ms?: number;
   best?: boolean;
@@ -653,9 +675,18 @@ export interface UnderstandOverrides {
 export interface LabelOptions {
   sampleIds?: string[];
   scope?: 'all' | 'unlabeled';
-  useEssentia?: boolean;   // default true  — local BPM/key
+  useEssentia?: boolean;   // default true  — local BPM/key (the analysis pass, whatever its sources)
   essentiaTempo?: { minTempo?: number; maxTempo?: number };
-  useGenius?: boolean;     // default false — canonical lyrics (needs token)
+  /** Where BPM comes from; the other source is the fallback. Default beat_this (HOTSTEP-730). */
+  tempoSource?: 'beat_this' | 'essentia';
+  /** Where key comes from; sheetsage also saves the lead sheet beside the audio. Default sheetsage. */
+  keySource?: 'sheetsage' | 'essentia';
+  useGenius?: boolean;     // default false — Genius lyrics (needs token; scraper, fragile)
+  /** Transcribe lyrics locally with Music Flamingo for every target that still has
+   *  none after the Genius step (or all of them, without Genius); under an
+   *  overwrite merge policy, existing lyrics are re-transcribed too.
+   *  Section-tagged. Default ON when Music Flamingo is installed. */
+  localLyrics?: boolean;
   useCaption?: boolean;    // default false — LLM caption+genre (audio-grounded on gemini)
   useUnderstand?: boolean; // default false — LEGACY /understand path (2026-07-27 pivot)
   mergePolicy?: MergePolicy;
@@ -669,6 +700,13 @@ export interface LabelOptions {
    *  labelling. Set by the bulk pipeline, for which an already-labelled dataset
    *  is a completed stage rather than a failure. */
   allowEmpty?: boolean;
+}
+
+export interface NormaliseLyricsOptions {
+  sampleIds?: string[];
+  /** Untagged lyrics: recover sections from the audio (Music Flamingo transcript,
+   *  aligned word by word; the existing words are kept). Needs the GPU. */
+  retag?: boolean;
 }
 
 export interface GeniusOptions {

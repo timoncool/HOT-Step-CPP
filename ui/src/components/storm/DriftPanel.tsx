@@ -2,10 +2,14 @@
 // MDMAchine / A&E Concepts 2026
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { usePersistedState } from '../../hooks/usePersistedState';
+import { stormDriftOptions } from '../../queries/shell-queue/queue';
+import { apiClient } from '../../services/httpClient';
 import type { useStreamAudio } from '../../hooks/useStreamAudio';
 import { Toggle } from '../shared/Toggle';
 import { ParamLabel } from '../shared/ParamLabel';
+import { QueryError } from '../shared/QueryError';
 
 // ---------------------------------------------------------------------------
 // Types mirrored from server/src/services/storm/drift.ts
@@ -32,17 +36,6 @@ interface ParamSpec {
   max: number;
   step: number;
   int?: boolean;
-}
-
-interface DriftSnapshot {
-  pos: Record<string, number>;
-  captionWeights: Record<string, number>;
-  seed: number;
-  slot: number;
-  pull: number;
-  rate: number;
-  jitter: number;
-  targetCaption: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -221,8 +214,14 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
     defaultPressure(),
   );
 
-  // Live snapshot from GET /storm/control
-  const [snapshot, setSnapshot] = useState<DriftSnapshot | null>(null);
+  // Live snapshot from GET /storm/control, polled only while streaming.
+  const driftQuery = useQuery({
+    ...stormDriftOptions(streamId),
+    enabled: sa.isPlaying,
+    refetchInterval: 2000,
+    refetchIntervalInBackground: true,
+  });
+  const snapshot = sa.isPlaying ? driftQuery.data?.drift ?? null : null;
 
   // Custom tag set editing
   const [newSetName, setNewSetName] = useState('');
@@ -236,11 +235,9 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
   const postPressure = useCallback((p: DriftPressure) => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      fetch('/api/generate/storm/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId, drift: p }),
-      }).catch(() => {});
+      // Silent: a dropped control tick is replaced by the next one; a toast per
+      // failure while dragging a slider would be noise.
+      void apiClient.post('/generate/storm/control', { streamId, drift: p }, { silent: true }).catch(() => {});
     }, 400);
   }, [streamId]);
 
@@ -258,11 +255,7 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
     const slotAtPress = snapshot?.slot ?? -1;
     // Update local state so UI and server agree immediately.
     setPressure(prev => ({ ...prev, pull: 1 }));
-    fetch('/api/generate/storm/control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ streamId, drift: { pull: 1 } }),
-    }).catch(() => {});
+    void apiClient.post('/generate/storm/control', { streamId, drift: { pull: 1 } }, { silent: true }).catch(() => {});
     pullRestoreRef.current = { prevPull, slotAtPress };
   }, [streamId, pressure, snapshot, setPressure]);
 
@@ -277,11 +270,7 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
     if (snapshot.slot > threshold) {
       pullRestoreRef.current = null;
       setPressure(prev => ({ ...prev, pull: prevPull }));
-      fetch('/api/generate/storm/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId, drift: { pull: prevPull } }),
-      }).catch(() => {});
+      void apiClient.post('/generate/storm/control', { streamId, drift: { pull: prevPull } }, { silent: true }).catch(() => {});
     }
   }, [snapshot, streamId, setPressure]);
 
@@ -299,23 +288,6 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
     setCaptionInput(pressure.targetCaption.join(', '));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // only on mount
-
-  // Poll GET /storm/control every 2s while streaming
-  useEffect(() => {
-    if (!sa.isPlaying) { setSnapshot(null); return; }
-    let alive = true;
-    const poll = async () => {
-      try {
-        const r = await fetch(`/api/generate/storm/control?streamId=${encodeURIComponent(streamId)}`);
-        if (!r.ok) return;
-        const data = await r.json() as { drift?: DriftSnapshot };
-        if (alive && data.drift) setSnapshot(data.drift);
-      } catch { /* ignore */ }
-    };
-    poll();
-    const id = setInterval(poll, 2000);
-    return () => { alive = false; clearInterval(id); };
-  }, [sa.isPlaying, streamId]);
 
   // Commit caption input on blur or Enter
   const commitCaption = useCallback(() => {
@@ -398,6 +370,9 @@ export function DriftPanel({ sa, isYue2, isSa3, streamId = 'default' }: DriftPan
     <div className="flex-1 flex overflow-hidden">
       {/* Single-column narrow / two-column wide */}
       <div className="flex-1 overflow-y-auto p-4">
+        {sa.isPlaying && driftQuery.isError && (
+          <QueryError error={driftQuery.error} onRetry={() => void driftQuery.refetch()} className="mb-3 max-w-4xl mx-auto" />
+        )}
         <div className="grid gap-4 grid-cols-1 min-[900px]:grid-cols-2 max-w-4xl mx-auto">
 
           {/* ── Column 1 ── */}

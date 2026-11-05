@@ -1,4 +1,4 @@
-import { apiClient, type ReadOptions } from './httpClient';
+import { apiClient, type ClientOptions, type ReadOptions } from './httpClient';
 import { readSnapshot } from '../queries/cover-lyrics/reads';
 import { coverLyricWorkflowApi as workflowApi, followCoverLyricJob as followJob } from '../queries/cover-lyrics/workflows';
 import type { WorkflowJob } from '../../../server/src/contracts/workflow';
@@ -14,14 +14,14 @@ export type LyricBatchRequest = {
 export type LyricItemResult = { index: number; status: 'done' | 'error'; value?: any; error?: string };
 export type LyricBatchResult = { results: LyricItemResult[] };
 
-async function submit(path: string, body: unknown): Promise<WorkflowJob> {
-  const value = await apiClient.post<{ job: WorkflowJob }>(`/lireek/${path}`, body);
+async function submit(path: string, body: unknown, opts?: ClientOptions): Promise<WorkflowJob> {
+  const value = await apiClient.post<{ job: WorkflowJob }>(`/lireek/${path}`, body, opts);
   return value.job;
 }
 
 export const lyricWorkflowApi = {
-  submitBatch: (items: LyricBatchRequest[], options: { concurrency?: number } = {}, idempotencyKey = crypto.randomUUID()) =>
-    submit('workflow-batches', { items, idempotencyKey, concurrency: options.concurrency }),
+  submitBatch: (items: LyricBatchRequest[], options: { concurrency?: number; silent?: boolean } = {}, idempotencyKey = crypto.randomUUID()) =>
+    submit('workflow-batches', { items, idempotencyKey, concurrency: options.concurrency }, options.silent ? { silent: true } : undefined),
   submitRenders: (intents: WrittenSongIntent[], idempotencyKey = crypto.randomUUID()) =>
     submit('workflow-renders', { intents, idempotencyKey }),
   cancel: (id: string) => workflowApi.cancel(id),
@@ -34,7 +34,11 @@ export async function runLyricOperation(request: LyricBatchRequest, handlers: {
   onChunk?: (text: string) => void; onPhase?: (phase: string) => void;
   onResult?: (value: unknown) => void; onError?: (message: string) => void;
 } = {}): Promise<void> {
-  const job = await lyricWorkflowApi.submitBatch([request]);
+  // Silent submit: this function owns failure notification — it throws with the
+  // job's own error message (often from the SSE follow, which the transport
+  // never sees), and every caller surfaces that. A transport toast on the POST
+  // leg would be a second copy of the same failure.
+  const job = await lyricWorkflowApi.submitBatch([request], { silent: true });
   let failure: string | undefined;
   const seen = new Set<number>();
   const status = await lyricWorkflowApi.follow(job.id, {

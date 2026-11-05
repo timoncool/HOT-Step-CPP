@@ -2,7 +2,8 @@ import { projectQuery } from '../queries/global-models/projection';
 import { vstPresetsApi } from '../queries/global-models/presets';
 import type { MonitorStatus } from '../queries/global-models/options';
 import { queryClient } from '../queries/client';
-import { localOptions, monitorOptions } from '../queries/global-models/options';
+import type { ServerKey } from '../queries/keys';
+import { monitorOptions, openGuisOptions, vstChainOptions, vstScanOptions } from '../queries/global-models/options';
 import { queryManager } from '../queries/invalidation';
 import { keysPlan, writeAndInvalidate } from '../queries/writes';
 import { apiClient } from '../services/httpClient';
@@ -12,6 +13,7 @@ import { apiClient } from '../services/httpClient';
 // and GUI launching. Chain state is persisted server-side.
 
 import { create } from 'zustand';
+import { QueryObserver } from '@tanstack/react-query';
 import { vstApi, type VstPlugin, type VstChainEntry } from '../services/api';
 import { hashImportValue, type VstChainPresetBody } from '../services/preferencesApi';
 import { PresetCollection, type PresetCollectionSnapshot } from '../services/presetCollection';
@@ -101,7 +103,40 @@ interface VstChainState {
   deletePreset: (key: string) => Promise<void>;
 }
 
-let guiPollTimer: ReturnType<typeof setInterval> | null = null;
+let guiPoll: { observer: QueryObserver<{ uids: string[] }, Error, { uids: string[] }, { uids: string[] }, ServerKey>; unsubscribe: () => void; stopped: boolean } | null = null;
+
+/** Follow the open-GUI read until every editor window has closed. */
+function startGuiPoll() {
+  if (guiPoll) return;
+  const startedAt = Date.now();
+  const observer = new QueryObserver(queryClient, {
+    ...openGuisOptions(),
+    refetchInterval: 1500,
+    refetchIntervalInBackground: true,
+  });
+  // Registered before subscribe(), which can call the listener synchronously:
+  // a stop from inside that first call must still tear this poll down.
+  const poll = { observer, unsubscribe: () => {}, stopped: false };
+  guiPoll = poll;
+  const unsubscribe = observer.subscribe(result => {
+    if (poll.stopped || !result.data) return;
+    // Only a read that finished after this poll started counts. subscribe()
+    // replays the cached entry, and that older snapshot stays in `data` while
+    // the first fetch runs; acting on it would clear the marker openGui just set.
+    if (result.isFetching || result.dataUpdatedAt < startedAt) return;
+    const open = useVstChainStore.getState().openGuiUids.filter(u => result.data!.uids.includes(u));
+    useVstChainStore.setState({ openGuiUids: open });
+    if (open.length === 0) stopGuiPoll();
+  });
+  poll.unsubscribe = unsubscribe;
+  if (poll.stopped) unsubscribe();
+}
+function stopGuiPoll() {
+  if (!guiPoll) return;
+  guiPoll.stopped = true;
+  guiPoll.unsubscribe();
+  guiPoll = null;
+}
 
 /** A preset collection whose changes are mirrored into the store. */
 function attachPresets(set: (partial: Partial<VstChainState>) => void) {
@@ -131,8 +166,8 @@ export const useVstChainStore = create<VstChainState>((set, get) => {
   scanPlugins: async () => {
     set({ scanning: true, scanError: null });
     try {
-      await queryManager.keys(queryClient, localOptions('vst-scan', '/vst/scan').queryKey);
-      await queryClient.query(localOptions<{ plugins: VstPlugin[] }>('vst-scan', '/vst/scan'));
+      await queryManager.invalidate(queryClient, vstScanOptions().queryKey);
+      await queryClient.query(vstScanOptions());
       set({ scanning: false });
     } catch (err: any) {
       set({ scanning: false, scanError: err.message });
@@ -141,7 +176,7 @@ export const useVstChainStore = create<VstChainState>((set, get) => {
 
   loadChain: async () => {
     try {
-      await queryClient.query(localOptions<{ plugins: VstChainEntry[] }>('vst-chain', '/vst/chain'));
+      await queryClient.query(vstChainOptions());
     } catch {
       set({ chainLoaded: true });
     }
@@ -212,23 +247,20 @@ export const useVstChainStore = create<VstChainState>((set, get) => {
       }));
       // Poll until every editor window has been closed, so the open marker
       // clears when the user closes the window.
-      if (!guiPollTimer) {
-        guiPollTimer = setInterval(async () => {
-          try {
-            const { uids } = await vstApi.openGuis();
-            set(s => ({ openGuiUids: s.openGuiUids.filter(u => uids.includes(u)) }));
-            if (get().openGuiUids.length === 0 && guiPollTimer) {
-              clearInterval(guiPollTimer);
-              guiPollTimer = null;
-            }
-          } catch { /* server unavailable; retry next tick */ }
-        }, 1500);
-      }
+      startGuiPoll();
     } catch { /* transport failure already toasted by the global handler */ }
   },
 
   closeGui: (uid: string) => {
-    set(s => ({ openGuiUids: s.openGuiUids.filter(u => u !== uid) }));
+    let lastOne = false;
+    set(s => {
+      const openGuiUids = s.openGuiUids.filter(u => u !== uid);
+      lastOne = openGuiUids.length === 0;
+      return { openGuiUids };
+    });
+    // The user closed the last editor before the next poll noticed; stop now
+    // instead of leaving the observer ticking forever.
+    if (lastOne) stopGuiPoll();
   },
 
   chainEnabled: () => {
@@ -333,7 +365,7 @@ export function _resetVstPresetsForTests(): void {
 }
 
 async function updateCachedChain(plugins: VstChainEntry[]) {
-  const key = localOptions<{ plugins: VstChainEntry[] }>('vst-chain', '/vst/chain').queryKey;
+  const key = vstChainOptions().queryKey;
   await queryClient.cancelQueries({ queryKey: key });
   const result = await writeAndInvalidate(queryClient,
     () => apiClient.put<{ plugins: VstChainEntry[] }>('/vst/chain', { plugins }),
@@ -344,9 +376,9 @@ async function updateCachedChain(plugins: VstChainEntry[]) {
 
 const detachVstProjections = [
   projectQuery<{ plugins: VstPlugin[] }>(queryClient,
-    localOptions('vst-scan', '/vst/scan').queryKey, data => useVstChainStore.setState({ plugins: data.plugins })),
+    vstScanOptions().queryKey, data => useVstChainStore.setState({ plugins: data.plugins })),
   projectQuery<{ plugins: VstChainEntry[] }>(queryClient,
-    localOptions('vst-chain', '/vst/chain').queryKey, data => useVstChainStore.setState({ chain: data.plugins ?? [], chainLoaded: true })),
+    vstChainOptions().queryKey, data => useVstChainStore.setState({ chain: data.plugins ?? [], chainLoaded: true })),
   projectQuery<MonitorStatus>(queryClient, monitorOptions().queryKey, data => useVstChainStore.setState({
     monitoring: data.running ?? false, monitorPaused: data.paused ?? false,
     monitorPosition: data.position ?? 0, monitorDuration: data.duration ?? 0,

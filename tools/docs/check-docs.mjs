@@ -84,6 +84,8 @@ const trackedSet = new Set(tracked);
 const isDanglingSymlink = (p) => { try { return fs.lstatSync(p).isSymbolicLink() && !fs.existsSync(p); } catch { return false; } };
 const linkRe = /!?\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 for (const file of [...tracked, ...untrackedNew]) {
+  // Scratch snapshots are not documentation sources.
+  if (file.startsWith('.tmp/')) continue;
   let raw;
   try {
     raw = skipWorktree.has(file)

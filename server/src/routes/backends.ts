@@ -17,7 +17,9 @@
 // every route below spells its own full sub-path.
 
 import { Router } from 'express';
-import { trackBackendRelease } from '../services/generation/backendRelease.js';
+import { releaseOnEveryWorker } from '../services/generation/backendRelease.js';
+import { laneWorkers } from '../services/generation/gpuLane.js';
+import { inWorkerScope } from '../services/engineWorkers.js';
 import {
   getBackend,
   listBackends,
@@ -57,7 +59,8 @@ router.get('/backends', (_req, res) => {
 // VRAM arbitration (plan §4.4): both families live in the one ace-server
 // process, so switching is model RESIDENCY, not process switching. The switch
 // itself is a settings write and answers at once; the outgoing backend's
-// `releaseVram()` runs in the background, and the next render waits for it to
+// `releaseVram()` runs in the background on every engine worker, each after
+// the work already queued there, and the next render waits for it to
 // confirm before loading weights (services/generation/backendRelease.ts,
 // awaited by the generation runner). A YuE2 unload can take minutes: it
 // waits engine-side for the renders already queued on its NAR lane (#204).
@@ -77,11 +80,7 @@ router.post('/backends/active', (req, res) => {
 
   if (previousId !== id) {
     const outgoing = getBackend(previousId);
-    if (outgoing?.releaseVram) {
-      trackBackendRelease(previousId, () => outgoing.releaseVram!()).catch(err => {
-        console.warn(`[backends] releaseVram not confirmed for outgoing '${previousId}':`, err?.message || err);
-      });
-    }
+    if (outgoing?.releaseVram) releaseOnEveryWorker(previousId, () => outgoing.releaseVram!());
     console.log(`[backends] active backend: ${previousId} → ${id}`);
   }
 
@@ -133,7 +132,11 @@ router.post('/backends/models', async (req, res) => {
     return;
   }
   try {
-    const result = await backend.selectModel(selection as Record<string, string>);
+    // Every ready worker runs the selection (a down one replays it from the
+    // restore hooks when it comes back). Each engine waits for, or refuses during,
+    // a render in flight rather than move weights under it.
+    const [result] = await Promise.all(laneWorkers().filter(w => w.primary || w.ready)
+      .map(w => inWorkerScope(w, () => backend.selectModel!(selection as Record<string, string>))));
     // The catalogue's `defaults` (what is actually in force) just changed.
     cache.delete(id);
     res.json(result);

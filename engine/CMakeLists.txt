@@ -674,6 +674,12 @@ link_ggml_backends(yue2-bf16-round-fuse-metal-test)
 add_executable(yue2-rms-double-round-test tools/yue2-rms-double-round-test.cpp)
 link_ggml_backends(yue2-rms-double-round-test)
 
+# backend-health-test: logic test for the #242 poisoned-backend probe,
+# fault injection (ACE_FAULT_BACKEND_ERROR) and teardown recovery.
+add_executable(backend-health-test tools/backend-health-test.cpp)
+link_ggml_backends(backend-health-test)
+target_compile_definitions(backend-health-test PRIVATE ACE_ENABLE_FAULT_INJECTION)
+
 # yue2-linear-lora-round-test: checks whether removing the seemingly
 # redundant round(ctx, x) in yue2-aitk-graph.h's linear() (LoRA branch)
 # is actually a bit-exact no-op like the rms() fix was -- unlike that
@@ -745,6 +751,27 @@ link_ggml_backends(ace-caption)
 # docs/plans/yue2/06-engine-port-plan.md milestone M0. Header-only loader
 # (no acestep-core dependency), same posture as moss-ggml-test.
 add_executable(yue2-probe tools/yue2-probe.cpp)
+# HeartMuLa's tokenizer probe reads a tensor-free GGUF and runs entirely on CPU.
+add_executable(heartmula-probe tools/heartmula-probe.cpp)
+target_link_libraries(heartmula-probe PRIVATE yyjson)
+link_ggml_backends(heartmula-probe)
+# HeartCodec decode parity probe (RVQ, flow, scalar decoder) against S1's fixtures.
+add_executable(heartcodec-probe tools/heartcodec-probe.cpp)
+target_link_libraries(heartcodec-probe PRIVATE yyjson)
+link_ggml_backends(heartcodec-probe)
+# HeartMuLa text to music through heartmula/pipeline.h; the smoke test's HeartMuLa case.
+add_executable(heartmula-generate tools/heartmula-generate.cpp)
+target_link_libraries(heartmula-generate PRIVATE yyjson)
+link_ggml_backends(heartmula-generate)
+# HeartMuLa imatrix collection and held-out quant scoring (tools/heartmula-quant-ladder.mjs).
+add_executable(heartmula-quant tools/heartmula-quant.cpp)
+target_link_libraries(heartmula-quant PRIVATE yyjson)
+link_ggml_backends(heartmula-quant)
+# HeartCodec encoder (waveform to RVQ codes) parity probe and round trip.
+add_executable(heartcodec-encode-probe tools/heartcodec-encode-probe.cpp)
+target_link_libraries(heartcodec-encode-probe PRIVATE yyjson)
+link_ggml_backends(heartcodec-encode-probe)
+
 add_executable(yue2-vae-lifetime-test tests/test-yue2-vae-lifetime.cpp)
 target_link_libraries(yue2-vae-lifetime-test PRIVATE yyjson)
 link_ggml_backends(yue2-vae-lifetime-test)
@@ -1009,6 +1036,22 @@ if(BUILD_TESTING)
     target_link_libraries(sa3-dora-load-test PRIVATE yyjson)
     add_test(NAME sa3-dora-load COMMAND sa3-dora-load-test)
     set_tests_properties(sa3-dora-load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    # SA3 training gate: one DiT block's backward (placement, finite
+    # differences, official-trainer replay). Skips (77) without the replay fixture.
+    add_executable(sa3-train-grad-test tests/test-sa3-train-grad.cpp)
+    link_ggml_backends(sa3-train-grad-test)
+    target_link_libraries(sa3-train-grad-test PRIVATE yyjson)
+    add_test(NAME sa3-train-grad COMMAND sa3-train-grad-test)
+    set_tests_properties(sa3-train-grad PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+    # SA3 trainer parity: full official-trainer steps, AdamW, export round trip,
+    # SAME and T5Gemma (ace-train sa3-train-check). Skips (77) without the step
+    # fixtures (tools/sa3-training-step-fixture.py) or the converted base DiT.
+    set(SA3_TRAIN_DATA ${CMAKE_CURRENT_SOURCE_DIR}/../_experiments/sa3-training)
+    add_test(NAME sa3-train-check COMMAND ace-train sa3-train-check --fixtures ${SA3_TRAIN_DATA}/step
+             --base-dit ${SA3_TRAIN_DATA}/base/sa3-dit-base-BF16.gguf --models ${CMAKE_CURRENT_SOURCE_DIR}/models)
+    set_tests_properties(sa3-train-check PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
     # YuE2 joint/AITK DoRA graph fixture: LoRA identity at m == nrm, rescale
     # forward/backward, exact vs expanded row norms.

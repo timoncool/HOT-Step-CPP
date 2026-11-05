@@ -33,7 +33,11 @@ import { StyledSelect } from '../shared/StyledSelect';
 ```
 
 `hint` is the second line of a panel row; it never shows on the trigger. `disabled` on an option
-greys it out. `size="sm"` for dense rows. `searchable` forces the filter box on or off.
+greys it out, and `disabled` on the select disables the trigger. `size="sm"` for dense rows.
+`searchable` forces the filter box on or off; `searchPlaceholder` and `emptyLabel` set its
+placeholder and its no-match line. `triggerLabel` shows a fixed label (such as "Presets") on the
+trigger instead of the selected option, and the trigger then sizes to that label; `panelWidth`
+sets a minimum panel width in pixels, right-aligned to the trigger when wider.
 
 ### 2. An on/off setting is `Toggle`
 
@@ -58,7 +62,8 @@ import { Toggle } from '../shared/Toggle';
 ```
 
 `size="md"` (default) is the settings and studio-form size; `size="sm"` is the global bar's dense
-row size. `disabled` dims it and ignores clicks.
+row size. `disabled` dims it and ignores clicks. With `label`, `meta` adds the default/range line
+to the hover card, as it does on `ParamLabel`.
 
 The older names `Toggle` in `settings/SettingsPrimitives.tsx` and `ToggleSwitch` in
 `global-bar/BarSection.tsx` are thin wrappers over this component. Do not add to them; import
@@ -90,6 +95,10 @@ they move it. "Timestep bias" explains nothing; "Which part of the denoising the
 Higher values spend more steps on the noisy end, which shapes structure; lower values on the clean
 end, which shapes detail" does. Keep the tone of [writing-style.md](writing-style.md).
 
+`className` styles the label text (the studios' field-label style by default) and
+`rootClassName` the wrapper, so margins and `block` go there. `underline` (on by default) draws
+the dotted hint under an explainable label; section headings turn it off.
+
 Inside a panel that closes when the pointer leaves it (the global bar's dropdowns), mark the panel
 `data-hovercard-boundary` so the card lands beside the panel instead of covering the knobs.
 
@@ -107,7 +116,9 @@ primitive to do the wiring.
 ```
 
 Show the icon only while the value differs from its default. `Slider`/`Toggle`/`EditableSlider` do
-this automatically from `defaultValue`; a bare `ParamLabel` needs the guard written by hand:
+this automatically from `defaultValue`. They also take their own `onReset`, called instead of
+`onChange(defaultValue)` when the icon is clicked, for the server-default overlay forms below. A
+bare `ParamLabel` needs the guard written by hand:
 
 ```tsx
 <ParamLabel label={t('gen.solver')} info={solverMeta?.description}
@@ -139,6 +150,9 @@ written value freezes that field at today's default and stops following the serv
 one thing a field the user never touched should keep doing. Pair the icon with a sibling
 `reset(k)` next to the existing `set(k, v)`, gated on `edits[k] !== undefined && edits[k] !== base[k]`
 (the same comparison `value !== defaultValue` reduces to once `form` is `{ ...base, ...edits }`).
+On a `Slider`, `EditableSlider` or `Toggle`, pass `defaultValue={base.steps}` and
+`onReset={() => reset('steps')}`: the primitive does the comparison and calls `reset` instead of
+writing the default.
 A dependent-field coupling on `onChange` (DiT method's PiSSA forcing HOT-PiZZA off, MM3 train's
 same pair) needs the identical coupling on reset — check the delta between the two would-be
 states and apply whatever the `onChange` handler would, not a delete-and-hope.
@@ -149,6 +163,19 @@ props and pass it straight through, one level of plumbing, not a new component. 
 toggle's own field, never on anything the section contains: an accordion's `onReset` and its
 content's own per-field resets (or an inner group "Reset" button) stay independent, each touching
 only what it says it does.
+
+## Collapsible sections
+
+`Fold` (`ui/src/components/shared/Fold.tsx`) is a titled section that opens and closes from its
+header row and remembers that state across page loads in localStorage under `storageKey`.
+`defaultOpen` sets the state on a first visit. Create and Cover Studio use it for their optional
+blocks (drafts, the negative prompt, dataset caption options). Give each fold its own key.
+
+```tsx
+<Fold title={t('studioDrafts.title', 'Drafts')} storageKey="hs-create-fold-drafts">
+  ...
+</Fold>
+```
 
 ## Phone bottom sheets
 
@@ -167,7 +194,7 @@ fixture, including child-dialog keyboard and focus checks.
 A render-time throw no longer blanks the tab. `ErrorBoundary`
 (`ui/src/components/shared/ErrorBoundary.tsx`) wraps the whole app in `main.tsx`, and the studio
 area in `App.tsx` with `resetKey={activeView}`. A broken studio shows the error with Try again and
-Reload, the sidebar and player keep working, and switching studio clears it. Wrap a new
+Reload page, the sidebar and player keep working, and switching studio clears it. Wrap a new
 independent region in its own boundary only if one failing part should not take its neighbours
 with it.
 
@@ -189,14 +216,15 @@ Every label, hint and `info` goes through `t('key', 'English default')` with the
 
 ## The check
 
-`node tools/docs/check-docs.mjs` counts native `<select` and `type="checkbox"` per file under
-`ui/src` and compares them with `tools/docs/ui-primitives-baseline.json`, the list of files that
-still had them when the rule was written. A file with more than its baseline allows, or a file not
-in the baseline with any, fails the check. It runs in CI (`docs.yml`) and inside
-`check-release-prereqs.mjs`.
+`node tools/docs/check-docs.mjs` counts native `<select` and `type="checkbox"` per `.tsx` file
+under `ui/src`, with comments stripped first, and compares them with
+`tools/docs/ui-primitives-baseline.json`, the list of files that still had them when the rule
+was written. A file with more than its baseline allows, or a file not in the baseline with any,
+fails the check. It runs in CI (`docs.yml`) and inside `check-release-prereqs.mjs`.
 
-When you convert a file, run `node tools/docs/check-docs.mjs --update-ui-baseline` so the
-baseline shrinks with it; the check warns while an entry is stale. The baseline only ever goes
+The baseline has been empty (`{}`) since every file was converted in `b6eff9e3`, so any native
+`<select>` or checkbox in a `.tsx` file now fails the check. Replace it with `StyledSelect` or
+`Toggle`; never run `--update-ui-baseline` to make a new one pass. The baseline only ever goes
 down.
 
 ## Verifying a change

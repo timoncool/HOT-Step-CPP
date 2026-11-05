@@ -32,7 +32,7 @@ export function readSnapshot<T>(domain: Domain, path: string, options: ReadOptio
 export async function changed(domain: Domain, scope?: { session?: number; api?: string }) {
   const queryKey = resourceKey(resource(domain), scope);
   await queryClient.cancelQueries({ queryKey });
-  await queryManager.keys(queryClient, queryKey);
+  await queryManager.invalidate(queryClient, queryKey);
 }
 
 export async function songsChanged() {

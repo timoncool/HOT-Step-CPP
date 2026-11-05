@@ -26,6 +26,7 @@ import { detailFor } from './datasetDetail.js';
 import * as repo from './datasetsRepo.js';
 import * as queue from './labelingQueue.js';
 import { trainingBaseDir } from './paths.js';
+import { describeOwner, isMine, owner, ownerAlive, type Owner } from '../instance.js';
 import { getTrainingDefaults } from './trainingDefaults.js';
 import type {
   PipelineLabelOptions,
@@ -107,7 +108,7 @@ function pipelinesDir(): string {
  *  per-item creation specs. Resume needs the specs (customTag is not derivable
  *  from the items); files written before specs were persisted still resume via
  *  the item-based fallback in revivePipeline. */
-type SnapshotFile = PipelineSummary & { specs?: PipelineFolderSpec[] };
+type SnapshotFile = PipelineSummary & { specs?: PipelineFolderSpec[]; owner?: Owner };
 
 function writeSnapshotFile(snap: SnapshotFile): void {
   fs.mkdirSync(pipelinesDir(), { recursive: true });
@@ -121,7 +122,8 @@ function writeSnapshotFile(snap: SnapshotFile): void {
 /** Snapshot on every item/stage transition — same spirit as jobs' _meta.json. */
 function persist(state: PipelineState): void {
   try {
-    writeSnapshotFile({ ...toSummary(state), specs: state.specs });
+    // Only the process running the loop persists it, so it stamps itself as owner.
+    writeSnapshotFile({ ...toSummary(state), specs: state.specs, owner: owner() });
   } catch (err: any) {
     console.warn(`[Training] Could not persist pipeline ${state.id}: ${err.message}`);
   }
@@ -144,7 +146,7 @@ function readSnapshotFiles(): SnapshotFile[] {
 
 /** The wire view of the snapshots — specs stay private to the runner. */
 function readSnapshots(): PipelineSummary[] {
-  return readSnapshotFiles().map(({ specs: _specs, ...summary }) => summary);
+  return readSnapshotFiles().map(({ specs: _specs, owner: _owner, ...summary }) => summary);
 }
 
 /**
@@ -153,9 +155,11 @@ function readSnapshots(): PipelineSummary[] {
  * running/paused pipeline as 'paused' so Resume can rebuild the loop and carry
  * on from the last completed stage. The stage that was mid-flight when the
  * process died is reset to pending (its job died with the process) and re-runs
- * from scratch on resume.
+ * from scratch on resume. A pipeline another live process is running (the
+ * other copy of the app, services/instance.ts) is left alone. Called once at
+ * startup, after the instance registry opens (index.ts).
  */
-function recoverStalePipelines(): void {
+export function recoverStalePipelines(): void {
   try {
     const base = pipelinesDir();
     if (!fs.existsSync(base)) return;
@@ -165,6 +169,7 @@ function recoverStalePipelines(): void {
       try {
         const snap = JSON.parse(fs.readFileSync(file, 'utf-8')) as SnapshotFile;
         if (snap.status !== 'running' && snap.status !== 'paused') continue;
+        if (!isMine(snap.owner) && ownerAlive(snap.owner)) continue;
         snap.status = 'paused';
         snap.pauseRequested = false;
         snap.finishedAt = null;
@@ -189,7 +194,15 @@ function recoverStalePipelines(): void {
     }
   } catch { /* pipelines dir unreadable */ }
 }
-recoverStalePipelines();
+
+/** Why this process must not cancel, pause or resume pipeline `id`: another
+ *  live process runs its loop. null when it may. */
+export function pipelineRunsElsewhere(id: string): string | null {
+  if (pipelines.has(id)) return null;
+  const snap = readSnapshotFiles().find(p => p.id === id);
+  if (!snap || !isActive(snap.status) || isMine(snap.owner) || !ownerAlive(snap.owner)) return null;
+  return `This pipeline is running in ${describeOwner(snap.owner)}; control it there`;
+}
 
 // ── Public API ───────────────────────────────────────────────────────────
 
@@ -273,6 +286,7 @@ export function cancelPipeline(id: string): boolean {
     // restart must stay dismissable, so rewrite the file directly.
     const snap = readSnapshotFiles().find(p => p.id === id);
     if (!snap) return false;
+    if (pipelineRunsElsewhere(id)) return true;   // its own loop owns the file; the route answers 409
     if (isActive(snap.status)) {
       snap.status = 'cancelled';
       snap.pauseRequested = false;
@@ -360,7 +374,7 @@ export function resumePipeline(id: string): PipelineResumeResult {
     ? { ...toSummary(state), specs: state.specs }
     : readSnapshotFiles().find(p => p.id === id);
   if (!snap) return 'not_found';
-  if (hasActivePipeline()) return 'busy';
+  if (hasActivePipeline() || pipelineRunsElsewhere(id)) return 'busy';
   revivePipeline(snap);
   return 'ok';
 }

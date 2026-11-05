@@ -2,11 +2,11 @@
 // Composes: SourcePanel, ArtistSettingsPanel
 
 import { pollWhile } from '../../queries/contract';
-import { waitForSnapshot } from '../../queries/cover-lyrics/wait';
-import { serverKey } from '../../queries/keys';
+import { waitForQuery } from '../../queries/wait';
+import { generationStatusOptions } from '../../queries/shell-queue/queue';
 import { songsChanged } from '../../queries/cover-lyrics/reads';
 import type { Yue2CoverResult } from '../../services/yue2CoverApi';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import type { LyricsSet } from '../../services/lireekApi';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
@@ -18,7 +18,9 @@ import { useGlobalParamsStore } from '../../context/GlobalParamsContext';
 import { usePersistedState } from '../../hooks/usePersistedState';
 import { DEFAULT_SETTINGS, type AppSettings } from '../settings/SettingsPanel';
 import { generateApi } from '../../services/api';
+import type { GenerationJob } from '../../types';
 import { apiClient, ApiError } from '../../services/httpClient';
+import { useUpload } from '../../queries/writes';
 import { createGenerationTimer, getGenerationTimeoutMinutes } from '../../utils/generationTimer';
 import { lireekApi, type Artist, type AlbumPreset } from '../../services/lireekApi';
 import {
@@ -46,11 +48,16 @@ import { normalizeAbc } from '../../../../server/src/contracts/yue2Prepare';
 import { LyricsSectionHighlight } from './LyricsSectionHighlight';
 import type { LatentMetadata } from '../shared/LatentImport';
 import { loadSelections, saveSelections } from '../lyric-studio/ProviderSelector';
+import { useCapabilities } from '../../hooks/useCapabilities';
+import { stableStepAdaptersOptions } from '../../queries/global-models/options';
+import { EditableSlider } from '../shared/EditableSlider';
+import { StyledSelect } from '../shared/StyledSelect';
+import { QueryError } from '../shared/QueryError';
 import { useBackendStore } from '../../stores/backendStore';
 import { fetchYue2CaptionSource, resolveYue2Caption, yue2PickAtEnqueue, type Yue2SourceTrack } from '../../utils/yue2CaptionSource';
 import { yue2CoverApi, type Yue2CoverDatasetMetadata, type Yue2CoverJob, type Yue2CoverReadiness,
   type Yue2ScoreSection } from '../../services/yue2CoverApi';
-import { Yue2CoverPanel, COVER_AR_DEFAULT, clampCoverAr } from './Yue2CoverPanel';
+import { Yue2CoverPanel, COVER_AR_DEFAULT, clampCoverAr, COVER_GUIDE_DEFAULT, coverGuideBlock, type CoverGuideState } from './Yue2CoverPanel';
 import { resolveYue2Render, type Yue2RenderMode } from './yue2RenderMode';
 import { Yue2CoverScore } from './Yue2CoverScore';
 import { CoverResizeHandle } from './CoverResizeHandle';
@@ -75,6 +82,8 @@ import { coverLyricWorkflowApi as workflowApi } from '../../queries/cover-lyrics
 // serializes anyway, this keeps the client-side recombine→submit→poll ordered.
 const _coverQueue: Array<() => Promise<void>> = [];
 let _coverRunning = false;
+/** Builds with a Save song queued or rendering: Delete build waits, because the render reads the build's files. */
+const _savingBuilds = new Map<string, number>();
 // Survives Cover Studio remounts (it unmounts when you leave the tab) so a
 // previously-sent library track isn't re-applied every time you revisit (#61).
 let _lastConsumedCoverTs = 0;
@@ -92,9 +101,13 @@ async function _drainCoverQueue() {
   _coverRunning = false;
 }
 
+// ABC mode suffixes SheetSage2-Refined's key_mode writes (K:Ddor, K:Gmix, ...).
+const KEY_MODES: Record<string, string> = { dor: 'dorian', phr: 'phrygian', lyd: 'lydian', mix: 'mixolydian', loc: 'locrian' };
+
 function coverScoreKeyLabel(abc: string): string {
-  const key = abc.match(/^K:\s*([A-Ga-g][#b]?)(m)?(?:\s+(minor|major|maj))?(?=\s|$)/m);
+  const key = abc.match(/^K:\s*([A-Ga-g][#b]?)(mix|dor|phr|lyd|loc|m)?(?:\s+(minor|major|maj))?(?=\s|$)/m);
   if (!key) return '';
+  if (key[2] && KEY_MODES[key[2]]) return `${key[1]} ${KEY_MODES[key[2]]}`;
   return `${key[1]} ${key[2] || key[3]?.toLowerCase() === 'minor' ? 'minor' : 'major'}`;
 }
 
@@ -102,7 +115,9 @@ function coverScoreKeyLabel(abc: string): string {
 function coverChoicesFor(abc: string, s: Omit<BuildSettings, 'arStrength'>) {
   const sourceKey = coverScoreKeyLabel(abc);
   const movedKey = s.keyShift && sourceKey ? transposeKey(sourceKey, s.keyShift) : '';
-  const key = movedKey ? movedKey.replace(/ major$/, '').replace(/ minor$/, 'm') : 'source';
+  const abcMode = (label: string) => Object.entries(KEY_MODES).reduce(
+    (text, [suffix, name]) => text.replace(new RegExp(` ${name}$`), suffix), label);
+  const key = movedKey ? abcMode(movedKey.replace(/ major$/, '').replace(/ minor$/, 'm')) : 'source';
   return { voices: s.voices, tempo: s.tempo, key, ...(movedKey ? { keyShift: s.keyShift } : {}), cfgScale: s.cfgScale };
 }
 
@@ -126,7 +141,16 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const { token } = useAuth();
   const gp = useGlobalParamsStore();
   const [settings] = usePersistedState<AppSettings>('ace-settings', DEFAULT_SETTINGS);
+  const { capabilities } = useCapabilities();
+  const audioTransformMode = capabilities?.features.cover === true && capabilities.features.coverAudioTransform === true;
   const yue2Mode = useBackendStore(s => s.activeBackendId === 'yue2');
+  const sa3AdaptersQuery = useQuery({ ...stableStepAdaptersOptions(), enabled: audioTransformMode });
+  const [sa3Transform, setSa3Transform] = useState(() => restore('sa3Transform', 0.3));
+  const [sa3Seed, setSa3Seed] = useState(() => restore('sa3Seed', -1));
+  const [sa3Adapter, setSa3Adapter] = useState(() => restore('sa3Adapter', ''));
+  useEffect(() => { persist('sa3Transform', sa3Transform); }, [sa3Transform]);
+  useEffect(() => { persist('sa3Seed', sa3Seed); }, [sa3Seed]);
+  useEffect(() => { persist('sa3Adapter', sa3Adapter); }, [sa3Adapter]);
   const yue2Models = useBackendStore(s => s.models.yue2);
   const [sourceMode, setSourceMode] = useState<'audio' | 'musicxml'>(() => restore('sourceMode', 'audio'));
   const [draftName, setDraftName] = useState(() => restore('draftName', ''));
@@ -150,7 +174,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [metadata, setMetadata] = useState<AudioMetadata | null>(() => restore('metadata', null));
   const [analysis, setAnalysis] = useState<AudioAnalysis | null>(() => restore('analysis', null));
   const [useDetectedDetails, setUseDetectedDetails] = usePersistedState('hs-cover-use-detected-details', true);
-  const [isUploading, setIsUploading] = useState(false);
+  const uploadMut = useUpload<{ audio_url?: string; asset_id?: string }>();
+  const isUploading = uploadMut.isPending;
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   // ── Song details ──
@@ -163,7 +188,6 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const sourceLookupRef = useRef(0);
   const lyricEditRef = useRef(0);
   const instrumentalEditRef = useRef(0);
-  const [isSearchingLyrics, setIsSearchingLyrics] = useState(false);
 
   // ── Target artist ──
   const artistsQuery = useQuery(snapshotOptions<Artist[]>('lireek', '/lireek/artists'));
@@ -184,7 +208,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // ── Cover caption LLM ──
   const [coverCaptionProvider, setCoverCaptionProvider] = useState(() => loadSelections().coverCaption.provider);
   const [coverCaptionModel, setCoverCaptionModel] = useState(() => loadSelections().coverCaption.model);
-  const [isGeneratingCaption, setIsGeneratingCaption] = useState(false);
+  // The background preset waterfall's caption leg; the manual regenerate is a
+  // mutation — the button spins on either (see isGeneratingCaption below).
+  const [bgCaptionPending, setBgCaptionPending] = useState(false);
   const captionRequestRef = useRef(0);
   const captionJobRef = useRef('');
 
@@ -208,6 +234,19 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   });
   const [yue2Ar, setYue2Ar] = useState(() => restore('yue2Ar', ''));
   const [yue2Nar, setYue2Nar] = useState(() => restore('yue2Nar', ''));
+  // #304: Base renders with no adapters, so a pair picked in the model picker
+  // was silently dropped. Custom's empty slots take the picker's pair, and a
+  // studio with no mode saved, loaded or clicked yet opens in Custom when the
+  // picker holds both halves. A saved mode always wins.
+  const modeChosen = useRef(restore<string | null>('pairMode', null) !== null);
+  const chooseRenderMode = (mode: Yue2RenderMode) => { modeChosen.current = true; setRenderMode(mode); };
+  const pickerAr = String(yue2Models?.defaults?.lmAdapterAr ?? '');
+  const pickerNar = String(yue2Models?.defaults?.lmAdapterNar ?? '');
+  useEffect(() => {
+    if (pickerAr) setYue2Ar(v => v || pickerAr);
+    if (pickerNar) setYue2Nar(v => v || pickerNar);
+    if (pickerAr && pickerNar && !modeChosen.current) { modeChosen.current = true; setRenderMode('custom'); }
+  }, [pickerAr, pickerNar]);
   const [selectedYue2ArtistId, setSelectedYue2ArtistId] = useState<number | null>(() => restore('selectedYue2ArtistId', null));
   const [selectedYue2LyricsSetId, setSelectedYue2LyricsSetId] = useState<number | null>(() => restore('selectedYue2LyricsSetId', null));
   const eligibleIds = new Set(allPresets.filter(p => p.yue2_ar_adapter_path && p.yue2_nar_adapter_path).map(p => p.lyrics_set_id));
@@ -225,10 +264,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [buildLyricsDraft, setBuildLyricsDraft] = useState<{ source: string; text: string } | null>(() => restore('buildLyricsDraft', null));
   const [coverVoices, setCoverVoices] = useState<'vocal' | 'both'>(() => restore('coverVoices', 'both'));
   const [keepChords, setKeepChords] = useState(() => restore('keepChords', false));
+  const [instrumentalMode, setInstrumentalMode] = useState<'overlap' | 'resting'>(() => restore('instrumentalMode', 'overlap'));
   const [coverTempoMode, setCoverTempoMode] = useState<'free' | 'source' | 'set'>(() => restore('coverTempoMode', 'free'));
   const [coverBpm, setCoverBpm] = useState(() => restore('coverBpm', 120));
   const [coverKeyShift, setCoverKeyShift] = useState(() => restore('coverKeyShift', 0));
   const [coverCfgScale, setCoverCfgScale] = useState(() => restore('coverCfgScale', 1));
+  const [coverGuide, setCoverGuide] = useState<CoverGuideState>(() => ({ ...COVER_GUIDE_DEFAULT, ...restore('coverGuide', {}) }));
   // Cover's own AR strength; it replaces the adapter picker's AR scale in every Cover request.
   const [coverArStrength, setCoverArStrength] = useState(COVER_AR_DEFAULT);
   const [coverLyricSchedule, setCoverLyricSchedule] = useState<'off' | 'bias' | 'mask'>(() => restore('coverLyricSchedule', 'off'));
@@ -257,7 +298,6 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const onScorePlaying = (playing: boolean) => { setScorePlaying(playing); if (playing) setScoreStarts(n => n + 1); };
   // A new object each call, so asking to stop is acted on even when nothing was playing from a range.
   const playScore = (range: ScoreRange | null) => setScorePlay({ range });
-  const [scoreDetailsSaving, setScoreDetailsSaving] = useState(false);
   // ½×/2× on the score tempo, for when the transcriber counted half or double time.
   const [scoreTempoScale, setScoreTempoScale] = useState(() => restore('scoreTempoScale', { abc: '', factor: 1 }));
   const [scoreDetailsConfirm, setScoreDetailsConfirm] = useState(false);
@@ -429,10 +469,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => { persist('yue2Nar', yue2Nar); }, [yue2Nar]);
   useEffect(() => { persist('coverVoices', coverVoices); }, [coverVoices]);
   useEffect(() => { persist('keepChords', keepChords); }, [keepChords]);
+  useEffect(() => { persist('instrumentalMode', instrumentalMode); }, [instrumentalMode]);
   useEffect(() => { persist('coverTempoMode', coverTempoMode); }, [coverTempoMode]);
   useEffect(() => { persist('coverBpm', coverBpm); }, [coverBpm]);
   useEffect(() => { persist('coverKeyShift', coverKeyShift); }, [coverKeyShift]);
   useEffect(() => { persist('coverCfgScale', coverCfgScale); }, [coverCfgScale]);
+  useEffect(() => { persist('coverGuide', coverGuide); }, [coverGuide]);
   useEffect(() => { persist('coverLyricSchedule', coverLyricSchedule); }, [coverLyricSchedule]);
   useEffect(() => { persist('captionMode', captionMode); }, [captionMode]);
   useEffect(() => { persist('sheetAbc', sheetAbc); }, [sheetAbc]);
@@ -442,14 +484,17 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => { persist('approvedSheet', approvedSheet); }, [approvedSheet]);
   // The editing fields, mirrored into this browser's revisioned server draft.
   // coverDraftId/Revision stay local: they point at the workflow's cover-draft.
-  const draft = useStudioDraftMirror('cover', token, { 'cover-studio-sourceFileName': sourceFileName, 'cover-studio-sourceAudioUrl': sourceAudioUrl, 'cover-studio-sourceAssetId': sourceAssetId, 'cover-studio-sourceSongId': sourceSongId, 'cover-studio-metadata': metadata, 'cover-studio-analysis': analysis, 'cover-studio-songArtist': songArtist, 'cover-studio-songTitle': songTitle, 'cover-studio-lyrics': lyrics, 'cover-studio-lyricsSource': lyricsSource, 'cover-studio-datasetAnalysis': datasetAnalysis, 'cover-studio-selectedArtistId': selectedArtistId, 'cover-studio-selectedPreset': selectedPreset, 'cover-studio-artistCaption': artistCaption, 'cover-studio-audioCoverStrength': audioCoverStrength, 'cover-studio-coverNoiseStrength': coverNoiseStrength, 'cover-studio-coverNoiseMethod': coverNoiseMethod, 'cover-studio-tempoScale': tempoScale, 'cover-studio-pitchShift': pitchShift, 'cover-studio-bpmCorrection': bpmCorrection, 'cover-studio-bpmOverride': bpmOverride, 'cover-studio-keyOverride': keyOverride, 'cover-studio-noFsq': noFsq, 'cover-studio-coverInstrumental': instrumental, 'cover-studio-sourceLatentUrl': sourceLatentUrl, 'cover-studio-coverVocalLanguage': vocalLanguage, 'cover-studio-coverTimbreOverride': timbreOverridePath, 'cover-studio-sepLevel': sepLevel,
-    'cover-studio-sourceMode': sourceMode, 'cover-studio-advancedMode': advancedMode, 'cover-studio-pairMode': renderMode, 'cover-studio-yue2Ar': yue2Ar, 'cover-studio-yue2Nar': yue2Nar, 'cover-studio-coverVoices': coverVoices, 'cover-studio-keepChords': keepChords, 'cover-studio-coverTempoMode': coverTempoMode, 'cover-studio-coverBpm': coverBpm, 'cover-studio-coverKeyShift': coverKeyShift, 'cover-studio-coverCfgScale': coverCfgScale, 'cover-studio-coverLyricSchedule': coverLyricSchedule, 'cover-studio-captionMode': captionMode, 'cover-studio-sheetAbc': sheetAbc, 'cover-studio-scoreSections': scoreSections, ...prep.draftFields, 'cover-studio-scoreTempoScale': scoreTempoScale, 'cover-studio-sheetAudioUrl': sheetAudioUrl, 'cover-studio-approvedSheet': approvedSheet, 'cover-studio-selectedYue2ArtistId': selectedYue2ArtistId, 'cover-studio-selectedYue2LyricsSetId': selectedYue2LyricsSetId, 'cover-studio-coveringBand': coveringBand, 'cover-studio-buildMode': buildMode, 'cover-studio-buildSessionId': buildSessionId, 'cover-studio-buildLyricsDraft': buildLyricsDraft, ...(draftName ? { 'cover-studio-draftName': draftName } : {}) },
+  const draft = useStudioDraftMirror('cover', token, { 'cover-studio-sa3Transform': sa3Transform, 'cover-studio-sa3Seed': sa3Seed, 'cover-studio-sa3Adapter': sa3Adapter, 'cover-studio-sourceFileName': sourceFileName, 'cover-studio-sourceAudioUrl': sourceAudioUrl, 'cover-studio-sourceAssetId': sourceAssetId, 'cover-studio-sourceSongId': sourceSongId, 'cover-studio-metadata': metadata, 'cover-studio-analysis': analysis, 'cover-studio-songArtist': songArtist, 'cover-studio-songTitle': songTitle, 'cover-studio-lyrics': lyrics, 'cover-studio-lyricsSource': lyricsSource, 'cover-studio-datasetAnalysis': datasetAnalysis, 'cover-studio-selectedArtistId': selectedArtistId, 'cover-studio-selectedPreset': selectedPreset, 'cover-studio-artistCaption': artistCaption, 'cover-studio-audioCoverStrength': audioCoverStrength, 'cover-studio-coverNoiseStrength': coverNoiseStrength, 'cover-studio-coverNoiseMethod': coverNoiseMethod, 'cover-studio-tempoScale': tempoScale, 'cover-studio-pitchShift': pitchShift, 'cover-studio-bpmCorrection': bpmCorrection, 'cover-studio-bpmOverride': bpmOverride, 'cover-studio-keyOverride': keyOverride, 'cover-studio-noFsq': noFsq, 'cover-studio-coverInstrumental': instrumental, 'cover-studio-sourceLatentUrl': sourceLatentUrl, 'cover-studio-coverVocalLanguage': vocalLanguage, 'cover-studio-coverTimbreOverride': timbreOverridePath, 'cover-studio-sepLevel': sepLevel,
+    'cover-studio-sourceMode': sourceMode, 'cover-studio-advancedMode': advancedMode, 'cover-studio-pairMode': renderMode, 'cover-studio-yue2Ar': yue2Ar, 'cover-studio-yue2Nar': yue2Nar, 'cover-studio-coverVoices': coverVoices, 'cover-studio-keepChords': keepChords, 'cover-studio-instrumentalMode': instrumentalMode, 'cover-studio-coverTempoMode': coverTempoMode, 'cover-studio-coverBpm': coverBpm, 'cover-studio-coverKeyShift': coverKeyShift, 'cover-studio-coverCfgScale': coverCfgScale, 'cover-studio-coverGuide': coverGuide, 'cover-studio-coverLyricSchedule': coverLyricSchedule, 'cover-studio-captionMode': captionMode, 'cover-studio-sheetAbc': sheetAbc, 'cover-studio-scoreSections': scoreSections, ...prep.draftFields, 'cover-studio-scoreTempoScale': scoreTempoScale, 'cover-studio-sheetAudioUrl': sheetAudioUrl, 'cover-studio-approvedSheet': approvedSheet, 'cover-studio-selectedYue2ArtistId': selectedYue2ArtistId, 'cover-studio-selectedYue2LyricsSetId': selectedYue2LyricsSetId, 'cover-studio-coveringBand': coveringBand, 'cover-studio-buildMode': buildMode, 'cover-studio-buildSessionId': buildSessionId, 'cover-studio-buildLyricsDraft': buildLyricsDraft, ...(draftName ? { 'cover-studio-draftName': draftName } : {}) },
     { ...(sourceAssetId ? { sourceAssetId } : {}), ...(sourceSongId ? { sourceSongId } : {}) });
   // Loading a draft sets the same state the controls edit. Its uploaded source
   // gets a fresh cover-draft from the stored analysis (no re-analysis, no job
   // beyond opening the source); nothing is generated.
   const applyDraft = (body: { fields: Record<string, unknown> }) => {
     const f = body.fields;
+    setSa3Transform(typeof f['cover-studio-sa3Transform'] === 'number' ? Math.max(0.1, Math.min(0.9, f['cover-studio-sa3Transform'])) : 0.3);
+    setSa3Seed(typeof f['cover-studio-sa3Seed'] === 'number' ? f['cover-studio-sa3Seed'] : -1);
+    setSa3Adapter(typeof f['cover-studio-sa3Adapter'] === 'string' ? f['cover-studio-sa3Adapter'] : '');
     setDraftName(typeof f['cover-studio-draftName'] === 'string' ? f['cover-studio-draftName'] : '');
     const nextSourceKey = JSON.stringify([
       f['cover-studio-sourceMode'] ?? 'audio',
@@ -496,16 +541,19 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (Object.hasOwn(f, 'cover-studio-advancedMode')) setAdvancedMode(f['cover-studio-advancedMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-pairMode')) {
       const mode = f['cover-studio-pairMode'];
+      modeChosen.current = true;
       setRenderMode(mode === 'pair' ? 'custom' : mode === 'artist' || mode === 'custom' ? mode : 'base');
     }
     if (Object.hasOwn(f, 'cover-studio-yue2Ar')) setYue2Ar(f['cover-studio-yue2Ar'] as never);
     if (Object.hasOwn(f, 'cover-studio-yue2Nar')) setYue2Nar(f['cover-studio-yue2Nar'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverVoices')) setCoverVoices(f['cover-studio-coverVoices'] as never);
     if (Object.hasOwn(f, 'cover-studio-keepChords')) setKeepChords(f['cover-studio-keepChords'] as never);
+    if (Object.hasOwn(f, 'cover-studio-instrumentalMode')) setInstrumentalMode(f['cover-studio-instrumentalMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverTempoMode')) setCoverTempoMode(f['cover-studio-coverTempoMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverBpm')) setCoverBpm(f['cover-studio-coverBpm'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverKeyShift')) setCoverKeyShift(f['cover-studio-coverKeyShift'] as never);
     if (Object.hasOwn(f, 'cover-studio-coverCfgScale')) setCoverCfgScale(f['cover-studio-coverCfgScale'] as never);
+    if (Object.hasOwn(f, 'cover-studio-coverGuide')) setCoverGuide({ ...COVER_GUIDE_DEFAULT, ...(f['cover-studio-coverGuide'] as object) });
     if (Object.hasOwn(f, 'cover-studio-coverLyricSchedule')) setCoverLyricSchedule(f['cover-studio-coverLyricSchedule'] as never);
     if (Object.hasOwn(f, 'cover-studio-captionMode')) setCaptionMode(f['cover-studio-captionMode'] as never);
     if (Object.hasOwn(f, 'cover-studio-sheetAbc')) setSheetAbc(f['cover-studio-sheetAbc'] as never);
@@ -531,7 +579,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (typeof assetId === 'string' && assetId) {
       const meta = f['cover-studio-metadata'] as AudioMetadata | null, found = f['cover-studio-analysis'] as AudioAnalysis | null;
       void openUploadedAsset(assetId, sourceLookupRef.current, meta && found ? { metadata: meta, analysis: found } : undefined)
-        .catch(err => showToast(String((err as Error).message)));
+        // Transport failures already toast via the global handler.
+        .catch(err => { if (!(err instanceof ApiError)) showToast(String((err as Error).message)); });
     }
   };
 
@@ -614,11 +663,13 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       } else if (audioUrl) {
         setIsAnalyzing(true);
         try {
-          const r = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ audioUrl }) });
-          const d = r.ok ? await r.json() : null;
-          if (d && sourceLookupRef.current === lookup) setAnalysis({ bpm: d.bpm || 120, key: `${d.key || 'C'} ${d.scale || 'major'}`, scale: d.scale });
+          // Silent: a failed analysis just leaves the 120 / C major defaults.
+          const d = await apiClient.post<{ bpm?: number; key?: string; scale?: string }>('/analyze', { audioUrl }, { silent: true });
+          if (sourceLookupRef.current === lookup) setAnalysis({ bpm: d.bpm || 120, key: `${d.key || 'C'} ${d.scale || 'major'}`, scale: d.scale });
         } catch { /* leave defaults; user can override */ }
-        finally { if (sourceLookupRef.current === lookup) setIsAnalyzing(false); }
+        // Unconditional: a guarded reset stuck the spinner forever when the
+        // source switched to one that needed no analysis (stored bpm/key).
+        finally { setIsAnalyzing(false); }
       }
     })();
     showToast(t('cover.loadedFromLibrary', 'Loaded source from library'));
@@ -631,12 +682,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => {
     if (restoredPresetLoaded.current || !setsQuery.data || !presetsQuery.data) return;
     restoredPresetLoaded.current = true;
-    if (!yue2Mode && selectedArtistId && !selectedPreset) {
+    if (!yue2Mode && !audioTransformMode && selectedArtistId && !selectedPreset) {
       const ids = new Set(setsQuery.data.filter(ls => ls.artist_id === selectedArtistId).map(ls => ls.id));
       const preset = presetsQuery.data.presets.find(p => ids.has(p.lyrics_set_id) && p.adapter_path);
       if (preset) setSelectedPreset(preset);
     }
-  }, [yue2Mode, setsQuery.data, presetsQuery.data, selectedArtistId]);
+  }, [yue2Mode, audioTransformMode, setsQuery.data, presetsQuery.data, selectedArtistId]);
 
   useEffect(() => {
     if (!yue2Mode || renderMode !== 'artist' || selectedYue2ArtistId == null || !setsQuery.data || !presetsQuery.data) return;
@@ -696,13 +747,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       setMetadata({ artist: cached.artist || '', title: cached.title || '', album: cached.album || '', duration: cached.duration });
       if (useDetectedDetails && Number.isFinite(cached.bpm) && cached.key) setAnalysis({ bpm: cached.bpm, key: cached.key, scale: cached.scale });
       // Still upload the file
-      setIsUploading(true);
       try {
-        const d = await apiClient.upload<{ audio_url?: string; asset_id?: string }>('/upload/audio', [{ field: 'audio', file }]);
+        const d = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file }] });
         if (sourceLookupRef.current !== lookup) return;
         setSourceAudioUrl(d.audio_url || '');
         setSourceAssetId(d.asset_id || '');
-        setIsUploading(false); setIsAnalyzing(true);
+        setIsAnalyzing(true);
         const opened = await openUploadedAsset(d.asset_id || '', lookup,
           Number.isFinite(cached.bpm) && cached.key ? {
           metadata: { artist: cached.artist || '', title: cached.title || '',
@@ -712,22 +762,25 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         if (useDetectedDetails && opened?.analysis) setAnalysis(opened.analysis);
         const dataset = await lookupDatasetMetadata({ sourceAudioUrl: d.audio_url });
         if (sourceLookupRef.current === lookup && dataset) applyDatasetMetadata(dataset, lyricEdit, instrumentalEdit);
-      } catch {} finally { if (sourceLookupRef.current === lookup) { setIsUploading(false); setIsAnalyzing(false); } }
+      } catch (err) {
+        // Transport failures already toast via the global handler; surface only
+        // domain errors (a failed cover-draft job throws a plain Error).
+        if (!(err instanceof ApiError)) showToast(err instanceof Error ? err.message : String(err));
+      } finally { if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
       return;
     }
 
     // Full pipeline
-    setIsUploading(true);
     let extractedArtist = '', extractedTitle = '', extractedAlbum = '';
     let extractedDuration: number | null = null;
     try {
       // Upload once; the Node workflow reads metadata and analyses that asset.
-      const upData = await apiClient.upload<{ audio_url?: string; asset_id?: string }>('/upload/audio', [{ field: 'audio', file }]);
+      const upData = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file }] });
       if (sourceLookupRef.current !== lookup) return;
       const audioUrl = upData.audio_url || '';
       setSourceAudioUrl(audioUrl);
       setSourceAssetId(upData.asset_id || '');
-      setIsUploading(false); setIsAnalyzing(true);
+      setIsAnalyzing(true);
 
       const opened = await openUploadedAsset(upData.asset_id || '', lookup);
       if (sourceLookupRef.current !== lookup) return;
@@ -765,23 +818,30 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       // Transport failures already toast via the global handler; surface only
       // domain errors (a failed cover-draft job throws a plain Error).
       if (!(err instanceof ApiError)) showToast(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally { if (sourceLookupRef.current === lookup) { setIsUploading(false); setIsAnalyzing(false); } }
+    } finally { if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
   };
 
   // ── Lyrics search ──
-  const handleSearchLyrics = async () => {
-    if (!songArtist.trim() || !songTitle.trim()) { showToast(t('cover.enterArtistTitle')); return; }
-    lyricEditRef.current++;
-    setIsSearchingLyrics(true);
-    try {
-      const result = await lireekApi.searchSongLyrics(songArtist.trim(), songTitle.trim());
+  const searchLyricsMut = useMutation({
+    mutationFn: ({ artist, title }: { artist: string; title: string }) => lireekApi.searchSongLyrics(artist, title),
+    onSuccess: (result, vars) => {
       setLyrics(result.lyrics);
       setLyricsSource(null);
       if (result.title) setSongTitle(result.title);
       showToast(t('cover.lyricsFound'));
-      if (sourceFileName) saveTrackCacheEntry(sourceFileName, { lyrics: result.lyrics, artist: songArtist.trim(), title: result.title || songTitle.trim() });
-    } catch (err: any) { showToast(err.message || t('cover.noLyricsFound')); }
-    finally { setIsSearchingLyrics(false); }
+      if (sourceFileName) saveTrackCacheEntry(sourceFileName, { lyrics: result.lyrics, artist: vars.artist, title: result.title || vars.title });
+    },
+    onError: (err: any) => {
+      // Transport failures already toast via the global handler; surface only
+      // domain errors (no lyrics found, etc.).
+      if (!(err instanceof ApiError)) showToast(err.message || t('cover.noLyricsFound'));
+    },
+  });
+  const isSearchingLyrics = searchLyricsMut.isPending;
+  const handleSearchLyrics = () => {
+    if (!songArtist.trim() || !songTitle.trim()) { showToast(t('cover.enterArtistTitle')); return; }
+    lyricEditRef.current++;
+    searchLyricsMut.mutate({ artist: songArtist.trim(), title: songTitle.trim() });
   };
 
   // ── Apply preset to global UI (adapter bar + mastering reference) ──
@@ -830,13 +890,13 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       if (!current()) return;
       // Find caption — waterfall: generations → profiles → LLM
       if (token && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
-        setIsGeneratingCaption(true);
+        setBgCaptionPending(true);
         const pending = resolveCaptionOnNode(artist.id, false);
         const request = captionRequestRef.current;
         void pending
           .then(caption => { if (caption !== null) setArtistCaption(caption); })
           .catch(err => console.warn('[CoverStudio] Caption generation failed:', err))
-          .finally(() => { if (captionRequestRef.current === request) setIsGeneratingCaption(false); });
+          .finally(() => { if (captionRequestRef.current === request) setBgCaptionPending(false); });
       } else {
       let caption = '';
       // Step 1: Try generation captions
@@ -870,11 +930,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         const sel = loadSelections();
         const { provider, model } = sel.coverCaption;
         if (provider) {
-          setIsGeneratingCaption(true);
+          setBgCaptionPending(true);
           lireekApi.generateCaption(artist.id, { provider, model: model || undefined })
             .then(res => { if (current() && res.caption) setArtistCaption(res.caption); })
             .catch(err => console.warn('[CoverStudio] Caption generation failed:', err))
-            .finally(() => setIsGeneratingCaption(false));
+            .finally(() => setBgCaptionPending(false));
         }
       }
       }
@@ -908,29 +968,35 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     sel.coverCaption = { ...sel.coverCaption, model };
     saveSelections(sel);
   };
-  const handleRegenerateCaption = async () => {
+  const captionMut = useMutation({
+    mutationFn: async ({ artistId, provider, model }: { artistId: number; provider: string; model: string }) => {
+      if (token && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+        return (await resolveCaptionOnNode(artistId, true)) || '';
+      }
+      const res = await lireekApi.generateCaption(artistId, { provider, model: model || undefined, force: true });
+      return res.caption;
+    },
+    onSuccess: caption => { if (caption) setArtistCaption(caption); },
+    onError: (err: any) => {
+      // Transport failures already toast via the global handler; surface only
+      // domain errors (a failed caption job throws a plain Error).
+      if (!(err instanceof ApiError)) showToast(`Caption generation failed: ${err.message}`);
+    },
+  });
+  const isGeneratingCaption = bgCaptionPending || captionMut.isPending;
+  const handleRegenerateCaption = () => {
     if (!selectedArtistId) return;
     const sel = loadSelections();
     const { provider, model } = sel.coverCaption;
     if (!provider) { showToast('Select a Caption LLM provider first'); return; }
-    setIsGeneratingCaption(true);
-    try {
-      if (token && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
-        const caption = await resolveCaptionOnNode(selectedArtistId, true);
-        if (caption) setArtistCaption(caption);
-        return;
-      }
-      const res = await lireekApi.generateCaption(selectedArtistId, { provider, model: model || undefined, force: true });
-      if (res.caption) setArtistCaption(res.caption);
-    } catch (err: any) { showToast(`Caption generation failed: ${err.message}`); }
-    finally { setIsGeneratingCaption(false); }
+    captionMut.mutate({ artistId: selectedArtistId, provider, model });
   };
 
   const prepareYue2Source = async (): Promise<{ sourceAudioUrl?: string; songId?: string; audioUrl: string }> => {
     if (advancedMode && sepStems?.length && sepJobId) {
       const controls = stemControls.map(c => ({ index: c.index, volume: c.muted ? 0 : c.volume, muted: c.muted }));
       const blob = await recombineStems(sepJobId, controls);
-      const uploaded = await apiClient.upload<{ audio_url?: string }>('/upload/audio', [{ field: 'audio', file: blob, name: 'recombined-stems.wav' }]);
+      const uploaded = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file: blob, name: 'recombined-stems.wav' }] });
       if (!uploaded.audio_url) throw new Error('Recombined source has no audio URL');
       return { sourceAudioUrl: uploaded.audio_url, audioUrl: uploaded.audio_url };
     }
@@ -1058,17 +1124,38 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // to be confirmed again.
   const [remeter, setRemeter] = useState<{ from: string; pickup: boolean; abc?: string; twoFourBars?: number; error?: string } | null>(null);
   const remeterOpen = remeter?.from === sheetAbc ? remeter : null;
-  const previewRemeter = async (pickup: boolean) => {
+  // No silent filter here: remeterScore is silent, so this popover's error line
+  // is the sole notifier and must show every failure.
+  const remeterMut = useMutation({
+    mutationFn: ({ from, pickup }: { from: string; pickup: boolean }) => yue2CoverApi.remeterScore(from, pickup),
+    onSuccess: (data, vars) => setRemeter(current =>
+      current?.from === vars.from && current.pickup === vars.pickup ? { ...current, ...data } : current),
+    onError: (err, vars) => setRemeter(current =>
+      current?.from === vars.from && current.pickup === vars.pickup
+        ? { ...current, error: err instanceof Error ? err.message : String(err) } : current),
+  });
+  const previewRemeter = (pickup: boolean) => {
     if (!token) return;
-    const from = sheetAbc;
-    const settle = (result: object) => setRemeter(current =>
-      current?.from === from && current.pickup === pickup ? { ...current, ...result } : current);
-    setRemeter({ from, pickup });
-    try { settle(await yue2CoverApi.remeterScore(from, pickup)); }
-    catch (err) { settle({ error: (err as Error).message }); }
+    setRemeter({ from: sheetAbc, pickup });
+    remeterMut.mutate({ from: sheetAbc, pickup });
   };
   const applyRemeter = () => {
     if (remeterOpen?.abc && prep.applyStructuralOp({ kind: 'replace', abc: remeterOpen.abc })) setRemeter(null);
+  };
+  // Bar lines a beat or more off the song's downbeats: the same preview, then one edit.
+  const [barShift, setBarShift] = useState<{ from: string; beats: number; abc?: string; error?: string } | null>(null);
+  const barShiftOpen = barShift?.from === sheetAbc ? barShift : null;
+  const previewBarShift = async (beats: number) => {
+    if (!token) return;
+    const from = sheetAbc;
+    const settle = (result: object) => setBarShift(current =>
+      current?.from === from && current.beats === beats ? { ...current, ...result } : current);
+    setBarShift({ from, beats });
+    try { settle(await yue2CoverApi.shiftBars(from, beats)); }
+    catch (err) { settle({ error: (err as Error).message }); }
+  };
+  const applyBarShift = () => {
+    if (barShiftOpen?.abc && prep.applyStructuralOp({ kind: 'replace', abc: barShiftOpen.abc })) setBarShift(null);
   };
 
   // The original source, never a recombined mix: its vocal stem is what the
@@ -1084,15 +1171,17 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const scoreTempoFactor = scoreTempoScale.abc === sheetAbc ? scoreTempoScale.factor : 1;
   const scaledScoreBpm = Math.round(scoreBpm * scoreTempoFactor);
   const scaleScoreTempo = (by: number) => setScoreTempoScale({ abc: sheetAbc, factor: scoreTempoFactor * by });
-  const scoreKey = coverScoreKeyLabel(sheetAbc).replace(/(major|minor)$/, m => m[0].toUpperCase() + m.slice(1));
+  const scoreKey = coverScoreKeyLabel(sheetAbc).replace(/(major|minor|dorian|phrygian|lydian|mixolydian|locrian)$/, m => m[0].toUpperCase() + m.slice(1));
   const scoreDetailsDiffer = yue2Mode && datasetAnalysis && !!analysis && scoreBpm > 0 && !!scoreKey &&
     (Math.round(analysis.bpm) !== scoreBpm || analysis.key.toLowerCase() !== scoreKey.toLowerCase());
-  const saveScoreDetails = async () => {
-    if (!token || !scoreDetailsDiffer) return;
-    const key = sourceKey;
-    let bpm = scaledScoreBpm, musicalKey = scoreKey;
-    setScoreDetailsSaving(true);
-    try {
+  // Both legs are silent — the sheet's "Save to dataset:" line is the sole
+  // notifier, so onError shows every failure. The source key travels as a
+  // variable: if the source changed while the save was in flight, the write
+  // still succeeded but its bpm/key belong to the old source, so only the
+  // toast applies — not the analysis state.
+  const scoreDetailsMut = useMutation({
+    mutationFn: async (key: string) => {
+      let bpm = scaledScoreBpm, musicalKey = scoreKey;
       if (sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
         const saved = await coverWorkflowApi.saveScoreDetails(coverDraftId,
           coverDraftRevision, sheetAbc, scoreTempoFactor);
@@ -1100,13 +1189,21 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       } else {
         await yue2CoverApi.saveDatasetDetails({ ...sectionSource(), bpm, key: musicalKey });
       }
-      if (sourceKeyRef.current === key) {
-        setAnalysis({ bpm, key: musicalKey, scale: musicalKey.split(' ')[1] });
+      return { bpm, key: musicalKey, stale: sourceKeyRef.current !== key };
+    },
+    onSuccess: ({ bpm, key, stale }) => {
+      if (!stale) {
+        setAnalysis({ bpm, key, scale: key.split(' ')[1] });
         setBpmOverride(null); setKeyOverride(null);
       }
       showToast('Tempo and key saved to the dataset');
-    } catch (err: any) { setSheetError(`Save to dataset: ${err.message}`); }
-    finally { setScoreDetailsSaving(false); }
+    },
+    onError: (err: any) => setSheetError(`Save to dataset: ${err.message}`),
+  });
+  const scoreDetailsSaving = scoreDetailsMut.isPending;
+  const saveScoreDetails = () => {
+    if (!token || !scoreDetailsDiffer) return;
+    scoreDetailsMut.mutate(sourceKey);
   };
 
   // ── Generation ──
@@ -1156,15 +1253,19 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
 
   const submitCoverWorkflow = () => {
     if (!token || !coverDraftId || !coverDraftRevision) return;
-    const engineParams = gp.getGlobalParams() as Record<string, unknown>;
+    // The workflow's yue2* engine params reach the render; the instrumental melody mode rides with them.
+    const engineParams = { ...gp.getGlobalParams() as Record<string, unknown>,
+      ...(renderInstrumental ? { yue2InstrumentalMode: instrumentalMode } : {}) };
     const backend = useBackendStore.getState().activeBackendId;
     const input = {
       documentId: coverDraftId, revision: coverDraftRevision,
       expectedBackend: backend, engineParams,
+      ...(audioTransformMode ? { strength: sa3Transform, seed: sa3Seed,
+        ...(sa3Adapter ? { adapter: `${sa3Adapter}:1` } : {}) } : {}),
       title: songTitle, artistName: songArtist,
-      targetArtistName: yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '',
-      lyrics: renderLyrics, caption: artistCaption,
-      instrumental: renderInstrumental, lyricsSource: renderLyricsSource, scoreSource: sheetScoreSource, analysis,
+      targetArtistName: audioTransformMode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '',
+      lyrics: audioTransformMode ? '' : renderLyrics, caption: artistCaption,
+      instrumental: audioTransformMode || renderInstrumental, lyricsSource: audioTransformMode ? null : renderLyricsSource, scoreSource: audioTransformMode ? null : sheetScoreSource, analysis,
       ...(yue2Mode ? { prepare: prep.doc } : {}),
       settings: { coResident: settings.coResident, cacheLmCodes: settings.cacheLmCodes,
         parallelWhisper: settings.parallelWhisper, parallelQualityEval: settings.parallelQualityEval,
@@ -1187,7 +1288,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     };
     const qId = addManualQueueItem({ title: songArtist
       ? `${songTitle || 'Cover'} (${songArtist} Cover)` : (songTitle || 'Cover'),
-      artistName: yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '', caption: artistCaption });
+      artistName: audioTransformMode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '', caption: artistCaption });
     updateManualQueueItem(qId, { stage: 'Preparing…' });
     setIsGenerating(true);
     void (async () => {
@@ -1281,6 +1382,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     const qId = addManualQueueItem({ title, artistName: String(buildSession.params.artistName || ''), caption: String(buildSession.params.caption || '') });
     updateManualQueueItem(qId, { stage: _coverRunning ? 'Queued…' : 'Preparing…' });
     setIsGenerating(true);
+    _savingBuilds.set(sessionId, (_savingBuilds.get(sessionId) ?? 0) + 1);
     enqueueCoverJob(async () => {
       try {
         const res = await generateApi.submit(params as any);
@@ -1290,7 +1392,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         // still the open one; any other outcome keeps it for a retry.
         if (outcome === 'succeeded') finishSavedBuild(sessionId);
       } catch (err: any) { failManualQueueItem(qId, err.message || 'Generation failed'); }
-      finally { if (_coverQueue.length === 0) { setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage(''); } }
+      finally {
+        const left = (_savingBuilds.get(sessionId) ?? 1) - 1;
+        if (left > 0) _savingBuilds.set(sessionId, left); else _savingBuilds.delete(sessionId);
+        if (_coverQueue.length === 0) { setIsGenerating(false); setActiveJobId(null); setGenProgress(0); setGenStage(''); }
+      }
     });
     showToast('Saving the build as a song: it is in the queue');
   };
@@ -1314,8 +1420,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       blocked={buildSession ? '' : typeof draftParams === 'string' ? `${draftParams} on the Prepare page.` : !canGenerate ? 'Finish the Prepare page first.' : ''}
       busy={build.busy} error={build.error} caption={buildCaption(params ?? undefined)}
       onOccurrenceLyrics={edits => void build.occurrenceLyrics(edits)}
-      onGenerate={generateBuildTakes} onPlan={planBuild} onCancel={() => void build.cancel()} onKeep={(take, crop) => void build.keep(take, crop)} onDelete={take => void build.remove(take)}
-      onUndo={section => void build.undo(section)} onStartOver={build.startOver} onSave={saveBuild}
+      onGenerate={generateBuildTakes} onPlan={planBuild} onCancel={() => void build.cancel()} onKeep={(take, crop, count) => void build.keep(take, crop, count)} onDelete={take => void build.remove(take)}
+      onUndo={section => void build.undo(section)} onStartOver={build.startOver} onDeleteBuild={() => buildSession && _savingBuilds.has(buildSession.id) ? showToast('A Save song render is queued for this build; delete it once that finishes.') : void build.deleteBuild()} onSave={saveBuild}
       onCrop={(take, frame, mode) => void build.crop(take, frame, mode)} onTrim={(take, seconds) => void build.trim(take, seconds)} onPreview={() => void build.preview()}
       onBack={() => setBuildMode(false)} />;
   };
@@ -1373,13 +1479,21 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     instrumental: renderInstrumental, source: 'cover-studio',
     ...(sourceMode === 'audio' ? { sourceAudioUrl: approvedSheet.audioUrl } : {}),
     yue2Cover: sourceMode === 'audio'
-      ? { sourceId: approvedSheet.sourceId, sourceLabel: approvedSheet.sourceLabel, ...coverChoices }
+      ? { sourceId: approvedSheet.sourceId, sourceLabel: approvedSheet.sourceLabel, ...coverChoices,
+          ...(coverGuide.on && !coverGuideBlock(coverKeyShift, coverTempoMode)
+            ? { guide: (({ on: _on, ...rest }) => rest)(coverGuide) } : {}) }
       : { sourceKind: 'musicxml', ...coverChoices },
-    yue2Abc: approvedSheet.abc, yue2Prepare: prep.doc, yue2Cot: keepChords ? 'full' : 'melody', yue2Pick: pair };
+    yue2Abc: approvedSheet.abc, yue2Prepare: prep.doc, yue2Cot: keepChords ? 'full' : 'melody', yue2Pick: pair,
+    ...(renderInstrumental ? { yue2InstrumentalMode: instrumentalMode } : {}) };
     return { params, title };
   };
 
   const handleGenerate = () => {
+    if (audioTransformMode) {
+      if (!token || !sourceAudioUrl || !coverDraftId || !coverDraftRevision || !artistCaption.trim()) return;
+      submitCoverWorkflow();
+      return;
+    }
     if (!token || (sourceMode === 'audio' && !sourceAudioUrl)) { showToast(t('cover.missingSrcOrLyrics')); return; }
     if (sourceMode === 'audio' && sourceAssetId && (!coverDraftId || !coverDraftRevision)) {
       showToast('Source is still being prepared'); return;
@@ -1447,9 +1561,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           console.log('[CoverStudio] Auto-recombine controls:', JSON.stringify(effectiveControls));
           console.log('[CoverStudio] Stem names:', sepStems.map(s => `[${s.index}] ${s.name}`).join(', '));
           const blob = await recombineStems(sepJobId, effectiveControls);
-          // Upload recombined WAV to get a server-side URL; on failure keep the original.
+          // Upload recombined WAV to get a server-side URL; on failure keep the
+          // original. Silent — that fallback is deliberate, not an error worth
+          // a global toast.
           try {
-            const { audio_url } = await apiClient.upload<{ audio_url?: string }>('/upload/audio', [{ field: 'audio', file: blob, name: 'recombined-stems.wav' }]);
+            const { audio_url } = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file: blob, name: 'recombined-stems.wav' }], silent: true });
             if (audio_url) {
               effectiveSourceUrl = audio_url;
               console.log('[CoverStudio] Using recombined stems:', audio_url);
@@ -1556,8 +1672,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     let timedOut = false;
     let outcome: 'succeeded' | 'failed' | 'cancelled' | 'timeout' = 'failed';
     try {
-      await waitForSnapshot(serverKey('shell-queue/generation-status', { id: jobId }),
-        signal => generateApi.status(jobId, { signal }),
+      await waitForQuery<GenerationJob>(generationStatusOptions(jobId),
         s => !timedOut && !['succeeded', 'failed', 'cancelled'].includes(s.status), s => {
           const tk = timer.tick(s.status);
           // Server sends 0-100; normalise to 0-100 for display
@@ -1600,7 +1715,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             showToast(`Failed: ${s.error || 'Unknown error'}`);
             failManualQueueItem(qId, s.error || (s.status === 'cancelled' ? 'Cancelled' : 'Unknown error'));
           }
-        }, { timeoutMs: (getGenerationTimeoutMinutes() + 30) * 60_000 });
+        }, { timeoutMs: (getGenerationTimeoutMinutes() + 30) * 60_000, deliverRepeats: true });
       await songsChanged();
     } catch (err) {
       failManualQueueItem(qId, err instanceof Error ? err.message : 'Generation status failed');
@@ -1612,10 +1727,13 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // Cancel the currently-running cover. The poll sees the cancelled status,
   // resolves, and the queue advances to the next item.
   const handleCancel = async () => {
+    let cancelled = false;
     if (coverRenderJobRef.current && token) {
-      await workflowApi.cancel(coverRenderJobRef.current).catch(() => {});
-    } else if (activeJobId) { try { await generateApi.cancel(activeJobId); } catch {} }
-    if (queueItemId) failManualQueueItem(queueItemId, 'Cancelled by user');
+      try { await workflowApi.cancel(coverRenderJobRef.current); cancelled = true; } catch {}
+    } else if (activeJobId) { try { await generateApi.cancel(activeJobId); cancelled = true; } catch {} }
+    // Only claim cancellation when the server confirmed it — a failed cancel
+    // leaves the job running, and the queue item must stay in flight.
+    if (queueItemId && cancelled) failManualQueueItem(queueItemId, 'Cancelled by user');
   };
 
   const handleClearSource = () => {
@@ -1653,7 +1771,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
 
   // Always allow queuing another cover — covers stack and run one at a time (#62).
-  const canGenerate = (!yue2Mode || sourceMode === 'audio' ? !!sourceAudioUrl && (!sourceAssetId || (!!coverDraftId && !!coverDraftRevision)) : true)
+  const canGenerate = audioTransformMode
+    ? !!sourceAudioUrl && !!coverDraftId && !!coverDraftRevision && !!artistCaption.trim()
+    : (!yue2Mode || sourceMode === 'audio' ? !!sourceAudioUrl && (!sourceAssetId || (!!coverDraftId && !!coverDraftRevision)) : true)
     && (yue2Mode ? !!confirmedPair : (!!lyrics.trim() || instrumental))
     && (!yue2Mode || (!!approvedSheet && approvedSheet.key === sourceKey && (renderMode === 'base' || (!!activeYue2Ar && !!activeYue2Nar))));
 
@@ -1678,6 +1798,52 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     <Fold title="Drafts" storageKey="cover-studio-fold-drafts">
       <StudioDraftPicker control={draft} textKey="cover-studio-songTitle" apply={applyDraft} namedSave={yue2Mode} inline />
     </Fold>
+  );
+
+  const renderAudioTransformPanel = () => (
+    <div className="flex-1 min-w-[300px] overflow-y-auto p-4 space-y-4">
+      <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">{t('cover.sa3.title', 'Audio transform')}</h2>
+      <p className="text-xs text-zinc-500">{t('cover.sa3.description', "Instrumental only. Follows the source's feel, with no melody guarantee.")}</p>
+      {sourceAudioUrl && !sourceAssetId && <p className="text-xs text-amber-600 dark:text-amber-400">{t('cover.sa3.uploadRequired', 'Upload the source audio to prepare an audio transform.')}</p>}
+      <label className="block space-y-2">
+        <ParamLabel label={t('cover.sa3.songTitle', 'Title')} info={t('cover.sa3.songTitleInfo', 'Name the transformed track saved in the Library.')} />
+        <input value={songTitle} onChange={e => setSongTitle(e.target.value)}
+          className="w-full rounded-lg border border-zinc-300 dark:border-white/10 bg-white dark:bg-black/20 p-2 text-sm text-zinc-900 dark:text-white" />
+      </label>
+      <label className="block space-y-2">
+        <ParamLabel label={t('cover.sa3.caption', 'Caption')} info={t('cover.sa3.captionInfo', 'Describe the instruments, genre, mood and production you want the transform to use.')} />
+        <textarea value={artistCaption} onChange={e => setArtistCaption(e.target.value)} rows={5}
+          className="w-full rounded-lg border border-zinc-300 dark:border-white/10 bg-white dark:bg-black/20 p-3 text-sm text-zinc-900 dark:text-white" />
+      </label>
+      <ParamLabel label={t('cover.targetArtist')} info={t('cover.sa3.artistInfo', 'Choose an artist from Lyric Studio to draft a caption with the Caption LLM. This does not load an ACE adapter.')} />
+      <StyledSelect accent="cyan" value={selectedArtistId == null ? '' : String(selectedArtistId)}
+        onChange={value => setSelectedArtistId(value ? Number(value) : null)}
+        options={[{ value: '', label: t('cover.sa3.customCaption', 'Custom caption') }, ...artists.map(artist => ({ value: String(artist.id), label: artist.name }))]} />
+      <button type="button" onClick={handleRegenerateCaption} disabled={!selectedArtistId || isGeneratingCaption || isAnalyzing}
+        className="rounded-lg bg-cyan-500/10 px-3 py-2 text-xs text-cyan-600 dark:text-cyan-300 disabled:opacity-50">
+        {t('cover.sa3.draftCaption', 'Draft caption')}
+      </button>
+      <EditableSlider label={t('cover.sa3.transform', 'Transform')} value={sa3Transform} onChange={setSa3Transform}
+        min={0.1} max={0.9} step={0.01} defaultValue={0.3}
+        tooltip={t('cover.sa3.transformInfo', 'Lower values keep closer to the source. Higher values allow a looser transform guided by your caption. Default 0.3; range 0.1 to 0.9.')}
+        helpText={t('cover.sa3.transformRange', '0.1 close / 0.9 loose')} />
+      <label className="block space-y-2">
+        <ParamLabel label={t('cover.sa3.seed', 'Seed')} info={t('cover.sa3.seedInfo', 'Use -1 for a random seed, or a fixed whole number to repeat a transform with the same settings.')} />
+        <input type="number" min={-1} step={1} value={sa3Seed} onChange={e => setSa3Seed(Math.max(-1, Math.trunc(Number(e.target.value))))}
+          className="w-full rounded-lg border border-zinc-300 dark:border-white/10 bg-white dark:bg-black/20 p-2 text-sm text-zinc-900 dark:text-white" />
+      </label>
+      <ParamLabel label={t('cover.sa3.adapter', 'Adapter')} info={t('cover.sa3.adapterInfo', 'Optional SA3 DoRA adapter from models/sa3-adapters, applied at strength 1. This selection is separate from StableStep.')} />
+      {sa3AdaptersQuery.isError ? <QueryError error={sa3AdaptersQuery.error} onRetry={() => void sa3AdaptersQuery.refetch()} compact /> :
+        <StyledSelect accent="cyan" value={sa3Adapter} onChange={setSa3Adapter}
+          options={[{ value: '', label: t('cover.sa3.noAdapter', 'No adapter') }, ...(sa3AdaptersQuery.data?.adapters ?? []).map(a => ({ value: a.name, label: a.name }))]} />}
+      <p className="text-xs text-zinc-500">{t('cover.sa3.fullSource', 'Transforms the full uploaded source. Stem separation is available for inspection; mixer changes do not alter this transform.')}</p>
+      <button type="button" onClick={handleGenerate} disabled={!canGenerate}
+        className="rounded-lg bg-cyan-500/20 px-4 py-2 text-sm font-medium text-cyan-700 dark:text-cyan-300 disabled:opacity-50">
+        {t('cover.sa3.generate', 'Transform audio')}
+      </button>
+      {isGenerating && <button type="button" onClick={handleCancel} className="ml-3 text-xs text-zinc-500">{t('cover.sa3.cancel', 'Cancel')}</button>}
+      {draftsFold}
+    </div>
   );
 
   // ── Render ──
@@ -1730,7 +1896,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           </MusicXmlImport>}
         </div>}
         {(!yue2Mode || sourceMode === 'audio') && <>
-        <div className="px-4 pt-4 space-y-2">
+        {!audioTransformMode && <div className="px-4 pt-4 space-y-2">
           <Toggle size="sm" accent="cyan" checked={useDetectedDetails}
             disabled={isUploading || isAnalyzing}
             onChange={enabled => {
@@ -1752,9 +1918,10 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
               {factor === 0.5 ? '÷2' : '×2'}
             </button>)}
           </div>}
-        </div>
+        </div>}
         <SourcePanel
           yue2Mode={yue2Mode}
+          audioTransformMode={audioTransformMode}
           sourceFileName={sourceFileName} metadata={metadata} analysis={analysis}
           fromDataset={datasetAnalysis}
           scoreDetails={scoreDetailsDiffer ? { bpm: scaledScoreBpm, key: scoreKey, saving: scoreDetailsSaving,
@@ -1795,9 +1962,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         /></>}
         </div>
 
-        <CoverResizeHandle label="Resize source column" direction="horizontal" onMouseDown={e => startResize(e, sourceWidth, setSourceWidth, 240, 900)} />
+        {!audioTransformMode && <CoverResizeHandle label="Resize source column" direction="horizontal" onMouseDown={e => startResize(e, sourceWidth, setSourceWidth, 240, 900)} />}
         {/* Center: Lyrics and score */}
-        <div className="min-w-[320px] flex-shrink-0 flex flex-col overflow-hidden border-r border-zinc-200 dark:border-white/5" style={{ width: scoreWidth }}>
+        {!audioTransformMode && <><div className="min-w-[320px] flex-shrink-0 flex flex-col overflow-hidden border-r border-zinc-200 dark:border-white/5" style={{ width: scoreWidth }}>
           <div className="flex-shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-white/5">
             <div className="flex items-center justify-between gap-2">
               {/* Artist + Title inputs */}
@@ -1844,6 +2011,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             {prep.step === 'structure'
               ? <PrepareStructure prep={prep} sourceAudioUrl={sourceMode === 'audio' ? sourceAudioUrl : ''} scorePlaying={scorePlaying}
                 onPlayScore={playScore} scoreStarts={scoreStarts} onHighlight={setScoreHighlight}
+                planFromLyrics={token && lyrics.trim() && sourceMode === 'audio' && sourceAudioUrl
+                  ? () => yue2CoverApi.planScoreSections({ ...sectionSource(), abc: prep.doc.abc, lyrics }) : undefined}
                 onConfirmed={() => void handleApproveSheet()}>
                 {mainMeter(sheetAbc) === '2/4' && !remeterOpen &&
                   <button type="button" onClick={() => void previewRemeter(false)} disabled={sheetPreparing}
@@ -1867,6 +2036,34 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
                     <button type="button" onClick={applyRemeter} disabled={!remeterOpen.abc}
                       className="text-xs text-cyan-700 dark:text-cyan-300 disabled:opacity-40">Apply 4/4</button>
                     <button type="button" onClick={() => setRemeter(null)} className="text-xs text-zinc-500">Cancel</button>
+                  </div>
+                </div>}
+                {sheetAbc.trim() && !barShiftOpen && <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="text-zinc-500">Bar lines off?</span>
+                  {([[-1, 'A beat earlier', 'after'], [1, 'A beat later', 'before']] as const).map(([beats, label, when]) =>
+                    <button key={beats} type="button" onClick={() => void previewBarShift(beats)} disabled={sheetPreparing}
+                      title={`Move every bar line ${label.toLowerCase()}, keeping each note where it sounds. Use it when the bar-1 click lands a beat ${when} the song's downbeat. Shows a preview before applying.`}
+                      className="rounded-md border border-cyan-500/50 px-2 py-1 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-40">{label}</button>)}
+                </div>}
+                {barShiftOpen && <div className="space-y-2 rounded-lg border border-cyan-500/30 p-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                    <button type="button" onClick={() => void previewBarShift(barShiftOpen.beats === 1 ? -1 : barShiftOpen.beats - 1)}
+                      className="rounded-md border border-zinc-300 dark:border-white/10 px-2">−</button>
+                    <span>Bar lines {Math.abs(barShiftOpen.beats)} beat{Math.abs(barShiftOpen.beats) > 1 ? 's' : ''} {barShiftOpen.beats < 0 ? 'earlier' : 'later'}</span>
+                    <button type="button" onClick={() => void previewBarShift(barShiftOpen.beats === -1 ? 1 : barShiftOpen.beats + 1)}
+                      className="rounded-md border border-zinc-300 dark:border-white/10 px-2">+</button>
+                  </div>
+                  {barShiftOpen.error ? <p role="alert" className="text-xs text-red-500">The bar lines cannot be moved: {barShiftOpen.error}</p>
+                    : !barShiftOpen.abc ? <p className="text-xs text-zinc-500">Moving…</p>
+                    : <>
+                      <p className="text-xs text-zinc-500">Every note keeps its time; notes across a new bar line are tied and section starts move with their bar lines.
+                        Applying replaces this cover's score (the dataset files are not changed) and can be undone above; the structure then needs confirming again.</p>
+                      <AbcChart abc={barShiftOpen.abc} disabled height={240} playingBar={null} onAbcChange={() => {}} />
+                    </>}
+                  <div className="flex gap-3">
+                    <button type="button" onClick={applyBarShift} disabled={!barShiftOpen.abc}
+                      className="text-xs text-cyan-700 dark:text-cyan-300 disabled:opacity-40">Apply</button>
+                    <button type="button" onClick={() => setBarShift(null)} className="text-xs text-zinc-500">Cancel</button>
                   </div>
                 </div>}
               </PrepareStructure>
@@ -1904,9 +2101,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           )}
         </div>
 
-        <CoverResizeHandle label="Resize lyrics and score column" direction="horizontal" onMouseDown={e => startResize(e, scoreWidth, setScoreWidth, 320, 1200)} />
+        <CoverResizeHandle label="Resize lyrics and score column" direction="horizontal" onMouseDown={e => startResize(e, scoreWidth, setScoreWidth, 320, 1200)} /></>}
         {/* Right: Artist + Settings */}
-        {yue2Mode ? <div className="min-w-[300px] flex-1 flex flex-col min-h-0" style={{ flexBasis: settingsWidth }}>
+        {audioTransformMode ? renderAudioTransformPanel() : yue2Mode ? <div className="min-w-[300px] flex-1 flex flex-col min-h-0" style={{ flexBasis: settingsWidth }}>
+          {renderMode === 'base' && (pickerAr || pickerNar) && <p className="px-4 pt-3 text-xs text-amber-600 dark:text-amber-400">
+            {t('cover.yue2BaseIgnoresLora')}</p>}
           <Yue2CoverPanel
           caption={artistCaption} onCaptionChange={value => { setArtistCaption(value); setCaptionMode('custom'); }}
           captionMode={captionMode} onCaptionMode={selectCaptionSource}
@@ -1919,10 +2118,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           buildStatus={buildSession ? `Build in progress: ${Math.min(nextBuild, buildSession.sections.length)} of ${buildSession.sections.length} sections` : ''}
           onStartOverBuild={buildSession ? build.startOver : undefined}
           instrumental={renderInstrumental} onInstrumentalChange={() => showToast('Instrumental follows the lyrics: mark every section Instrumental in Assign lyrics, or give a section words.')}
-          renderMode={renderMode} onRenderMode={setRenderMode}
+          renderMode={renderMode} onRenderMode={chooseRenderMode}
           ar={yue2Ar} nar={yue2Nar} onAr={setYue2Ar} onNar={setYue2Nar}
           arOptions={adapterOptions('ar')} narOptions={adapterOptions('nar')}
           keepChords={keepChords} onKeepChords={setKeepChords}
+          instrumentalMode={instrumentalMode} onInstrumentalMode={setInstrumentalMode}
           scoreAbc={sheetAbc} scoreKeyLabel={coverScoreKeyLabel(sheetAbc)}
           voices={coverVoices} onVoices={setCoverVoices}
           tempoMode={coverTempoMode} onTempoMode={setCoverTempoMode}
@@ -1931,6 +2131,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           cfgScale={coverCfgScale} onCfgScale={setCoverCfgScale}
           arStrength={coverArStrength} onArStrength={v => setCoverArStrength(clampCoverAr(v))}
           lyricSchedule={coverLyricSchedule} onLyricSchedule={setCoverLyricSchedule}
+          guide={coverGuide} onGuide={setCoverGuide} hasSourceAudio={sourceMode === 'audio'}
           canGenerate={canGenerate} isGenerating={isGenerating} onGenerate={handleGenerate}
           footer={draftsFold}
         />

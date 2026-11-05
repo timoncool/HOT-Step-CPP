@@ -9,13 +9,13 @@ import { changed, readSnapshot } from '../queries/cover-lyrics/reads';
 const API_BASE = '';
 
 async function api<T>(endpoint: string, options: {
-  method?: string; body?: unknown; timeoutMs?: number; signal?: AbortSignal;
+  method?: string; body?: unknown; timeoutMs?: number; signal?: AbortSignal; silent?: boolean;
 } = {}): Promise<T> {
   const { method = 'GET', body, timeoutMs = 10_000, signal } = options;
   const path = endpoint.replace(/^\/api/, '');
   if (method === 'GET') return readSnapshot<T>('lireek', path, { signal });
   // LLM-backed writes run past the 60s default; each caller overrides timeoutMs.
-  const opts = { signal, timeout: timeoutMs };
+  const opts = { signal, timeout: timeoutMs, silent: options.silent };
   let result: T;
   if (method === 'DELETE') result = await apiClient.delete<T>(path, opts);
   else if (method === 'PUT') result = await apiClient.put<T>(path, body, opts);
@@ -354,10 +354,12 @@ export const lireekApi = {
   listAllPresets: (options: ReadOptions = {}): Promise<{ presets: AlbumPreset[] }> =>
     api('/api/lireek/presets', options),
 
+  // The settings panel renders this failure itself (a localized line with the
+  // error embedded), so the transport stays quiet — one notifier per failure.
   updateAdapterReferences: (): Promise<{
     scanned: number; updated: number;
     changes: Array<{ lyricsSetId: number; presetName: string; field: string; adapter: string }>;
-  }> => api('/api/lireek/presets/update-adapter-references', { method: 'POST' }),
+  }> => api('/api/lireek/presets/update-adapter-references', { method: 'POST', silent: true }),
 
   // ── Slop Detection ──────────────────────────────────────────────────────
   slopScan: (text: string): Promise<any> =>
@@ -411,11 +413,12 @@ export const lireekApi = {
   listPrompts: (options: ReadOptions = {}): Promise<{ prompts: { name: string; default_content: string; custom: string | null }[] }> =>
     api('/api/lireek/prompts', options),
 
+  // silent: PromptEditor's toast is the sole notifier for save/reset failures.
   savePrompt: (name: string, value: string): Promise<{ success: boolean }> =>
-    api(`/api/lireek/prompts/${name}`, { method: 'PUT', body: { value } }),
+    api(`/api/lireek/prompts/${name}`, { method: 'PUT', body: { value }, silent: true }),
 
   resetPrompt: (name: string): Promise<{ success: boolean }> =>
-    api(`/api/lireek/prompts/${name}`, { method: 'DELETE' }),
+    api(`/api/lireek/prompts/${name}`, { method: 'DELETE', silent: true }),
 
   // ── Recent Songs ────────────────────────────────────────────────────────
   getRecentSongs: (limit = 30, options: ReadOptions = {}): Promise<{ songs: RecentSong[] }> =>
@@ -585,4 +588,4 @@ export const composeMm3Caption = (
   controls?: Mm3ComposeControls,
   seed?: number,
 ): Promise<Mm3ComposeResult> =>
-  api('/api/lireek/mm3/compose', { method: 'POST', body: { brief, controls, seed } });
+  api('/api/lireek/mm3/compose', { method: 'POST', body: { brief, controls, seed }, silent: true });

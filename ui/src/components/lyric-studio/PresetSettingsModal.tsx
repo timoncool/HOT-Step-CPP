@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import type { AlbumPreset } from '../../services/lireekApi';
 import React, { useState, useEffect } from 'react';
@@ -10,6 +10,7 @@ import { StyledSelect, type SelectOption } from '../shared/StyledSelect';
 import { useBackendStore } from '../../stores/backendStore';
 import { MM3_BACKEND_ID } from '../../utils/captionForBackend';
 import { YUE2_BACKEND_ID } from '../../utils/yue2CaptionSource';
+import { QueryError } from '../shared/QueryError';
 
 interface PresetForm {
   adapter_path: string;
@@ -81,7 +82,7 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
   const { t } = useTranslation();
   const presetQuery = useQuery({ ...snapshotOptions<{ preset: AlbumPreset | null }>('lireek', `/lireek/lyrics-sets/${lyricsSetId}/preset`), enabled: isOpen });
   const loading = presetQuery.isPending;
-  const [saving, setSaving] = useState(false);
+
   const [groupsExpanded, setGroupsExpanded] = useState(false);
   const [browserOpen, setBrowserOpen] = useState(false);
   const [browserTarget, setBrowserTarget] = useState<'adapter' | 'lmAdapter' | 'reference' | 'yue2Folder'>('adapter');
@@ -177,41 +178,32 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
     }
   }, [isOpen, lyricsSetId, presetQuery.data]);
 
-  const save = async () => {
-    setSaving(true);
-    try {
-      await lireekApi.upsertPreset(lyricsSetId, {
-        // Normalise typed/pasted file paths to their folder on the way out too.
-        adapter_path: stripWeightsFile(form.adapter_path) || undefined,
-        adapter_group_scales: { self_attn: form.self_attn, cross_attn: form.cross_attn, mlp: form.mlp, cond_embed: form.cond_embed },
-        reference_track_path: form.reference_track_path || undefined,
-        lm_adapter_path: stripWeightsFile(form.lm_adapter_path) || undefined,
-        mm3_adapter_path: form.mm3_adapter_path || undefined,
-        yue2_ar_adapter_path: form.yue2_ar_adapter_path || undefined,
-        yue2_nar_adapter_path: form.yue2_nar_adapter_path || undefined,
-      });
-      showToast('Preset saved');
-      onClose();
-    } catch (err: any) {
-      showToast(`Save failed: ${err.message}`);
-    } finally {
-      setSaving(false);
-    }
-  };
+  const saveMut = useMutation({
+    mutationFn: () => lireekApi.upsertPreset(lyricsSetId, {
+      // Normalise typed/pasted file paths to their folder on the way out too.
+      adapter_path: stripWeightsFile(form.adapter_path) || undefined,
+      adapter_group_scales: { self_attn: form.self_attn, cross_attn: form.cross_attn, mlp: form.mlp, cond_embed: form.cond_embed },
+      reference_track_path: form.reference_track_path || undefined,
+      lm_adapter_path: stripWeightsFile(form.lm_adapter_path) || undefined,
+      mm3_adapter_path: form.mm3_adapter_path || undefined,
+      yue2_ar_adapter_path: form.yue2_ar_adapter_path || undefined,
+      yue2_nar_adapter_path: form.yue2_nar_adapter_path || undefined,
+    }),
+    onSuccess: () => { showToast('Preset saved'); onClose(); },
+  });
 
-  const clear = async () => {
-    setSaving(true);
-    try {
-      await lireekApi.deletePreset(lyricsSetId);
+  const clearMut = useMutation({
+    mutationFn: () => lireekApi.deletePreset(lyricsSetId),
+    onSuccess: () => {
       setForm(DEFAULT_FORM);
       showToast('Preset cleared');
       onClose();
-    } catch (err: any) {
-      showToast(`Failed: ${err.message}`);
-    } finally {
-      setSaving(false);
-    }
-  };
+    },
+  });
+
+  const saving = saveMut.isPending || clearMut.isPending;
+  const save = () => saveMut.mutate();
+  const clear = () => clearMut.mutate();
 
   if (!isOpen) return null;
 
@@ -240,7 +232,12 @@ export const PresetSettingsModal: React.FC<PresetSettingsModalProps> = ({
 
           {/* Content */}
           <div className="px-6 py-5 space-y-5 max-h-[70vh] overflow-y-auto">
-            {loading ? (
+            {presetQuery.isError && !presetQuery.data ? (
+              <QueryError
+                error={presetQuery.error}
+                onRetry={() => void presetQuery.refetch()}
+              />
+            ) : loading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-6 h-6 text-zinc-500 animate-spin" />
               </div>

@@ -17,8 +17,9 @@ import {
   config,
 } from '../config.js';
 import { listGpus } from '../services/gpuDevices.js';
+import { engineWorkerStatus } from '../services/engineWorkers.js';
 import { validateDownloadDir } from '../services/downloadSave.js';
-import type { EnvResponse, EnvUpdateResponse, GpusResponse } from '../contracts/settings.js';
+import type { EngineWorkersResponse, EnvResponse, EnvUpdateResponse, GpusResponse } from '../contracts/settings.js';
 import { getDataLocation, getBusyBlockers, previewOperation, scheduleOperation, cancelPending, registerBusyCheck } from '../dataroot/pointer.js';
 import { listJobs } from '../services/training/labelingQueue.js';
 import { gpuLaneBusy, gpuLaneDepth } from '../services/generation/gpuLane.js';
@@ -223,6 +224,19 @@ router.post('/env', (req, res) => {
  */
 router.get('/gpus', async (_req, res) => {
   res.json({ gpus: await listGpus() } satisfies GpusResponse);
+});
+
+/**
+ * GET /api/settings/engine-workers
+ *
+ * Per-worker engine status for the multi-GPU section (experimental). One row
+ * per ace-server: id, pinned card UUID (null = the Settings/Auto pick), port,
+ * pid, ready, status text, device and in-flight call count. `busy` is true
+ * while any call is bound to a worker, which is when a worker restart is refused.
+ */
+router.get('/engine-workers', (_req, res) => {
+  const workers = engineWorkerStatus();
+  res.json({ workers, busy: workers.some(w => w.busy > 0) } satisfies EngineWorkersResponse);
 });
 
 export default router;

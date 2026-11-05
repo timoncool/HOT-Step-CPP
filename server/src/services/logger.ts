@@ -86,12 +86,26 @@ export function initLogger(): string {
  * Write a line to the ace-engine log file.
  * Call this from the ace-server child process stdout/stderr handlers.
  */
-export function logEngine(line: string): void {
-  if (!engineLogStream) return;
+export function logEngine(line: string, file = 'ace_engine.log'): void {
+  if (!engineLogStream || !sessionDir) return;
+  // Secondary engine workers (engineWorkers.ts) each write their own file.
+  let stream = engineLogStream;
+  if (file !== 'ace_engine.log') {
+    let own = workerLogStreams.get(file);
+    if (!own) {
+      own = fs.createWriteStream(path.join(sessionDir, file), { flags: 'a' });
+      own.on('error', () => { /* a full disk must not kill the engine feed */ });
+      workerLogStreams.set(file, own);
+    }
+    stream = own;
+  }
   try {
-    engineLogStream.write(line.endsWith('\n') ? line : line + '\n');
+    stream.write(line.endsWith('\n') ? line : line + '\n');
   } catch { /* ignore */ }
 }
+
+/** Engine log streams of secondary workers: file name → stream. */
+const workerLogStreams = new Map<string, fs.WriteStream>();
 
 /** Per-training-job log files: jobId → stream, opened on the first line. */
 const trainingStreams = new Map<string, fs.WriteStream>();

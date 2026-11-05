@@ -3,9 +3,9 @@
 import { Router } from 'express';
 import fs from 'node:fs';
 import { aceClient } from '../services/aceClient.js';
-import { APP_VERSION, config } from '../config.js';
+import { APP_VERSION, BUILD_INFO, config } from '../config.js';
 import { engineReady, engineBootStatus, engineNoModels, engineDevice, backendFamily } from '../engineState.js';
-import { startupCommit, dirtyCheckout } from '../services/training/workerUpdate.js';
+import { startupCommit, cachedDirtyCheckout } from '../services/training/workerUpdate.js';
 import type { HealthResponse } from '../contracts/health.js';
 
 const router = Router();
@@ -35,26 +35,28 @@ router.get('/', async (_req, res) => {
   let aceStatus = 'disconnected';
   let aceVersion = '';
 
-  try {
-    const health = await aceClient.health();
-    aceStatus = health.status || 'ok';
-
-    // Try to get version info from props
-    try {
-      const props = await aceClient.props();
-      aceVersion = (props as any).version || '';
-    } catch {
-      // Props not critical for health
-    }
-  } catch {
-    aceStatus = 'disconnected';
+  // Both probes at once, capped under the UI's 2 s abort on this route: the
+  // Restart overlay and the offline check must hear Node answer even while the
+  // engine is slow to reply or still booting (aceFetch retries a refused
+  // connect for ~1.5 s).
+  const [health, props] = await Promise.allSettled([aceClient.health(1500), aceClient.props(1500)]);
+  if (health.status === 'fulfilled') {
+    aceStatus = health.value.status || 'ok';
+    // Props not critical for health
+    if (props.status === 'fulfilled') aceVersion = (props.value as any).version || '';
   }
 
   res.json({
     status: 'ok',
     version: APP_VERSION,
     commit: startupCommit,
-    dirty: dirtyCheckout(),
+    dirty: cachedDirtyCheckout(),
+    build: {
+      tag: BUILD_INFO?.tag ?? null,
+      sha: BUILD_INFO?.sha ?? (startupCommit || null),
+      variant: BUILD_INFO?.variant ?? null,
+      channel: BUILD_INFO?.channel ?? null,
+    },
     engineBuiltAt: (() => { try { return fs.statSync(config.aceServer.exe).mtime.toISOString(); } catch { return null; } })(),
     aceServer: {
       status: aceStatus,

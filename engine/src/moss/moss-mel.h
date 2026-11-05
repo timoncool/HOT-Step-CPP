@@ -40,6 +40,7 @@
 #include <cmath>
 #include <complex>
 #include <cstddef>
+#include <map>
 #include <vector>
 
 namespace moss {
@@ -59,6 +60,24 @@ using Cpx = std::complex<double>;
 // this is a header others will include in any order. Carry our own constant.
 constexpr double kPi = 3.14159265358979323846;
 
+// exp(-2*pi*i*m/N) for m in [0, N), built once per size per thread. Computing the
+// twiddles inline cost ~10k cos/sin calls per 400-point frame and made the mel
+// ~90 % of an encode. thread_local: Flamingo runs one mel per thread.
+// std::map, not a vector: the recursion holds a reference to its own size's table
+// while a deeper level inserts the next one, so entries must never move.
+inline const std::vector<Cpx> & twiddles(size_t N) {
+    thread_local std::map<size_t, std::vector<Cpx>> cache;
+    std::vector<Cpx> & t = cache[N];
+    if (t.empty()) {
+        t.resize(N);
+        for (size_t m = 0; m < N; ++m) {
+            const double a = -2.0 * kPi * (double) m / (double) N;
+            t[m] = Cpx(std::cos(a), std::sin(a));
+        }
+    }
+    return t;
+}
+
 // Recursive Cooley-Tukey, falling back to a naive DFT on odd N. n_fft=400
 // factors as 2^4 * 25, so the recursion bottoms out in a 25-point DFT.
 inline void fft(std::vector<Cpx> & x) {
@@ -66,13 +85,13 @@ inline void fft(std::vector<Cpx> & x) {
     if (N <= 1) {
         return;
     }
+    const std::vector<Cpx> & tw = twiddles(N);
     if (N % 2 != 0) {
         std::vector<Cpx> out(N);
         for (size_t k = 0; k < N; ++k) {
             Cpx s(0.0, 0.0);
             for (size_t n = 0; n < N; ++n) {
-                const double a = -2.0 * kPi * (double) k * (double) n / (double) N;
-                s += x[n] * Cpx(std::cos(a), std::sin(a));
+                s += x[n] * tw[(k * n) % N];
             }
             out[k] = s;
         }
@@ -87,8 +106,7 @@ inline void fft(std::vector<Cpx> & x) {
     fft(even);
     fft(odd);
     for (size_t k = 0; k < N / 2; ++k) {
-        const double a = -2.0 * kPi * (double) k / (double) N;
-        const Cpx t = Cpx(std::cos(a), std::sin(a)) * odd[k];
+        const Cpx t = tw[k] * odd[k];
         x[k]         = even[k] + t;
         x[k + N / 2] = even[k] - t;
     }

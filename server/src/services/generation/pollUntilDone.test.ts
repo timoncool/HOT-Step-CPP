@@ -64,3 +64,47 @@ test('real ODE step updates reset the watchdog across a long solve', async t => 
   await pollUntilDone('steps', job, new AbortController().signal, 45, { narChunkFrames: 1500 });
   assert.equal(cancel.mock.callCount(), 0);
 });
+
+test('quiet YuE2 completion phases survive 900 seconds without losing the result', async t => {
+  const { cancel, job } = clock(t, 'vae_decode', 1200_000);
+  await pollUntilDone('long-completion', job, new AbortController().signal, 45,
+    { quietCompletionPhases: ['vae_decode', 'encoding_output'] });
+  assert.equal(cancel.mock.callCount(), 0);
+});
+
+test('quiet output completion is still bounded by the wall-clock timeout', async t => {
+  const { cancel, job, elapsed } = clock(t, 'encoding_output');
+  await assert.rejects(pollUntilDone('hung-output', job, new AbortController().signal, 20,
+    { quietCompletionPhases: ['vae_decode', 'encoding_output'] }), /Generation timed out \(20 min limit\)/);
+  assert.ok(elapsed() >= 1200_000 && elapsed() < 1210_000);
+  assert.equal(cancel.mock.callCount(), 1);
+});
+
+test('completion allowance does not exempt model loading from stall detection', async t => {
+  const { job, elapsed } = clock(t, 'loading_dit');
+  await assert.rejects(pollUntilDone('hung-load', job, new AbortController().signal, 45,
+    { quietCompletionPhases: ['vae_decode', 'encoding_output'] }), /Generation stalled/);
+  assert.ok(elapsed() >= 900_000 && elapsed() < 960_000);
+});
+
+test('leaving a quiet completion phase restores inactivity detection', async t => {
+  const { job, elapsed } = clock(t, 'vae_decode');
+  t.mock.method(aceClient, 'pollJob', async () => ({
+    status: 'running', phase: elapsed() < 1000_000 ? 'vae_decode' : 'loading_dit',
+  } as AceJobStatus));
+  await assert.rejects(pollUntilDone('phase-change', job, new AbortController().signal, 45,
+    { quietCompletionPhases: ['vae_decode', 'encoding_output'] }), /Generation stalled/);
+  assert.ok(elapsed() >= 1900_000 && elapsed() < 1960_000);
+});
+
+test('quiet completion still honours cancellation', async t => {
+  const { cancel, job } = clock(t, 'vae_decode');
+  const controller = new AbortController();
+  t.mock.method(aceClient, 'pollJob', async () => {
+    controller.abort();
+    return { status: 'running', phase: 'vae_decode' } as AceJobStatus;
+  });
+  await assert.rejects(pollUntilDone('cancel-completion', job, controller.signal, 45,
+    { quietCompletionPhases: ['vae_decode', 'encoding_output'] }), /Cancelled/);
+  assert.equal(cancel.mock.callCount(), 1);
+});

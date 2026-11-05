@@ -7,6 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import i18n from '../i18n';
 
 type FakeResponse = { ok: boolean; status: number; statusText: string; headers: Headers; json: () => Promise<any> };
 function jsonResponse(status: number, body: unknown): FakeResponse {
@@ -19,7 +20,10 @@ class FakeXhr {
   static made: FakeXhr[] = [];
   status = 0;
   responseText = '';
-  upload = { onprogress: null as ((e: { lengthComputable: boolean; loaded: number; total: number }) => void) | null };
+  upload = {
+    onprogress: null as ((e: { lengthComputable: boolean; loaded: number; total: number }) => void) | null,
+    onload: null as (() => void) | null,
+  };
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
@@ -98,7 +102,9 @@ test('a non-JSON error body still throws, falling back to a status-mapped messag
   await assert.rejects(() => client.get('/x'), (err: unknown) => {
     assert.ok(err instanceof ApiError);
     assert.equal(err.status, 500);
-    assert.equal(err.message, 'Server error (HTTP 500)');
+    // The message is the localized fallback for unmapped statuses — no raw
+    // status code reaches the user (api.error.* in the locale files).
+    assert.equal(err.message, i18n.t('api.error.serverError'));
     return true;
   });
 });
@@ -156,7 +162,34 @@ test('upload rejects instead of hanging when a non-2xx body is JSON null or not 
   await assert.rejects(result, (err: unknown) => {
     assert.ok(err instanceof ApiError);
     assert.equal(err.status, 500);
-    assert.equal(err.message, 'Server error (HTTP 500)');
+    // The message is the localized fallback for unmapped statuses — no raw
+    // status code reaches the user (api.error.* in the locale files).
+    assert.equal(err.message, i18n.t('api.error.serverError'));
+    return true;
+  });
+});
+
+test('upload times out on silence, not on total length: steady progress outlives the limit', async () => {
+  const client = new ApiClient();
+  const result = client.upload<{ ok: boolean }>('/import', [{ field: 'audio', file: new File([], 'a.wav') }], { timeout: 40 });
+  const xhr = FakeXhr.made.at(-1)!;
+  for (let i = 1; i <= 5; i++) {
+    await new Promise(r => setTimeout(r, 20));
+    xhr.upload.onprogress?.({ lengthComputable: true, loaded: i, total: 5 });
+  }
+  // Body sent: the server's processing time is not capped.
+  xhr.upload.onload?.();
+  await new Promise(r => setTimeout(r, 60));
+  xhr.respond(200, { ok: true });
+  assert.deepEqual(await result, { ok: true });
+});
+
+test('a stalled upload rejects as unreachable instead of hanging', async () => {
+  const client = new ApiClient();
+  const result = client.upload('/import', [{ field: 'audio', file: new File([], 'a.wav') }], { timeout: 30, silent: true });
+  await assert.rejects(result, (err: unknown) => {
+    assert.ok(err instanceof ApiError);
+    assert.equal(err.status, 0);
     return true;
   });
 });

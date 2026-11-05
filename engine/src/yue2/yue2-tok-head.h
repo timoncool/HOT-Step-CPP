@@ -213,6 +213,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -288,6 +289,20 @@ struct Yue2TokHeadConfig {
     // converter writes "gelu_erf" from pin §1.6 and the reference actually
     // runs the tanh form. See the GELU section in this file's header.
     std::string activation;
+
+    // yue2tok.head.kind: "" = the transformer head above; "cvq" =
+    // WannabeTokenizer's per-frame head (convert-yue2-wannabe.py): a SwiGLU
+    // adapter, a 256-d projection and a cosine match against a codebook the
+    // converter stored l2-normalised and divided by tau. No attention, so the
+    // windowed driver below gives the same answer as one whole-track pass.
+    std::string kind;
+    uint32_t    cvq_dim    = 0;  // yue2tok.cvq.dim    (256)
+    uint32_t    cvq_hidden = 0;  // yue2tok.cvq.hidden (8192)
+    uint32_t    offset     = 0;  // yue2tok.cvq.offset: code[t] = argmax[max(t - offset, 0)]
+    // yue2tok.companion (absent = true): this tokenizer's codes are decoded
+    // with the v9 companion decoder adapter. WannabeTokenizer files say false.
+    bool        companion  = true;
+    bool        is_cvq() const { return kind == "cvq"; }
 };
 
 struct Yue2TokHeadLayer {
@@ -322,6 +337,16 @@ struct Yue2TokHead {
     ggml_tensor * norm_b = nullptr;
     ggml_tensor * head_w = nullptr;  // ne (D, vocab)
     ggml_tensor * head_b = nullptr;
+
+    // cvq head (cfg.is_cvq()).
+    ggml_tensor * cvq_norm_w   = nullptr;  // ne (din)
+    ggml_tensor * cvq_norm_b   = nullptr;
+    ggml_tensor * cvq_gate_w   = nullptr;  // ne (din, hidden)
+    ggml_tensor * cvq_up_w     = nullptr;  // ne (din, hidden)
+    ggml_tensor * cvq_down_w   = nullptr;  // ne (hidden, din)
+    ggml_tensor * cvq_proj_w   = nullptr;  // ne (din, dim)
+    ggml_tensor * cvq_proj_b   = nullptr;
+    ggml_tensor * cvq_codebook = nullptr;  // ne (dim, vocab), normalised / tau
 
     // Backend + graph state.
     ggml_backend_t       backend     = nullptr;
@@ -365,6 +390,8 @@ static void yue2_tok_head_free(Yue2TokHead * h) {
     wctx_free(&h->wctx);
     h->blk.clear();
     h->pos = h->inp_w = h->inp_b = h->norm_w = h->norm_b = h->head_w = h->head_b = nullptr;
+    h->cvq_norm_w = h->cvq_norm_b = h->cvq_gate_w = h->cvq_up_w = h->cvq_down_w = nullptr;
+    h->cvq_proj_w = h->cvq_proj_b = h->cvq_codebook = nullptr;
     if (h->backend_ref) {
         backend_release(h->backend, h->cpu_backend);
         h->backend     = nullptr;
@@ -395,6 +422,13 @@ static void yue2_tok_parse_head_config(const GGUFModel & gf, Yue2TokHeadConfig *
     c->qkv_fused    = gf_get_bool(gf, "yue2tok.head.attention.qkv_fused");
     const char * act = gf_get_str(gf, "yue2tok.head.activation");
     c->activation    = act ? act : "";
+    c->kind          = gf_get_str(gf, "yue2tok.head.kind");
+    c->cvq_dim       = gf_get_u32(gf, "yue2tok.cvq.dim");
+    c->cvq_hidden    = gf_get_u32(gf, "yue2tok.cvq.hidden");
+    c->offset        = gf_get_u32(gf, "yue2tok.cvq.offset");
+    if (gguf_find_key(gf.gguf, "yue2tok.companion") >= 0) {
+        c->companion = gf_get_bool(gf, "yue2tok.companion");
+    }
 }
 
 // Refuse a structurally different head before any VRAM is touched. Same
@@ -405,6 +439,20 @@ static void yue2_tok_head_validate_config(const Yue2TokHeadConfig & c, std::vect
             errs->push_back(std::string("tok head config: ") + what);
         }
     };
+    if (c.is_cvq()) {
+        need(c.win > 0 && c.stride == c.win / 2 && c.trim == c.win / 4, "cvq head window/stride/trim");
+        need(c.din == 1024, "yue2tok.head.input_length != 1024 (MERT hidden width)");
+        need(c.vocab == 32768 && c.codec_size == c.vocab, "cvq head vocab/codec_size != 32768");
+        need(c.codec_off > 0, "yue2tok.codec_offset is 0 or missing (want 151853)");
+        need(c.cvq_dim > 0 && c.cvq_hidden > 0, "yue2tok.cvq.dim / yue2tok.cvq.hidden missing");
+        need(c.offset < 8, "yue2tok.cvq.offset out of range");
+        need(c.ln_eps > 0.0f && c.ln_eps < 1e-3f, "yue2tok.head.layer_norm_epsilon out of range (want 1e-5)");
+        return;
+    }
+    if (!c.kind.empty()) {
+        need(false, "yue2tok.head.kind is not one this engine knows (want cvq or absent)");
+        return;
+    }
     need(c.win == 512, "yue2tok.head.window != 512 (pos is (1,512,512) in the checkpoint)");
     need(c.d == 512, "yue2tok.head.embedding_length != 512");
     need(c.layers == 8, "yue2tok.head.block_count != 8");
@@ -431,6 +479,38 @@ static void yue2_tok_head_validate_config(const Yue2TokHeadConfig & c, std::vect
     // ignored rather than trusted or "fixed" in a shipped GGUF nobody would
     // re-download. The activation is gated by --tok-head-parity instead, which
     // compares against the reference's actual output and not its label.
+}
+
+// The transformer head's tensors (the default kind).
+static void yue2_tok_head_load_transformer(Yue2Loader & ld, Yue2TokHead * h) {
+    const int64_t D = h->cfg.d, FF = h->cfg.ff, DIN = h->cfg.din, V = h->cfg.vocab, WIN = h->cfg.win;
+    const int     L = (int) h->cfg.layers;
+    h->pos   = ld.req("tok.pos", D, WIN);  // ne (D, WIN): pos[:T] is a view on ne1
+    h->inp_w = ld.req("tok.inp.weight", DIN, D);
+    h->inp_b = ld.req("tok.inp.bias", D);
+
+    h->blk.assign((size_t) L, Yue2TokHeadLayer{});
+    for (int i = 0; i < L; i++) {
+        Yue2TokHeadLayer & b = h->blk[(size_t) i];
+        const std::string  p = "tok.blk." + std::to_string(i) + ".";
+        b.norm1_w    = ld.req(p + "norm1.weight", D);
+        b.norm1_b    = ld.req(p + "norm1.bias", D);
+        b.qkv_w      = ld.req(p + "attn_qkv.weight", D, 3 * D);
+        b.qkv_b      = ld.req(p + "attn_qkv.bias", 3 * D);
+        b.out_w      = ld.req(p + "attn_output.weight", D, D);
+        b.out_b      = ld.req(p + "attn_output.bias", D);
+        b.norm2_w    = ld.req(p + "norm2.weight", D);
+        b.norm2_b    = ld.req(p + "norm2.bias", D);
+        b.ffn_up_w   = ld.req(p + "ffn_up.weight", D, FF);
+        b.ffn_up_b   = ld.req(p + "ffn_up.bias", FF);
+        b.ffn_down_w = ld.req(p + "ffn_down.weight", FF, D);
+        b.ffn_down_b = ld.req(p + "ffn_down.bias", D);
+    }
+
+    h->norm_w = ld.req("tok.norm.weight", D);
+    h->norm_b = ld.req("tok.norm.bias", D);
+    h->head_w = ld.req("tok.head.weight", D, V);
+    h->head_b = ld.req("tok.head.bias", V);
 }
 
 // Load the tok.* half of a yue2-tok GGUF. The mert.* tensors in the same file
@@ -473,7 +553,7 @@ static bool yue2_tok_head_load(const std::string & path, Yue2TokHead * h, std::s
     // Remember what the file STORES the matmul weights as, before we promote
     // them. The probe picks its rel-L2 bar from this: F16 storage is a ~2e-4
     // rel-L2 perturbation of every weight and the port cannot undo it.
-    if (ggml_tensor * ht = ggml_get_tensor(gf.meta, "tok.head.weight")) {
+    if (ggml_tensor * ht = ggml_get_tensor(gf.meta, h->cfg.is_cvq() ? "cvq.adapter.gate.weight" : "tok.head.weight")) {
         h->store_type = ht->type;
     }
 
@@ -482,10 +562,9 @@ static bool yue2_tok_head_load(const std::string & path, Yue2TokHead * h, std::s
     h->cpu_backend = bp.cpu_backend;
     h->backend_ref = true;
 
-    const int64_t D = h->cfg.d, FF = h->cfg.ff, DIN = h->cfg.din, V = h->cfg.vocab, WIN = h->cfg.win;
-    const int     L = (int) h->cfg.layers;
+    const int64_t DIN = h->cfg.din, V = h->cfg.vocab;
 
-    wctx_init(&h->wctx, 12 * L + 8);
+    wctx_init(&h->wctx, h->cfg.is_cvq() ? 16 : 12 * (int) h->cfg.layers + 8);
 
     // Same loader the LM and VAE use, with force_f32 on (see Yue2Loader's own
     // comment in yue2-model.h for why). Shapes below are the CONFIG's, not the
@@ -496,32 +575,19 @@ static bool yue2_tok_head_load(const std::string & path, Yue2TokHead * h, std::s
     ld.errors    = &errs;
     ld.force_f32 = true;
 
-    h->pos   = ld.req("tok.pos", D, WIN);  // ne (D, WIN): pos[:T] is a view on ne1
-    h->inp_w = ld.req("tok.inp.weight", DIN, D);
-    h->inp_b = ld.req("tok.inp.bias", D);
-
-    h->blk.assign((size_t) L, Yue2TokHeadLayer{});
-    for (int i = 0; i < L; i++) {
-        Yue2TokHeadLayer & b = h->blk[(size_t) i];
-        const std::string  p = "tok.blk." + std::to_string(i) + ".";
-        b.norm1_w    = ld.req(p + "norm1.weight", D);
-        b.norm1_b    = ld.req(p + "norm1.bias", D);
-        b.qkv_w      = ld.req(p + "attn_qkv.weight", D, 3 * D);
-        b.qkv_b      = ld.req(p + "attn_qkv.bias", 3 * D);
-        b.out_w      = ld.req(p + "attn_output.weight", D, D);
-        b.out_b      = ld.req(p + "attn_output.bias", D);
-        b.norm2_w    = ld.req(p + "norm2.weight", D);
-        b.norm2_b    = ld.req(p + "norm2.bias", D);
-        b.ffn_up_w   = ld.req(p + "ffn_up.weight", D, FF);
-        b.ffn_up_b   = ld.req(p + "ffn_up.bias", FF);
-        b.ffn_down_w = ld.req(p + "ffn_down.weight", FF, D);
-        b.ffn_down_b = ld.req(p + "ffn_down.bias", D);
+    if (h->cfg.is_cvq()) {
+        const int64_t E = h->cfg.cvq_dim, HID = h->cfg.cvq_hidden;
+        h->cvq_norm_w   = ld.req("cvq.adapter.norm.weight", DIN);
+        h->cvq_norm_b   = ld.req("cvq.adapter.norm.bias", DIN);
+        h->cvq_gate_w   = ld.req("cvq.adapter.gate.weight", DIN, HID);
+        h->cvq_up_w     = ld.req("cvq.adapter.up.weight", DIN, HID);
+        h->cvq_down_w   = ld.req("cvq.adapter.down.weight", HID, DIN);
+        h->cvq_proj_w   = ld.req("cvq.proj.weight", DIN, E);
+        h->cvq_proj_b   = ld.req("cvq.proj.bias", E);
+        h->cvq_codebook = ld.req("cvq.codebook", E, V);
+    } else {
+        yue2_tok_head_load_transformer(ld, h);
     }
-
-    h->norm_w = ld.req("tok.norm.weight", D);
-    h->norm_b = ld.req("tok.norm.bias", D);
-    h->head_w = ld.req("tok.head.weight", D, V);
-    h->head_b = ld.req("tok.head.bias", V);
 
     if (!errs.empty()) {
         if (err) {
@@ -555,10 +621,16 @@ static bool yue2_tok_head_load(const std::string & path, Yue2TokHead * h, std::s
     h->loaded = true;
 
     const size_t bytes = h->wctx.buffer ? ggml_backend_buffer_get_size(h->wctx.buffer) : 0;
-    fprintf(stderr,
-            "[YuE2-TokHead] %s: L=%u D=%u H=%u FF=%u din=%u vocab=%u WIN=%u, stored %s -> F32, %.1f MB\n",
-            yue2_basename(path).c_str(), h->cfg.layers, h->cfg.d, h->cfg.heads, h->cfg.ff, h->cfg.din, h->cfg.vocab,
-            h->cfg.win, ggml_type_name(h->store_type), (double) bytes / (1024.0 * 1024.0));
+    if (h->cfg.is_cvq()) {
+        fprintf(stderr, "[YuE2-TokHead] %s: cvq head din=%u hidden=%u dim=%u vocab=%u offset=%u, stored %s -> F32, %.1f MB\n",
+                yue2_basename(path).c_str(), h->cfg.din, h->cfg.cvq_hidden, h->cfg.cvq_dim, h->cfg.vocab, h->cfg.offset,
+                ggml_type_name(h->store_type), (double) bytes / (1024.0 * 1024.0));
+    } else {
+        fprintf(stderr,
+                "[YuE2-TokHead] %s: L=%u D=%u H=%u FF=%u din=%u vocab=%u WIN=%u, stored %s -> F32, %.1f MB\n",
+                yue2_basename(path).c_str(), h->cfg.layers, h->cfg.d, h->cfg.heads, h->cfg.ff, h->cfg.din,
+                h->cfg.vocab, h->cfg.win, ggml_type_name(h->store_type), (double) bytes / (1024.0 * 1024.0));
+    }
     if (!yue2_tok_tf32_disabled()) {
         fprintf(stderr,
                 "[YuE2-TokHead] WARNING: NVIDIA_TF32_OVERRIDE is not \"0\". Every matmul in this head is\n"
@@ -658,6 +730,16 @@ static ggml_tensor * yue2_tok_head_layer(ggml_context * ctx, const Yue2TokHeadCo
 static ggml_tensor * yue2_tok_head_build(ggml_context * ctx, const Yue2TokHead & h, ggml_tensor * x) {
     const Yue2TokHeadConfig & c = h.cfg;
     const int64_t             T = x->ne[1];
+
+    if (c.is_cvq()) {
+        // h = x + down(silu(gate(LN(x))) * up(LN(x)));  z = proj(h) / |proj(h)|
+        // logits = codebook z, the codebook already normalised and divided by tau.
+        ggml_tensor * n = yue2_tok_ln(ctx, x, h.cvq_norm_w, h.cvq_norm_b, c.ln_eps);
+        ggml_tensor * a = ggml_mul(ctx, ggml_silu(ctx, ggml_mul_mat(ctx, h.cvq_gate_w, n)), ggml_mul_mat(ctx, h.cvq_up_w, n));
+        ggml_tensor * r = ggml_add(ctx, x, ggml_mul_mat(ctx, h.cvq_down_w, a));
+        ggml_tensor * z = ggml_l2_norm(ctx, yue2_tok_linear(ctx, h.cvq_proj_w, h.cvq_proj_b, r), 1e-12f);
+        return ggml_mul_mat(ctx, h.cvq_codebook, z);  // ne (vocab, T)
+    }
 
     ggml_tensor * s = yue2_tok_linear(ctx, h.inp_w, h.inp_b, x);  // ne (D, T)
 
@@ -830,6 +912,16 @@ static void yue2_tok_head_window_starts(int64_t win, int64_t stride, int64_t T, 
 // reference does and because that padding is ATTENDED (no key-padding mask),
 // so it changes the answer for the real frames next to it. Only the first `n`
 // outputs of a padded window are ever used.
+// A cvq head's clock: token t comes from feature frame t - offset, frame 0
+// repeated (the reference's to_token_clock). Rows of `k` values per frame.
+template <typename V> static void yue2_tok_head_delay(const Yue2TokHead & h, std::vector<V> * rows, int64_t k) {
+    const int64_t off = (int64_t) h.cfg.offset, T = (int64_t) rows->size() / k;
+    for (int64_t t = T - 1; off > 0 && t >= 0; t--) {
+        const int64_t src = std::max<int64_t>(t - off, 0);
+        std::copy_n(rows->begin() + src * k, k, rows->begin() + t * k);
+    }
+}
+
 static bool yue2_tok_head_predict(Yue2TokHead * h, const float * x, int64_t T, std::vector<int32_t> * codes,
                                   std::string * err) {
     if (!h->loaded) {
@@ -873,6 +965,61 @@ static bool yue2_tok_head_predict(Yue2TokHead * h, const float * x, int64_t T, s
             (*codes)[(size_t) i] = pred[(size_t) (i - s0)];  // ascending order: later windows win
         }
     }
+    yue2_tok_head_delay(*h, codes, 1);
+    return true;
+}
+
+// yue2_tok_head_predict, keeping the K best codes per frame instead of the
+// argmax: same windows, same trims, same later-window-wins order. `ids` and
+// `lp` are resized to T*K, best first per frame; `lp` is the log-softmax over
+// the whole vocab, so it is comparable across frames and with the LM's own
+// log-probs. Feeds the semantic-stage source guide (yue2-guide.h). ids[f*K]
+// equals what yue2_tok_head_predict writes for frame f, ties aside.
+static bool yue2_tok_head_predict_topk(Yue2TokHead * h, const float * x, int64_t T, int64_t K,
+                                       std::vector<int32_t> * ids, std::vector<float> * lp, std::string * err) {
+    if (!h->loaded || T <= 0 || K <= 0 || K > (int64_t) h->cfg.vocab) {
+        if (err) *err = "predict_topk: head not loaded, no frames, or K outside 1..vocab";
+        return false;
+    }
+    const int64_t WIN = (int64_t) h->cfg.win, STRIDE = (int64_t) h->cfg.stride, TRIM = (int64_t) h->cfg.trim;
+    const int64_t DIN = (int64_t) h->cfg.din, V = (int64_t) h->cfg.vocab;
+    ids->assign((size_t) (T * K), 0);
+    lp->assign((size_t) (T * K), 0.0f);
+
+    std::vector<int64_t> starts;
+    yue2_tok_head_window_starts(WIN, STRIDE, T, &starts);
+    std::vector<float>   win((size_t) (DIN * WIN));
+    std::vector<float>   logits;
+    std::vector<int32_t> order((size_t) V);
+    for (int64_t s0 : starts) {
+        const int64_t n = std::min<int64_t>(WIN, T - s0);
+        std::memcpy(win.data(), x + s0 * DIN, (size_t) (n * DIN) * sizeof(float));
+        if (n < WIN) {
+            std::memset(win.data() + n * DIN, 0, (size_t) ((WIN - n) * DIN) * sizeof(float));
+        }
+        if (!yue2_tok_head_forward(h, win.data(), WIN, &logits, /*codes*/ nullptr, err)) {
+            return false;
+        }
+        const int64_t lo = s0 + (s0 == 0 ? 0 : TRIM);
+        const int64_t hi = s0 + n - ((s0 + n >= T) ? 0 : TRIM);
+        for (int64_t i = lo; i < hi; i++) {
+            const float * row = logits.data() + (size_t) ((i - s0) * V);  // ne (vocab, T): frame-major
+            float         mx  = -INFINITY;
+            for (int64_t v = 0; v < V; v++) mx = std::max(mx, row[v]);
+            double z = 0.0;
+            for (int64_t v = 0; v < V; v++) z += std::exp((double) (row[v] - mx));
+            const float lse = mx + (float) std::log(z);
+            std::iota(order.begin(), order.end(), 0);
+            std::partial_sort(order.begin(), order.begin() + K, order.end(),
+                              [&](int32_t a, int32_t b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+            for (int64_t j = 0; j < K; j++) {
+                (*ids)[(size_t) (i * K + j)] = order[(size_t) j];
+                (*lp)[(size_t) (i * K + j)]  = row[order[(size_t) j]] - lse;
+            }
+        }
+    }
+    yue2_tok_head_delay(*h, ids, K);
+    yue2_tok_head_delay(*h, lp, K);
     return true;
 }
 

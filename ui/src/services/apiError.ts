@@ -6,6 +6,18 @@
 // need a second error class. Both transports (axios for JSON, XHR for uploads)
 // normalize through it; see axiosClient.ts's handleFailure().
 
+/** The HTTP statuses the app branches on — one name per meaning, so a
+ *  comparison never depends on remembering which number meant what. */
+export const HttpStatus = {
+  badRequest: 400,
+  unauthorized: 401,
+  forbidden: 403,
+  notFound: 404,
+  conflict: 409,
+  serviceUnavailable: 503,
+} as const;
+export type HttpStatusValue = typeof HttpStatus[keyof typeof HttpStatus];
+
 export class ApiError extends Error {
   readonly status: number;
   readonly body: unknown;

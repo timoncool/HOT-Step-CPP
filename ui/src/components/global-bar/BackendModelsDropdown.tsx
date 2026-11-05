@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { backendModelsOptions } from '../../queries/global-models/options';
+import { QueryError } from '../shared/QueryError';
 // BackendModelsDropdown.tsx — model picker for backends whose model choice is
 // ENGINE STATE rather than a per-request parameter.
 //
@@ -16,14 +17,68 @@ import { backendModelsOptions } from '../../queries/global-models/options';
 // here hardcodes a bucket name beyond a label lookup with a sane fallback.
 
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ParamLabel } from '../shared/ParamLabel';
 import { Download } from 'lucide-react';
 import { useBackendStore } from '../../stores/backendStore';
 import { useCapabilities } from '../../hooks/useCapabilities';
 import { useGlobalParamsStore } from '../../stores/globalParamsStore';
 import { ModelManagerModal } from '../model-manager/ModelManagerModal';
-import { ModelSelect } from './ModelSelect';
+import { VariantModelSelect } from './ModelSelect';
+import { splitModel } from './modelLabels';
 import type { Mm3DitRuntime } from './Mm3RendererRow';
 import { Mm3RendererRow } from './Mm3RendererRow';
+import { snapshotOptions } from '../../queries/cover-lyrics/reads';
+import type { Yue2CoverReadiness } from '../../services/yue2CoverApi';
+import { useSheetTranscriber, type SheetTranscriber } from '../cover-studio/sheetTranscriber';
+import { StyledSelect } from '../shared/StyledSelect';
+import { Toggle } from '../shared/Toggle';
+
+/** The lead-sheet transcriber: SheetSage2 or SheetSage2-Refined, and Refined's
+ *  modal keys. Stored on the server; covers, the AR sheet stage and labelling
+ *  all use it. */
+const Yue2SheetTranscriberRow: React.FC = () => {
+  const { t } = useTranslation();
+  const { choice, set: setSheetTranscriberChoice } = useSheetTranscriber();
+  const { data: readiness } = useQuery(snapshotOptions<Yue2CoverReadiness>('cover', '/yue2-cover/readiness'));
+  const refinedInstalled = readiness?.refined === true;
+  const refined = choice.transcriber === 'sheetsage2-refined';
+  return (
+    <div className="border-t border-zinc-200 dark:border-white/5 pt-3">
+      <label htmlFor="yue2-sheet-transcriber">
+        <ParamLabel
+          label={t('globalBar.yue2SheetTranscriber', 'Lead-sheet transcriber')}
+          info={t('globalBar.yue2SheetTranscriberInfo', 'Writes the ABC lead sheets that YuE2 covers follow, that the AR sheet stage trains on and that labelling saves beside each track. SheetSage2-Refined (anime-song) reads odd meters, slash chords and tension chords that SheetSage2 writes as 4/4 and plain triads. It needs SheetSage2 installed too: it reuses its encoder.')}
+          className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
+          rootClassName="block mb-1.5" />
+      </label>
+      <StyledSelect<SheetTranscriber>
+        id="yue2-sheet-transcriber"
+        value={choice.transcriber}
+        onChange={(v) => setSheetTranscriberChoice({ transcriber: v })}
+        options={[
+          { value: 'sheetsage2', label: 'SheetSage2' },
+          { value: 'sheetsage2-refined', label: `SheetSage2-Refined${refinedInstalled ? '' : ' (not installed)'}`,
+            disabled: !refinedInstalled && !refined },
+        ]}
+        className="w-full"
+      />
+      {refined && (
+        <Toggle
+          className="mt-2"
+          checked={choice.keyMode}
+          onChange={(v) => setSheetTranscriberChoice({ keyMode: v })}
+          label={t('globalBar.yue2SheetKeyMode', 'Keys with modes (dorian, mixolydian, ...)')}
+        />
+      )}
+      {refined && !refinedInstalled && (
+        <p className="text-[10px] text-amber-500 mt-1.5">
+          {t('globalBar.yue2SheetRefinedMissing', 'Not installed: get yue2-sheetsage2-refined-f16 in Model Manager.')}
+        </p>
+      )}
+    </div>
+  );
+};
 
 /** Friendly names for the buckets we know about. Unknown buckets fall back to
  *  their raw key rather than being hidden — a backend that grows a bucket
@@ -37,6 +92,11 @@ const BUCKET_LABELS: Record<string, string> = {
   voc: 'Vocoder',
   vae: 'VAE Decoder',
   embedding: 'Text Encoder',
+  variant: 'Model variant',
+  global: 'Global language model',
+  local: 'Local decoder',
+  flow: 'Codec flow model',
+  scalar_decoder: 'Waveform decoder',
 };
 
 function formatBytes(bytes?: number): string {
@@ -45,8 +105,9 @@ function formatBytes(bytes?: number): string {
 }
 
 export const BackendModelsDropdown: React.FC = () => {
+  const { t } = useTranslation();
   const activeBackendId = useBackendStore(s => s.activeBackendId);
-  const { data: catalogue } = useQuery(backendModelsOptions(activeBackendId));
+  const { data: catalogue, isError, error, refetch } = useQuery(backendModelsOptions(activeBackendId));
   const selectModels = useBackendStore(s => s.selectModels);
   // Same path the Generation dropdown's old Renderer hint used to read
   // dit_runtime off of: the active backend's capability manifest (see the
@@ -86,6 +147,10 @@ export const BackendModelsDropdown: React.FC = () => {
       : 'Could not switch model; the previous one is still loaded.');
   };
 
+  if (isError && !catalogue) {
+    return <QueryError error={error} onRetry={() => void refetch()} />;
+  }
+
   if (!catalogue) {
     return <p className="text-[11px] text-zinc-500">Loading models…</p>;
   }
@@ -112,18 +177,20 @@ export const BackendModelsDropdown: React.FC = () => {
 
   return (
     <div className="space-y-3">
+      {isError && <QueryError error={error} onRetry={() => void refetch()} compact />}
       {buckets.map(([bucket, options]) => {
         const current = String(catalogue.defaults?.[bucket] ?? '');
         const meta = catalogue.meta?.[bucket] ?? {};
         return (
           <div key={bucket}>
-            <label
-              htmlFor={`backend-model-${bucket}`}
-              className="block text-xs font-medium text-zinc-500 uppercase tracking-wider mb-1.5"
-            >
-              {BUCKET_LABELS[bucket] ?? bucket}
+            <label htmlFor={`backend-model-${bucket}`}>
+            <ParamLabel
+              label={t(`globalBar.modelBucket.${bucket}`, BUCKET_LABELS[bucket] ?? bucket)}
+              info={t('globalBar.modelBucketInfo', 'Selects the weights for this component. Different quantizations trade memory use for precision. Incompatible files cannot be selected.')}
+              className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
+              rootClassName="block mb-1.5" />
             </label>
-            <ModelSelect
+            <VariantModelSelect
               id={`backend-model-${bucket}`}
               value={current}
               onChange={(v) => void onPick(bucket, v)}
@@ -137,11 +204,15 @@ export const BackendModelsDropdown: React.FC = () => {
               formatLabel={(opt) =>
                 `${opt === 'convrot' ? 'INT8 ConvRot (CUDA)' : opt}${meta[opt]?.bytes ? ` — ${formatBytes(meta[opt].bytes)}` : ''}`}
               placeholder={busy === bucket ? 'Switching…' : 'Select model…'}
+              variantLabel={(v) => v === '' ? t('globalBar.standardVariant', 'Standard')
+                : v === 'convrot' ? 'INT8 ConvRot (CUDA)' : v}
+              quantLabel={(opt) =>
+                `${splitModel(opt).quant || (opt === 'convrot' ? 'INT8' : opt)}${meta[opt]?.bytes ? ` — ${formatBytes(meta[opt].bytes)}` : ''}`}
             />
             {meta[current]?.label && (
               <p className="text-[10px] text-zinc-500 mt-1.5 font-mono truncate">{meta[current].label}</p>
             )}
-            {bucket === 'dit' && (
+            {bucket === 'dit' && ditRuntime && (
               <Mm3RendererRow
                 ditRuntime={ditRuntime}
                 value={ditBackend}
@@ -152,6 +223,8 @@ export const BackendModelsDropdown: React.FC = () => {
           </div>
         );
       })}
+
+      {activeBackendId === 'yue2' && <Yue2SheetTranscriberRow />}
 
       {note && <p className="text-[10px] text-zinc-500 leading-relaxed">{note}</p>}
 

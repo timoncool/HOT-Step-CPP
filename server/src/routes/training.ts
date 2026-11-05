@@ -59,6 +59,7 @@ import { selectYue2Audio, YUE2_AUDIO_EXTS, yue2SeparationAudioDir } from '../ser
 //   POST   /datasets/:id/yue2-preprocess                — audio -> cached YuE2 VAE latents
 //   POST   /datasets/:id/yue2-train                     — start a YuE2 NAR LoRA training job
 //   POST   /datasets/:id/yue2-joint-train              — start explicit AITK joint training
+//   PATCH  /datasets/:id/yue2-joint-runs/:jobId/params — checkpoint/preview interval of the live run
 //   GET    /datasets/:id/yue2-runs                      — previous YuE2 runs + their adapters
 //   GET    /datasets/:id/yue2-ar                        — per-stage AR readiness + defaults
 //   POST   /datasets/:id/yue2-tokenize                  — manifest -> codes/ (codec_ids)
@@ -69,6 +70,14 @@ import { selectYue2Audio, YUE2_AUDIO_EXTS, yue2SeparationAudioDir } from '../ser
 //   POST   /datasets/:id/train-lm                       — start an LM LoRA training job
 //   GET    /datasets/:id/train-lm                       — LM adapter / codes status
 //   POST   /datasets/:id/train-dit                      — start a DiT LoRA training job
+//   GET    /datasets/:id/heartmula-previews?run=        — HeartMuLa checkpoint-preview takes
+//   POST   /datasets/:id/heartmula-previews/render      — render or retry one take (base or a saved step)
+//   GET    /datasets/:id/heartmula-previews/audio?run=&file= — one HeartMuLa preview WAV
+//   POST   /datasets/:id/sa3-train                      — prepare and train SA3 Medium DoRA-rows
+//   GET    /datasets/:id/sa3-train                      — readiness, recipe and resumable SA3 runs
+//   GET    /datasets/:id/sa3-previews?run=              — SA3 checkpoint-preview records
+//   POST   /datasets/:id/sa3-previews/render            — render or retry one captured SA3 step
+//   GET    /datasets/:id/sa3-previews/audio?run=&file=  — one SA3 preview WAV (Range aware)
 //   GET    /datasets/:id/train-dit                      — DiT adapter / variant status
 //   GET    /previews/:previewId/:slot                   — stream a codes preview (Range aware)
 //   POST   /datasets/:id/audition                       — start an A/B codes-audition job
@@ -89,19 +98,31 @@ import {
   scanPreview as scanPreviewFolder, ScanLimitError,
 } from '../services/training/datasetScan.js';
 import { AUDIO_EXTENSIONS, datasetDir, isInside, sampleIdFor, trainingBaseDir } from '../services/training/paths.js';
-import { resolveMossPaths } from '../services/training/mossCaption.js';
+import { isLocalCaptioner, LOCAL_CAPTIONER_NAMES, resolveMossPaths } from '../services/training/mossCaption.js';
 import { samplesMissingYue2Caption } from '../services/training/yue2CaptionJob.js';
 import { datasetTrackCaption, yue2DatasetCaptions } from '../services/training/yue2DatasetCaptions.js';
-import { bestScoredRung } from '../services/training/yue2BestRung.js';
+import { bestReviewFact, reviewRungFacts } from '../services/training/yue2BestRung.js';
 import { deleteLabel, deleteLabels, patchLabel, readLabel } from '../services/training/labelStore.js';
 import { listDatasetsWithAssets } from '../services/training/datasetAssets.js';
 import { createDatasetFromFolder, DatasetCreateError } from '../services/training/datasetCreate.js';
 import { detailFor, syncCounters } from '../services/training/datasetDetail.js';
 import {
-  cancelPipeline, getPipeline, hasActivePipeline, listPipelines, pausePipeline, PIPELINE_STAGES,
+  cancelPipeline, getPipeline, hasActivePipeline, listPipelines, pausePipeline, pipelineRunsElsewhere, PIPELINE_STAGES,
   resumePipeline, startPipeline,
 } from '../services/training/pipelineRunner.js';
 import { getTrainingDefaults, setTrainingDefaults } from '../services/training/trainingDefaults.js';
+import { heartmulaReadiness, heartmulaStatus } from '../services/training/heartmulaStatus.js';
+import { heartmulaPrepareStatus } from '../services/training/heartmulaPrepare.js';
+import { missingEncoderMessage, resolveHeartmulaPreviewSettings, resolveHeartmulaBatchRecipe } from '../services/training/heartmulaTrain.js';
+import { ensureHeartmulaRunPreview } from '../services/training/heartmulaPreviewSource.js';
+import {
+  heartmulaCheckpointSteps, heartmulaRunById, HEARTMULA_RUN_ID, listHeartmulaRuns, resolveHeartmulaRun,
+} from '../services/training/heartmulaRuns.js';
+import {
+  heartmulaPreviewAudioPath, heartmulaPreviewKind, listHeartmulaPreviewRecords, renderHeartmulaPreview,
+} from '../services/training/heartmulaPreview.js';
+import { HEARTMULA_PREVIEW_DEFAULTS, type HeartmulaPreviewListResponse } from '../contracts/heartmulaTraining.js';
+import { requestHeartmulaCheckpoint, type HeartmulaTrainJobOpts } from '../services/training/heartmulaRunner.js';
 import {
   availableMm3Bases, MM3_VRAM_MODEL, mm3FlashVramCalibrated, recommendMm3Config,
   MM3_LM_DEFAULTS, MM3_LM_PRESETS, MM3_LM_DEFAULT_PRESET, applyMm3Preset,
@@ -128,6 +149,7 @@ import {
 } from '../services/training/yue2ArTrain.js';
 import {
   missingYue2TokenizeModels, readYue2CodecIdsStatus, resolveYue2TokenizerModel,
+  YUE2_TOKENIZER_IDS, yue2TokenizerChoices, yue2TokenizerSetting, type Yue2TokenizerId,
   YUE2_TOKENIZE_DEFAULTS,
 } from '../services/training/yue2Tokenize.js';
 import {
@@ -144,7 +166,7 @@ import {
 } from '../services/training/yue2ArRuns.js';
 import { YUE2_LICENSE_NOTICE } from '../services/backends/yue2/index.js';
 import { yue2StyleString } from '../services/backends/yue2/style.js';
-import { isCheckpointLadder, jointRunForAdapter, listYue2AitkRuns, yue2JointOutputDirectory, yue2ReviewComplete, setYue2ReviewComplete, yue2RunFinished } from '../services/training/yue2AitkRuns.js';
+import { isCheckpointLadder, jointRunForAdapter, listYue2AitkRuns, listYue2AitkRunsForDatasets, yue2JointOutputDirectory, yue2ReviewComplete, setYue2ReviewComplete, yue2RunFinished } from '../services/training/yue2AitkRuns.js';
 import { deleteYue2Run } from '../services/training/yue2Mirror.js';
 import { clearPreparedCaches, listPreparedCaches, YUE2_CORE_CACHE } from '../services/training/preparedDataReset.js';
 import { jointCaptionTracks } from '../services/training/yue2AitkCaptions.js';
@@ -162,6 +184,10 @@ import { essentiaAvailable, essentiaTempoProfile } from '../services/training/es
 import { engineQueueDepth, engineUnderstandReady, pickBestLm } from '../services/training/understandClient.js';
 import { buildGpuEnv } from '../services/gpuDevices.js';
 import * as queue from '../services/training/labelingQueue.js';
+import { listSa3Runs, resolveSa3Run, sa3Readiness, sa3RunById, SA3_RUN_ID, type Sa3Run } from '../services/training/trainSa3Runner.js';
+import { listSa3PreviewRecords, parseSa3PreviewSettings, renderSa3Previews, sa3PreviewAudioPath, SA3_PREVIEW_DEFAULTS } from '../services/training/sa3Preview.js';
+import { sa3SnapshotSteps } from '../services/training/sa3Snapshots.js';
+import type { Sa3PreviewListResponse } from '../contracts/training.js';
 import {
   buildYue2AitkPrepareArgs, validateYue2AitkPrepareOptions,
   parseYue2AitkModels,
@@ -169,9 +195,9 @@ import {
 } from '../services/training/yue2AitkPrepareRunner.js';
 import { isEngineSuspended } from '../services/aceEngineProcess.js';
 import { FIXED_RECIPE_CAPTION_GRAMMAR, fixedRecipeTrigger } from '../services/training/fixedRecipeCaption.js';
-import { legacyYue2DoraError, parseYue2JointStopMode, applyBaseMatchedRecipe, applyFixedRecipe, resolveYue2JointBase, yue2JointBases, defaultYue2JointBase, defaultYue2JointDevice, yue2ConvRotCheckpoint } from '../services/training/yue2JointTrainRunner.js';
+import { legacyYue2DoraError, parseYue2JointStopMode, updateYue2JointParams, applyBaseMatchedRecipe, applyFixedRecipe, resolveYue2JointBase, yue2JointBases, defaultYue2JointBase, defaultYue2JointDevice, yue2ConvRotCheckpoint, planPlannerGateHoldout, PLANNER_GATE_DEFAULTS, yue2GateSongIds, yue2PlannerGatePreview, type Yue2PlannerGate } from '../services/training/yue2JointTrainRunner.js';
 import { jointAdmissionError, takeJointAdmission } from '../services/training/yue2JointAdmission.js';
-import { appendToBatch as appendToYue2Batch, finishScoredLadders, cancelBatch as cancelYue2Batch, getBatch as getYue2Batch, listBatches as listYue2Batches, pauseBatch as pauseYue2Batch, resumeBatch as resumeYue2Batch, startBatch as startYue2Batch } from '../services/training/yue2BatchRunner.js';
+import { appendToBatch as appendToYue2Batch, hasActiveBatch, finishScoredLadders, cancelBatch as cancelYue2Batch, batchRunsElsewhere, getBatch as getYue2Batch, listBatches as listYue2Batches, pauseBatch as pauseYue2Batch, resumeBatch as resumeYue2Batch, startBatch as startYue2Batch } from '../services/training/yue2BatchRunner.js';
 import {
   aceTrainExe, engineGpuBackend, engineSupportsFlashAttnTraining,
   findRegCorpora, getModelSnapshot, pickBf16, pickDitBaseFor, pickLmFor, refreshModelSnapshot,
@@ -209,7 +235,7 @@ import '../services/training/review/operations.js';
 import '../services/training/yue2PreparationOperations.js';
 import type {
   AuditionListResponse, AuditionOptions, AuditionSideSpec,
-  BulkSetInput, CaptionOptions, CreateDatasetInput, FieldSource, GeniusOptions, LabelOptions, LmSize,
+  BulkSetInput, CaptionOptions, CreateDatasetInput, FieldSource, GeniusOptions, LabelOptions, LmSize, NormaliseLyricsOptions,
   LyricStudioExportInput, Mm3PreviewOptions,
   PatchSampleInput, PipelineFolderSpec, PipelineLabelOptions, PipelineStage,
   PreprocessCompat, PreprocessDtype, PreprocessNormalize, PreprocessOptions,
@@ -286,6 +312,7 @@ router.get('/capabilities', async (_req: Request, res: Response) => {
     // Local audio captioning. Probed synchronously below — it is two fs.existsSync
     // calls, not a subprocess, so it cannot hang this endpoint.
     moss: { available: false, missing: '' },
+    flamingo: { available: false, missing: '' },
     preprocess: {
       available: false, binPath: '', ditModels: [], vaeModels: [], textEncoders: [],
       defaultDit: '', defaultVae: '', defaultTextEnc: '', modelsCachedAt: 0,
@@ -328,6 +355,11 @@ router.get('/capabilities', async (_req: Request, res: Response) => {
     if ('paths' in probe) caps.moss.available = true;
     else caps.moss.missing = probe.missing;
   } catch (err: any) { caps.moss.missing = String(err?.message || err).slice(0, 200); }
+  try {
+    const probe = resolveMossPaths('flamingo');
+    if ('paths' in probe) caps.flamingo.available = true;
+    else caps.flamingo.missing = probe.missing;
+  } catch (err: any) { caps.flamingo.missing = String(err?.message || err).slice(0, 200); }
 
   try {
     const providers = await listProviders();
@@ -489,6 +521,11 @@ router.get('/jobs/:jobId', (req: Request, res: Response) => {
 router.delete('/jobs/:jobId', (req: Request, res: Response) => {
   try {
     const jobId = req.params.jobId as string;
+    const elsewhere = queue.jobRunsElsewhere(jobId);
+    if (elsewhere) {
+      res.status(409).json({ error: elsewhere });
+      return;
+    }
     if (!queue.cancelJob(jobId)) {
       res.status(404).json({ error: 'Job not found' });
       return;
@@ -499,10 +536,11 @@ router.delete('/jobs/:jobId', (req: Request, res: Response) => {
   }
 });
 
-router.get('/jobs/:jobId/stream', (req: Request, res: Response) => {
+router.get('/jobs/:jobId/stream', async (req: Request, res: Response) => {
   try {
     const job = queue.getJob(req.params.jobId as string);
     if (!job) {
+      if (await queue.attachFinishedJointStream(req.params.jobId as string, res)) return;
       res.status(404).json({ error: 'Job not found' });
       return;
     }
@@ -669,6 +707,11 @@ router.get('/pipeline/:id', (req: Request, res: Response) => {
 
 router.delete('/pipeline/:id', (req: Request, res: Response) => {
   try {
+    const elsewhere = pipelineRunsElsewhere(req.params.id as string);
+    if (elsewhere) {
+      res.status(409).json({ error: elsewhere });
+      return;
+    }
     if (!cancelPipeline(req.params.id as string)) {
       res.status(404).json({ error: 'Pipeline not found' });
       return;
@@ -685,6 +728,11 @@ router.delete('/pipeline/:id', (req: Request, res: Response) => {
 // pipeline; a finished/cancelled one answers 409.
 router.post('/pipeline/:id/pause', (req: Request, res: Response) => {
   try {
+    const elsewhere = pipelineRunsElsewhere(req.params.id as string);
+    if (elsewhere) {
+      res.status(409).json({ error: elsewhere });
+      return;
+    }
     const result = pausePipeline(req.params.id as string);
     if (result === 'not_found') {
       res.status(404).json({ error: 'Pipeline not found' });
@@ -707,6 +755,11 @@ router.post('/pipeline/:id/pause', (req: Request, res: Response) => {
 // already active.
 router.post('/pipeline/:id/resume', (req: Request, res: Response) => {
   try {
+    const elsewhere = pipelineRunsElsewhere(req.params.id as string);
+    if (elsewhere) {
+      res.status(409).json({ error: elsewhere });
+      return;
+    }
     const result = resumePipeline(req.params.id as string);
     if (result === 'not_found') {
       res.status(404).json({ error: 'Pipeline not found' });
@@ -734,6 +787,28 @@ router.post('/yue2-batch', (req: Request, res: Response) => {
     res.status(202).json({ batch: result });
   } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
+router.post('/heartmula-batch', (req: Request, res: Response) => {
+  try {
+    const b = req.body;
+    if (!b || !Array.isArray(b.datasetIds) || !b.datasetIds.length || b.datasetIds.some((id: unknown) => typeof id !== 'string' || !id)
+      || !b.recipe || typeof b.recipe !== 'object' || Array.isArray(b.recipe)) {
+      res.status(400).json({ error: 'Expected datasetIds and a HeartMuLa training request in recipe' }); return;
+    }
+    if (Object.keys(b.recipe).some(k => !['recipe', 'preview', 'adapterName', 'resumeRun'].includes(k))
+      || (b.recipe.recipe !== undefined && (!b.recipe.recipe || typeof b.recipe.recipe !== 'object' || Array.isArray(b.recipe.recipe)))
+      || (b.recipe.resumeRun !== undefined && (b.datasetIds.length !== 1 || typeof b.recipe.resumeRun !== 'string'))
+      || (b.recipe.resumeRun !== undefined && b.recipe.preview !== undefined)
+      || (b.recipe.adapterName !== undefined && (typeof b.recipe.adapterName !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(b.recipe.adapterName)))) {
+      res.status(400).json({ error: 'Invalid HeartMuLa training request; resume accepts one dataset' }); return;
+    }
+    const recipe = b.recipe.resumeRun === undefined
+      ? { ...b.recipe, recipe: resolveHeartmulaBatchRecipe(b.recipe.recipe), preview: resolveHeartmulaPreviewSettings(b.recipe.preview) }
+      : b.recipe;
+    const result = startYue2Batch({ family: 'heartmula', datasetIds: b.datasetIds, lyricTiming: false, recipe });
+    if ('error' in result) { res.status(409).json(result); return; }
+    res.status(202).json({ batch: result });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+});
 router.get('/yue2-batch', (_req: Request, res: Response) => {
   try { res.json({ batches: listYue2Batches() }); } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
@@ -743,6 +818,8 @@ router.get('/yue2-batch/:id', (req: Request, res: Response) => {
   res.json(batch);
 });
 router.delete('/yue2-batch/:id', (req: Request, res: Response) => {
+  const elsewhere = batchRunsElsewhere(req.params.id as string);
+  if (elsewhere) { res.status(409).json({ error: elsewhere }); return; }
   if (!cancelYue2Batch(req.params.id as string)) { res.status(404).json({ error: 'Batch not found' }); return; }
   res.json({ ok: true });
 });
@@ -758,21 +835,27 @@ router.post('/yue2-batch/finish', (req: Request, res: Response) => {
   res.status(202).json({ batch: result });
 });
 router.post('/yue2-batch/:id/items', (req: Request, res: Response) => {
+  const elsewhere = batchRunsElsewhere(req.params.id as string);
+  if (elsewhere) { res.status(409).json({ error: elsewhere }); return; }
   const ids = Array.isArray(req.body?.datasetIds) ? (req.body.datasetIds as unknown[]).filter((x): x is string => typeof x === 'string' && x.length > 0) : [];
   const result = appendToYue2Batch(req.params.id as string, ids);
   if ('error' in result) { res.status(409).json({ error: result.error }); return; }
   res.json({ batch: result });
 });
 router.post('/yue2-batch/:id/pause', (req: Request, res: Response) => {
+  const elsewhere = batchRunsElsewhere(req.params.id as string);
+  if (elsewhere) { res.status(409).json({ error: elsewhere }); return; }
   const r = pauseYue2Batch(req.params.id as string);
   if (r === 'not_found') { res.status(404).json({ error: 'Batch not found' }); return; }
   if (r === 'not_active') { res.status(409).json({ error: 'Batch is not running' }); return; }
   res.json({ ok: true });
 });
 router.post('/yue2-batch/:id/resume', (req: Request, res: Response) => {
+  const elsewhere = batchRunsElsewhere(req.params.id as string);
+  if (elsewhere) { res.status(409).json({ error: elsewhere }); return; }
   const r = resumeYue2Batch(req.params.id as string);
   if (r === 'not_found') { res.status(404).json({ error: 'Batch not found' }); return; }
-  if (r === 'busy') { res.status(409).json({ error: 'A YuE2 batch is already running' }); return; }
+  if (r === 'busy') { res.status(409).json({ error: 'A training batch is already running' }); return; }
   res.json({ ok: true });
 });
 
@@ -994,8 +1077,9 @@ router.get('/datasets/:id/prepared-data', (req: Request, res: Response) => {
     const ds = repo.getDataset(req.params.id as string);
     if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
     // Everything, with `core` marking YuE2's kept-by-default data, so the card can show both parts.
-    const caches = listPreparedCaches(ds.slug, ds.sourceDir, { includeYue2Core: true }).map(c => ({ ...c, core: c.name === YUE2_CORE_CACHE }));
-    res.json({ slug: ds.slug, caches, busy: !!queue.activeJobForDataset(ds.id) || hasActivePipeline() });
+    if (req.query.target !== undefined && req.query.target !== 'heartmula') { res.status(400).json({ error: 'Invalid cache target' }); return; }
+    const caches = listPreparedCaches(ds.slug, ds.sourceDir, { includeYue2Core: true, ...(req.query.target === 'heartmula' ? { target: 'heartmula' as const } : {}) }).map(c => ({ ...c, core: c.name === YUE2_CORE_CACHE }));
+    res.json({ slug: ds.slug, caches, busy: !!queue.activeJobForDataset(ds.id) || hasActivePipeline() || hasActiveBatch() });
   } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
 
@@ -1004,10 +1088,12 @@ router.delete('/datasets/:id/prepared-data', (req: Request, res: Response) => {
     const ds = repo.getDataset(req.params.id as string);
     if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
     if (req.body?.confirm !== ds.slug) { res.status(400).json({ error: 'Confirm with the dataset slug shown in the dialog.' }); return; }
-    if (queue.activeJobForDataset(ds.id) || hasActivePipeline()) {
+    if (queue.activeJobForDataset(ds.id) || hasActivePipeline() || hasActiveBatch()) {
       res.status(409).json({ error: 'A job or pipeline is queued or running for this dataset.' }); return;
     }
-    const cleared = clearPreparedCaches(ds.slug, ds.sourceDir, { includeYue2Core: req.body?.includeYue2Core === true });
+    if (req.body?.target !== undefined && req.body.target !== 'heartmula') { res.status(400).json({ error: 'Invalid cache target' }); return; }
+    const cleared = clearPreparedCaches(ds.slug, ds.sourceDir, { includeYue2Core: req.body?.includeYue2Core === true,
+      ...(req.body?.target === 'heartmula' ? { target: 'heartmula' as const } : {}) });
     console.log(`[Training] Cleared prepared caches for ${ds.slug}: ${cleared.map(c => c.name).join(', ') || 'none'}`);
     res.json({ cleared });
   } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
@@ -1310,7 +1396,7 @@ function pickTargets(
 // it in place. Neither opens a sidecar — the aligner's lyrics come out of the
 // manifest, not the .txt the labeller writes — so a cloud captioner beside them
 // cannot lose an edit. `yue2-ar-train` joins for `yue2-nar-train`'s reason.
-const TRAINER_KINDS = new Set<string>(['train-lm', 'train-dit', 'mm3-train-lm', 'yue2-nar-train', 'yue2-tokenize', 'yue2-align', 'yue2-ar-train', 'audition', 'lm-calibrate', 'dit-calibrate']);
+const TRAINER_KINDS = new Set<string>(['train-lm', 'train-dit', 'sa3-train', 'mm3-train-lm', 'yue2-nar-train', 'yue2-tokenize', 'yue2-align', 'yue2-ar-train', 'audition', 'lm-calibrate', 'dit-calibrate']);
 function labelBlockedBy(datasetId: string, needsEngine: boolean): ReturnType<typeof queue.activeJobForDataset> {
   const active = queue.activeJobForDataset(datasetId);
   if (!active) return undefined;
@@ -1329,13 +1415,13 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
     try { essentiaTempoProfile(body.essentiaTempo); }
     catch (err) { res.status(400).json({ error: err instanceof Error ? err.message : String(err) }); return; }
     {
-      const needsEngine = body.useUnderstand === true
-        || (body.useCaption !== false && body.caption?.provider === 'moss');
+      const needsEngine = body.useUnderstand === true || body.localLyrics === true
+        || (body.useCaption !== false && isLocalCaptioner(body.caption?.provider));
       const blocker = labelBlockedBy(ds.id, needsEngine);
       if (blocker) {
         res.status(409).json({
           error: needsEngine && TRAINER_KINDS.has(blocker.kind)
-            ? 'MOSS and the /understand step need the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+            ? 'Local captioning and lyric transcription (MOSS, Music Flamingo) and the /understand step need the card, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
             : 'A job is already running for this dataset',
         });
         return;
@@ -1353,7 +1439,9 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
     // and train-lm lmSize divergences: the form's numbers and this handler's
     // numbers are two different sets reached by two different callers.
     const useUnderstand = body.useUnderstand === true;
-    let useGenius = body.useGenius !== false;
+    // Genius is OFF unless asked for (2026-10-24): the scraper is fragile and
+    // lyrics come from the audio now (localLyrics, below, defaults on).
+    let useGenius = body.useGenius === true;
     let useCaption = body.useCaption !== false;
 
     // Capability handling has to distinguish ASKED-FOR from DEFAULTED-ON, now
@@ -1373,15 +1461,16 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
       }
       useGenius = false;
     }
-    if (useCaption && (body.caption?.provider === 'moss')) {
-      // MOSS is a local binary, not a chat API — getProvider() throws on it, and
-      // its availability is "built + weights present", not "API key set". Handled
-      // before the LLM branch so labeling can run with no cloud credentials at
-      // all, which is the entire point of the local captioner.
-      const probe = resolveMossPaths();
+    if (useCaption && isLocalCaptioner(body.caption?.provider)) {
+      // MOSS and Music Flamingo are local binaries, not chat APIs — getProvider()
+      // throws on them, and availability is "built + weights present", not "API
+      // key set". Handled before the LLM branch so labeling can run with no cloud
+      // credentials at all, which is the entire point of the local captioners.
+      const local = body.caption!.provider as 'moss' | 'flamingo';
+      const probe = resolveMossPaths(local);
       if ('missing' in probe) {
         if (captionAsked) {
-          res.status(503).json({ error: `MOSS captioning is not available: ${probe.missing}` });
+          res.status(503).json({ error: `${LOCAL_CAPTIONER_NAMES[local]} captioning is not available: ${probe.missing}` });
           return;
         }
         useCaption = false;
@@ -1414,7 +1503,23 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
 
     // Checked AFTER the capability downgrades above, or a keyless machine would
     // pass this test on steps that are about to be switched off.
-    if (!useEssentia && !useUnderstand && !useGenius && !useCaption) {
+    // Local lyric transcription where Genius has none (Music Flamingo). Asked for
+    // but not installed is a refusal, like the other steps.
+    // Local lyrics default ON wherever Music Flamingo is installed; asked for
+    // explicitly but not installed is a refusal, defaulted-on is just skipped.
+    let localLyrics = body.localLyrics !== false;
+    if (localLyrics) {
+      const probe = resolveMossPaths('flamingo');
+      if ('missing' in probe) {
+        if (body.localLyrics === true) {
+          res.status(503).json({ error: `Music Flamingo is not available for lyric transcription: ${probe.missing}` });
+          return;
+        }
+        localLyrics = false;
+      }
+    }
+
+    if (!useEssentia && !useUnderstand && !useGenius && !useCaption && !localLyrics) {
       res.status(400).json({ error: 'No labeling steps enabled' });
       return;
     }
@@ -1464,6 +1569,7 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
       useUnderstand,
       useGenius,
       useCaption,
+      localLyrics,
       mergePolicy: body.mergePolicy || 'fill_missing',
     });
     repo.updateDataset(ds.id, { status: 'labeling' });
@@ -1475,6 +1581,42 @@ router.post('/datasets/:id/label', async (req: Request, res: Response) => {
 });
 
 // ── Enhance jobs (§2.6) ──────────────────────────────────────────────────
+
+/** POST /datasets/:id/enhance/normalise-lyrics — every sidecar's lyrics onto the
+ *  one tag vocabulary (lyricTags.ts), .bak kept. Body: { sampleIds?, retag? }.
+ *  `retag` recovers sections for untagged lyrics from the audio (Music Flamingo). */
+router.post('/datasets/:id/enhance/normalise-lyrics', async (req: Request, res: Response) => {
+  try {
+    const ds = repo.getDataset(req.params.id as string);
+    if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+    const body = (req.body || {}) as NormaliseLyricsOptions;
+    const retag = body.retag === true;
+    const blocker = labelBlockedBy(ds.id, retag);
+    if (blocker) {
+      res.status(409).json({
+        error: retag && TRAINER_KINDS.has(blocker.kind)
+          ? 'Recovering sections from audio needs the card, which a training job owns. Run without it, or wait.'
+          : 'A job is already running for this dataset',
+      });
+      return;
+    }
+    if (retag) {
+      const probe = resolveMossPaths('flamingo');
+      if ('missing' in probe) {
+        res.status(503).json({ error: `Music Flamingo is not available to recover sections: ${probe.missing}` });
+        return;
+      }
+    }
+    const samples = await buildSamples(ds);
+    const targets = pickTargets(samples, body.sampleIds, 'all', s => !!s.lyrics.trim());
+    if (targets.length === 0) { res.status(400).json({ error: 'No lyrics to normalise' }); return; }
+    const job = queue.startNormaliseLyricsJob(ds.id, targets, { ...body, retag });
+    res.status(202).json({ jobId: job.id });
+  } catch (err: any) {
+    console.error(`[Training] Normalise-lyrics start failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.post('/datasets/:id/enhance/genius', async (req: Request, res: Response) => {
   try {
@@ -1522,11 +1664,11 @@ router.post('/datasets/:id/enhance/caption', async (req: Request, res: Response)
     const body = (req.body || {}) as CaptionOptions;
     const providerName = body.provider || config.lireek.defaultProvider;
     {
-      const blocker = labelBlockedBy(ds.id, providerName === 'moss');
+      const blocker = labelBlockedBy(ds.id, isLocalCaptioner(providerName));
       if (blocker) {
         res.status(409).json({
-          error: providerName === 'moss' && TRAINER_KINDS.has(blocker.kind)
-            ? 'MOSS needs the engine, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.'
+          error: isLocalCaptioner(providerName) && TRAINER_KINDS.has(blocker.kind)
+            ? `${LOCAL_CAPTIONER_NAMES[providerName]} needs the card, which a training job owns. Wait for it, or caption with a cloud provider (Gemini) instead.`
             : 'A job is already running for this dataset',
         });
         return;
@@ -1536,10 +1678,10 @@ router.post('/datasets/:id/enhance/caption', async (req: Request, res: Response)
     // it must be admitted BEFORE getProvider(), which throws on an unknown id.
     // Its availability check is "binary built + weights on disk", and the failure
     // message has to say which, since neither is fixed in Settings → AI Services.
-    if (providerName === 'moss') {
-      const probe = resolveMossPaths();
+    if (isLocalCaptioner(providerName)) {
+      const probe = resolveMossPaths(providerName);
       if ('missing' in probe) {
-        res.status(503).json({ error: `MOSS captioning is not available: ${probe.missing}` });
+        res.status(503).json({ error: `${LOCAL_CAPTIONER_NAMES[providerName]} captioning is not available: ${probe.missing}` });
         return;
       }
     } else {
@@ -1591,8 +1733,8 @@ router.post('/datasets/:id/enhance/yue2-caption', async (req: Request, res: Resp
     }
     const body = (req.body || {}) as { sampleIds?: string[]; provider?: string; model?: string; temperature?: number };
     const providerName = body.provider || config.lireek.defaultProvider;
-    if (providerName === 'moss') {
-      res.status(400).json({ error: 'The YuE2 caption is a text rewrite of the existing label — pick a chat provider (Gemini, OpenAI, a local LLM); MOSS has no such mode.' });
+    if (isLocalCaptioner(providerName)) {
+      res.status(400).json({ error: 'The YuE2 caption is a text rewrite of the existing label — pick a chat provider (Gemini, OpenAI, a local LLM); the local audio models have no such mode.' });
       return;
     }
     const blocker = labelBlockedBy(ds.id, false);
@@ -1632,7 +1774,7 @@ router.post('/datasets/:id/enhance/yue2-caption', async (req: Request, res: Resp
 /** POST /datasets/:id/yue2-captions-missing — run before YuE2 training. A
  *  full audio re-caption (ACE caption + MM3 + YuE2 sidecars; lyrics and BPM
  *  left alone) of ONLY the tracks with no `.yue2.txt`, through the ordinary
- *  label job. Body: { provider: 'gemini' | 'moss', model?, checkOnly? }.
+ *  label job. Body: { provider: 'gemini' | 'moss' | 'flamingo', model?, checkOnly? }.
  *  { jobId: null, skipped } when every track already has one. */
 router.post('/datasets/:id/yue2-captions-missing', async (req: Request, res: Response) => {
   try {
@@ -1642,13 +1784,13 @@ router.post('/datasets/:id/yue2-captions-missing', async (req: Request, res: Res
     const missing = await samplesMissingYue2Caption(ds);
     if (b.checkOnly === true) { res.json({ missing: missing.length }); return; }
     if (!missing.length) { res.json({ jobId: null, skipped: 'Every track already has a YuE2 caption' }); return; }
-    const provider = b.provider === 'moss' ? 'moss' : 'gemini';
-    if (provider === 'moss') {
+    const provider = isLocalCaptioner(b.provider) ? b.provider : 'gemini';
+    if (isLocalCaptioner(provider)) {
       // MOSS writes the ACE and MM3 captions; the one-sentence YuE2 caption is
       // a text rewrite, which goes to the default chat provider.
       let chatOk = false;
-      try { chatOk = config.lireek.defaultProvider !== 'moss' && getProvider(config.lireek.defaultProvider).isAvailable(); } catch { /* stays false */ }
-      if (!chatOk) { res.status(400).json({ error: 'MOSS cannot write the YuE2 caption itself: it needs a chat provider (Gemini) configured in Settings → AI Services.' }); return; }
+      try { chatOk = !isLocalCaptioner(config.lireek.defaultProvider) && getProvider(config.lireek.defaultProvider).isAvailable(); } catch { /* stays false */ }
+      if (!chatOk) { res.status(400).json({ error: `${LOCAL_CAPTIONER_NAMES[provider]} cannot write the YuE2 caption itself: it needs a chat provider (Gemini) configured in Settings → AI Services.` }); return; }
     }
     const r = await fetch(`http://127.0.0.1:${config.server.port}/api/training/datasets/${encodeURIComponent(ds.id)}/label`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -3544,7 +3686,18 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
         res.status(400).json({ error: `Set the total step count above checkpoint step ${step}.` });
         return;
       }
+      // A gated run resumes with its own gate, split and decoder budget (the
+      // engine refuses a mismatch); `inherited` already carries the gate.
+      if (b.plannerGate) {
+        if (b.refinePlanner === true) {
+          res.status(400).json({ error: 'A run that used the held-out planner gate cannot be planner-refined: the refinement unfreezes the planner without a decoder budget.' });
+          return;
+        }
+        b = { ...b, narExtraSteps: saved.narExtraSteps };
+      }
     }
+    const gateRequested = !!b.plannerGate && typeof b.plannerGate === 'object';
+    const gateNarExtraSteps = b.narExtraSteps;
     // Base-matched method: the fixed parts of the recipe replace whatever the
     // body says (they define the method); its knobs fill in where blank.
     if (b.method !== undefined && b.method !== 'tuned' && b.method !== 'base-matched' && b.method !== 'fixed-recipe') {
@@ -3573,6 +3726,8 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
     }
     if (method === 'base-matched') b = applyBaseMatchedRecipe(b);
     if (method === 'fixed-recipe') b = applyFixedRecipe(b);
+    // The recipes zero the decoder budget; the gate needs its own.
+    if (gateRequested) b = { ...b, narExtraSteps: gateNarExtraSteps };
     const str = (key: string): string => typeof b[key] === 'string' ? (b[key] as string).trim() : '';
     const automatic = b.autoPrepare === true && !str('resume');
     const prepDefaults = automatic ? yue2AitkPrepareDefaults(ds).options : undefined;
@@ -3847,13 +4002,47 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       if (typeof pc.lyrics === 'string') planCheck.lyrics = pc.lyrics;
     }
     let narExtraSteps: number | undefined;
-    if (stopMode === 'kl' && b.narExtraSteps !== undefined && b.narExtraSteps !== null && b.narExtraSteps !== '') {
+    if ((stopMode === 'kl' || gateRequested) && b.narExtraSteps !== undefined && b.narExtraSteps !== null && b.narExtraSteps !== '') {
       const raw = Number(b.narExtraSteps);
       if (!Number.isInteger(raw) || raw < 0 || raw > 0x7fffffff) {
         res.status(400).json({ error: 'narExtraSteps must be a non-negative integer.' });
         return;
       }
       if (raw > 0) narExtraSteps = raw;
+    }
+    // Held-out planner gate (GH #316): off unless the body asks for it.
+    let plannerGate: Yue2PlannerGate | undefined;
+    if (gateRequested) {
+      const pg = b.plannerGate as Record<string, unknown>;
+      const d = PLANNER_GATE_DEFAULTS;
+      const field = (key: 'every' | 'minEpochs' | 'patience' | 'epsilon' | 'evalSeed', lo: number, hi: number, int: boolean): number | null => {
+        const v = pg[key] === undefined || pg[key] === null || pg[key] === '' ? d[key] : Number(pg[key]);
+        return Number.isFinite(v) && v >= lo && v <= hi && (!int || Number.isInteger(v)) ? v : null;
+      };
+      const gate = { every: field('every', 1, 100000, true), minEpochs: field('minEpochs', 0, 100000, true), patience: field('patience', 1, 1000, true),
+        epsilon: field('epsilon', 0, 10, false), evalSeed: field('evalSeed', 0, 0xffffffff, true) };
+      const bad = (Object.keys(gate) as Array<keyof typeof gate>).find(k => gate[k] === null);
+      if (bad) { res.status(400).json({ error: `plannerGate.${bad} is out of range.` }); return; }
+      if (!(narExtraSteps !== undefined && narExtraSteps > 0)) { res.status(400).json({ error: 'The planner gate needs a decoder budget: set the decoder steps after the freeze above 0.' }); return; }
+      if (lrSchedule.lrSchedule === 'wsd') { res.status(400).json({ error: 'The planner gate does not support the wsd schedule: its tail would end the run when the planner freezes.' }); return; }
+      if (b.autoRefine === true) { res.status(400).json({ error: 'The planner gate cannot be combined with automatic planner refinement.' }); return; }
+      // A resume keeps the split it started with; a new run takes the ids the
+      // card showed, or the default pick for this dataset's songs.
+      // A resume checks the saved ids against the manifest it trains on; a new
+      // run against the current audio files, which preparation will name its items from.
+      const songs = resume ? yue2ManifestItemIds(dataset) : yue2GateSongIds(await buildSamples(ds));
+      const given = Array.isArray(pg.holdoutIds) && pg.holdoutIds.every(x => typeof x === 'string') ? [...new Set(pg.holdoutIds as string[])] : undefined;
+      let holdoutIds = given;
+      if (!holdoutIds?.length) {
+        const pick = planPlannerGateHoldout(songs, gate.evalSeed!);
+        if ('error' in pick) { res.status(400).json({ error: pick.error }); return; }
+        holdoutIds = pick.holdoutIds;
+      }
+      const unknown = holdoutIds.filter(id => !songs.includes(id));
+      if (songs.length && unknown.length) { res.status(400).json({ error: `Held-out songs are not in this dataset: ${unknown.join(', ')}` }); return; }
+      if (songs.length && songs.length - holdoutIds.length < 1) { res.status(400).json({ error: 'The planner gate would leave no song to train on.' }); return; }
+      const savedItems = resume && Array.isArray(pg.holdoutItems) && pg.holdoutItems.every(x => Number.isInteger(x)) ? pg.holdoutItems as number[] : undefined;
+      plannerGate = { ...(gate as Omit<Yue2PlannerGate, 'holdoutIds'>), holdoutIds, ...(savedItems ? { holdoutItems: savedItems } : {}) };
     }
     if (resume && (!fs.existsSync(resume) || !fs.statSync(resume).isFile())) {
       res.status(400).json({ error: `Joint-training resume record is missing: ${resume}` });
@@ -3897,6 +4086,7 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       ...(targetKl !== undefined ? { targetKl } : {}),
       ...(targetKlMode ? { targetKlMode } : {}),
       ...(narExtraSteps !== undefined ? { narExtraSteps } : {}),
+      ...(plannerGate ? { plannerGate } : {}),
       ...(b.stopEngine === false ? { stopEngine: false } : {}),
       ...spike,
       ...(planCheck ? { planCheck } : {}),
@@ -3921,7 +4111,35 @@ router.post('/datasets/:id/yue2-joint-train', async (req: Request, res: Response
       ...(calibration ? { calibration } : {}),
       optimizer, cautious, rank, alpha: alphaRaw, adapterType, ...(adapterType === 'lokr' ? { lokrDim, lokrFactor } : {}), stopMode, ...advanced,
       ...(targetLoss !== undefined ? { targetLoss } : {}), ...(targetKl !== undefined ? { targetKl } : {}), ...(targetKlMode ? { targetKlMode } : {}),
-      ...(narExtraSteps !== undefined ? { narExtraSteps } : {}) });
+      ...(narExtraSteps !== undefined ? { narExtraSteps } : {}), ...(plannerGate ? { plannerGate } : {}) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+/** Item ids of a prepared manifest ([] when unreadable); the resume check. */
+function yue2ManifestItemIds(file: string): string[] {
+  try {
+    if (!file || !fs.existsSync(file) || fs.statSync(file).size > 16 * 1024 * 1024) return [];
+    const items = (JSON.parse(fs.readFileSync(file, 'utf8')) as { items?: unknown }).items;
+    return Array.isArray(items) ? items.map((x: any) => String(x?.id ?? '')).filter(Boolean) : [];
+  } catch { return []; }
+}
+
+/** GET /datasets/:id/yue2-joint-holdout?seed=42
+ *
+ * The planner gate's default split for this dataset, so the card can show the
+ * held-out songs before the run starts, even before any stage has run: the ids
+ * come from the dataset's current audio files, the same inventory preprocessing
+ * names its sources from. Start uses the same pick. A read, so it does not
+ * wait for an idle dataset or the trainer binary. */
+router.get('/datasets/:id/yue2-joint-holdout', async (req: Request, res: Response) => {
+  try {
+    const ds = repo.getDataset(req.params.id as string);
+    if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+    const seed = req.query.seed === undefined ? PLANNER_GATE_DEFAULTS.evalSeed : Number(req.query.seed);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) { res.status(400).json({ error: 'seed must fit uint32.' }); return; }
+    res.json(yue2PlannerGatePreview(await buildSamples(ds), seed));
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -4218,16 +4436,20 @@ router.get('/datasets/:id/yue2-joint-previews', (req: Request, res: Response) =>
 router.get('/yue2-review', (_req: Request, res: Response) => {
   try {
     const rows: Array<Record<string, unknown>> = [];
-    for (const ds of repo.listDatasets()) {
+    const datasets = repo.listDatasets();
+    const runsByDataset = listYue2AitkRunsForDatasets(datasets);
+    for (const ds of datasets) {
       const active = queue.activeJobForDataset(ds.id);
-      for (const run of listYue2AitkRuns(ds.id, ds.slug)) {
+      for (const run of runsByDataset.get(ds.id) ?? []) {
         const rungs = run.checkpoints.filter(c => c.rung && c.arPath && c.narPath);
         if (!rungs.length) continue;
-        const previews = listYue2JointPreviews(run.output).filter(p => p.status === 'done' && rungs.some(r => r.step === p.step));
-        const scored = new Set(listYue2RungScores(ds.id, run.jobId).filter(s => s.likeness !== null || s.corruption !== null || s.notes).map(s => s.step));
+        const allPreviews = listYue2JointPreviews(run.output);
+        const previews = allPreviews.filter(p => p.status === 'done' && rungs.some(r => r.step === p.step));
+        const scores = listYue2RungScores(ds.id, run.jobId);
+        const scored = new Set(scores.filter(s => s.likeness !== null || s.corruption !== null || s.notes).map(s => s.step));
         const kls = rungs.map(r => r.kl).filter((k): k is number => typeof k === 'number');
-        let best: ReturnType<typeof bestScoredRung> = null;
-        try { best = bestScoredRung(ds.id, run.jobId, ds.slug); } catch { /* stays null */ }
+        let best: ReturnType<typeof bestReviewFact> = null;
+        try { best = bestReviewFact(reviewRungFacts(run, scores, allPreviews)); } catch { /* stays null */ }
         // A mirrored run's own queue lives on its worker, not this machine's
         // `active` job — "still refining" tracks the worker's status as mirrored.
         const live = active?.id === run.jobId || (run.status === 'running' && !!run.origin);
@@ -4299,6 +4521,21 @@ router.delete('/datasets/:id/yue2-joint-runs/:jobId', async (req: Request, res: 
     const active = queue.activeJobForDataset(ds.id);
     if (active?.id === jobId || run.status === 'running') { res.status(409).json({ error: 'That run is still training; stop it first' }); return; }
     res.json(await deleteYue2Run(jobId));
+  } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
+});
+
+/** PATCH /datasets/:id/yue2-joint-runs/:jobId/params — change the checkpoint
+ * and preview interval of the run training now (GH #307). Body:
+ * { saveEvery?, previewEvery? }; the trainer takes them up between steps. */
+router.patch('/datasets/:id/yue2-joint-runs/:jobId/params', (req: Request, res: Response) => {
+  try {
+    const ds = repo.getDataset(req.params.id as string);
+    if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+    const active = queue.activeJobForDataset(ds.id);
+    if (active?.id !== req.params.jobId || active.kind !== 'yue2-joint-train') { res.status(409).json({ error: 'That run is not training on this machine' }); return; }
+    const result = updateYue2JointParams(active, req.body ?? {});
+    if ('error' in result) { res.status(result.status).json({ error: result.error }); return; }
+    res.json(result);
   } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
 
@@ -4486,7 +4723,8 @@ router.get('/datasets/:id/yue2-ar', (req: Request, res: Response) => {
     const abc    = readYue2AbcStatus(manifestPath);
     const stemsDir = yue2StemsDir(ds.slug);
     const minted = yue2MintedManifest();
-    const tokenizer = resolveYue2TokenizerModel();
+    const tokenizerId = yue2TokenizerSetting().training;
+    const tokenizer = resolveYue2TokenizerModel(tokenizerId);
     const aligner = resolveYue2AlignerModel();
     const sheetModel = resolveYue2SheetModel();
 
@@ -4523,8 +4761,12 @@ router.get('/datasets/:id/yue2-ar', (req: Request, res: Response) => {
           // into the other.
           done: !!codes?.present && codes.sourcesWithCodes > 0,
           status: codes ?? null,
-          missing: missingYue2TokenizeModels(),
+          missing: missingYue2TokenizeModels(tokenizerId),
           tokenizerFile: tokenizer ? path.basename(tokenizer) : '',
+          /** The chosen tokenizer (preferences `yue2-tokenizer`.training) and
+           *  every choice with whether it is installed, for the card's picker. */
+          tokenizer: tokenizerId,
+          tokenizers: yue2TokenizerChoices(),
           defaults: YUE2_TOKENIZE_DEFAULTS,
         },
         align: {
@@ -4594,12 +4836,16 @@ router.post('/datasets/:id/yue2-tokenize', (req: Request, res: Response) => {
       return Number.isFinite(v) && v >= lo && v <= hi ? v : d;
     };
     const D = YUE2_TOKENIZE_DEFAULTS;
+    // An explicit choice wins (the preparation chain sends one, so a remote
+    // worker uses the main server's); otherwise the stored setting.
+    const tokenizer: Yue2TokenizerId = YUE2_TOKENIZER_IDS.includes(b.tokenizer as Yue2TokenizerId)
+      ? b.tokenizer as Yue2TokenizerId : yue2TokenizerSetting().training;
 
-    const missing = missingYue2TokenizeModels();
+    const missing = missingYue2TokenizeModels(tokenizer);
     if (missing.length) {
       res.status(400).json({
         error: `The tokenize stage is missing: ${missing.join(', ')}. Install it from the Model Manager `
-             + '(yue2-tok-f16) — nothing in generation needs it, so a fresh install will not have it.',
+             + '— nothing in generation needs it, so a fresh install will not have it.',
       });
       return;
     }
@@ -4634,12 +4880,13 @@ router.post('/datasets/:id/yue2-tokenize', (req: Request, res: Response) => {
       only: typeof b.only === 'string' ? b.only.trim() : D.only,
       limit: num('limit', D.limit, 0, 100000),
       force: b.force === true,
+      tokenizer,
       datasetSlug: ds.slug,
     });
     res.json({
       jobId: job.id, kind: job.kind, manifest,
       sources: cache.sources, clips: cache.clips,
-      tokenizer: path.basename(resolveYue2TokenizerModel()),
+      tokenizer: path.basename(resolveYue2TokenizerModel(tokenizer)),
       license: YUE2_LICENSE_NOTICE,
     });
   } catch (err: any) {
@@ -5845,6 +6092,272 @@ router.get('/datasets/:id/train-lm', async (req: Request, res: Response) => {
 // ── DiT LoRA training (§2.7, phase 4) ────────────────────────────────────
 
 const TRAIN_DIT_STAGES: readonly TrainDitStage[] = ['train', 'export'];
+
+router.get('/datasets/:id/sa3-train', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    const active = queue.activeJobForDataset(ds.id);
+    res.json({ ...sa3Readiness(), runs: listSa3Runs(ds.id, ds.slug),
+      activeJob: active ? queue.toSummary(active) : null });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ── SA3 checkpoint previews (contracts/training.ts) ─────────────────────
+// Runs are named by their opaque id and resolved under the dataset's own runs;
+// audio is served only by the file name a record holds.
+
+type Sa3PreviewRun = { id: string; dir: string; run: Sa3Run };
+
+/** The asked run (400 malformed, 404 unknown), or the newest one when none is asked. */
+function sa3PreviewRun(ds: TrainingDatasetRow, asked: unknown, res: Response): Sa3PreviewRun | null | undefined {
+  // Newest by run stamp: listSa3Runs orders by adapter name first.
+  const id = typeof asked === 'string' && asked.trim() ? asked.trim()
+    : listSa3Runs(ds.id, ds.slug).map(r => r.run).sort((a, b) => b.split('/')[1].localeCompare(a.split('/')[1]))[0];
+  if (id === undefined) return null;
+  if (!SA3_RUN_ID.test(id)) { res.status(400).json({ error: 'Invalid SA3 run' }); return undefined; }
+  try { return { id, ...sa3RunById(ds.id, ds.slug, id) }; }
+  catch { res.status(404).json({ error: 'SA3 run not found' }); return undefined; }
+}
+
+function sa3PreviewList(ds: TrainingDatasetRow, r: Sa3PreviewRun | null): Sa3PreviewListResponse {
+  if (!r) return { run: null, settings: SA3_PREVIEW_DEFAULTS, previews: [] };
+  return { run: r.id, settings: r.run.preview ?? SA3_PREVIEW_DEFAULTS,
+    previews: listSa3PreviewRecords(r.dir).map(({ file, ...p }) => ({ ...p,
+      audioUrl: p.status === 'done' && file && sa3PreviewAudioPath(r.dir, file)
+        ? `/api/training/datasets/${encodeURIComponent(ds.id)}/sa3-previews/audio?run=${encodeURIComponent(r.id)}&file=${encodeURIComponent(file)}`
+        : null })) };
+}
+
+router.get('/datasets/:id/sa3-previews', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    const r = sa3PreviewRun(ds, req.query.run, res);
+    if (r !== undefined) res.json(sa3PreviewList(ds, r));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+/** Body: Sa3PreviewRenderRequest. Renders the step's cells that have no done
+ *  render yet (a retry renders the failed ones), with the run's settings
+ *  under any given. Needs the engine up and no job on this dataset. */
+router.post('/datasets/:id/sa3-previews/render', async (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    const b = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    if (typeof b.run !== 'string' || !b.run.trim()) { res.status(400).json({ error: 'SA3 preview render needs a run' }); return; }
+    const r = sa3PreviewRun(ds, b.run, res);
+    if (!r) return;
+    const step = Number(b.step);
+    if (!Number.isSafeInteger(step) || !sa3SnapshotSteps(r.dir).includes(step)) { res.status(400).json({ error: 'No captured snapshot at that step in that run' }); return; }
+    let settings;
+    try { settings = parseSa3PreviewSettings(b.settings, r.run.preview ?? SA3_PREVIEW_DEFAULTS); }
+    catch (err: any) { res.status(400).json({ error: err.message }); return; }
+    if (!settings.prompts.length) { res.status(400).json({ error: 'SA3 previews need at least one prompt' }); return; }
+    if (queue.activeJobForDataset(ds.id)) { res.status(409).json({ error: 'A job is queued or running for this dataset.' }); return; }
+    if (isEngineSuspended() || !engineReady) { res.status(503).json({ error: 'The engine is not running; previews need it up' }); return; }
+    await runOnGpuLane(async () => {
+      await evictOtherFamilies('sa3');
+      return renderSa3Previews({ runDir: r.dir, runId: r.id, snapshotRun: `${ds.slug}/${r.id}`, step, settings,
+        inferenceDit: path.basename(r.run.inferenceDit), final: step === r.run.steps });
+    }, { label: 'sa3 checkpoint preview', family: 'sa3' });
+    res.json(sa3PreviewList(ds, r));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/datasets/:id/sa3-previews/audio', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    if (typeof req.query.run !== 'string' || !req.query.run.trim()) { res.status(400).json({ error: 'SA3 preview audio needs a run' }); return; }
+    const r = sa3PreviewRun(ds, req.query.run, res);
+    if (!r) return;
+    const file = typeof req.query.file === 'string' ? sa3PreviewAudioPath(r.dir, req.query.file) : null;
+    if (!file) { res.status(404).json({ error: 'Preview audio not found' }); return; }
+    res.type('audio/wav').sendFile(file, { dotfiles: 'allow' }); // validated above; a data folder may sit under a dot directory
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/datasets/:id/sa3-train', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  if (queue.activeJobForDataset(ds.id) || hasActivePipeline()) {
+    res.status(409).json({ error: 'A job or pipeline is queued or running for this dataset.' }); return;
+  }
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    res.status(400).json({ error: 'SA3 options must be an object' }); return;
+  }
+  try {
+    const opts = resolveSa3Run(ds.id, ds.slug, req.body);
+    const job = queue.startSa3TrainJob(ds.id, opts);
+    res.status(202).json({ jobId: job.id, job: queue.toSummary(job) });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+// ── HeartMuLa backbone LoRA (contracts/heartmulaTraining.ts) ─────────────
+// No ACE preprocessing anywhere on this path: prepare encodes with the
+// HeartCodec encoder pack and the trainer reads that cache.
+
+router.get('/datasets/:id/heartmula-status', async (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try { res.json(await heartmulaStatus(ds)); } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+/** Shared admission for the two HeartMuLa starts; returns an error text, or null when the job may start. */
+function heartmulaBlocked(ds: TrainingDatasetRow, needEncoder: boolean): string | null {
+  if (queue.activeJobForDataset(ds.id) || hasActivePipeline()) return 'A job or pipeline is queued or running for this dataset.';
+  if (queue.gpuPreviewReserved()) return 'A checkpoint preview is rendering; training waits until it ends.';
+  const ready = heartmulaReadiness();
+  if (ready.backend !== 'cuda') return `HeartMuLa training needs a CUDA engine build (this one is ${ready.backend}).`;
+  if (!aceTrainExe()) return 'ace-train was not found next to ace-server — rebuild the engine';
+  if (ready.deviceProblem) return ready.deviceProblem;
+  if (ready.missingModels.length) return `HeartMuLa models are missing: ${ready.missingModels.join(', ')}`;
+  if (needEncoder && ready.encoderMissing) return missingEncoderMessage();
+  return null;
+}
+
+router.post('/datasets/:id/heartmula-prepare', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  const body = (req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {}) as Record<string, unknown>;
+  if (Object.keys(body).some(k => k !== 'force') || (body.force !== undefined && typeof body.force !== 'boolean')) {
+    res.status(400).json({ error: 'Options are { force?: boolean }' }); return;
+  }
+  const blocked = heartmulaBlocked(ds, true);
+  if (blocked) { res.status(409).json({ error: blocked }); return; }
+  const job = queue.startHeartmulaPrepareJob(ds.id, { force: body.force === true });
+  res.status(202).json({ jobId: job.id, job: queue.toSummary(job) });
+});
+
+router.post('/datasets/:id/heartmula-train', async (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    res.status(400).json({ error: 'HeartMuLa options must be an object' }); return;
+  }
+  try {
+    const blocked = heartmulaBlocked(ds, false);
+    if (blocked) { res.status(409).json({ error: blocked }); return; }
+    // The cache must match the sources now: training on a stale one would silently use old audio or text.
+    const prepare = heartmulaPrepareStatus(ds, await buildSamples(ds));
+    if (!prepare.cacheValid) {
+      res.status(400).json({ error: prepare.preparedSamples
+        ? `The HeartMuLa prepare cache is out of date (${prepare.staleSamples} sample(s) changed) — run Prepare again`
+        : 'Dataset has no prepared HeartMuLa data — run Prepare first' });
+      return;
+    }
+    const run = resolveHeartmulaRun(ds, req.body as Record<string, unknown>);
+    const job = queue.startHeartmulaTrainJob(ds.id, { runId: run.id, runDir: run.dir, record: run.record, resume: run.resume });
+    res.status(202).json({ jobId: job.id, run: run.id, job: queue.toSummary(job) });
+  } catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+
+/** Body: { run }. Checkpoint now and stop; the run stays resumable. */
+router.post('/datasets/:id/heartmula-checkpoint', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  const run = (req.body as { run?: unknown } | undefined)?.run;
+  const job = queue.activeJobForDataset(ds.id);
+  if (typeof run !== 'string' || !job || job.kind !== 'heartmula-train'
+    || (job.opts as HeartmulaTrainJobOpts).runId !== run) {
+    res.status(404).json({ error: 'That HeartMuLa run is not training' }); return;
+  }
+  if (!requestHeartmulaCheckpoint(job)) { res.status(409).json({ error: 'The trainer is still loading; try again once it reports its first step' }); return; }
+  res.status(202).json({ ok: true });
+});
+
+// ── HeartMuLa checkpoint previews ────────────────────────────────────────
+// The runner renders them between trainer segments; these routes list them,
+// retry one, and serve the audio by the file name a record holds.
+
+type HeartmulaPreviewRun = { id: string; dir: string; record: ReturnType<typeof heartmulaRunById>['record'] };
+
+/** The asked run (400 malformed, 404 unknown), or the dataset's newest when none is asked. */
+function heartmulaPreviewRun(ds: TrainingDatasetRow, asked: unknown, res: Response): HeartmulaPreviewRun | null | undefined {
+  const id = typeof asked === 'string' && asked.trim() ? asked.trim() : listHeartmulaRuns(ds.id, ds.slug)[0]?.id;
+  if (id === undefined) return null;
+  if (!HEARTMULA_RUN_ID.test(id)) { res.status(400).json({ error: 'Invalid HeartMuLa run' }); return undefined; }
+  try { return heartmulaRunById(ds.id, ds.slug, id); }
+  catch { res.status(404).json({ error: 'HeartMuLa run not found' }); return undefined; }
+}
+
+function heartmulaRunPreviewSettings(r: HeartmulaPreviewRun): ReturnType<typeof resolveHeartmulaPreviewSettings> {
+  try { return resolveHeartmulaPreviewSettings(r.record.preview, HEARTMULA_PREVIEW_DEFAULTS); } catch { return HEARTMULA_PREVIEW_DEFAULTS; }
+}
+
+/** The run's settings with the prompt resolved from the dataset (saved on the run the first time), or the unresolved ones when that fails. */
+async function heartmulaResolvedPreview(ds: TrainingDatasetRow, r: HeartmulaPreviewRun) {
+  try { return await ensureHeartmulaRunPreview(ds, r); }
+  catch { return { settings: heartmulaRunPreviewSettings(r), source: null }; }
+}
+
+function heartmulaPreviewList(ds: TrainingDatasetRow, r: HeartmulaPreviewRun | null, resolved?: Awaited<ReturnType<typeof heartmulaResolvedPreview>>): HeartmulaPreviewListResponse {
+  if (!r) return { run: null, settings: HEARTMULA_PREVIEW_DEFAULTS, source: null, previews: [] };
+  return { run: r.id, settings: resolved?.settings ?? heartmulaRunPreviewSettings(r), source: resolved?.source ?? null,
+    previews: listHeartmulaPreviewRecords(r.dir).map(({ file, id: _id, ...p }) => ({ ...p,
+      audioUrl: p.status === 'done' && file && heartmulaPreviewAudioPath(r.dir, file)
+        ? `/api/training/datasets/${encodeURIComponent(ds.id)}/heartmula-previews/audio?run=${encodeURIComponent(r.id)}&file=${encodeURIComponent(file)}`
+        : null })) };
+}
+
+router.get('/datasets/:id/heartmula-previews', async (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    const r = heartmulaPreviewRun(ds, req.query.run, res);
+    if (r !== undefined) res.json(heartmulaPreviewList(ds, r, r ? await heartmulaResolvedPreview(ds, r) : undefined));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+/** Body: HeartmulaPreviewRenderRequest. Renders (or retries) one take at the base (step 0) or a saved checkpoint.
+ *  Never while a job runs on the dataset: previews and training do not share the GPU. */
+router.post('/datasets/:id/heartmula-previews/render', async (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    const b = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+    if (typeof b.run !== 'string' || !b.run.trim()) { res.status(400).json({ error: 'HeartMuLa preview render needs a run' }); return; }
+    const r = heartmulaPreviewRun(ds, b.run, res);
+    if (!r) return;
+    const step = Number(b.step);
+    if (!Number.isSafeInteger(step) || (step !== 0 && !heartmulaCheckpointSteps(r.dir).includes(step))) {
+      res.status(400).json({ error: 'That run has no saved checkpoint at that step' }); return;
+    }
+    let settings, source;
+    try {
+      const run = await ensureHeartmulaRunPreview(ds, r);
+      settings = resolveHeartmulaPreviewSettings(b.settings, run.settings);
+      // A take's own tags or lyrics replace the run's, and say so.
+      const given = (b.settings && typeof b.settings === 'object' ? b.settings : {}) as Record<string, unknown>;
+      source = { ...run.source, ...(typeof given.tags === 'string' && given.tags.trim() && given.tags !== run.settings.tags ?{ tags: 'override' as const } : {}),
+        ...(typeof given.lyrics === 'string' && given.lyrics.trim() && given.lyrics !== run.settings.lyrics ?{ lyrics: 'override' as const } : {}) };
+    } catch (err: any) { res.status(400).json({ error: err.message }); return; }
+    if (hasActivePipeline()) { res.status(409).json({ error: 'A pipeline is queued or running; previews wait until it ends.' }); return; }
+    if (isEngineSuspended() || !engineReady) { res.status(503).json({ error: 'The engine is not running; previews need it up' }); return; }
+    // One GPU owner for every dataset: refused while any trainer is queued or running, or another preview holds the GPU.
+    if (!queue.reserveGpuForPreview()) { res.status(409).json({ error: 'The GPU is busy with a training job or another preview; previews wait until it ends.' }); return; }
+    await queue.runReservedPreview(() => runOnGpuLane(async () => {
+      await renderHeartmulaPreview({ runDir: r.dir, runId: r.id, step, kind: heartmulaPreviewKind(step, r.record.recipe.steps), settings, source,
+        base: { variant: r.record.recipe.variant ?? '3B', quant: r.record.recipe.quant ?? 'F16' } });
+    }, { label: 'heartmula checkpoint preview', family: 'heartmula' }));
+    res.json(heartmulaPreviewList(ds, r, await heartmulaResolvedPreview(ds, r)));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/datasets/:id/heartmula-previews/audio', (req: Request, res: Response) => {
+  const ds = repo.getDataset(String(req.params.id));
+  if (!ds) { res.status(404).json({ error: 'Dataset not found' }); return; }
+  try {
+    if (typeof req.query.run !== 'string' || !req.query.run.trim()) { res.status(400).json({ error: 'HeartMuLa preview audio needs a run' }); return; }
+    const r = heartmulaPreviewRun(ds, req.query.run, res);
+    if (!r) return;
+    const file = typeof req.query.file === 'string' ? heartmulaPreviewAudioPath(r.dir, req.query.file) : null;
+    if (!file) { res.status(404).json({ error: 'Preview audio not found' }); return; }
+    res.type('audio/wav').sendFile(file, { dotfiles: 'allow' }); // validated above; a data folder may sit under a dot directory
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
 
 router.post('/datasets/:id/train-dit', async (req: Request, res: Response) => {
   try {

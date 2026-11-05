@@ -1,12 +1,14 @@
-import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, RefreshCw } from 'lucide-react';
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { pollWhile } from '../../queries/contract';
+import { resourceKey } from '../../queries/keys';
 import { trainingQueries } from '../../queries/training-data/queries';
-import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { runQueries, trainingWritePlan } from '../../queries/training-runs/queries';
 import {
   cancelWorkerUpdate,
+  isTerminalStatus,
   startWorkerUpdate
 } from '../../services/trainingApi';
 
@@ -20,14 +22,18 @@ export const WorkersPanel: React.FC = () => {
   const [commandError, setError] = useState('');
   const error = commandError || workersQuery.error?.message || updateQueries.find(q => q.error)?.error?.message || '';
   const refresh = async () => { await workersQuery.refetch(); await Promise.all(updateQueries.map(q => q.refetch())); };
-  const update = async (name: string) => {
-    try { await runCommand(client, null, () => startWorkerUpdate(name)); setError(''); }
-    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-  };
-  const cancel = async (name: string) => {
-    try { await runCommand(client, null, () => cancelWorkerUpdate(name)); await refresh(); }
-    catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-  };
+  const updateMut = useMutation({
+    mutationFn: (name: string) => startWorkerUpdate(name),
+    onSuccess: () => { setError(''); void trainingWritePlan(client, null, resourceKey('training-data/workers')); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const cancelMut = useMutation({
+    mutationFn: (name: string) => cancelWorkerUpdate(name),
+    onSuccess: async () => { await refresh(); void trainingWritePlan(client, null, resourceKey('training-data/workers')); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const update = (name: string) => { updateMut.mutate(name); };
+  const cancel = (name: string) => { cancelMut.mutate(name); };
   return (
     <div className="rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-3 space-y-3">
       <div className="flex items-center justify-between">
@@ -37,7 +43,9 @@ export const WorkersPanel: React.FC = () => {
       {error && <p className="text-xs text-red-500">{error}</p>}
       {workers.map(w => {
         const updateJob = updates[w.name];
-        const busy = updateJob && !['done', 'failed', 'cancelled'].includes(updateJob.status);
+        const busy = !!updateJob && !isTerminalStatus(updateJob.status);
+        const updating = updateMut.isPending && updateMut.variables === w.name;
+        const cancelling = cancelMut.isPending && cancelMut.variables === w.name;
         const badge = !w.online ? t('trainingStudio.workers.offlineBadge', 'Offline')
           : !w.commit ? t('trainingStudio.workers.legacyBadge', 'Update API unavailable')
           : w.relation === 'current' ? t('trainingStudio.workers.currentBadge', 'Current')
@@ -48,12 +56,13 @@ export const WorkersPanel: React.FC = () => {
             <strong className="text-zinc-800 dark:text-zinc-200">{w.name}</strong>
             <span className={w.relation === 'current' ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}>{badge}</span>
             {w.dirty && <span className="text-amber-600 dark:text-amber-400">{t('trainingStudio.workers.dirty', 'Local changes')}</span>}
-            <button type="button" onClick={() => void update(w.name)}
-              disabled={!w.online || w.relation !== 'behind' || !w.idle || !!busy}
+            <button type="button" onClick={() => update(w.name)}
+              disabled={!w.online || w.relation !== 'behind' || !w.idle || !!busy || updating}
               className="ml-auto rounded-md bg-amber-600 px-2 py-1 font-semibold text-white disabled:opacity-40">
               {busy ? <Loader2 size={13} className="animate-spin" /> : t('trainingStudio.workers.update', 'Update')}
             </button>
-            {updateJob?.cancellable && <button type="button" onClick={() => void cancel(w.name)} className="text-red-500 hover:underline">{t('trainingStudio.workers.cancel', 'Cancel')}</button>}
+            {updateJob?.cancellable && <button type="button" onClick={() => cancel(w.name)} disabled={cancelling}
+              className="text-red-500 hover:underline disabled:opacity-40">{t('trainingStudio.workers.cancel', 'Cancel')}</button>}
           </div>
           {w.online && <div className="flex flex-wrap gap-x-4 gap-y-1 text-zinc-600 dark:text-zinc-400">
             <span>Git {w.commit?.slice(0, 8) ?? 'unknown'}</span>

@@ -141,7 +141,7 @@ export interface BackendFeatureCapabilities {
  *  thing keeping a backend's planner-LM knobs out of the Generation panel.
  *  Absent means 'generation' — the behaviour before groups existed, and the
  *  right default for a backend that never thinks about it. */
-export type BackendExtensionGroup = 'generation' | 'lm';
+export type BackendExtensionGroup = 'generation' | 'lm' | 'adapter';
 
 /** A backend-declared knob. Same schema the Lua plugins use (so one renderer
  *  serves both), plus the cluster it belongs to. */
@@ -201,6 +201,10 @@ export interface BackendModels {
     rank?: number;
     steps?: number;
     bytes?: number;
+    /** HeartMuLa: the adapter carries MLP factors, so its MLP dial does something. */
+    mlp?: boolean;
+    /** HeartMuLa: the variant the adapter was trained on (its home base for re-base). */
+    variant?: string;
     dataset?: string;
     /** The run's final export rather than a mid-run snapshot. */
     final?: boolean;
@@ -332,6 +336,9 @@ export interface GenerationContext {
   nextLaneFamily?: () => string | undefined;
   /** Take the lane again for GPU work after releasing it. */
   runOnLane?: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** A queued job claimed into this job's batch runs on this job's engine
+   *  worker (lead set); one handed back to the queue has none (lead null). */
+  assignFollower?: (follower: GenerationJob, lead: GenerationJob | null) => void;
 }
 
 export interface ResolvedRequest {

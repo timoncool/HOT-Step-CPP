@@ -2,15 +2,30 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
+import { listBackends } from '../backends/registry.js';
 import { runYue2CoverSheetJob } from './yue2ArTrainRunner.js';
 import { createJob, type TrainingJob } from './labelingQueue.js';
 import { gpuLaneOwner, runOnGpuLane } from '../generation/gpuLane.js';
-import { type RelayState, type Yue2Kind, runYue2AceTrain } from './yue2TrainRunner.js';
+import { type RelayState, runYue2AceTrain } from './yue2TrainRunner.js';
 import {
-  buildYue2SheetArgs, readYue2CoverAbc, writeYue2CoverSheetManifest,
+  buildYue2SheetArgs, readYue2CoverAbc, setSheetTranscriberSource, writeYue2CoverSheetManifest,
   type ResolvedYue2SheetOptions,
 } from './yue2Sheet.js';
+
+beforeEach(t => {
+  assert.ok('mock' in t);
+  // The runner is mocked below, but fallback also evicts other backends.
+  // Stub those releases so a unit test cannot unload the dev engine's models.
+  for (const backend of listBackends()) {
+    if (backend.releaseVram) t.mock.method(backend as Required<typeof backend>, 'releaseVram', async () => {});
+  }
+  const network = t.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('SheetSage unit tests must not contact the network');
+  });
+  // Some clients swallow fetch errors, so throwing alone cannot enforce isolation.
+  t.after(() => assert.equal(network.mock.callCount(), 0, 'SheetSage tests made no network requests'));
+});
 
 const trainingOptions: ResolvedYue2SheetOptions = {
   manifest: 'training.json', only: '', force: false, fast: false, datasetSlug: 'fixture',
@@ -25,6 +40,23 @@ test('dataset sheet arguments keep the full-score default', () => {
 test('cover sheet arguments request melody-only notation', () => {
   const args = buildYue2SheetArgs({ ...trainingOptions, melodyOnly: true });
   assert.equal(args.filter(arg => arg === '--melody-only').length, 1);
+});
+
+test('SheetSage2-Refined arguments: --refined, and --key-mode only with it', () => {
+  assert.equal(buildYue2SheetArgs(trainingOptions).includes('--refined'), false);
+  assert.deepEqual(buildYue2SheetArgs({ ...trainingOptions, refined: true, keyMode: true }).slice(-2), ['--refined', '--key-mode']);
+  assert.equal(buildYue2SheetArgs({ ...trainingOptions, keyMode: true }).includes('--key-mode'), false);
+});
+
+test('labelling and the AR sheet stage follow the stored transcriber choice', () => {
+  setSheetTranscriberSource(() => ({ refined: true, keyMode: true }));
+  try {
+    // No refined field: the Models dropdown's stored choice decides.
+    assert.deepEqual(buildYue2SheetArgs(trainingOptions).slice(-2), ['--refined', '--key-mode']);
+    assert.equal(buildYue2SheetArgs({ ...trainingOptions, refined: false }).includes('--refined'), false);
+  } finally {
+    setSheetTranscriberSource(() => ({ refined: false, keyMode: false }));
+  }
 });
 
 test('a cover source gets a private one-source manifest and usable ABC', () => {
@@ -83,7 +115,7 @@ function mockCoverRun(action: (call: number, stopEngine: boolean, args: string[]
   onLine: (line: string, st: RelayState) => void, st: RelayState) => Promise<void>): CoverRun {
   let calls = 0;
   return async <S extends RelayState>(
-    _job: TrainingJob, _kind: Yue2Kind, args: string[], _idleMs: number,
+    _job: TrainingJob, _kind: string, args: string[], _idleMs: number,
     _verify: () => string | null, onLine: (line: string, st: S) => void,
     st: S, _env?: NodeJS.ProcessEnv, stopEngine = true,
   ): Promise<S> => {

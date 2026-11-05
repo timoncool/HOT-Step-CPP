@@ -38,7 +38,9 @@ export const BackendExtensionControls: React.FC<{
   /** Cluster accent, so a declared toggle matches the section it lives in
    *  (the same one BarSection is given in GlobalParamBar). */
   accentColor?: Accent;
-}> = ({ group, accentColor = 'sky' }) => {
+  /** Keys to leave out, for a knob that does nothing in the current state. */
+  hide?: string[];
+}> = ({ group, accentColor = 'sky', hide }) => {
   const gp = useGlobalParams() as any;
   const declared = useBackendExtensions(group);
 
@@ -57,6 +59,7 @@ export const BackendExtensionControls: React.FC<{
     return gp.backendParams?.[key] ?? dep?.default;
   };
   const params = declared.filter((p) => {
+    if (hide?.includes(p.key)) return false;
     const vw = p.visible_when as { key: string; equals?: string; not_equals?: string } | undefined;
     if (!vw) return true;
     const cur = String(valueOf(vw.key) ?? '');

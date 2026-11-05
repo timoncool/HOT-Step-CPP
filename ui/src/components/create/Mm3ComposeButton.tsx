@@ -11,6 +11,7 @@
 // express) are shown rather than swallowed.
 
 import React, { useState } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import { Wand2, Loader2, AlertTriangle, Dices } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { composeMm3Caption, type Mm3ComposeControls, type Mm3ComposeResult } from '../../services/lireekApi';
@@ -24,8 +25,6 @@ interface Mm3ComposeButtonProps {
 
 export const Mm3ComposeButton: React.FC<Mm3ComposeButtonProps> = ({ brief, controls, onComposed }) => {
   const { t } = useTranslation();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<Mm3ComposeResult | null>(null);
   const [seed, setSeed] = useState(1);
 
@@ -34,27 +33,27 @@ export const Mm3ComposeButton: React.FC<Mm3ComposeButtonProps> = ({ brief, contr
   // brief — re-composing would route on Structured Caption prose, not intent.
   const alreadyComposed = /^Global Metadata\b/.test(trimmed);
 
-  const run = async (nextSeed: number) => {
-    if (!trimmed || busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const r = await composeMm3Caption(trimmed, controls, nextSeed);
+  const composeMut = useMutation({
+    mutationFn: (nextSeed: number) => composeMm3Caption(trimmed, controls, nextSeed),
+    onSuccess: (r, nextSeed) => {
       setResult(r);
       setSeed(nextSeed);
       onComposed(r.caption);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
+    },
+  });
+  const busy = composeMut.isPending;
+  const error = composeMut.error ? (composeMut.error instanceof Error ? composeMut.error.message : String(composeMut.error)) : null;
+
+  const run = (nextSeed: number) => {
+    if (!trimmed || busy) return;
+    composeMut.mutate(nextSeed);
   };
 
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
         <button
-          onClick={() => void run(1)}
+          onClick={() => run(1)}
           disabled={busy || !trimmed || alreadyComposed}
           title={!trimmed ? t('mm3Compose.empty') : t('mm3Compose.tooltip')}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-cyan-400 hover:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20 border border-cyan-500/20 hover:border-cyan-500/30 transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -65,7 +64,7 @@ export const Mm3ComposeButton: React.FC<Mm3ComposeButtonProps> = ({ brief, contr
 
         {result && (
           <button
-            onClick={() => void run(seed + 1)}
+            onClick={() => run(seed + 1)}
             disabled={busy}
             title={t('mm3Compose.reroll')}
             className="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200 bg-white/5 hover:bg-white/10 border border-white/10 transition-all disabled:opacity-40"

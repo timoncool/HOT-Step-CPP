@@ -50,6 +50,9 @@ export const LatentImport: React.FC<LatentImportProps> = ({
         setLoadedMeta(data.metadata || null);
         onLatentLoaded(data.latent_url, data.metadata || {});
       },
+      // Silent: this panel renders the failure itself (its inline error line),
+      // so it is the only notifier.
+      silent: true,
       onError: err => setError(err instanceof Error && err.message ? err.message : t('latent.uploadFailed')),
     });
   }, [onLatentLoaded, uploadLatent, t]);

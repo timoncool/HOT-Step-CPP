@@ -21,9 +21,10 @@ import { pushLog } from './logs.js';
 import { getBackend, getActiveBackendId } from '../services/backends/registry.js';
 import { mm3StreamUrl } from '../services/backends/minimax/client.js';
 import {
-  runOnGpuLane, gpuLaneBusy, gpuLaneDepth, gpuLaneOwner, gpuLaneNextFamily, releaseGpuLane, resetGpuLane,
+  runOnGpuLane, runOnWorkerLane, gpuLaneBusy, gpuLaneDepth, gpuLaneOwner, gpuLaneNextFamily, releaseGpuLane, resetGpuLane,
   type LaneLease,
 } from '../services/generation/gpuLane.js';
+import { inWorkerScope, workerForJob } from '../services/engineWorkers.js';
 import { isActiveJob, type GenerationJob } from '../services/generation/jobTypes.js';
 import { pollUntilDone } from '../services/generation/pollUntilDone.js';
 import { dropYue2BatchMember } from '../services/backends/yue2/generate.js';
@@ -166,7 +167,8 @@ async function runGeneration(
   if (!lease.isCurrent()) return emptyOutcome(job, 'reset');
   // A backend switch evicts the outgoing family in the background; no family
   // loads weights until that eviction, and every other family's, is confirmed.
-  await evictOtherFamilies(backendId);
+  // A batch follower's own turn does no engine work: leave its worker's VRAM be.
+  if (!job.coalescedInto) await evictOtherFamilies(backendId);
   return backend.generate(job, {
     envelope: job.envelope,
     attempt,
@@ -174,20 +176,32 @@ async function runGeneration(
     signal,
     pollUntilDone,
     hooks: { onEngineJob() {}, onStage() {}, onArtifact() {} },
+    // Only jobs no worker has taken yet: one already dispatched is preparing
+    // in its own lane turn, maybe on another worker.
     pendingJobs: () => Array.from(jobs.values())
-      .filter(j => j.id !== job.id && j.status === 'pending' && j.envelope?.backendId === backendId)
+      .filter(j => j.id !== job.id && j.status === 'pending' && !j.workerId && j.envelope?.backendId === backendId)
       .sort((a, b) => a.createdAt - b.createdAt),
     releaseLane: () => releaseGpuLane(lease),
     nextLaneFamily: gpuLaneNextFamily,
     runOnLane: fn => runOnGpuLane(fn, { label: `${job.id} finish`, family: backendId }),
+    assignFollower(follower, lead) {
+      follower.workerId = lead?.workerId;
+      withLedger('assign', ledger => ledger.assigned(follower));
+    },
   });
 }
 // ── Async generation queue ────────────────────────────────────────────
-// Generations run one at a time on the shared GPU lane (services/generation/
-// gpuLane.ts). The C++ engine is single-GPU, and concurrent runGeneration
-// calls also leak progress between jobs because subscribeLines() is a global
-// pub/sub with no job tagging. The lane is shared rather than private because
-// post-processing re-runs are just as GPU-hungry and must not race a render.
+// Each generation holds one engine worker's lease on the shared GPU lane
+// (services/generation/gpuLane.ts) for its whole run, every retry included,
+// and every engine call, log line and crash epoch inside follows that worker.
+// One engine runs one job at a time; with worker concurrency off (the
+// default) the primary is the only worker, so generations run one at a time
+// as they always have. The lane is shared rather than private because
+// post-processing re-runs are just as GPU-hungry and must not race a render:
+// those stay exclusive and wait for every worker.
+/** Each queued job's whole lane run, so a batch follower can wait for its lead. */
+const laneRuns = new Map<string, Promise<void>>();
+
 function enqueueGeneration(job: GenerationJob): void {
   const family = job.envelope.backendId;
   noteEnqueued(family);
@@ -195,7 +209,10 @@ function enqueueGeneration(job: GenerationJob): void {
     console.log(`[Generate] Job ${job.id} queued (${gpuLaneDepth() + 1} waiting)`);
   }
 
-  void trackBusy('generation', runOnGpuLane(async (lease) => {
+  const run = runOnWorkerLane(async (lease) => {
+    // A YuE2 batch follower already runs inside its lead's engine job.
+    if (!job.coalescedInto) job.workerId = lease.worker!.id;
+    withLedger('assign', ledger => ledger.assigned(job));
     const retryPolicy = job.envelope.policy.retry;
     let attemptNumber = 0;
     let reseededForAttempt = false;
@@ -264,12 +281,30 @@ function enqueueGeneration(job: GenerationJob): void {
 
   }, { label: `generate:${job.id}`, family }).catch((err: any) => {
     // The retry loop above swallows every generation failure, so reaching here
-    // means the lane itself broke. Never leave that silent.
-    console.error(`[Generate] Job ${job.id} lane error:`, err?.message || err);
+    // means the lane never ran the job (no engine worker can take it) or broke.
+    // End the job with the error unless a cancel or reset already ended it.
+    const msg = err?.message || String(err);
+    console.error(`[Generate] Job ${job.id} lane error:`, msg);
+    if (isActiveJob(job)) {
+      job.status = 'failed';
+      job.error = msg;
+      job.stage = 'Failed';
+      failGenerationLog(job.id, msg, 'unknown');
+    }
   }).finally(() => {
     noteFinished(family);
+  }).then(async () => {
+    // A batch follower's own turn returns at once; how it ends (rendered, or
+    // handed back because the batch failed or its lead was cancelled) is only
+    // known once the lead's run ends. Record it then, and queue a handed-back
+    // job again, so it is never stranded.
+    const lead = job.coalescedInto ? laneRuns.get(job.coalescedInto) : undefined;
+    if (lead) await lead;
     withLedger('finish', ledger => ledger.finished(job));
-  }));
+    if (job.status === 'pending' && !job.coalescedInto) enqueueGeneration(job);
+  }).finally(() => { if (laneRuns.get(job.id) === run) laneRuns.delete(job.id); });
+  laneRuns.set(job.id, run);
+  void trackBusy('generation', run);
 }
 
 // POST /api/generate — start a generation job
@@ -463,6 +498,11 @@ export async function submitGeneration(raw: any, userId: string | null): Promise
   return { ok: true, jobId: job.id, status: job.status };
 }
 
+/** True while a queued or running job will render build session `id` (Save song reads its files when it runs). */
+export function buildSessionHasActiveJob(id: string): boolean {
+  return [...jobs.values()].some(j => isActiveJob(j) && (j.params?.yue2Build as { session?: unknown } | undefined)?.session === id);
+}
+
 /** The in-memory job, while it is still held (terminal jobs go after an hour). */
 export function getGenerationJob(id: string): GenerationJob | undefined {
   return jobs.get(id);
@@ -494,6 +534,8 @@ router.get('/status/:id', (req, res) => {
     result: job.result,
     error: job.error,
     attempts: job.attempts,
+    // Engine worker the job runs on (multi-GPU); null until one takes it.
+    workerId: job.workerId ?? null,
     ace_job_id: job.aceJobId ?? null,
     ace_phase: job.acePhase ?? null,
     ace_phase_progress: job.acePhaseProgress ?? null,
@@ -562,9 +604,11 @@ router.get('/mm3/stream/:id', async (req, res) => {
   let session: StreamSession | null = null;
 
   try {
+    // This request runs outside the job's lease: address the job's own worker.
+    const streamUrl = inWorkerScope(workerForJob(job), () => mm3StreamUrl(job.aceJobId!));
     const engUrl = take > 0
-      ? `${mm3StreamUrl(job.aceJobId)}${mm3StreamUrl(job.aceJobId).includes('?') ? '&' : '?'}take=${take}`
-      : mm3StreamUrl(job.aceJobId);
+      ? `${streamUrl}${streamUrl.includes('?') ? '&' : '?'}take=${take}`
+      : streamUrl;
     const eng = await fetch(engUrl, { signal: upstream.signal });
     if (!eng.ok || !eng.body) {
       const msg = await eng.text().catch(() => '');
@@ -608,14 +652,17 @@ export function cancelGenerationJob(id: string): boolean {
   const job = jobs.get(id);
   if (!job) return false;
   markGenerationJobCancelled(job);
-  // One song of a running YuE2 batch: the engine drops it, the rest carry on.
-  if (dropYue2BatchMember(job)) return true;
-  if (job.aceJobId) {
-    aceClient.cancelJob(job.aceJobId).catch(() => {});
-  }
-  if ((job as any)._abort) {
-    (job as any)._abort.abort();
-  }
+  // A cancel arrives outside the job's lease: send it to the job's own worker.
+  inWorkerScope(workerForJob(job), () => {
+    // One song of a running YuE2 batch: the engine drops it, the rest carry on.
+    if (dropYue2BatchMember(job)) return;
+    if (job.aceJobId) {
+      aceClient.cancelJob(job.aceJobId).catch(() => {});
+    }
+    if ((job as any)._abort) {
+      (job as any)._abort.abort();
+    }
+  });
   return true;
 }
 
@@ -631,7 +678,8 @@ router.post('/cancel-all', (req, res) => {
     if (isActiveJob(job)) {
       markGenerationJobCancelled(job);
       if (job.aceJobId) {
-        aceClient.cancelJob(job.aceJobId).catch(() => {});
+        const aceJobId = job.aceJobId;
+        inWorkerScope(workerForJob(job), () => aceClient.cancelJob(aceJobId)).catch(() => {});
       }
       if ((job as any)._abort) {
         (job as any)._abort.abort();
@@ -678,7 +726,8 @@ router.post('/reset-queue', (_req, res) => {
       job.stage = 'Reset';
       withLedger('finish', ledger => ledger.finished(job));
       if (job.aceJobId) {
-        aceClient.cancelJob(job.aceJobId).catch(() => {});
+        const aceJobId = job.aceJobId;
+        inWorkerScope(workerForJob(job), () => aceClient.cancelJob(aceJobId)).catch(() => {});
       }
       if ((job as any)._abort) {
         (job as any)._abort.abort();

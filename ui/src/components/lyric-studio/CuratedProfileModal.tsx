@@ -93,7 +93,12 @@ export const CuratedProfileModal: React.FC<CuratedProfileModalProps> = ({
     const { profiling } = loadSelections();
 
     try {
-      // TODO: Backend curated-profile endpoint needs implementation
+      // This stays on raw fetch, not apiClient, for two reasons: the response
+      // is (or will be) an SSE stream — streaming reads stay on fetch by design
+      // of the transport split — and the endpoint is still a 501 stub on the
+      // server (llmRoutes.ts, '/artists/:id/curated-profile(-stream)'). Note
+      // the path below does not match that stub; when the backend lands, point
+      // this at the -stream route under the artist id.
       const res = await fetch('/api/lireek/curated-profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

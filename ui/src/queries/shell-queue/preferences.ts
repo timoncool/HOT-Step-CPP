@@ -24,7 +24,7 @@ const presetsOptions = <T>(family: PresetFamily) => queryOptions({
   gcTime: 0,
 });
 
-const settingOptions = <T>(family: SettingsFamily) => queryOptions({
+export const settingOptions = <T>(family: SettingsFamily) => queryOptions({
   queryKey: serverKey('shell-queue/setting', { filters: { family } }),
   queryFn: ({ signal }) => preferencesApi.settings.get<T>(family, { signal }),
   staleTime: 0,
@@ -35,7 +35,7 @@ const settingOptions = <T>(family: SettingsFamily) => queryOptions({
 async function write<R>(key: readonly unknown[], command: () => Promise<R>): Promise<R> {
   await queryClient.cancelQueries({ queryKey: key });
   try { return await command(); }
-  finally { await queryManager.keys(queryClient, key); }
+  finally { await queryManager.invalidate(queryClient, key); }
 }
 
 export const queriedPresetsApi: typeof preferencesApi.presets = {

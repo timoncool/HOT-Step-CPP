@@ -111,6 +111,7 @@ balance to 0.63 dB (mid) / 0.83 dB (side) RMS error. It cannot restore HF *coher
 (only ~0.2 correlated with the 30-step above 2.5 kHz), so fixing the trajectory beats
 correcting after the vocoder. Analysis scripts + A/B renders:
 `D:/Ace-Step-Latest/_experiments/_LISTENING/2026-08-21_lowstep-dsp/`.
+<!-- TODO(verify): neither this folder nor 2026-08-22_mm3-distilled-lm (above) was under D:\Ace-Step-Latest\_experiments\_LISTENING on 2026-10-23. -->
 
 ## MM3 Plank: the AR code cache (built 2026-08-17 — compiled, NOT YET RUN)
 
@@ -208,7 +209,9 @@ window is checked against it rather than trusted.
 shape `POST /api/generate/storm/stream` already emits, so `extractWav` is shared
 (moved to `ui/src/utils/wavStream.ts`). But `useStreamAudio` CROSSFADES between
 independent generations; MM3 windows are consecutive spans of ONE signal and
-must HARD-SPLICE, so `useMm3StreamAudio.ts` is a separate hook. Three things it
+must HARD-SPLICE, so `ui/src/stores/mm3StreamStore.ts` is a separate module (a
+singleton since a0cd06f8, because the engine allows one reader per job and the
+same stream shows in the queue card, the generations grid and the play bar). Three things it
 does that a copy of the STORM path would get wrong: the AudioContext is built at
 the **rate read from the first WAV header** (MM3 is 44.1 kHz, `useStreamAudio`
 hardcodes 48 k, and a resampling context destroys the exact frame counts the
@@ -246,6 +249,11 @@ identities are what make the streamed bytes the saved bytes.
 - **Installing a sink CHANGES WHEN THE VOCODER RUNS** — inline per window
   instead of one pass after every window is denoised. That is why it is opt-in:
   a render with no sink keeps today's exact stage order and VRAM profile.
+- **Natural-ending candidates turn interleaving off.** With `require_eos` (the
+  server's `mm3RequireEnding`, default ON) the candidates need the whole plan
+  before any of them renders, so `mm3-job.h` keeps a streamed run serial and logs
+  why: audio starts once planning finishes. The fresh-plan interleaved numbers
+  above need that toggle off.
 - **Interleaving and `after_ar` are mutually exclusive.** That hook means "the
   LM is done, swap residency", and interleaving has already run stage 2 against
   a live LM by the time the AR returns. `mm3-job.h` only asks for interleaving
@@ -300,8 +308,10 @@ check, `GET /mm3/stream`) -> `minimax/client.ts`
 `minimax/generate.ts` (mapping, `job.mm3Streaming`/`mm3Interleaved`, the
 `stream` stage text) -> `minimax/index.ts` (manifest extension) ->
 `routes/generate.ts` (`GET /api/generate/mm3/stream/:id` pipe + `mm3_streaming`
-/ `mm3_interleaved` on `/status`) -> `useMm3StreamAudio.ts` +
-`Mm3StreamPlayer.tsx` -> `CreatePanel.tsx`.
+/ `mm3_interleaved` on `/status`) -> `stores/audioGenQueueStore.ts`
+(`_captureMm3Stream`, called from every poll loop) -> `stores/mm3StreamStore.ts` ->
+`components/player/Mm3StreamStatus.tsx`, shown in the active queue card
+(`InlineAudioQueue.tsx`).
 
 ## MM3 AR cache: the speedup the Plank is not (built + measured 2026-08-21)
 

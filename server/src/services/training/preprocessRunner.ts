@@ -19,7 +19,7 @@ import { spawn } from 'child_process';
 import { config, getFFmpegPath } from '../../config.js';
 import { pushLog } from '../../routes/logs.js';
 import {
-  restartAceServer, stopAceServer,
+  resumeEngines, suspendEngines,
 } from '../aceEngineProcess.js';
 import { aceTrainExe, buildPreprocessArgs, type ResolvedPreprocessOptions } from './aceTrain.js';
 import { buildSamples } from './datasetScan.js';
@@ -238,14 +238,14 @@ export async function runPreprocessJob(job: TrainingJob): Promise<void> {
     let stopped = false;
     let engineExited = true;
     // NOT gated on getAceProcess() being non-null: a crashed engine leaves a
-    // respawn scheduled 3 s out, and stopAceServer() is what cancels it. Skipping
+    // respawn scheduled 3 s out, and suspendEngines() is what cancels it. Skipping
     // the call would let that timer spawn an engine into the middle of the job
     // and compete for VRAM. With no live child the stop is a cheap no-op.
     if (opts.stopEngine) {
       job.phase = 'engine-stop';
       emitProgress(job);
       log(job, 'info', 'Stopping the engine to free VRAM…');
-      engineExited = await stopAceServer('Paused for training preprocessing');
+      engineExited = await suspendEngines('Paused for training preprocessing');
       stopped = true;
     }
 
@@ -336,7 +336,7 @@ export async function runPreprocessJob(job: TrainingJob): Promise<void> {
         // here on is written to a job nobody is listening to. Mirror it into the
         // app log or the up-to-90 s restart happens completely invisibly.
         pushLog(`[Training] Preprocess job ${job.id}: restarting the engine…`);
-        const back = await restartAceServer();
+        const back = await resumeEngines();
         if (!back) {
           log(job, 'warn',
             'Engine did not answer /health within 90 s — restart the app if generation fails');

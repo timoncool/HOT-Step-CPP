@@ -1025,7 +1025,7 @@ static bool yue2_ar_prefill(const Yue2Model & m, Yue2ArKvCache & cache, const st
         ggml_backend_tensor_set(in_lidx, lidx.data(), 0, (size_t) Kl * sizeof(int32_t));
     }
 
-    ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+    ok = backend_compute_ok(ggml_backend_sched_graph_compute(sched, gf));
     if (!ok) {
         if (err) {
             *err = "YuE2 prefill graph compute failed";

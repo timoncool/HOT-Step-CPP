@@ -15,7 +15,7 @@
 import type { TypedDocument } from '../../../server/src/contracts/workflow';
 import { preferencesApi, type ImportPreferenceItem, type PresetFamily } from './preferencesApi';
 import { queriedPresetsApi } from '../queries/shell-queue/preferences';
-import { ApiError } from './apiError';
+import { ApiError, HttpStatus } from './apiError';
 
 export type PresetEntryStatus = 'saved' | 'creating' | 'saving' | 'deleting' | 'failed' | 'conflict';
 
@@ -320,11 +320,11 @@ export class PresetCollection<B extends Record<string, unknown>> {
     const e = this.entry(key);
     if (!e?.id) return;
     const status = err instanceof ApiError ? err.status : 0;
-    if (status !== 409 && status !== 404) {
+    if (status !== HttpStatus.conflict && status !== HttpStatus.notFound) {
       this.patch(key, { status: 'failed', pendingOp: op, error: `${op === 'delete' ? 'Delete' : 'Save'} failed: ${message(err)}` });
       return;
     }
-    if (status === 404) {
+    if (status === HttpStatus.notFound) {
       this.patch(key, { status: 'conflict', pendingOp: op, serverBody: null, serverKnown: true, error: 'This preset was deleted elsewhere.' });
       return;
     }

@@ -5,7 +5,7 @@ import { createQueryClient } from '../client';
 import { trainingQueries } from '../training-data/queries';
 import { setTrainingWorker } from '../../services/trainingApi';
 import { pollWhile } from '../contract';
-import { runQueries, runCommand, activeJob } from './queries';
+import { runQueries, trainingWritePlan, activeJob } from './queries';
 import { gpusOptions } from '../shell-queue/settings';
 import { invalidateRunReads } from './events';
 
@@ -38,7 +38,7 @@ test('run GPU and preparation reads join other areas and refresh after commands 
     await Promise.all([cache.query(one), cache.query(two)]);
   }
   assert.equal(calls, 3);
-  await runCommand(cache, 'remote-worker', async () => {});
+  await trainingWritePlan(cache, 'remote-worker');
   for (const [one] of pairs.slice(1)) {
     assert.equal(cache.getQueryState(one.queryKey)?.isInvalidated, true);
     cache.setQueryData(one.queryKey, { status: 'running' });
@@ -127,7 +127,7 @@ test('terminal jobs stop polling; failing active reads use capped backoff', () =
   }
 });
 
-test('a successful command refreshes its captured scope once and never repeats submission', async () => {
+test('a write plan invalidates its captured worker scope and shared reads', async () => {
   const cache = client();
   const a = runQueries.arStatus('A', 'set');
   const b = runQueries.arStatus('B', 'set');
@@ -135,16 +135,11 @@ test('a successful command refreshes its captured scope once and never repeats s
   cache.setQueryData(b.queryKey, {} as never);
   cache.setQueryData(trainingQueries.datasets('A').queryKey, []);
   cache.setQueryData(runQueries.review().queryKey, { rows: [] });
-  let submissions = 0;
-  await runCommand(cache, 'A', async () => { submissions++; setTrainingWorker('B'); return { jobId: 'started' }; });
-  assert.equal(submissions, 1);
+  await trainingWritePlan(cache, 'A');
   assert.equal(cache.getQueryState(a.queryKey)?.isInvalidated, true);
   assert.equal(cache.getQueryState(b.queryKey)?.isInvalidated, false);
   assert.equal(cache.getQueryState(trainingQueries.datasets('A').queryKey)?.isInvalidated, true);
   assert.equal(cache.getQueryState(runQueries.review().queryKey)?.isInvalidated, true);
-  await assert.rejects(runCommand(cache, 'B', async () => { submissions++; throw new TypeError('offline'); }));
-  assert.equal(submissions, 2);
-  assert.equal(cache.getQueryState(b.queryKey)?.isInvalidated, false);
 });
 
 test('review ladder cancellation reaches the local operation transport', async () => {
@@ -161,9 +156,9 @@ test('review ladder cancellation reaches the local operation transport', async (
   assert.equal(aborted, true);
 });
 
-test('a command refreshes mounted consumers without resubmitting the command', async () => {
+test('a write plan refreshes mounted consumers', async () => {
   const cache = client();
-  let reads = 0; let starts = 0;
+  let reads = 0;
   globalThis.fetch = async () => json({ ready: ++reads });
   const options = runQueries.mm3Status('A', 'set');
   const observer = new QueryObserver(cache, options);
@@ -171,9 +166,8 @@ test('a command refreshes mounted consumers without resubmitting the command', a
   try {
     await tick();
     assert.equal(reads, 1);
-    await runCommand(cache, 'A', async () => { starts++; return { jobId: 'job' }; });
+    await trainingWritePlan(cache, 'A');
     assert.equal(reads, 2);
-    assert.equal(starts, 1);
     assert.equal((cache.getQueryData(options.queryKey) as unknown as { ready: number }).ready, 2);
   } finally { stop(); }
 });
@@ -205,4 +199,38 @@ test('terminal SSE replay invalidates once, reconnect refreshes scope, teardown 
   await new Promise(resolve => setTimeout(resolve, 70));
   assert.equal(stopped, 1);
   assert.equal(cache.getQueryState(a.queryKey)?.isInvalidated, false);
+});
+
+test('run stream frames merge into the job cache and never blank omitted fields', async () => {
+  const { bridgeRunEvents } = await import('./events');
+  const cache = client();
+  const jobKey = trainingQueries.job('A', 'job1').queryKey;
+  cache.setQueryData(jobKey, {
+    id: 'job1', status: 'queued', done: 0, total: 10, failed: 0,
+    phase: '', currentSampleId: null, engineQueueDepth: 0, error: null,
+  } as never);
+  let handlers: { message?: (data: string) => void } = {};
+  const stop = bridgeRunEvents(cache, 'job1', 'A', (_url, callbacks) => {
+    handlers = callbacks; return () => {};
+  });
+  try {
+    handlers.message?.(JSON.stringify({
+      type: 'progress', done: 3, total: 10, failed: 0,
+      phase: 'preprocess', currentSampleId: 's1', engineQueueDepth: 2,
+    }));
+    let job = cache.getQueryData(jobKey) as Record<string, unknown>;
+    assert.equal(job.status, 'running', 'progress implies running');
+    assert.equal(job.done, 3);
+    assert.equal(job.phase, 'preprocess');
+
+    handlers.message?.(JSON.stringify({ type: 'job', job: { id: 'job1', status: 'running', done: 4 } }));
+    job = cache.getQueryData(jobKey) as Record<string, unknown>;
+    assert.equal(job.done, 4);
+    assert.equal(job.phase, 'preprocess', 'a job frame leaves fields it omits intact');
+
+    handlers.message?.(JSON.stringify({ type: 'status', status: 'failed', error: 'boom' }));
+    job = cache.getQueryData(jobKey) as Record<string, unknown>;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.error, 'boom');
+  } finally { stop(); }
 });

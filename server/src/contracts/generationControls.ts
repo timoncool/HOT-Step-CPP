@@ -106,6 +106,10 @@ export const generationControlsSchema = z.object({
   lmTopK: z.unknown().optional(), // number, default 0 (meaningful — disables top-k)
   lmTopP: z.unknown().optional(), // number, default 0.92
   lmRepPenalty: z.unknown().optional(), // number, default 1.1
+  lmMinP: z.unknown().optional(), // number, default 0 (off)
+  lmCfgMinP: z.unknown().optional(), // number, default 0 (off)
+  lmCfgLogprob: z.unknown().optional(), // boolean, default false
+  lmCfgRescale: z.unknown().optional(), // number, default 0 (off)
   lmRepWindow: z.unknown().optional(), // number, default 64
   lmRepMode: z.unknown().optional(), // 'presence' | 'dry', default 'presence'
   lmDryBase: z.unknown().optional(), // number, default 1.75

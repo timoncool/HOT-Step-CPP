@@ -230,6 +230,16 @@ export function hasSoundingVocalBar(abc: string, includeInstrumental = false): b
   return false;
 }
 
+/** Any voice carries a note. A cover render that is instrumental has nothing to
+ *  sing, so a declared-silent Vocal beside a sounding Ins is still a score;
+ *  vocal renders and training keep hasSoundingVocalBar. */
+export function hasSoundingScore(abc: string): boolean {
+  return abc.split('\n').some(line => {
+    const l = line.trim();
+    return l && !l.startsWith('%') && !/^[A-Za-z]:/.test(l) && scoreBarSegments(l).some(hasNote);
+  });
+}
+
 export const EMPTY_COVER_SCORE_ERROR = 'The transcriber heard no melody in this source';
 
 export function classifyYue2Score(abc: string, endReason?: string, lyrics?: string, norms?: Yue2StyleNorms | null): Yue2ScoreHealth {

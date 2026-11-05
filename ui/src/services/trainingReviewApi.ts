@@ -53,19 +53,22 @@ function snapshot<P>(kind: string, payload: P, picks: ReviewPick[]): TrainingSna
     sources: picks.map(pick => ({ kind: 'yue2-run', id: pick.runId, revision: String(pick.runRevision) })), payload });
 }
 
+// All four write commands are silent: each has a single component caller that
+// renders the failure in its own error line (ReviewPanel's finish line,
+// Yue2LadderReview's rung/cleanup lines, RefinePanel's NAR-use line).
 export function finishReviewBatch(picks: ReviewPick[], knee: boolean) {
   return trainingOperation<{ batch: unknown }>('review', '/finish-batch', { body: snapshot('review:finish-batch',
-    { entries: picks, knee }, picks) });
+    { entries: picks, knee }, picks), silent: true });
 }
 export function selectReviewRung(pick: ReviewPick) {
   const { datasetRevision: _datasetRevision, ...payload } = pick;
   return trainingOperation<{ linked: boolean; alreadyLinked: boolean; plan: Yue2CleanupPlan }>('review', '/select',
-    { body: snapshot('review:select', payload, [pick]) });
+    { body: snapshot('review:select', payload, [pick]), silent: true });
 }
 export function cleanupReviewRung(pick: ReviewPick, choice: Yue2CleanupChoice) {
   const { datasetRevision: _datasetRevision, ...payload } = pick;
   return trainingOperation<{ freedBytes: number; done: string[]; finishError?: string }>('review', '/cleanup',
-    { body: snapshot('review:cleanup', { ...payload, choice }, [pick]) });
+    { body: snapshot('review:cleanup', { ...payload, choice }, [pick]), silent: true });
 }
 
 export function decideReviewUse(pick: ReviewPick, narFurther: boolean, nar: {
@@ -73,5 +76,5 @@ export function decideReviewUse(pick: ReviewPick, narFurther: boolean, nar: {
 }) {
   const { datasetRevision: _datasetRevision, ...payload } = pick;
   return trainingOperation<{ outcome: 'skip' | 'reject' | 'chain'; worker?: string; jobId?: string }>('review', '/decision',
-    { body: snapshot('review:decision', { ...payload, narFurther, nar }, [pick]) });
+    { body: snapshot('review:decision', { ...payload, narFurther, nar }, [pick]), silent: true });
 }

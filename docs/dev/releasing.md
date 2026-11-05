@@ -10,8 +10,8 @@ every platform and creates a **draft** GitHub Release; you review and publish it
 A separate `Cache Warm` workflow keeps the engine build cache on `master` so
 release builds take ~10–15 min instead of ~1.5h for the CUDA jobs.
 
-Starting with the next release containing `.github/workflows/runpod-image.yml`,
-the separate `RunPod image` workflow runs when you **publish** the GitHub Release
+The separate `RunPod image` workflow (`.github/workflows/runpod-image.yml`) runs
+when you **publish** the GitHub Release
 (not on tag push, so the draft stays private) and publishes
 `ghcr.io/scragnog/hot-step-cpp:<release-tag>`, plus `:latest` unless the release is
 a prerelease or the tag is hyphenated (`-CI-Test`). It uses `GITHUB_TOKEN`
@@ -34,7 +34,11 @@ or configure registry credentials in RunPod for a private package.
 - `gh` authenticated (as `scragnog`).
 - On `master`, working tree clean, everything committed **and pushed**.
 - Pick a semver version **without a hyphen**: `vX.Y.Z` (hyphens are reserved for
-  test/pre-release tags — see gotchas).
+  test/pre-release tags — see gotchas). Use exactly three numbers. The in-app
+  update check (`server/src/services/updates/checker.ts`) reads GitHub's latest
+  release and accepts only `vX.Y.Z`, so while a tag like `v1.4.1.1` or `v1.3` is
+  the latest release, every install's check fails with "latest release is not a
+  stable version tag".
 - **Prerequisites check passes** (below). This one is not optional.
 
 ## 0. Check that users can actually get everything the build needs
@@ -44,9 +48,15 @@ node server/scripts/check-release-prereqs.mjs
 ```
 
 Exit 0 or do not tag. It verifies that every model in the catalogue really
-exists in its Hugging Face repo at the size claimed, that the repos are public,
-that no pack points at a missing file id, and that every runtime data file is
-packaged by `release.yml`.
+exists in its Hugging Face repo at the size claimed (and the sha256, where an
+entry declares one), that the repos are public, that no pack points at a missing
+file id, and that every runtime data file is packaged by `release.yml`. It also
+fails when an engine binary the server spawns is missing from `release.yml`'s
+package lists, when the portable layout checks below fail, when the TensorRT
+files CI downloads are missing from Hugging Face, when the latest Cache Warm run
+on `master` is still running or did not succeed (it asks `gh`), and when
+`tools/docs/check-docs.mjs` fails. `--offline` skips only the Hugging Face and
+TensorRT checks.
 
 **Why this is a hard gate.** A packaged build only ships code. Everything else —
 weights, catalogues, corpora — has to be either inside the archive or
@@ -67,16 +77,24 @@ node tools/release-gate/run.mjs --zip release/out/HOT-Step-CPP-vX.Y.Z-win-x64-cu
 ```
 
 Exit 0 or do not tag. The gate boots the extracted zip against this checkout's
-models, then walks the app through its API: every ACE generation mode, a check
-that solvers, schedulers, guidance modes and adapters actually change the
-output, MM3 and YuE2 renders, the audio tools, a few steps of every trainer,
-and fixed-seed fingerprints. Budget about an hour on the 5090 with training
-included, or `--tiers 0-3` for the half-hour subset. The run ends by staging
-every render in `_experiments/_LISTENING/<stamp>-release-gate/` with a score
-sheet: listen before you tag, because nothing mechanical judges quality.
+`models/` and `adapters/` folders, or the ones you pass with `--models` and
+`--adapters` (take them from `cd server && npx tsx scripts/data-paths.ts` when
+your data folder has moved), then walks the app through its API: every ACE
+generation mode, a check that solvers, schedulers, guidance modes and adapters
+actually change the output, MM3 and YuE2 renders, the audio tools, a few steps
+of every trainer, and fixed-seed fingerprints. Budget about an hour on the 5090
+with training included, or `--tiers 0-3` for the half-hour subset. The run ends
+by staging every render in `_experiments/_LISTENING/<stamp>-release-gate/` with
+a score sheet: listen before you tag, because nothing mechanical judges quality.
 Details and flags: [tools/release-gate/README.md](../../tools/release-gate/README.md).
 
-Every assembler (the local `release/build-release.ps1` and each CI platform job) also runs `release/smoke-boot.mjs` on the freshly bundled `server.mjs`, once the server and its native deps are staged, before anything is packaged. It boots the bundle from the staged release root, with a throwaway data folder and profile, no engine, on a free port, and fails the build if it exits or never answers `/api/health` (60 s). Run it with the Node the release ships, because the staged `better-sqlite3` is built for that version. A bundle that dies at startup cannot be zipped.
+<!-- TODO(verify): the timings above are estimates; no full gate run is recorded under logs/release-gate/ in this checkout. -->
+
+The example zip name is what `release/build-release.ps1 -Variant cuda` writes. A
+CI archive, such as a preflight artifact, is named by its exact variant
+(`win-x64-cuda13.1.zip`).
+
+Every assembler (the local `release/build-release.ps1` and `package-release.sh`, and each CI platform job) also runs `release/smoke-boot.mjs` on the freshly bundled `server.mjs`, once the server and its native deps are staged, before anything is packaged. It boots the bundle from the staged release root, with a throwaway data folder and profile, no engine, on a free port, and fails the build if it exits or never answers `/api/health` (60 s). Run it with the Node the release ships, because the staged `better-sqlite3` is built for that version. A bundle that dies at startup cannot be zipped.
 
 The server bundle is `server/server.mjs` plus `server/chunks/`. esbuild code splitting is on deliberately: without it, the top-level await in `dataroot/bootstrap.ts` plus the server's import cycles deadlock the bundle at startup (exit 13, the 1.4.1 bug).
 
@@ -156,6 +174,10 @@ gh release delete vX.Y.Z-CI-Test --cleanup-tag --yes   # removes draft + remote 
 git tag -d vX.Y.Z-CI-Test
 ```
 
+A failed run creates no draft, so `gh release delete` reports that the release
+was not found. Delete the remote tag with
+`git push origin --delete vX.Y.Z-CI-Test` instead.
+
 Re-pushing the **same** `-CI-Test` name is free (delete remote+local, recreate,
 push). Tags cannot be renamed.
 
@@ -201,8 +223,17 @@ release body in this order:
    curated notes.
 3. The Downloads table, unchanged.
 
+The draft's own `What's Changed` section is not GitHub's generated list. The
+workflow builds it from commit subjects since the previous non-hyphenated tag,
+bucketed into Features (`feat`), Fixes (`fix`) and Other, then appends the
+Downloads table, a ROCm install note when a ROCm archive is present, and a line
+about the `.sha256` files.
+
 Verify the asset count and notes, then leave the draft for the maintainer to
-publish. The maintainer uses:
+publish. Publishing starts the `RunPod image` workflow (see the TL;DR), and once
+the release is the latest one, the in-app update check reports it as an update
+to older installs on the release channel (see
+[Update notices](config.md#update-notices)). The maintainer uses:
 
 ```bash
 gh release view vX.Y.Z --json assets --jq '.assets | length'   # expect 24
@@ -220,9 +251,11 @@ Delete any leftover test tags and their drafts (see section 1).
   visible to every run, including release tags. So releases can only reuse a
   cache that was created on `master`.
 - **`.github/workflows/cache-warm.yml`** builds the engine on `master` (when
-  `engine/ggml` or `engine/CMakeLists.txt` change, or via manual dispatch) and
-  saves the build dir under the **same cache keys** `release.yml` uses. Release
-  runs restore it and skip the CUDA compile (the long part).
+  `engine/ggml`, `engine/CMakeLists.txt` or the workflow file change, or via
+  manual dispatch) and saves the build dir under the **same cache keys**
+  `release.yml` uses. Release runs restore it and skip the CUDA compile (the long
+  part). It warms the five Windows and six Linux variants only; there is no macOS
+  job, so `build-macos` never gets a `master` cache.
 - **Timings:** cold (no master cache) CUDA jobs ≈ 1.5h each; warm ≈ 7–13 min.
 - **Tag only after Cache Warm has finished green.** A release job restores the
   cache once, at its start; a warm run still in flight is a miss and that job
@@ -235,6 +268,13 @@ Delete any leftover test tags and their drafts (see section 1).
   auto-runs when `engine/ggml`/`CMakeLists.txt` change.
 - Cache reuse depends on git-restored source mtimes (incl. the **ggml submodule**
   — its `.cu` files live in the submodule's own history, not the superproject).
+- Commit times do not follow build order, so every engine build also writes
+  `engine/build/.built-commit`. After a restore, the timestamp step touches every
+  `engine/` file changed since that commit (all of `engine/src` and
+  `engine/tools` when the stamp is missing or unknown) and every `engine/ggml`
+  file changed between the cached and current ggml pins (all of `engine/ggml`
+  when the cached pin cannot be resolved). This guard exists because of the
+  v1.1.3 mixed-ABI crash (#82, #83).
 
 ## TensorRT SDK for CI
 
@@ -264,9 +304,14 @@ itself, for that one matrix entry only.
 - The assembled `engine/deps/tensorrt/` is cached (`actions/cache`, keyed on
   `TRT_SDK_ZIP` + the nvinfer DLL sha256) so a normal release re-run doesn't
   re-download or re-derive anything.
-- A step right after the CMake configure asserts the configure log contains
+- The step after the engine build asserts the configure log
+  (`engine/build/configure.log`) contains
   `[TRT] Found vendored SDK` — if TRT silently failed to enable, the job fails
   loudly instead of shipping a cuda13.1 build with a stubbed-out renderer.
+- Cache Warm has no TensorRT step, so the `master` cache for `cuda13.1` is
+  configured without `HOT_STEP_TRT`. The release job's configure turns it on, and
+  because `acestep-core` defines it `PUBLIC`, the engine targets recompile on
+  every release while the ggml objects stay cached.
 - The runtime DLLs themselves are **never** packaged into the release archive
   — a user gets them through the Model Manager, same as any other large model
   file (see `docs/plans/2026-09-11-mm3-trt-dit-shipping.md`). CI downloads
@@ -292,10 +337,12 @@ itself, for that one matrix entry only.
 - **Windows runner is pinned to `windows-2022`.** Do NOT switch to
   `windows-latest` — that's windows-2025, whose MSVC (`_MSC_VER >= 1950`) is
   rejected by CUDA 12.8/13.1 `nvcc` (`host_config.h`: VS 2017–2022 only).
-- **The Vulkan SDK is pinned (1.4.357.0), not `latest`.** LunarG can list a new
+- **The Windows Vulkan SDK is pinned (1.4.357.0), not `latest`,** in both
+  `release.yml` and `cache-warm.yml`. LunarG can list a new
   version before its `config.json` exists, and `latest` then 404s in
   `setup-vulkan-sdk`. To bump it, check
   `https://vulkan.lunarg.com/sdk/config/<ver>/windows/config.json` returns 200.
+  Linux installs LunarG's `vulkan-sdk` apt package, which is not pinned.
 - **Any pushed `v*` tag triggers the Release pipeline.** Use `vX.Y.Z` for
   releases and `-CI-Test` (or other hyphenated) tags for throwaway checks; delete
   them afterward. Don't push local feature tags that match `v*`.
@@ -303,17 +350,41 @@ itself, for that one matrix entry only.
   (`git describe ... --exclude '*-*'`). This is why a stray `vX-CI-Test` tag must
   not be treated as a release; the exclude guard handles it, but still clean up.
 - **The release is a draft** — it does not auto-publish. Review before going live.
-- **Cache key** = `cmake-<runner>-<variant>-<hash(engine/ggml, CMakeLists)>`.
-  Changing the runner image invalidates it (compiler abs-paths bake into
-  `CMakeCache.txt`); the key includes the runner image to prevent stale restores.
+- **Cache keys** hash `engine/ggml/**` and `engine/CMakeLists.txt`:
+  `cmake-windows-2022-<variant>-<hash>`, `cmake-linux-<variant>-<hash>` and
+  `cmake-macos-<hash>`. The Windows key names the runner image because compiler
+  absolute paths bake into `CMakeCache.txt`; changing the image starts a new
+  key. With no exact match, `restore-keys` restores the newest cache with the
+  same prefix, so a changed hash still builds incrementally on the older cache.
+  CMake flags are not in the key.
 
 ## Reference
 
 - Workflows: [`.github/workflows/release.yml`](../../.github/workflows/release.yml),
-  [`.github/workflows/cache-warm.yml`](../../.github/workflows/cache-warm.yml)
+  [`.github/workflows/cache-warm.yml`](../../.github/workflows/cache-warm.yml),
+  [`.github/workflows/essentia.yml`](../../.github/workflows/essentia.yml) (called
+  by `release.yml` for the Linux and macOS Essentia bundles),
+  [`.github/workflows/runpod-image.yml`](../../.github/workflows/runpod-image.yml)
+
+## Build identity
+
+Every package carries `build-info.json` beside `VERSION`. All five assemblers (the three CI platform jobs, `release/build-release.ps1` and `package-release.sh`) write it with `release/build-info.mjs`, then run `node release/check-layout.mjs --package <root> --os <os> --variant <variant>`, which fails the build when the file is missing, breaks a rule in the table below, disagrees with the asset, or names a tag that `VERSION` does not match.
+
+| Field | Value |
+|---|---|
+| `format` | `1` |
+| `tag` | The release tag, only when it names the packaged commit; otherwise `null` |
+| `sha` | Full source commit (HEAD when packaged) |
+| `channel` | `release` with a tag, `master` without |
+| `os`, `arch` | `windows`/`linux` with `x64`, or `macos` with `arm64` |
+| `variant` | Exact asset variant: `cuda13.1`, `cuda12.8`, `cuda12-volta`, `vulkan`, `cpu`, `rocm` (Linux), `metal` (macOS) |
+| `engineSha` | Git tree id of `engine/` at that commit; it changes with any engine source or ggml pin change |
+| `updaterProtocol` | `0` until the updater can apply packages |
+
+The package check also matches the ggml backend library in `engine/` to the variant, and `engine/.variant` and `.cuda-version` when present. `engine/.variant` keeps its coarse meaning (`cuda` for every CUDA asset) for the code that reads it. The server reads the file in `config.ts` (`BUILD_INFO`) and reports `build.tag`, `build.sha`, `build.variant` and `build.channel` in `/api/health`. A package without the file (an older release), a package whose file breaks those rules (the server logs a warning and ignores it), or a git checkout has unknown identity: `sha` falls back to the checkout's HEAD and the rest is `null`. Nothing guesses a variant. The update notices read the same file for the installed identity (`server/src/services/updates/install.ts`).
 
 ## Data layout acceptance
 
-Archives contain app binaries and immutable `server/data/` resources. User data is initialized in sibling `HOT-Step-Data` or reused through the profile pointer. Package `release/.env.example`, `profile-path.mjs`, the platform launcher and `README.txt`, plus `open-browser-if-needed.mjs` on Windows (a Node helper; the launcher must never start PowerShell, which antivirus quarantines); do not create mutable app-root models or adapters. Windows uses `runtime/node.exe`, Linux and macOS use `runtime/bin/node`. Local packagers follow the same layout.
+Archives contain app binaries and immutable `server/data/` resources. User data is initialized in sibling `HOT-Step-Data` or reused through the profile pointer. Package `release/.env.example`, `profile-path.mjs`, the platform launcher and `README.txt`, plus `open-browser-if-needed.mjs` on Windows (a Node helper; the launcher must never start PowerShell, which antivirus quarantines); do not create mutable app-root models or adapters. Windows uses `runtime/node.exe`, Linux and macOS use `runtime/bin/node`. The CI archives also carry `presets/yue2-plan-play/`, copied from `docs/user/presets/yue2-plan-play/`, and each platform job fails when `plan-play-sections.json` is missing from it. Local packagers follow the same layout.
 
 The prereq script checks three workflow platform sections and both local assemblers, required engine targets and wholesale resource copies, unset managed defaults, profile marker agreement and disposable release/dev fixtures. Run it without `--offline` to retain Hugging Face checks. Actual native platform startup remains a release smoke-test requirement. See [Data folder and upgrades](../user/data-folder.md).

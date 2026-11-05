@@ -25,11 +25,17 @@ export function setEngineReady(ready: boolean, status: string) {
 /** Raw ggml device name ("CUDA0", "Vulkan0", "CPU") from the engine's last "[Load] <label> backend:" line; null until a model has loaded. */
 export let engineDevice: string | null = null;
 
+/** The device named by one engine "[Load] <label> backend: <device>" line, or null. */
+export function engineBackendFromLine(line: string): string | null {
+  const m = /^\[Load\] .+? backend: (\S+)/.exec(line);
+  return m ? m[1] : null;
+}
+
 /** Record the device from one engine log line. Returns true if the line was a backend line. */
 export function noteEngineBackendLine(line: string): boolean {
-  const m = /^\[Load\] .+? backend: (\S+)/.exec(line);
-  if (!m) return false;
-  engineDevice = m[1];
+  const device = engineBackendFromLine(line);
+  if (!device) return false;
+  engineDevice = device;
   return true;
 }
 
@@ -51,11 +57,11 @@ export function backendFamily(device: string | null): 'cuda' | 'vulkan' | 'metal
 }
 
 /** Per-stream feeder for raw chunks: holds back a trailing partial line so a marker split across chunks still parses. */
-export function backendLineFeeder(): (chunk: string) => void {
+export function backendLineFeeder(note: (line: string) => unknown = noteEngineBackendLine): (chunk: string) => void {
   let rest = '';
   return (chunk) => {
     const lines = (rest + chunk).split('\n');
     rest = lines.pop() ?? '';
-    for (const l of lines) noteEngineBackendLine(l);
+    for (const l of lines) note(l);
   };
 }

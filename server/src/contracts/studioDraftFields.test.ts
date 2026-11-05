@@ -12,13 +12,13 @@ import { createStudioDraftsRouter } from '../routes/studioDrafts.js';
 // (b92bb7fd): "<studio>|<accepted value kinds>" per key. s=string b=boolean
 // n=finite number inf=Infinity null o=object a=array; '-' = no studio.
 const RECORDED: Record<string, string[]> = {
-  'cover|null,o,': ['cover-studio-analysis', 'cover-studio-metadata', 'cover-studio-selectedPreset', 'cover-studio-scoreTempoScale', 'cover-studio-approvedSheet', 'cover-studio-buildLyricsDraft'],
+  'cover|null,o,': ['cover-studio-analysis', 'cover-studio-metadata', 'cover-studio-selectedPreset', 'cover-studio-scoreTempoScale', 'cover-studio-approvedSheet', 'cover-studio-buildLyricsDraft', 'cover-studio-coverGuide'],
   'cover|null,': ['cover-studio-prepareV2'],
   'cover|s,': ['cover-studio-artistCaption', 'cover-studio-coverNoiseMethod', 'cover-studio-coverTimbreOverride', 'cover-studio-coverVocalLanguage',
     'cover-studio-lyrics', 'cover-studio-songArtist', 'cover-studio-songTitle', 'cover-studio-sourceAssetId', 'cover-studio-sourceAudioUrl',
     'cover-studio-sourceFileName', 'cover-studio-sourceLatentUrl', 'cover-studio-sourceSongId',
     'cover-studio-sourceMode', 'cover-studio-pairMode', 'cover-studio-yue2Ar', 'cover-studio-yue2Nar',
-    'cover-studio-coverVoices', 'cover-studio-coverTempoMode', 'cover-studio-coverLyricSchedule',
+    'cover-studio-coverVoices', 'cover-studio-instrumentalMode', 'cover-studio-coverTempoMode', 'cover-studio-coverLyricSchedule',
     'cover-studio-captionMode', 'cover-studio-sheetAbc', 'cover-studio-sheetAudioUrl',
     'cover-studio-coveringBand', 'cover-studio-buildSessionId', 'cover-studio-draftName'],
   'cover|n,': ['cover-studio-audioCoverStrength', 'cover-studio-bpmCorrection', 'cover-studio-coverNoiseStrength', 'cover-studio-pitchShift',

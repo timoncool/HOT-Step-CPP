@@ -10,6 +10,8 @@ import { ParamLabel } from '../shared/ParamLabel';
 import { Fold } from '../shared/Fold';
 import { usePersistedState } from '../../hooks/usePersistedState';
 import { StylePresetSelect } from './StylePresetSelect';
+import { useBackendStore } from '../../stores/backendStore';
+import { useCapabilities } from '../../hooks/useCapabilities';
 
 interface ContentSectionProps {
   caption: string;
@@ -65,6 +67,8 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
   afterStyle,
 }) => {
   const { t } = useTranslation();
+  const tagsMode = useBackendStore(s => s.activeBackendId === 'heartmula');
+  const { capabilities } = useCapabilities();
   const hasMetadata = !!(title || artist || subject);
   const [showMetadata, setShowMetadata] = usePersistedState('hs-create-fold-songInfo', hasMetadata);
   const styleRef = React.useRef<HTMLTextAreaElement>(null);
@@ -111,9 +115,11 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
         <div className="flex items-center justify-between mb-1.5">
           <label className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
             <ParamLabel
-              label={t('contentSection.styleDescription')}
+              label={tagsMode ? t('contentSection.heartmulaTags', 'Tags') : t('contentSection.styleDescription')}
               className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
-              info={t('contentSection.styleDescriptionInfo')}
+              info={tagsMode
+                ? t('contentSection.heartmulaTagsInfo', 'Comma-separated genre, mood, instruments and vocal style for HeartMuLa. Lyrics go in the Lyrics field below.')
+                : t('contentSection.styleDescriptionInfo')}
             />
           </label>
           <div className="flex items-center gap-1.5">
@@ -125,7 +131,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
                 {'{·}'} {t('contentSection.expand')}
               </button>
             )}
-            {!yue2Mode && autoExpandBtn}
+            {!yue2Mode && !tagsMode && autoExpandBtn}
             {/* Style presets write an ensemble description straight into the caption. */}
             {!captionReadOnly && <StylePresetSelect caption={caption} onCaptionChange={onCaptionChange} />}
           </div>
@@ -138,7 +144,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
               ? 'bg-zinc-100 dark:bg-zinc-900/50 text-zinc-500 dark:text-zinc-500 font-mono text-xs cursor-default'
               : 'bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200 focus:border-pink-500/50 focus:ring-1 focus:ring-pink-500/20'
           }`}
-          placeholder="Dreamy indie folk, warm acoustic guitar, soft female vocals, intricate fingerpicking..."
+          placeholder={tagsMode ? t('contentSection.heartmulaTagsPlaceholder', 'indie folk, acoustic guitar, warm, female vocals') : 'Dreamy indie folk, warm acoustic guitar, soft female vocals, intricate fingerpicking...'}
           value={caption}
           onChange={e => onCaptionChange(e.target.value)}
           rows={captionReadOnly ? 8 : 3}
@@ -149,7 +155,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
       {afterStyle}
 
       {/* LoRA trigger word + Beat intro/outro — compose-time caption helpers */}
-      {!yue2Mode && <div className="flex flex-col gap-2">
+      {!yue2Mode && !tagsMode && <div className="flex flex-col gap-2">
         <div className="flex items-center gap-2">
           <span className="flex items-center gap-1 text-[10px] text-zinc-500 shrink-0 w-20">
             <Plug size={11} />
@@ -164,10 +170,10 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
             value={loraTrigger}
             onChange={e => onLoraTriggerChange(e.target.value)}
             placeholder={t('contentSection.loraTriggerPlaceholder')}
-            className="flex-1 px-2 py-1 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-xs text-zinc-700 dark:text-zinc-300 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 outline-none focus:border-pink-500/30 transition-colors"
+            className="flex-1 min-w-0 px-2 py-1 rounded-lg bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-xs text-zinc-700 dark:text-zinc-300 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 outline-none focus:border-pink-500/30 transition-colors"
           />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => onBeatIntroChange(!beatIntro)}
             title={t('contentSection.beatIOTooltip')}
@@ -319,7 +325,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
       )}
 
       {/* Negative Prompt — folded away on YuE2 */}
-      {yue2Mode ? (
+      {capabilities?.core.negativePrompt === false ? null : yue2Mode ? (
         <Fold title="Negative Prompt" storageKey="hs-create-fold-negative">
           <textarea
             className="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 text-sm text-zinc-800 dark:text-zinc-200 placeholder:text-zinc-400 dark:placeholder:text-zinc-600 focus:border-red-500/50 focus:ring-1 focus:ring-red-500/20 outline-none resize-none transition-colors"
@@ -335,7 +341,7 @@ export const ContentSection: React.FC<ContentSectionProps> = ({
             <ParamLabel
               label="Negative Prompt"
               className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
-              info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Sent to all backends.'
+              info='Free-text description of what to avoid in the output, for example "jazz, acoustic, slow, ambient, piano". Used by ACE-Step 1.5 only; the other backends ignore it.'
             />
           </label>
           <textarea

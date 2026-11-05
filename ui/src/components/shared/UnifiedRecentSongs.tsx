@@ -9,7 +9,7 @@
  */
 
 import React, { useCallback } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Play, Loader2, Music, ListPlus, Check } from 'lucide-react';
 import { songApi } from '../../services/api';
 import type { UnifiedRecentSong } from '../../types';
@@ -21,6 +21,7 @@ import { SongActionsMenu, songFromRecent } from './SongActionsMenu';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { CoverImage } from './CoverImage';
 import { recentSongsOptions, removeSongs } from '../../queries/shell-queue/songs';
+import { QueryError } from './QueryError';
 
 interface UnifiedRecentSongsProps {
   showToast: (msg: string, type?: 'success' | 'error') => void;
@@ -58,21 +59,26 @@ export const UnifiedRecentSongs: React.FC<UnifiedRecentSongsProps> = ({
     playFromList(track, allTracks, playbackSource);
   }, [songs, source, currentTrackId]);
 
-  const handleDelete = useCallback(async (rs: UnifiedRecentSong) => {
-    if (!token || !rs.audio_url) return;
-    try {
-      await songApi.delete(rs.id);
+  const deleteMut = useMutation({
+    mutationFn: (rs: UnifiedRecentSong) => songApi.delete(rs.id),
+    onSuccess: (_res, rs) => {
       void removeSongs(queryClient, [rs.id]);
       showToast('Song deleted');
-    } catch {
-      showToast('Failed to delete song', 'error');
-    }
-  }, [token, showToast, queryClient]);
+    },
+  });
+  const handleDelete = useCallback((rs: UnifiedRecentSong) => {
+    if (!token || !rs.audio_url) return;
+    deleteMut.mutate(rs);
+  }, [token, deleteMut]);
 
   const handleDownload = useCallback((rs: UnifiedRecentSong) => {
     if (!rs.audio_url) return;
     downloadTrack(songFromRecent(rs), { artistName: rs.artist_name || '' });
   }, []);
+
+  if (query.isError && songs.length === 0) {
+    return <QueryError error={query.error} onRetry={() => void query.refetch()} className="mx-2 my-2" />;
+  }
 
   if (loading && songs.length === 0) {
     return (

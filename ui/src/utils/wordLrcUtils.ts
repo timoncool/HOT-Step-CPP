@@ -1,6 +1,6 @@
 // wordLrcUtils.ts — Parse .lyrics.json and find active word/line by time
 
-import { ApiError } from '../services/httpClient';
+import { ApiError, HttpStatus } from '../services/httpClient';
 
 export interface LyricsWord {
   word: string;
@@ -55,7 +55,7 @@ export function sidecarUrl(audioUrl: string, suffix: string): string {
 export async function fetchLyricsJson(audioUrl: string, opts: { signal?: AbortSignal } = {}): Promise<LyricsJson | null> {
   if (!audioUrl) return null;
   const res = await fetch(sidecarUrl(audioUrl, '.lyrics.json'), { signal: opts.signal });
-  if (res.status === 404) return null;
+  if (res.status === HttpStatus.notFound) return null;
   if (!res.ok) throw new ApiError(res.status, `Lyrics fetch failed (${res.status})`, null);
   // A missing sidecar can also answer 200 with the SPA shell (see above), so
   // anything that does not parse as lyrics is "none".

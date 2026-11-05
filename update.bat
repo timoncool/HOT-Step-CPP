@@ -1,5 +1,15 @@
 @echo off
 setlocal enabledelayedexpansion
+REM Serialize engine snapshots with rebuilds and updates in this checkout.
+if "%HOTSTEP_UPDATE_FROM_TEMP%"=="1" goto :engine_lock_held
+if /i not "%HOTSTEP_ENGINE_LOCK_ROOT%\"=="%~dp0" (
+    pwsh -NoProfile -File "%~dp0tools\prod\engine-lock.ps1" -Script "%~f0" %*
+    goto :engine_lock_result
+)
+goto :engine_lock_held
+:engine_lock_result
+exit /b %errorlevel%
+:engine_lock_held
 
 REM --- Self-copy workaround for CMD execution pointer corruption ---
 REM Windows CMD reads .bat files line-by-line from disk. If git pull modifies
@@ -163,39 +173,21 @@ if exist "engine\ggml-pre-fork-overlay.ps1" (
     )
 )
 
-REM Shut down running server (if any) to avoid file locks
+REM Shut down only this checkout's server and engine.
 echo   Checking for running server...
-curl -s -o nul -w "%%{http_code}" http://localhost:3001/api/status >"%TEMP%\hotstep_status.txt" 2>nul
-set /p STATUS_CODE=<"%TEMP%\hotstep_status.txt"
-del "%TEMP%\hotstep_status.txt" 2>nul
-
-if "%STATUS_CODE%"=="200" (
-    echo   Server is running — requesting graceful shutdown...
-    curl -s -X POST http://localhost:3001/api/shutdown >nul 2>&1
-
-    REM Wait for ace-server to exit
-    set /A retries=0
-    :shutdown_wait
-    tasklist /FI "IMAGENAME eq ace-server.exe" 2>nul | find /I "ace-server.exe" >nul
-    if %errorlevel% neq 0 goto :shutdown_done
-    timeout /t 1 /nobreak >nul
-    set /A retries+=1
-    if !retries! GEQ 10 (
-        echo   Force-killing ace-server after 10s timeout...
-        taskkill /F /IM ace-server.exe /T >nul 2>&1
-        timeout /t 2 /nobreak >nul
-    )
-    if !retries! GEQ 15 (
-        echo   WARNING: Could not stop ace-server. Build may fail with file locks.
-        goto :shutdown_done
-    )
-    goto :shutdown_wait
-
-    :shutdown_done
-    echo   Server stopped.
-) else (
-    echo   No running server detected.
+REM Read the same active .env as the server, including a moved data folder.
+set "HOTSTEP_SHUTDOWN_PORT="
+pushd "%HOTSTEP_REPO_DIR%server" || goto :fail
+for /f "delims=" %%p in ('node --import tsx --input-type=module -e "import fs from 'node:fs'; import {parse} from 'dotenv'; import {locateData} from './src/dataroot/locate.ts'; const r=locateData(); if(r.pendingMove || r.pointerError || r.children === null) process.exit(1); const f=r.children.envFile; const e=fs.existsSync(f)?parse(fs.readFileSync(f)):{}; const p=Number(process.env.SERVER_PORT ?? e.SERVER_PORT ?? 3001); if(Number.isInteger(p)===false||p<1||p>65535) process.exit(1); console.log(p);" 2^>nul') do set "HOTSTEP_SHUTDOWN_PORT=%%p"
+popd
+if not defined HOTSTEP_SHUTDOWN_PORT (
+    set "HOTSTEP_SHUTDOWN_PORT=3001"
+    if defined SERVER_PORT set "HOTSTEP_SHUTDOWN_PORT=!SERVER_PORT!"
+    echo WARNING: could not resolve this checkout's server port; using !HOTSTEP_SHUTDOWN_PORT!.
 )
+REM A trailing directory separator excludes sibling checkouts with a shared prefix.
+pwsh -NoProfile -File "%HOTSTEP_REPO_DIR%tools\prod\stop-checkout.ps1" -Root "%HOTSTEP_REPO_DIR%." -Port "%HOTSTEP_SHUTDOWN_PORT%"
+if errorlevel 1 goto :fail
 
 REM ── Phase 2: Code sync ─────────────────────────────────────────────
 echo.
@@ -351,8 +343,12 @@ if not defined DETECTED (
 
 REM Delegate to build.cmd — handles vcvars, ORT, cuDNN, and cmake build.
 REM HOT_STEP_CMAKE_FLAGS env var overrides the default CUDA-only cmake flags.
+REM build.cmd changes directory and does not restore it, so keep our cwd.
+pushd "%HOTSTEP_REPO_DIR%"
 call engine\build.cmd
-if errorlevel 1 (
+set "ENGINE_RC=!errorlevel!"
+popd
+if not "!ENGINE_RC!"=="0" (
     echo.
     echo   ERROR: Engine build failed!
     echo   Check the output above for errors.
@@ -367,14 +363,43 @@ echo   Engine build complete.
 REM --- UI build ---
 :build_ui
 echo   Building UI...
-pushd ui
-REM Use npx vite build directly — bypasses tsc strict type-checking which
-REM may fail on transient TypeScript errors on master during development.
-call npx vite build
-if errorlevel 1 (
-    echo   WARNING: UI build had issues. The app may still work with old UI.
+if not exist "%HOTSTEP_REPO_DIR%ui\package.json" (
+    echo   ERROR: ui\package.json not found in %HOTSTEP_REPO_DIR%
+    goto :fail
 )
+pushd "%HOTSTEP_REPO_DIR%ui" || goto :fail
+if not exist "node_modules\.bin\vite.cmd" (
+    echo   UI dependencies missing, running npm ci...
+    call npm ci --no-audit --no-fund
+    if errorlevel 1 (
+        echo   npm ci failed, retrying with npm install...
+        call npm install --no-audit --no-fund
+        if errorlevel 1 (
+            echo   ERROR: UI npm install failed. See errors above.
+            popd
+            goto :fail
+        )
+    )
+)
+REM Marker file: dist\index.html must end up newer than this.
+set "UI_MARKER=%TEMP%\hotstep_ui_build_marker.txt"
+echo marker> "%UI_MARKER%"
+REM vite build from the local install only. Skips the tsc step of
+REM "npm run build", which may fail on transient TypeScript errors on master.
+call "node_modules\.bin\vite.cmd" build
+if errorlevel 1 (
+    echo   ERROR: UI build failed. See errors above.
+    popd
+    goto :fail
+)
+powershell.exe -NoProfile -Command "if ((Test-Path 'dist\index.html') -and (Get-Item 'dist\index.html').LastWriteTime -gt (Get-Item $env:UI_MARKER).LastWriteTime) { exit 0 } else { exit 1 }"
+set "UI_FRESH_RC=!errorlevel!"
+del "%UI_MARKER%" 2>nul
 popd
+if not "!UI_FRESH_RC!"=="0" (
+    echo   ERROR: ui\dist\index.html was not rebuilt by the UI build.
+    goto :fail
+)
 echo   UI build complete.
 
 REM ── Phase 5: Validation & Report ────────────────────────────────────

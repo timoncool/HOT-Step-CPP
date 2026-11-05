@@ -39,6 +39,10 @@
 #    endif
 #    include <direct.h>
 #    include <windows.h>
+#    include <shellapi.h>  // CommandLineToArgvW
+#    ifdef _MSC_VER
+#        pragma comment(lib, "shell32.lib")
+#    endif
 #endif
 
 // stat buffer type — 64-bit sizes on both platforms.
@@ -131,6 +135,30 @@ static inline int hs_mkdir(const std::string & path) {
 #else
     return mkdir(path.c_str(), 0755);
 #endif
+}
+
+// The command line as UTF-8. On Windows main()'s argv is decoded in the ANSI
+// codepage, so a path argument with any character outside it arrives mangled;
+// this re-reads the UTF-16 command line instead.
+static inline std::vector<std::string> hs_utf8_args(int argc, char ** argv) {
+#ifdef _WIN32
+    int     n = 0;
+    LPWSTR * w = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (w) {
+        std::vector<std::string> out;
+        for (int i = 0; i < n; ++i) {
+            const int len = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, nullptr, 0, nullptr, nullptr);
+            std::string s(len > 0 ? (size_t) len - 1 : 0, '\0');
+            if (len > 1) {
+                WideCharToMultiByte(CP_UTF8, 0, w[i], -1, &s[0], len, nullptr, nullptr);
+            }
+            out.push_back(s);
+        }
+        LocalFree(w);
+        return out;
+    }
+#endif
+    return std::vector<std::string>(argv, argv + argc);
 }
 
 // Run a shell command whose text may embed UTF-8 paths. cmd.exe is handed the

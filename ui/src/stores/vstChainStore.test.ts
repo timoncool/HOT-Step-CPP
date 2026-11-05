@@ -131,3 +131,25 @@ test('deleting a preset while its create is in flight deletes the created docume
     assert.match(left.error!, /Delete failed/);
   });
 });
+
+test('reopening an editor against an older empty open-GUI entry keeps the marker until a fresh read', async () => {
+  const { vstApi } = await import('../services/api');
+  const { openGuisOptions } = await import('../queries/global-models/options');
+  const saved = { openGui: vstApi.openGui, openGuis: vstApi.openGuis };
+  let answer: (v: { uids: string[] }) => void = () => {};
+  vstApi.openGui = async () => ({}) as never;
+  vstApi.openGuis = () => new Promise(r => { answer = r; });
+  // The last poll ended with every window closed; that snapshot is still cached.
+  queryClient.setQueryData(openGuisOptions().queryKey, { uids: [] }, { updatedAt: Date.now() - 10_000 });
+  try {
+    await store().openGui(plugin('a'));
+    await tick();
+    assert.deepEqual(store().openGuiUids, ['a'], 'the stale empty entry must not clear the marker while the read runs');
+    answer({ uids: ['a'] });
+    await tick(); await tick();
+    assert.deepEqual(store().openGuiUids, ['a']);
+  } finally {
+    store().closeGui('a');
+    Object.assign(vstApi, saved);
+  }
+});

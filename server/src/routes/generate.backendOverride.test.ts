@@ -71,9 +71,9 @@ for (const backend of registry.listBackends() as any[]) {
     events.push(`released:${backend.id}`);
   };
 }
-// The families the override cases switch between; MM3's release runs too but
-// is not part of what these assert.
-const aceYue2 = () => events.filter(e => !e.includes('minimax'));
+// Only the two families these override cases switch between. Other
+// registered backends also release residency before either family loads.
+const aceYue2 = () => events.filter(e => /:(ace|yue2)$/.test(e));
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;

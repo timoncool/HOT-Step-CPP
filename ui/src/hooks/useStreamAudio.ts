@@ -2,6 +2,7 @@ import { useRef, useState, useCallback, useEffect } from 'react';
 // Moved out to utils/wavStream.ts when the MM3 player needed the same parser —
 // same function, same behaviour, one copy.
 import { extractWav } from '../utils/wavStream';
+import { apiClient } from '../services/httpClient';
 // One copy of the slot analysis, shared with Node's stream sessions so both agree.
 import { detectBpm, detectKey } from '../../../server/src/services/streamSessions/analysis';
 
@@ -78,11 +79,7 @@ export function useStreamAudio(streamId = 'default') {
     // Resume gate — runs every RAF frame, breaks the deadlock
     if (serverPausedRef.current && ahead <= maxBufferRef.current * 0.8) {
       serverPausedRef.current = false;
-      fetch('/api/generate/storm/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId, stream_pause: false }),
-      }).catch(() => {});
+      void apiClient.post('/generate/storm/control', { streamId, stream_pause: false }, { silent: true }).catch(() => {});
     }
 
     rafRef.current = requestAnimationFrame(tick);
@@ -230,11 +227,7 @@ export function useStreamAudio(streamId = 'default') {
   const stop = useCallback(async () => {
     aliveRef.current = false;
     cancelAnimationFrame(rafRef.current);
-    try { await fetch('/api/generate/storm/stop', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ streamId }),
-    }); } catch {}
+    try { await apiClient.post('/generate/storm/stop', { streamId }, { silent: true }); } catch { /* teardown continues */ }
     abortRef.current?.abort();
     try { acRef.current?.close(); } catch {}
     acRef.current = null; gainRef.current = null;
@@ -332,12 +325,8 @@ export function useStreamAudio(streamId = 'default') {
 
   const sendControl = useCallback(async (key: string, value: unknown) => {
     try {
-      await fetch('/api/generate/storm/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamId, [key]: value }),
-      });
-    } catch {}
+      await apiClient.post('/generate/storm/control', { streamId, [key]: value }, { silent: true });
+    } catch { /* control POST is best-effort */ }
   }, [streamId]);
 
   useEffect(() => () => {

@@ -27,7 +27,7 @@ export async function waitForCoverJob(jobId: string, cancelled: () => boolean,
         throw new Error('Cover operation cancelled');
       }
       progress?.(data.job);
-    });
+    }, { deliverRepeats: true });
   if (result.job.status !== 'succeeded') throw new Error(result.job.error || `Cover operation ${result.job.status}`);
   if (result.job.kind === 'cover-render') await songsChanged();
   return result.job;
@@ -52,10 +52,12 @@ export const coverWorkflowApi = {
     await Promise.all([changed('drafts'), changed('cover')]);
     return data;
   },
+  // Silent: CoverStudio's score sheet renders the save failure itself (its
+  // "Save to dataset:" line is the sole notifier).
   saveScoreDetails: async (documentId: string, revision: number,
     abc: string, factor: number) => {
     const data = await apiClient.post<{ saved: true; bpm: number; key: string }>(
-      `/yue2-cover/drafts/${encodeURIComponent(documentId)}/save-score-details`, { revision, abc, factor });
+      `/yue2-cover/drafts/${encodeURIComponent(documentId)}/save-score-details`, { revision, abc, factor }, { silent: true });
     await changed('cover');
     return data;
   },

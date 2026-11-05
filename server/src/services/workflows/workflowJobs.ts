@@ -21,6 +21,12 @@
 //     the old process's step after a restart and retry, changes nothing.
 //   - Nothing that started is run again automatically. After a restart a
 //     job caught running is `interrupted`; only an explicit retry reruns it.
+//   - Two copies of the app can share these tables (services/instance.ts).
+//     A job belongs to the copy that submitted (or retried) it, and only that
+//     copy starts it; a running job belongs to the process that claimed it.
+//     A job whose process is alive is never interrupted by the other copy,
+//     and the other copy cannot cancel it (409: cancel it where it runs).
+//     A job whose process died is interrupted by whichever copy looks next.
 //   - Audio never runs here. A step queues it on the audio intent queue
 //     (ctx.audio), which owns GPU admission, under a key scoped to the job.
 //     A retried job therefore gets the same audio items back instead of
@@ -40,6 +46,7 @@ import {
 } from '../../contracts/workflow.js';
 import type { AudioIntentItem } from '../../contracts/audioQueue.js';
 import { requestVersion } from '../generation/resolve/resolveIntent.js';
+import { copyId, describeOwner, instanceAlive, instanceId } from '../instance.js';
 
 const TERMINAL: WorkflowJobStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted'];
 const AUDIO_TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
@@ -101,7 +108,11 @@ interface Row {
   input: string; input_hash: string; attempt: number; cancel_requested: number; claim_id: string | null; audio_intent_ids: string;
   result: string | null; error: string | null; last_seq: number;
   created_at: number; started_at: number | null; finished_at: number | null; updated_at: number;
+  owner_copy: string | null; owner_instance: string | null;
 }
+
+/** Running in a live process other than this one. */
+const foreignLive = (r: Pick<Row, 'owner_instance'>) => r.owner_instance !== instanceId() && instanceAlive(r.owner_instance);
 
 export function ensureWorkflowSchema(db: Database.Database): void {
   db.exec(`
@@ -136,9 +147,11 @@ export function ensureWorkflowSchema(db: Database.Database): void {
       PRIMARY KEY (job_id, seq)
     );
   `);
-  // Databases from before claim_id was added.
-  const hasClaim = (db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('workflow_jobs') WHERE name = 'claim_id'`).get() as { c: number }).c;
-  if (!hasClaim) db.exec('ALTER TABLE workflow_jobs ADD COLUMN claim_id TEXT');
+  // Databases from before these columns were added.
+  for (const name of ['claim_id', 'owner_copy', 'owner_instance']) {
+    const has = (db.prepare(`SELECT COUNT(*) AS c FROM pragma_table_info('workflow_jobs') WHERE name = ?`).get(name) as { c: number }).c;
+    if (!has) db.exec(`ALTER TABLE workflow_jobs ADD COLUMN ${name} TEXT`);
+  }
 }
 
 function toJob(r: Row): WorkflowJob {
@@ -262,8 +275,8 @@ export class WorkflowJobs {
     const t = this.now();
     try {
       this.change(id, () => {
-        this.db.prepare(`INSERT INTO workflow_jobs (id, user_id, kind, idempotency_key, status, input, input_hash, created_at, updated_at)
-          VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`).run(id, userId, input.kind, input.idempotencyKey, captured, hash, t, t);
+        this.db.prepare(`INSERT INTO workflow_jobs (id, user_id, kind, idempotency_key, status, input, input_hash, created_at, updated_at, owner_copy)
+          VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`).run(id, userId, input.kind, input.idempotencyKey, captured, hash, t, t, copyId());
         return [this.append(id, 'status', { status: 'pending' })];
       });
     } catch (err: any) {
@@ -278,6 +291,9 @@ export class WorkflowJobs {
     const r = this.row(id, userId);
     if (TERMINAL.includes(r.status)) throw new WorkflowError(409, `Workflow job is already ${r.status}`);
     if (r.cancel_requested === 1) return toJob(r);
+    if (r.status === 'running' && foreignLive(r)) {
+      throw new WorkflowError(409, `This job is running in ${describeOwner(r.owner_instance)}; cancel it there`);
+    }
     const t = this.now();
     this.change(id, () => {
       // Guarded: a start may have claimed it since the read above.
@@ -307,8 +323,8 @@ export class WorkflowJobs {
     }
     this.change(id, () => {
       const done = this.db.prepare(`UPDATE workflow_jobs SET status = 'pending', attempt = attempt + 1, cancel_requested = 0, claim_id = NULL,
-        result = NULL, error = NULL, started_at = NULL, finished_at = NULL, updated_at = ? WHERE id = ? AND status = ?`)
-        .run(this.now(), id, r.status);
+        result = NULL, error = NULL, started_at = NULL, finished_at = NULL, owner_copy = ?, owner_instance = NULL, updated_at = ? WHERE id = ? AND status = ?`)
+        .run(copyId(), this.now(), id, r.status);
       if (done.changes !== 1) throw new WorkflowError(409, 'Workflow job changed while retrying; reload it');
       return [this.append(id, 'status', { status: 'pending', attempt: r.attempt + 1 })];
     });
@@ -320,9 +336,20 @@ export class WorkflowJobs {
 
   /** Run once at startup, before any job starts. A job that was running when
    *  the process stopped is interrupted: its step died with the process and
-   *  may have half-finished. Pending jobs never started, so they stay pending. */
+   *  may have half-finished. Pending jobs never started, so they stay pending.
+   *  A job another live process is running is left alone. */
   reconcileAfterRestart(): number {
-    const rows = this.db.prepare(`SELECT id FROM workflow_jobs WHERE status = 'running'`).all() as Array<{ id: string }>;
+    return this.interrupt(r => !foreignLive(r));
+  }
+
+  /** Interrupt running jobs whose process has died (the other copy crashed
+   *  or stopped). Called at the top of every pump. */
+  reconcileDeadOwners(): number {
+    return this.interrupt(r => r.owner_instance !== instanceId() && !instanceAlive(r.owner_instance));
+  }
+
+  private interrupt(which: (r: Row) => boolean): number {
+    const rows = (this.db.prepare(`SELECT * FROM workflow_jobs WHERE status = 'running'`).all() as Row[]).filter(which);
     const t = this.now();
     const error = 'The server stopped while this job was running. Its last step may or may not have finished; retry it to run it again.';
     for (const { id } of rows) {
@@ -339,7 +366,10 @@ export class WorkflowJobs {
 
   /** Start every pending job whose kind has a free slot, oldest first. */
   pump(): void {
-    const pending = this.db.prepare(`SELECT * FROM workflow_jobs WHERE status = 'pending' ORDER BY created_at, rowid`).all() as Row[];
+    this.reconcileDeadOwners();
+    // This copy's pending jobs (and legacy unowned ones); the other copy starts its own.
+    const pending = this.db.prepare(`SELECT * FROM workflow_jobs WHERE status = 'pending' AND (owner_copy IS NULL OR owner_copy = ?) ORDER BY created_at, rowid`)
+      .all(copyId()) as Row[];
     for (const r of pending) {
       const def = this.kinds.get(r.kind);
       if (!def) continue;
@@ -349,8 +379,8 @@ export class WorkflowJobs {
       const claimId = randomUUID();
       let claimed = false;
       this.change(r.id, () => {
-        const claim = this.db.prepare(`UPDATE workflow_jobs SET status = 'running', claim_id = ?, started_at = ?, updated_at = ?
-          WHERE id = ? AND status = 'pending' AND cancel_requested = 0`).run(claimId, t, t, r.id);
+        const claim = this.db.prepare(`UPDATE workflow_jobs SET status = 'running', claim_id = ?, owner_instance = ?, started_at = ?, updated_at = ?
+          WHERE id = ? AND status = 'pending' AND cancel_requested = 0`).run(claimId, instanceId(), t, t, r.id);
         claimed = claim.changes === 1;
         return claimed ? [this.append(r.id, 'status', { status: 'running', attempt: r.attempt })] : [];
       });

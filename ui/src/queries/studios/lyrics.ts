@@ -1,10 +1,3 @@
-import { queryOptions } from '@tanstack/react-query';
-import { fetchLrc } from '../../utils/lrcUtils';
-import { sidecarUrl } from '../../utils/wordLrcUtils';
-import { sharedKeys } from '../keys';
-
-export const lyricsOptions = (audioUrl: string) => queryOptions({
-  queryKey: sharedKeys.lrc(sidecarUrl(audioUrl, '.lrc')),
-  queryFn: ({ signal }) => fetchLrc(audioUrl, { signal }),
-  enabled: !!audioUrl,
-});
+// One owner: the player's shared sidecar factory. Repaint Studio imports this
+// name; the key and queryFn stay in shell-queue/lyrics.
+export { lrcOptions as lyricsOptions } from '../shell-queue/lyrics';

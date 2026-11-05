@@ -8,7 +8,7 @@
 // decoder rides along; it never decays), save a checkpoint every 0.1 KL up to
 // a ceiling, render a preview per rung, pick the last good one.
 import { yue2SamplerSnapshot } from '../../stores/globalParamsStore';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Loader2, Play, Sparkles, Trash2 } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -16,7 +16,7 @@ import { pollWhile } from '../../queries/contract';
 import { YUE2_JOINT_LADDER_PREVIEW } from '../../../../server/src/contracts/trainingRecipes';
 import { trainingQueries } from '../../queries/training-data/queries';
 import { useJobSelection, useRunJob } from '../../queries/training-runs/hooks';
-import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { runQueries, trainingWritePlan } from '../../queries/training-runs/queries';
 import {
   cancelJob,
   deleteYue2AitkRun,
@@ -26,7 +26,7 @@ import {
   type Yue2AitkRunRecord,
   type Yue2JointTrainRequest
 } from '../../services/trainingApi';
-import { decideReviewUse, pickFromLadder } from '../../services/trainingReviewApi';
+import { decideReviewUse, pickFromLadder, type ReviewPick } from '../../services/trainingReviewApi';
 import { useTrainingStore } from '../../stores/trainingStore';
 import { Toggle } from '../settings/SettingsPrimitives';
 import { ParamLabel } from '../shared/ParamLabel';
@@ -84,7 +84,6 @@ export const RefinePanel: React.FC = () => {
   const previews = previewsQuery.data?.previews ?? [];
   const [commandError, setError] = useState('');
   const error = commandError || runsQuery.error?.message || previewsQuery.error?.message || '';
-  const [busy, setBusy] = useState(false);
   const [picked, setPicked] = useState('');
 
   // The last live run this panel auto-switched the ladder to — so a server-
@@ -122,12 +121,11 @@ export const RefinePanel: React.FC = () => {
   }, [runs, ladderRun]);
   const active = !!job && (job.status === 'running' || job.status === 'queued');
 
-  const start = async () => {
-    const run = finished.find(r => r.jobId === source);
-    const last = run ? lastOf(run) : undefined;
-    if (!datasetId || !run || !last) return;
-    setBusy(true); setError('');
-    try {
+  const startMut = useMutation({
+    mutationFn: async () => {
+      const run = finished.find(r => r.jobId === source);
+      const last = run ? lastOf(run) : undefined;
+      if (!datasetId || !run || !last) throw new Error('Pick a finished run to refine first.');
       const opts = run.options as Record<string, unknown>;
       const request = { trainingMethod: 'aitk', refinePlanner: true, resumeRunId: run.jobId, resumeStep: last.step,
         steps: last.step + 1000, stopMode: 'kl', targetKl: ceiling, klCheckpointEvery: rung, refineLrScale: lrScale,
@@ -136,22 +134,37 @@ export const RefinePanel: React.FC = () => {
         // Rung previews: the engine pauses after each rung checkpoint and the
         // server renders `takes` previews there before resuming.
         preview: { enabled: autoPreview, everySteps: 0, arScale: (opts.preview as Yue2JointTrainRequest['preview'])?.arScale ?? YUE2_JOINT_LADDER_PREVIEW.arScale, takes, seconds, seed: 424242, previewMaxFrames: seconds * 25, baseline: false, control: false, parallel, sharedSheet: true, sampler: yue2SamplerSnapshot(), ...draftOpts } } as unknown as Yue2JointTrainRequest;
-      const result = await runCommand(client, trainingWorker, () => startYue2JointTrain(datasetId, request, { worker: trainingWorker }));
-      setJob(await client.query(trainingQueries.job(trainingWorker, result.jobId)));
-      setLadderRun(result.jobId);
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-    finally { setBusy(false); }
+      const result = await startYue2JointTrain(datasetId, request, { worker: trainingWorker });
+      return { jobId: result.jobId, job: await client.query(trainingQueries.job(trainingWorker, result.jobId)) };
+    },
+    onSuccess: r => { setJob(r.job); setLadderRun(r.jobId); void trainingWritePlan(client, trainingWorker); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const busy = startMut.isPending;
+  const start = () => {
+    const run = finished.find(r => r.jobId === source);
+    if (!datasetId || !run || !lastOf(run)) return;
+    setError('');
+    startMut.mutate();
   };
-  const remove = async (jobId: string) => {
+  const removeMut = useMutation({
+    mutationFn: async (v: { datasetId: string; jobId: string }) => {
+      await deleteYue2AitkRun(v.datasetId, v.jobId);
+      return v.jobId;
+    },
+    onSuccess: jobId => {
+      if (source === jobId) setSource('');
+      if (ladderRun === jobId) setLadderRun('');
+      void trainingWritePlan(client, null);
+    },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const remove = (jobId: string) => {
     const run = runs.find(r => r.jobId === jobId);
     if (!datasetId || !run) return;
     if (!window.confirm(t('trainingStudio.refine.deleteConfirm', 'Delete this run and its {{n}} checkpoint(s) from disk? Scores you entered are kept.', { n: run.checkpoints.length }))) return;
     setError('');
-    try {
-      await runCommand(client, null, () => deleteYue2AitkRun(datasetId, jobId));
-      if (source === jobId) setSource('');
-      if (ladderRun === jobId) setLadderRun('');
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    removeMut.mutate({ datasetId, jobId });
   };
   // Short enough to survive the picker's middle-ellipsis (about 40 chars).
   const runLabel = (r: Yue2AitkRunRecord) => {
@@ -164,17 +177,26 @@ export const RefinePanel: React.FC = () => {
   // ladder component links the rung and opens its cleanup modal itself.
   const ladderRef = useRef<Yue2LadderReviewHandle>(null);
   const [cleanupNote, setCleanupNote] = useState('');
+  const decideMut = useMutation({
+    mutationFn: (v: { pick: ReviewPick; narFurther: boolean; nar: { budget: number; lrScale: number; keepDelta: number; target: number | null; knee: boolean } }) =>
+      decideReviewUse(v.pick, v.narFurther, v.nar),
+    onSuccess: () => { void trainingWritePlan(client, null); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
   const onUse = async (_dir: string, step: number): Promise<boolean> => {
     if (!datasetId || !ladderRun) return true;
     setError(''); setCleanupNote('');
+    let pick: ReviewPick;
     try {
       const ladder = await client.query({ ...runQueries.ladder(datasetId, ladderRun), staleTime: 0 });
-      const pick = pickFromLadder(ladder, step);
+      pick = pickFromLadder(ladder, step);
       if (pick.checkpointDir !== _dir) throw new Error('The selected checkpoint changed. Reload the ladder.');
-      const decision = await runCommand(client, null, () => decideReviewUse(pick, narFurther, { budget: narBudget, lrScale: narLrScale,
-        keepDelta: narKeepDelta, target: narTarget === '' ? null : narTarget, knee: narKnee }));
-      if (decision.outcome === 'skip') return false;
-      if (decision.outcome === 'reject') {
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); return true; }
+    const decision = await decideMut.mutateAsync({ pick, narFurther,
+      nar: { budget: narBudget, lrScale: narLrScale, keepDelta: narKeepDelta, target: narTarget === '' ? null : narTarget, knee: narKnee } }).catch(() => null);
+    if (!decision) return true;
+    if (decision.outcome === 'skip') return false;
+    if (decision.outcome === 'reject') {
       // Remote-origin NAR further training isn't supported yet (Reviewer/
       // Lead, round 3 #4) — reject outright rather than silently finishing/
       // linking/deleting instead, which would produce a different result
@@ -183,14 +205,13 @@ export const RefinePanel: React.FC = () => {
       setError(t('trainingStudio.refine.narRemoteUnsupported',
         'NAR further training on a ladder trained on {{worker}} is not supported yet. Turn off Further training for NAR to finish this rung directly, or pick a different rung.',
         { worker: decision.worker }));
-        return true;
-      }
-      // Node admitted the captured decoder continuation after rechecking the rung.
-      if (!decision.jobId) throw new Error('The review server did not start decoder training.');
-      setNarJob({ jobId: decision.jobId, step });
-      setJob(await client.query(trainingQueries.job(null, decision.jobId)));
-      setCleanupNote(t('trainingStudio.refine.narStarted', 'Decoder training on from step {{step}}; the adapter is linked when it stops.', { step }));
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+      return true;
+    }
+    // Node admitted the captured decoder continuation after rechecking the rung.
+    if (!decision.jobId) { setError('The review server did not start decoder training.'); return true; }
+    setNarJob({ jobId: decision.jobId, step });
+    setJob(await client.query(trainingQueries.job(null, decision.jobId)));
+    setCleanupNote(t('trainingStudio.refine.narStarted', 'Decoder training on from step {{step}}; the adapter is linked when it stops.', { step }));
     return true;
   };
   // When the decoder follow-up ends, its last checkpoint is the adapter. A
@@ -213,12 +234,27 @@ export const RefinePanel: React.FC = () => {
 
   // "Reviewing complete": the winner is found, the other rungs need no scores.
   // The Review phase then lists the ladder as scored, ready for Finish scored.
-  const toggleReviewed = async () => {
+  const reviewedMut = useMutation({
+    mutationFn: async (v: { datasetId: string; ladderRun: string; complete: boolean }) => {
+      await setYue2ReviewComplete(v.datasetId, v.ladderRun, v.complete);
+      return v.ladderRun;
+    },
+    onSuccess: () => { void trainingWritePlan(client, null); },
+    onError: err => setError(err instanceof Error ? err.message : String(err)),
+  });
+  const toggleReviewed = () => {
     if (!datasetId || !ladderRun) return;
-    try {
-      await runCommand(client, null, () => setYue2ReviewComplete(datasetId, ladderRun, !runs.find(r => r.jobId === ladderRun)?.reviewComplete));
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    reviewedMut.mutate({ datasetId, ladderRun, complete: !runs.find(r => r.jobId === ladderRun)?.reviewComplete });
   };
+  // Not silent and no onError: a failed Stop is the global toast's to report.
+  const stopMut = useMutation({
+    mutationFn: async (v: { jobId: string; worker: string | null }) => {
+      await cancelJob(v.jobId, { worker: v.worker });
+      return client.query(trainingQueries.job(v.worker, v.jobId));
+    },
+    onSuccess: (measured, vars) => { setJob(measured); void trainingWritePlan(client, vars.worker); },
+  });
+  const stop = () => { if (job) void stopMut.mutateAsync({ jobId: job.id, worker: trainingWorker }).catch(() => null); };
 
   if (!datasetId) return <p className="text-sm text-zinc-500">{t('trainingStudio.refine.noDataset', 'Pick a dataset first.')}</p>;
   // Once a run has stopped and none of its rungs is picked yet, say plainly
@@ -247,7 +283,7 @@ export const RefinePanel: React.FC = () => {
                   placeholder={t('trainingStudio.refine.pick', 'Pick a run')}
                   options={finished.map(r => ({ value: r.jobId, label: runLabel(r), hint: `${r.checkpoints.length} checkpoints · ${r.status}` }))} />
               </div>
-              <button type="button" onClick={() => void remove(source)} disabled={!source || active || busy} title={t('trainingStudio.refine.deleteRun', 'Delete run')}
+              <button type="button" onClick={() => remove(source)} disabled={!source || active || busy || (removeMut.isPending && removeMut.variables?.jobId === source)} title={t('trainingStudio.refine.deleteRun', 'Delete run')}
                 className="p-2 rounded-lg border border-zinc-300/70 dark:border-white/10 text-zinc-500 hover:text-red-500 hover:border-red-500/40 disabled:opacity-40"><Trash2 size={14} /></button>
             </div>
           </div>
@@ -328,12 +364,12 @@ export const RefinePanel: React.FC = () => {
           </div>
         </div>
         <div className="mt-3 flex items-center gap-3">
-          <button type="button" onClick={() => void start()} disabled={!source || active || busy}
+          <button type="button" onClick={start} disabled={!source || active || busy}
             className="px-4 py-2 rounded-lg text-xs font-semibold bg-amber-500 text-black hover:bg-amber-400 disabled:opacity-40 flex items-center gap-2">
             {busy || active ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
             {active ? t('trainingStudio.refine.running', 'Refining…') : t('trainingStudio.refine.start', 'Start refinement')}
           </button>
-          {active && <button type="button" onClick={() => { if (job) void runCommand(client, trainingWorker, () => cancelJob(job.id, { worker: trainingWorker })).then(() => client.query(trainingQueries.job(trainingWorker, job.id))).then(setJob); }} className="text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.refine.stop', 'Stop')}</button>}
+          {active && <button type="button" onClick={stop} className="text-xs text-red-600 dark:text-red-400 hover:underline">{t('trainingStudio.refine.stop', 'Stop')}</button>}
           {job && <span className="text-[11px] text-zinc-600 dark:text-zinc-400">{job.status} · {job.phase || 'waiting'}{job.total ? ` · step ${job.done} / ${job.total}` : ''}</span>}
         </div>
         {error && <div className="mt-2 text-xs text-red-600 dark:text-red-400">{error}</div>}
@@ -353,14 +389,14 @@ export const RefinePanel: React.FC = () => {
                   placeholder={t('trainingStudio.refine.pickLadder', 'Pick a refinement run')}
                   options={runs.filter(r => r.checkpoints.some(c => c.kl !== undefined)).map(r => ({ value: r.jobId, label: runLabel(r), hint: `${r.checkpoints.filter(c => c.rung).length} rungs · ${r.checkpoints.length} checkpoints` }))} />
               </div>
-              <button type="button" onClick={() => void remove(ladderRun)} disabled={!ladderRun || !!runs.find(r => r.jobId === ladderRun)?.live}
+              <button type="button" onClick={() => remove(ladderRun)} disabled={!ladderRun || !!runs.find(r => r.jobId === ladderRun)?.live || (removeMut.isPending && removeMut.variables?.jobId === ladderRun)}
                 title={ladderRunRec?.origin
                   ? t('trainingStudio.refine.discardOnWorker', 'Discard on {{worker}} — no rung from this ladder, free its checkpoints and previews there too', { worker: ladderRunRec.origin.worker })
                   : t('trainingStudio.refine.deleteRun', 'Delete run')}
                 className="p-2 rounded-lg border border-zinc-300/70 dark:border-white/10 text-zinc-500 hover:text-red-500 hover:border-red-500/40 disabled:opacity-40"><Trash2 size={14} /></button>
               {ladderRunRec?.origin && <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-500/15 text-violet-700 dark:text-violet-300"
                 title={t('trainingStudio.review.originInfo', 'Trained on this worker and mirrored here; previews and scoring run here.') as string}>{ladderRunRec.origin.worker}</span>}
-              {ladderRunRec && <button type="button" onClick={() => void toggleReviewed()}
+              {ladderRunRec && <button type="button" disabled={reviewedMut.isPending} onClick={toggleReviewed}
                 title={t('trainingStudio.refine.reviewCompleteInfo', 'You have found the winner and will not score the other rungs. The Review tab then counts this ladder as scored and offers it to Finish scored, which uses the best-scored rung.')}
                 className={`px-3 py-2 rounded-lg text-xs font-semibold border ${ladderRunRec.reviewComplete ? 'border-emerald-500 text-emerald-700 dark:text-emerald-300 bg-emerald-500/10' : 'border-zinc-300/70 dark:border-white/10 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-500/10'}`}>
                 {ladderRunRec.reviewComplete ? t('trainingStudio.refine.reviewCompleteOn', 'Review complete ✓') : t('trainingStudio.refine.reviewComplete', 'Reviewing complete')}

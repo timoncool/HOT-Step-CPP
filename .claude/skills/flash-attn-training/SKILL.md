@@ -14,22 +14,26 @@ The deep docs are **gitignored, local-only** (`docs/plans/2026-09-01-flash-attn-
 so every trainer built attention as `mul_mat → soft_max_ext → mul_mat` and retained the
 `[S,S,Nh]` softmax per layer for the backward — the O(S²) term that capped DiT training crops
 at ~50 s of audio on 32 GB. We wrote our own fused forward+backward ops (CPU reference + CUDA
-TF32 kernels), carried as commits on the HOT-ggml fork that `engine/ggml` pins (see `docs/dev/ggml-fork.md`). Attention memory is now
-linear in S; the DiT auto-fit picks full-song crops. Rob ear-validated the first flash-trained
-adapter as "fantastic".
+TF32 kernels; Vulkan and Metal kernels and a CUDA BF16 path followed for the YuE2 joint trainer),
+carried as commits on the HOT-ggml fork that `engine/ggml` pins (see `docs/dev/ggml-fork.md`).
+Attention memory is now linear in S, so the DiT auto-fit could pick full-song crops; since
+2026-09-03 an 800-frame default crop cap holds it back for quality reasons (§5). The maintainer
+ear-validated the first flash-trained adapter as "fantastic".
 
 ## 1. What exists
 
 | Piece | Where | Notes |
 |---|---|---|
 | Ops `GGML_OP_FLASH_ATTN_TRAIN` / `_BACK` | `engine/ggml/include/ggml.h`, `src/ggml.c` (constructors, view getters, **autodiff case**), `src/ggml-cpu/ops.cpp` (f32 reference), `src/ggml-backend-meta.cpp` | Appended at the END of the op enum. Forward output is ONE packed tensor: O `[D,Nh,S,B]` then LSE `[Nh,S,B]`; `ggml_flash_attn_train_get_o()` views O out. Backward packs dQ\|dK\|dV. |
-| CUDA kernels | `engine/ggml/src/ggml-cuda/fattn-train.cu/.cuh` (NEW files — never touch the inference `fattn-*.cu/.cuh`) | Scalar f32 v1 kernels kept as strict mode + pre-sm_80 fallback; TF32 mma (m16n8k8) kernels are the default. Bitwise-deterministic in every mode: no fp atomics, fixed schedules. |
-| Precision knob | `ggml_flash_attn_train_set_prec/get_prec` (op_params slot 3) | `GGML_PREC_DEFAULT` (= 0 = zero-init!) → TF32 on sm_80+; `GGML_PREC_F32` → v1 scalar. Autodiff copies the forward's prec onto the backward node. |
-| Where it lives | HOT-ggml `hot-step-neutral` commits `flash-attn-train` (+ `alloc-free-blocks`), pinned by `engine/ggml` ([docs/dev/ggml-fork.md](../../../docs/dev/ggml-fork.md)) | Change the kernels on the fork, then move the gitlink. `verify-hooks.ps1` Hook 12/13 grep the markers; Hook 17 refuses a dirty `engine/ggml`. |
-| DiT trainer surface | `ace-train train-dit --attn exact\|flash\|flash-f32` (default `exact` in the CLI; the Training Studio form defaults to `flash`) | `dit_attn_flash()` in `engine/src/train/dit-train-graph.h` beside the untouched `dit_attn_f32()`. Both self- and cross-attention route through it. |
-| Parity harness | `engine/tools/fattn-train-test.cpp`, target `fattn-train-test` | `--backend cpu\|cuda\|vulkan` (default `cpu`), resolved by registry device name — never "first GPU found", and a missing requested backend is a hard failure, never a silent CPU fallback. `--prec f32\|tf32` (tf32 is CUDA-only; Vulkan runs f32 at 1e-4 same as CPU), `--extra`, `--large`, `--bench`, `--bench-tr` (CUDA-only; rejects `--backend vulkan`). |
+| CUDA kernels | `engine/ggml/src/ggml-cuda/fattn-train.cu/.cuh` (NEW files — never touch the inference `fattn-*.cu/.cuh`) | Scalar f32 v1 kernels kept as strict mode + pre-sm_80 fallback; TF32 mma (m16n8k8) kernels are the default. BF16 m16n8k16 kernels (2026-10-14) run for an explicit `GGML_PREC_BF16` with BF16 Q/K/V at D = 128 on sm_80+; they read the causal hint and skip dK/dV below `kv_grad_start` (fork change `fa-train-cuda-hints`). Bitwise-deterministic in every mode: no fp atomics, fixed schedules. |
+| Vulkan and Metal kernels | `ggml-vulkan/vulkan-shaders/fa_train_{fwd,bwd_dq,bwd_dkv}.comp` (fork change `zzzz-vulkan-train-ops`, Hook 14); `ggml-metal/kernels/hotstep_train.metal` | F32 only; Metal takes D 64 or 128. Built for the YuE2 joint trainer, which probes the backend itself. The MM3 and legacy YuE2 AR routes still coerce `--attn flash` to `exact` on a Vulkan or Metal engine (`engineSupportsFlashAttnTraining()` in `server/src/services/training/aceTrain.ts`, whose comment predates these kernels). |
+| Precision knob | `ggml_flash_attn_train_set_prec/get_prec` (op_params slot 3) | `GGML_PREC_DEFAULT` (= 0 = zero-init!) → TF32 on sm_80+; `GGML_PREC_F32` → v1 scalar; `GGML_PREC_BF16` → the BF16 kernels where supported. Autodiff copies the forward's prec onto the backward node. |
+| Op hints | `ggml_flash_attn_train_set_kv_grad_start`, `_set_causal`, `_set_saved` | Set on the forward node (autodiff copies them to the backward). A backend that ignores a hint stays correct: `kv_grad_start` lets it skip dK/dV rows of a detached prefix, `causal` promises the mask is causal from a given offset, `saved` attaches an earlier O+LSE so the backward recompute can copy it (Metal). |
+| Where it lives | HOT-ggml `hot-step-neutral` commits `flash-attn-train` (+ `alloc-free-blocks`, `fa-train-cuda-hints`, `zzzz-vulkan-train-ops`), pinned by `engine/ggml` ([docs/dev/ggml-fork.md](../../../docs/dev/ggml-fork.md)) | Change the kernels on the fork, then move the gitlink. `verify-hooks.ps1` Hook 12/13/14 grep the markers; Hook 17 refuses a dirty `engine/ggml`. |
+| DiT trainer surface | `ace-train train-dit --attn exact\|flash\|flash-f32` (default `exact` in the CLI; the Training Studio form defaults to `flash`) | `dit_attn_flash()` in `engine/src/train/dit-train-graph.h`, the drop-in for the untouched `dit_attn_f32()` (`engine/src/dit-graph.h`). Both self- and cross-attention route through it. |
+| Parity harness | `engine/tools/fattn-train-test.cpp`, target `fattn-train-test` | `--backend cpu\|cuda\|vulkan\|metal` (default `cpu`), resolved by registry device name — never "first GPU found", and a missing requested backend is a hard failure, never a silent CPU fallback. `--prec f32\|tf32\|bf16` (tf32 and bf16 are CUDA-only; Vulkan runs f32 at 1e-4 same as CPU), `--extra`, `--large`. The bench path (`--bench`, `--bench-tr`, `--bench-lm`, `--bench-yue2`, `--yue2-sites` for BF16 against strict at the YuE2 AR/NAR shapes, `--saved-check`, `--dsw-check`) runs on CUDA, or on Metal with `--backend metal`; any other `--backend` is rejected. |
 | Profilers | `--profile-step N` (coarse buckets); `DIT_PROFILE_NODES=1` per-node with site attribution (`engine/src/train/dit-node-profile.h`) | Node profiler is env-gated, zero cost when off. |
-| Server/UI | `attnBackend: 'exact'\|'flash'\|'flash-f32'` through `types.ts` → `routes/training.ts` → `aceTrain.ts`; Training Studio checkbox | `cropMax 0` = "no pin" end to end (see trap 6). |
+| Server/UI | `attnBackend: 'exact'\|'flash'\|'flash-f32'` through `types.ts` → `routes/training.ts` → `aceTrain.ts`; Training Studio toggle | `cropMax 0` = "no pin" end to end (see trap 6). |
 
 ## 2. The adoption contract (non-negotiable, proven necessary)
 
@@ -66,10 +70,10 @@ gives back the VRAM win).
 
 | Trainer | Files | Specifics |
 |---|---|---|
-| **AS1.5 LM** (R2) — **DONE 2026-09-02** | `engine/src/train/lm-graph.h`, `lm-train-run.h`, `lm-vram.h`, `lm-selftest.h`, `flash-prec.h` | Causal = one triangular −INF mask; the kernel skips all-−INF tiles, so causal gets ~half its compute skipped free. Qwen GQA at B=1 is the tested path. Ships **off by default** (CLI and Training Studio checkbox); 4B low-VRAM is 5.5% faster than the shipped head-blocked arm and 1.2% faster at equal graph shape (opposite split from the DiT — there the fused kernel is the whole win, here the head-block copies are); naive 0.6B roughly doubles auto-fit `maxLen`, 1.7B only 1.27×. Not yet ear-validated — see `project-flash-attn-backward.md` in memory and §7/§8 below for the full numbers and open items. |
-| **MM3 LM** (R3) — **DONE 2026-09-05** | `mm3-lm-train-run.h`, `mm3-lm-adapter.h`, `mm3-lm-graph.h` | The "sequence term was quadratic all along" retained softmax is what goes — but refused rather than composed with a frozen/trained KV prefix: `--attn flash` is rejected together with `--prefix-frames > 0` or `--prefix-n > 0` (the fused kernel doesn't take the rectangular mask a prefix needs), so the no-dK/dV-for-frozen-columns idea above was never built. **Default `exact`.** Measured (RTX 5090, `mm3-lm-f16`/`mm3-lm-q8_0`, `oasis_morningglory`, rank 256, checkpointed): flash is within noise of exact up to ~1500 frames (checkpointing already hides the small softmax in allocator slack), then saves VRAM growing to ~9 GB by 5000 frames; the usable crop ceiling moves from ~4300 frames (exact, before it starts spilling past ~29 GB used) to at least 11,178 frames (flash — this corpus's longest track, no OOM reached). Paired 20-step run at the shipped recipe's crop (750): 2118 ms/step flash vs 2215 ms exact, max loss drift 1.9e-4. Resolves to tf32 on this card for `--attn flash`, f32 for `--attn flash-f32`. **Not ear-validated** — the shipped recipe still trains at crop 750, where flash measures no benefit. Full numbers: `docs/dev/training-internals.md` MM3 section. |
+| **AS1.5 LM** (R2) — **DONE 2026-09-02** | `engine/src/train/lm-graph.h`, `lm-train-run.h`, `lm-vram.h`, `lm-selftest.h`, `flash-prec.h` | Causal = one triangular −INF mask; the kernel skips all-−INF tiles, so causal gets ~half its compute skipped free. Qwen GQA at B=1 is the tested path. CLI default `exact`. The Training Studio and route have defaulted to `flash` since 2026-09-03, but the route turns it back to `exact` whenever the soft-prompt KV prefix is on, and that prefix is on by default since 2026-09-04, so a default run trains exact (the engine has composed flash with a prefix since 7070238e). Measured: 4B low-VRAM is 5.5% faster than the shipped head-blocked arm and 1.2% faster at equal graph shape (opposite split from the DiT — there the fused kernel is the whole win, here the head-block copies are); naive 0.6B roughly doubles auto-fit `maxLen`, 1.7B only 1.27×. Not yet ear-validated — see `project-flash-attn-backward.md` in memory and §7/§8 below for the full numbers and open items. |
+| **MM3 LM** (R3) — **DONE 2026-09-05** | `engine/src/train/mm3-lm-train-run.h`, `engine/src/minimax/mm3-lm-adapter.h`, `engine/src/minimax/mm3-lm-graph.h` | The "sequence term was quadratic all along" retained softmax is what goes. On the first day `--attn flash` was refused together with `--prefix-frames > 0` or `--prefix-n > 0`; since 7070238e (2026-09-06) both LM trainers probe the fused op at `S_kv = n_pfx + S` and run it on the spliced K/V. The `kv_grad_start` hint (skip dK/dV for frozen prefix columns) exists on the fork now, but only the YuE2 trainer sets it. CLI default `exact`; the in-app recipe has used `flash` since 2026-09-06, and its VRAM model has a measured flash fit since 2026-09-11 (`MM3_VRAM_MODEL.flash` in `mm3Train.ts`, three whole-song anchors, linear in S). Measured (RTX 5090, `mm3-lm-f16`/`mm3-lm-q8_0`, a 12-track album, rank 256, checkpointed): flash is within noise of exact up to ~1500 frames (checkpointing already hides the small softmax in allocator slack), then saves VRAM growing to ~9 GB by 5000 frames; the usable crop ceiling moves from ~4300 frames (exact, before it starts spilling past ~29 GB used) to at least 11,178 frames (flash — this corpus's longest track, no OOM reached). Paired 20-step run at the shipped recipe's crop (750): 2118 ms/step flash vs 2215 ms exact, max loss drift 1.9e-4. Resolves to tf32 on this card for `--attn flash`, f32 for `--attn flash-f32`. On 2026-09-06 it tied exact in a blind test (68 vs 72 of 90) and joined the stacked recipe; the whole-song presets since 2026-09-11 depend on it. Full numbers: `docs/dev/training-internals.md` MM3 section. |
 | **MM3 DiT** (R4) | `mm3-dit-train-*.h` | Bidirectional like the AS DiT; smallest win (shorter sequences). |
-| **YuE2 joint (AITK)** — **already flash, always** | `engine/src/train/yue2-aitk-graph.h` `block()` | Every AR and NAR attention call is `ggml_flash_attn_train` (TF32; `YUE2_AITK_STRICT_F32` = F32). The quadratic chain exists only under `YUE2_AITK_DIAGNOSTIC_MATH_ATTENTION`. The log's `attention_forward: "tf32"` is this kernel. No port needed; the decoder window is `--nar-crop-frames` (2026-09-24). Don't mistake it for an exact-attention trainer (an agent did). |
+| **YuE2 joint (AITK)** — **already flash, always** | `engine/src/train/yue2-aitk-graph.h` `block()`, probe in `yue2-aitk-runtime.cpp` | Every AR and NAR attention call is `ggml_flash_attn_train` wherever the backend supports it (CUDA, CPU, Vulkan, Metal). On CUDA sm_80+ it runs BF16 Q/K/V at `GGML_PREC_BF16` (since 2026-10-14, S2c), with 1/sqrt(D) applied to the F32 scores (`YUE2_AITK_QK_PRESCALE=1` restores the prescale); `YUE2_AITK_PRECISION=strict-f32`, `YUE2_AITK_STRICT_F32` or `YUE2_AITK_BASELINE` keep the TF32/F32 dispatch. The quadratic chain runs only where the probe finds no kernel, under `YUE2_AITK_MATH_ATTENTION=1`, or in a build compiled with `YUE2_AITK_DIAGNOSTIC_MATH_ATTENTION`. The log's `attention_forward` field names the kernel that ran. No port needed; the decoder window is `--nar-crop-frames` (2026-09-24). Don't mistake it for an exact-attention trainer (an agent did). |
 
 For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual chain returned;
 (b) flag + log fields; (c) probe; (d) selftest rung; (e) VRAM branch; (f) drift A/B;
@@ -97,8 +101,9 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 - **A 3% end-to-end bar for kernel churn.** Isolated-kernel wins of 15–25% can be 1% of a step.
 - **Loss-to-target speed ≠ quality.** The overnight sweep's fastest-to-0.5 config (LoRA r128,
   pinned short crop) is a step-cost win that inverts at long crops; the 0.5 proxy's leader
-  changed three times between ma5 0.8 and 0.5. Ear tests decide; nothing trained in flash mode
-  after the first adapter has been heard.
+  changed three times between ma5 0.8 and 0.5. Ear tests decide. When this was written only the
+  first flash-trained adapter had been heard; since then the MM3 recipe has trained under flash
+  (2026-09-06) and the YuE2 joint trainer always does.
 
 ## 5. VRAM model rules
 
@@ -113,8 +118,11 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 - Fits are per-adapter-graph: `DIT_FLASH_LOKR_RETENTION` (0.62) was fitted before the LoKR
   apply reorder and now over-predicts +16.5% (safe direction, ~one crop step unspent). **Owed
   refit**; the batch>1 term is B=1-fitted and over-conservative.
-- The flash lift raises `crop_max` to the dataset's longest track ONLY when the user passed
-  no `--crop-max`; `a.crop_max_user` is the pin flag. See trap 6.
+- The flash lift (raise `crop_max` to the dataset's longest track when the user passed no
+  `--crop-max`) is GONE since 2026-09-03: long auto-fit crops (~1500) lost three ear A/Bs to
+  short ones, so `crop_max` stays at its 800-frame default in every attention mode and the cap
+  is a quality guard, not a VRAM one. `a.crop_max_user` still marks an explicit pin, which wins
+  in both directions (`dit-train-run.h`). See trap 6.
 
 ## 6. Trap list
 
@@ -134,9 +142,10 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
    expansion (native GQA), which also disarms the CUDA `REPEAT_BACK` cap on `Nkv·max(S,enc_S)·B`.
    Measured: **batch 1 still wins** on throughput and loss.
 6. **The server always emitted `--crop-max`**, which the engine treats as a user pin → the flash
-   lift never fired from the UI. `cropMax 0` now means "omit the flag". Quality presets must not
-   re-pin it in flash mode. Any new trainer flag with an engine-side "user set it" sentinel has
-   this exact failure mode — check the arg emitter.
+   lift never fired from the UI. `cropMax 0` now means "omit the flag", and the quality presets
+   leave it at 0. The lift itself has been gone since 2026-09-03 (§5), so an omitted flag now
+   means the 800-frame default cap, but the lesson stands: any new trainer flag with an
+   engine-side "user set it" sentinel has this exact failure mode — check the arg emitter.
 7. **The parity tool must seed the loss gradient with 1.0** (`ggml_set_loss` only allocates)
    and assert a non-zero reference gradient, or both arms compare 0 vs 0 and pass vacuously.
 8. **`dit_sa_mask` never produces a fully-masked key column** (pad columns stay open for padded
@@ -145,26 +154,30 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
    Exclude them from reference diffs, check them directly.
 10. **TF32 A-operand lane map ≠ accumulator map.** mma.cuh's `tile<16,8,float>` is the C/D map;
     using it as the tf32 A operand gives deterministic garbage. Derive with a probe kernel.
-11. **Patch files are LF; a scratch tree extracted under `core.autocrlf=true` is CRLF** and every
-    hunk fails. Replay with `git -c core.autocrlf=false -c core.eol=lf archive`. Export patches
-    hunk-filtered: several patches share `ggml.c` and `ggml-cuda.cu`.
-12. **rocm-build.yml did not apply patches** until 1b7e50d5 — every workflow that builds the
-    engine needs the apply loop now that the trainer references patch-provided symbols.
-13. **`MAX_FREE_BLOCKS`** (ggml-alloc) was 256; LoKR dim 256 (19k-node graph) overflowed it.
-    Now 1024 via `alloc-free-blocks.patch`. Inference-shared → smoke generation after touching.
-14. **Workflows die with the VSCode/Claude process.** Long unattended runs need the window open;
-    machine sleep is "never" on this box (checked).
-15. **`--mirror bf16` means bf16 COMPUTE, not just bf16 storage** — it rounds activations and
+11. **There are no patch files any more.** Until 2026-10 these ops lived in `engine/patches/`
+    and every workflow needed an apply loop (`rocm-build.yml` missed it until 1b7e50d5). Since
+    the HOT-ggml fork the changes are commits on `hot-step-neutral`: edit the fork, move the
+    gitlink, and keep `engine/ggml` clean (Hook 17). A stock ggml-org checkout fails configure
+    and `verify-hooks.ps1` names the missing op.
+12. **`MAX_FREE_BLOCKS`** (ggml-alloc) was 256; LoKR dim 256 (19k-node graph) overflowed it.
+    Now 1024 via the fork's `alloc-free-blocks` change (Hook 13). Inference-shared → run
+    `node tools/engine-smoke.mjs` after touching it.
+13. **Long runs die with the agent's process.** A workflow dies with the VSCode/Claude window,
+    and anything an agent run starts lives in a kill-on-close job, so start a long unattended
+    job through `pwsh -NoProfile -File tools\detach.ps1 <script>` (AGENTS.md). Machine sleep
+    is "never" on this box (checked).
+14. **`--mirror bf16` means bf16 COMPUTE, not just bf16 storage** — it rounds activations and
     gradients at every trainable-layer GEMM, and the adapters it trains are audibly coarse
-    ("bitty", Rob 2026-09-02). Use **`--mirror bf16-f32`**: same BF16 residency, an in-graph
-    `ggml_cast` to F32 at each `mul_mat` site, and over 12 same-seed epochs on mika it is
-    bit-identical to `--mirror f32` while `bf16` drifts to 7.8e-3. It costs ~180 MB of transient
-    arena and ~25% step time against f32 at equal crop, and buys 2.5× the flash auto-fit crop
-    (1542 vs 610). Only `--bwd mm` carries it — the `out_prod` fallback arm keeps the forward
-    cast alive and silently spends the ~8 GB back.
-16. **Disk.** Probe runs write adapters; a campaign filled D: to 2.4 GB free and artifacts were
+    ("bitty", by ear, 2026-09-02). Use **`--mirror bf16-f32`** (the app default): same BF16
+    residency, an in-graph `ggml_cast` to F32 at each `mul_mat` site, and over 12 same-seed
+    epochs on one album dataset it is bit-identical to `--mirror f32` while `bf16` drifts to
+    7.8e-3. It costs ~180 MB of transient arena and ~25% step time against f32 at equal crop,
+    and bought 2.5× the flash auto-fit crop (1542 vs 610, before the 800-frame default cap).
+    Only `--bwd mm` carries it — the `out_prod` fallback arm keeps the forward cast alive and
+    silently spends the ~8 GB back.
+15. **Disk.** Probe runs write adapters; a campaign filled D: to 2.4 GB free and artifacts were
     deleted for space. Clean scratch dirs between grid cells.
-17. **A bench tool's own reference arm can be non-contiguous where the trainer's never is.**
+16. **A bench tool's own reference arm can be non-contiguous where the trainer's never is.**
     `fattn-train-test --bench-lm`'s `blocked` arm fed a `ggml_cont(view)` straight into the
     reference attention chain, whose backward hands back a transposed (non-contiguous) gradient
     — `GGML_OP_CONT`'s backward asserts on that and the tool produced no table at all. The
@@ -173,12 +186,12 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
     `ggml_reshape` too, so the bench pays the same backward copy the trainer pays. Any bench
     harness that hand-builds a reference graph needs to mirror the trainer's node shapes, not
     just its op sequence.
-18. **`--max-len` filters, it does not truncate.** Songs longer than it are skipped outright, so
+17. **`--max-len` filters, it does not truncate.** Songs longer than it are skipped outright, so
     `alloc_seq = min(max_len, longest SURVIVING sample)` — pinning a value above the whole
     corpus's longest track yields an empty dataset (`no-samples`), and a VRAM-model cell "at
     S=1024" is really whatever the longest surviving song happens to be. Pick the dataset for
     the S you want, then report the actual S; don't trust the flag to hit a number.
-19. **The exact-mode naive auto-fit can pick a `maxLen` whose own `estMb` already exceeds free
+18. **The exact-mode naive auto-fit can pick a `maxLen` whose own `estMb` already exceeds free
     VRAM**, then die on `cudaMalloc` with a hard access violation (0xC0000005) instead of a
     clean `lm_fatal` — reproduces identically on a pre-flash binary, so it is not new. Root
     cause is the same non-attention polynomial (`c2f`/`c2h`) the flash branch's
@@ -194,7 +207,7 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 | Attention VRAM per site at S=3000 | 487 MB fused vs 4.9 GB manual |
 | Parity worst rel err | f32 3.5e-6 (bar 1e-4); tf32 4.7e-4 (bar 5e-3, floor 1e-5) |
 | Flash vs exact drift, 200 same-seed epochs | smaller than `--bwd mm` |
-| Done-gate auto-fit, production LoKR, unpinned | albumJ 1498 (enc_S 1877), album D 1616 (enc_S 640); LoRA r16 ~3400 |
+| Done-gate auto-fit, production LoKR, unpinned (before the 800-frame default cap) | albumJ 1498 (enc_S 1877), album D 1616 (enc_S 640); LoRA r16 ~3400 |
 | LoKR apply reorder | −10% step, LoKR:LoRA 1.35→1.21; the two copies are unavoidable, ~7% of step |
 | 12 GB emulated card, flash+bf16+LoRA r16 | full 32-layer depth, crop 410, 4 segments |
 | **LM, 4B low-VRAM, flash vs shipped (`exact --attn-head-block 8`)** | **5.5% faster/micro-step, 3.8% lower peak VRAM** (paired, interleaved, albumF substitute) |
@@ -202,12 +215,12 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
 | LM attention-only bound (`fattn-train-test --bench-lm` vs blocked) | 0.74×/0.79×/0.80× at S=1024/2113/3500 |
 | LM naive auto-fit `maxLen` lift, flash vs exact | 0.6B ~2.0× (3136→6208 tok); 1.7B ~1.27× (2624→3328 tok) |
 | LM 50-epoch same-seed drift, flash vs exact | same class as `--weights bf16`; smaller on 2/3 measures, ~20% larger on final CE (1 seed, no error bar) |
-| **MM3 LM, usable crop ceiling, flash vs exact** | **~4300 frames exact -> >=11,178 frames flash** (this corpus's longest track; RTX 5090, `oasis_morningglory`, rank 256) |
+| **MM3 LM, usable crop ceiling, flash vs exact** | **~4300 frames exact -> >=11,178 frames flash** (this corpus's longest track; RTX 5090, a 12-track album, rank 256) |
 | MM3 LM, paired step time at the shipped recipe's crop (750 frames) | 2118 ms/step flash vs 2215 ms exact |
 
-## 8. Open items (as of 2026-09-02)
+## 8. Open items (as of 2026-09-02, status updated 2026-10-23)
 
-- R4 (MM3 DiT) port remains (this skill is its brief) — R2 (AS1.5 LM) and R3 (MM3 LM) are DONE, both off by default pending ear tests.
+- R4 (MM3 DiT) port remains (this skill is its brief; `mm3-dit-train-*.h` still builds the manual chain). R2 (AS1.5 LM) and R3 (MM3 LM) are DONE. R3 is the in-app MM3 default since 2026-09-06; R2 defaults to `flash` in the app, but default ACE LM runs train exact because the route turns flash off under the soft-prompt prefix (§3).
 - Cross-attention backward kernel: dK/dV role split blocked by smem; a dQ split exists in
   the plan doc (reverted, −2.7%).
 - `DIT_FLASH_LOKR_RETENTION` refit after the apply reorder; batch>1 VRAM term.
@@ -220,10 +233,11 @@ For each: (a) sibling `xxx_attn_flash()` returning exactly the shape the manual 
   the plan's ear pair (G7) is specified on album I/E3 lineage. album I codes need Preprocess +
   Extract via the Training Studio batch pipeline before G7 can run as written.
 - LM G7 ear test (twin album I adapters, staged in `_experiments/_LISTENING`) — not run, needs
-  Rob; the flash checkbox stays off until it lands.
+  the maintainer. The app turned flash on for the LM on 2026-09-03 without it.
 - Pre-existing bugs surfaced while porting R2, neither fixed (both reproduce on a pre-flash
   binary): `mm3-lm-train` crashes at export with a `ggml-backend.cpp` tensor-write-out-of-bounds
   assert; the LM exact-mode naive auto-fit can pick a `maxLen` that OOMs via access violation
-  instead of a clean fatal (trap 19).
-- Ear validation of anything trained since the first flash adapter, and of the LoKR reorder.
-- Low-VRAM training profiles for users (B1) — deferred by Rob until the 32 GB path is nailed.
+  instead of a clean fatal (trap 18).
+  <!-- TODO(verify): the MM3 export assert may be fixed. In-app MM3 runs have exported checkpoints routinely since 2026-09-06, but no commit names a fix for it. -->
+- Ear validation of the AS1.5 flash arms trained since the first flash adapter, and of the LoKR reorder.
+- Low-VRAM training profiles for users (B1) — deferred by the maintainer until the 32 GB path is nailed.

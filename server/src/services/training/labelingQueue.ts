@@ -9,6 +9,11 @@
 //     the trainers joined it and started blocking labeling for hours
 //   * one active job per dataset, enforced at the route layer with a 409
 //
+// Two copies of the app can share one training folder (services/instance.ts).
+// Each job's _meta.json carries its owner (instance id and PID). A restart
+// fails only jobs whose owner is dead, and a dataset a live process in the
+// other copy is working on is busy here too (a claim in the database).
+//
 // Within a label job, Essentia + tag reading (Pass A) and the network steps
 // (Pass B) run as concurrent lanes, so the review grid populates within seconds
 // while Genius/LLM work is still going. Per-service throughput is governed by
@@ -25,12 +30,15 @@ import { pushLog } from '../../routes/logs.js';
 import { closeTrainingLog, logTraining } from '../logger.js';
 import { config } from '../../config.js';
 import { jobsDir } from './paths.js';
+import { claim, describeOwner, foreignClaim, isMine, owner, ownerAlive, release, type Owner } from '../instance.js';
 import { buildSamples, loadSidecarMetadata, sampleFromParts } from './datasetScan.js';
 import { mergeFields, writeSidecar } from './sidecarIO.js';
 import {
   clearTransientStatus, clearTransientStatuses, patchLabel, readLabel, setTransientStatus,
 } from './labelStore.js';
 import { analyzeWithEssentia, essentiaAvailable, essentiaKeyString, reconcileEssentiaBpm } from './essentiaClient.js';
+import { analyzeTempoWithBeatThis } from './beatThisClient.js';
+import { abcKeyString, readAbcSidecar, withAbcTempo, writeAbcSidecar } from './abcSidecar.js';
 import { captionLimiter, essentiaLimiter, geniusLimiter } from './rateLimit.js';
 import { AbortError, runUnderstand } from './understandClient.js';
 import {
@@ -40,10 +48,14 @@ import { buildDataset } from './datasetBuilder.js';
 import * as audioMeta from './audioMeta.js';
 import { getDataset, updateCounters, updateDataset } from './datasetsRepo.js';
 import type { AceRequest } from '../aceClient.js';
-import { arbitrateSidecarGenre, prepareMossBatch, clearMossBatch } from './mossCaption.js';
+import {
+  arbitrateSidecarGenre, clearMossBatch, dropLocalLyrics, genreHint, isLocalCaptioner,
+  prepareLocalLyrics, prepareMossBatch, takeLocalLyrics,
+} from './mossCaption.js';
 import { captionSampleForYue2, writeYue2Sidecar } from './yue2CaptionJob.js';
+import { hasSectionTags, normaliseLyricTags, transferTags } from './lyricTags.js';
 import type {
-  BuildOptions, CaptionOptions, FieldSource, GeniusOptions, LabelOptions, MergePolicy,
+  BuildOptions, CaptionOptions, FieldSource, GeniusOptions, LabelOptions, MergePolicy, NormaliseLyricsOptions,
   TrainingDatasetRow, TrainingJobKind, TrainingJobStatus, TrainingJobSummary,
   TrainingSample, TrainingStreamEvent,
 } from './types.js';
@@ -106,9 +118,20 @@ export interface TrainingJob {
    *  An AbortController does nothing to a spawned process — cancelJob() kills
    *  this directly. */
   child?: ChildProcess;
+  /** Graceful trainer cancellation; the GPU lane stays held until close/restart. */
+  cancelChild?: () => void;
+  cleanupPending?: boolean;
+  /** The process running this job. A stand-in for another copy's job
+   *  (activeJobForDataset) carries that copy's owner. */
+  owner?: Owner;
 }
 
+/** What _meta.json holds: the summary plus the owner (absent in legacy files)
+ *  and, while a stopped trainer is still exiting, cleanupPending. */
+type MetaFile = TrainingJobSummary & { owner?: Owner; cleanupPending?: boolean };
+
 const jobs = new Map<string, TrainingJob>();
+const datasetKey = (datasetId: string) => `dataset:${datasetId}`;
 // Two serial chains, not one — see laneFor(). GPU work (trainers, preprocess,
 // audition) must not block CPU/network work (labeling, Genius, captions).
 let gpuTail: Promise<void> = Promise.resolve();
@@ -161,7 +184,12 @@ export function createJob(
     events: [],
     listeners: new Set(),
     controller: new AbortController(),
+    owner: owner(),
   };
+  if (datasetId) {
+    const held = claim(datasetKey(datasetId), job.id, jobStillActive);
+    if (held) throw new Error(`This dataset is busy in ${describeOwner(held.instance)} (job ${held.holder}); wait for it or stop it there`);
+  }
   jobs.set(job.id, job);
   // On disk from the start, not only once it ends: a job the server dies
   // during must still be there for recoverStaleJobs to mark failed.
@@ -173,11 +201,52 @@ export function getJob(id: string): TrainingJob | undefined {
   return jobs.get(id);
 }
 
+function readMeta(id: string): MetaFile | null {
+  try { return JSON.parse(fs.readFileSync(path.join(jobsDir(), id, '_meta.json'), 'utf-8')) as MetaFile; }
+  catch { return null; }
+}
+
+/** A claimed job is still going: its record says queued or running, a
+ *  cancelled trainer is still exiting (cleanupPending), or it has no record
+ *  yet. A claim its owner forgot to release frees itself. */
+function jobStillActive(id: string): boolean {
+  const meta = readMeta(id);
+  return !meta || meta.status === 'queued' || meta.status === 'running' || meta.cleanupPending === true;
+}
+
 export function activeJobForDataset(datasetId: string): TrainingJob | undefined {
   for (const job of jobs.values()) {
-    if (job.datasetId === datasetId && (job.status === 'queued' || job.status === 'running')) return job;
+    if (job.datasetId === datasetId && (job.status === 'queued' || job.status === 'running' || job.cleanupPending)) return job;
   }
-  return undefined;
+  // The other copy of the app may be working on it: a read-only stand-in, so
+  // every caller's "busy" check covers it. It is not in this process's map,
+  // so a cancel here does not reach it (see jobRunsElsewhere).
+  const held = foreignClaim(datasetKey(datasetId), jobStillActive);
+  if (!held) return undefined;
+  const meta = readMeta(held.holder);
+  return {
+    id: held.holder, datasetId, kind: meta?.kind ?? 'build', status: meta?.status === 'queued' ? 'queued' : 'running',
+    total: meta?.total ?? 0, done: meta?.done ?? 0, failed: meta?.failed ?? 0, currentSampleId: meta?.currentSampleId ?? null,
+    phase: meta?.phase ?? 'running elsewhere', engineQueueDepth: 0, error: null, createdAt: meta?.createdAt ?? held.claimed_at,
+    startedAt: meta?.startedAt ?? null, finishedAt: null, sampleIds: [], opts: undefined, events: [], listeners: new Set(),
+    controller: new AbortController(), owner: meta?.owner ?? { instance: held.instance, pid: 0 },
+  };
+}
+
+/** Why this process cannot cancel job `id`: another live process runs it.
+ *  null when it is ours, finished, unknown, or its owner is dead. */
+export function jobRunsElsewhere(id: string): string | null {
+  if (jobs.has(id)) return null;
+  const meta = readMeta(id);
+  if (!meta || (meta.status !== 'queued' && meta.status !== 'running')) return null;
+  if (isMine(meta.owner) || !ownerAlive(meta.owner)) return null;
+  return `This job is running in ${describeOwner(meta.owner)}; stop it there`;
+}
+
+/** Drop this job's dataset claim once the job no longer holds the dataset. */
+function releaseIfIdle(job: TrainingJob): void {
+  if (!job.datasetId || job.status === 'queued' || job.status === 'running' || job.cleanupPending) return;
+  release(datasetKey(job.datasetId), job.id);
 }
 
 /** Active jobs (memory) + finished jobs (disk `_meta.json`), newest first. */
@@ -318,11 +387,76 @@ export function attachStream(job: TrainingJob, res: Response): void {
   res.on('close', () => job.listeners.delete(res));
 }
 
+/** Recover a finished joint run after its in-memory replay has been lost. */
+export async function attachFinishedJointStream(jobId: string, res: Response): Promise<boolean> {
+  const summary = listJobs().find(job => job.id === jobId);
+  if (!summary || summary.kind !== 'yue2-joint-train' || ['queued', 'running'].includes(summary.status)) return false;
+  const { listYue2AitkRuns } = await import('./yue2AitkRuns.js');
+  const run = listYue2AitkRuns(summary.datasetId).find(run => run.jobId === jobId);
+  if (!run || run.status === 'running') return false;
+  const frames = await finishedJointFrames(run.output, summary);
+  if (!frames.length) return false;
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  for (const frame of frames) res.write(`data: ${JSON.stringify(frame)}\n\n`);
+  for (const checkpoint of run.checkpoints) {
+    res.write(`data: ${JSON.stringify({ type: 'metric', metric: 'milestone', ts: summary.finishedAt ?? summary.createdAt,
+      step: checkpoint.step, loss: checkpoint.loss, path: checkpoint.dir })}\n\n`);
+  }
+  res.end(`data: ${JSON.stringify({ type: 'status', status: summary.status, ...(summary.error ? { error: summary.error } : {}) })}\n\n`);
+  return true;
+}
+
+/** Only server-catalogued directories reach this reader. Segment order and
+ * duplicate-step replacement match a resumed run's training clock. */
+export async function finishedJointFrames(output: string, summary: TrainingJobSummary): Promise<TrainingStreamEvent[]> {
+  const { parseYue2JointEvent } = await import('./yue2JointTrainRunner.js');
+  const dirs = [output];
+  try {
+    for (const entry of (await fs.promises.readdir(path.join(output, 'segments'), { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.isDirectory() && /^segment-\d{6}$/.test(entry.name)) dirs.push(path.join(output, 'segments', entry.name));
+    }
+  } catch { /* unsegmented run */ }
+  const byStep = new Map<number, TrainingStreamEvent & { type: 'metric' }>();
+  let budget = 64 * 1024 * 1024;
+  for (const dir of dirs) {
+    let text: string;
+    try {
+      const file = path.join(dir, 'train.jsonl');
+      const stat = await fs.promises.stat(file);
+      if (!stat.isFile() || stat.size > budget) return [];
+      budget -= stat.size;
+      text = await fs.promises.readFile(file, 'utf8');
+    } catch { continue; }
+    for (const line of text.split(/\r?\n/)) {
+      const event = parseYue2JointEvent(line, summary.total);
+      if (!event || event.step === undefined) continue;
+      const { stage, step, ...metrics } = event;
+      if (stage === 'joint') {
+        byStep.set(step, { type: 'metric', metric: 'step', ts: summary.startedAt ?? summary.createdAt, step, ...metrics });
+      } else if (stage === 'meters') {
+        const raw = JSON.parse(line) as Record<string, unknown>;
+        const prior = byStep.get(step);
+        if (prior) for (const [source, target] of [['nar_recon', 'narRecon'], ['nar_drift', 'narDrift']] as const) {
+          const value = raw[source];
+          if (typeof value === 'number' && Number.isFinite(value)) prior[target] = value;
+        }
+      }
+    }
+  }
+  let trainMs = 0;
+  return [...byStep.values()].sort((a, b) => a.step! - b.step!).map(frame => {
+    trainMs += frame.stepMs ?? 0;
+    return { ...frame, trainMs };
+  });
+}
+
 // ── Persistence (§7.9) ───────────────────────────────────────────────────
 
 /** Replace a job's _meta.json through a temp file and a rename, so a write
  *  that fails part-way leaves the previous record whole, never truncated. */
-function writeMetaFile(metaPath: string, summary: TrainingJobSummary): void {
+function writeMetaFile(metaPath: string, summary: MetaFile): void {
   const temp = `${metaPath}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temp, JSON.stringify(summary, null, 2), 'utf-8');
@@ -337,14 +471,19 @@ function persistMeta(job: TrainingJob): void {
   try {
     const dir = path.join(jobsDir(), job.id);
     fs.mkdirSync(dir, { recursive: true });
-    writeMetaFile(path.join(dir, '_meta.json'), toSummary(job));
+    writeMetaFile(path.join(dir, '_meta.json'), {
+      ...toSummary(job), owner: job.owner, ...(job.cleanupPending ? { cleanupPending: true } : {}),
+    });
   } catch (err: any) {
     console.warn(`[Training] Could not persist job ${job.id}: ${err.message}`);
   }
 }
 
-/** A server restart loses running jobs — rewrite their meta so the list is honest. */
-function recoverStaleJobs(): void {
+/** A server restart loses running jobs — rewrite their meta so the list is
+ *  honest. Jobs another live process owns (the other copy of the app) are
+ *  left alone; no owner is a legacy record, whose process is gone. Called
+ *  once at startup, after the instance registry opens (index.ts). */
+export function recoverStaleJobs(): void {
   try {
     const base = jobsDir();
     if (!fs.existsSync(base)) return;
@@ -353,8 +492,9 @@ function recoverStaleJobs(): void {
       const metaPath = path.join(base, entry.name, '_meta.json');
       if (!fs.existsSync(metaPath)) continue;
       try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as TrainingJobSummary;
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as MetaFile;
         if (meta.status !== 'running' && meta.status !== 'queued') continue;
+        if (!isMine(meta.owner) && ownerAlive(meta.owner)) continue;
         meta.status = 'failed';
         meta.error = 'Server restarted';
         meta.finishedAt = Date.now();
@@ -363,7 +503,6 @@ function recoverStaleJobs(): void {
     }
   } catch { /* jobs dir unreadable */ }
 }
-recoverStaleJobs();
 
 // ── Queue + cancellation ─────────────────────────────────────────────────
 
@@ -386,6 +525,7 @@ function laneFor(job: TrainingJob): 'gpu' | 'net' {
     case 'preprocess':
     case 'train-lm':
     case 'train-dit':
+    case 'sa3-train':
     case 'audition':
     case 'lm-calibrate':   // drives /lm generations — engine must be up, GPU-serial
     case 'dit-calibrate':  // drives /synth + /vae — same rule
@@ -400,6 +540,8 @@ function laneFor(job: TrainingJob): 'gpu' | 'net' {
     case 'yue2-ar-train':    // whole songs to 12,288 tokens through a bf16 base
     case 'yue2-joint-train': // explicit AITK joint AR+NAR trainer
     case 'yue2-base-loss':   // forward-only base planner + decoder over every song
+    case 'heartmula-prepare': // HeartCodec encoder pack, whole-card
+    case 'heartmula-train':  // backbone LoRA through a frozen 3B base
       return 'gpu';
     case 'yue2-prepare-aitk': // native cache import; CPU-only, never stops ace-server
       return 'net';
@@ -432,6 +574,35 @@ export function enqueue(job: TrainingJob, run: (j: TrainingJob) => Promise<void>
   } else {
     netTail = netTail.then(() => run(job)).catch(swallow);
   }
+}
+
+// ── Checkpoint previews on the trainers' GPU chain ───────────────────────
+// A manual preview renders on the engine, which every GPU-lane trainer stops.
+// It therefore takes the same chain, and a reservation closes the gap between
+// the admission check and the chain reaching it: while one is held no GPU job
+// is admitted for any dataset, and it is refused while a GPU job is queued or running.
+let previewReserved = false;
+
+/** True while a GPU-lane job is queued or running, for any dataset. */
+export function gpuJobActive(): boolean {
+  for (const j of jobs.values()) if (laneFor(j) === 'gpu' && (j.status === 'queued' || j.status === 'running')) return true;
+  return false;
+}
+
+export const gpuPreviewReserved = (): boolean => previewReserved;
+
+/** Take the GPU for one preview; false when a GPU job is queued or running, or another preview holds it. */
+export function reserveGpuForPreview(): boolean {
+  if (previewReserved || gpuJobActive()) return false;
+  previewReserved = true;
+  return true;
+}
+
+/** Run a reserved preview at the head of the GPU chain and release the reservation when it settles. */
+export function runReservedPreview<T>(fn: () => Promise<T>): Promise<T> {
+  const run = gpuTail.then(fn);
+  gpuTail = run.then(() => {}, () => {}).finally(() => { previewReserved = false; });
+  return run;
 }
 
 /**
@@ -484,7 +655,7 @@ export function cancelJob(id: string): boolean {
     // A spawned child (ace-train) ignores the AbortController entirely — kill
     // the whole tree, or a cancelled preprocess job keeps the GPU for hours and
     // leaves an ffmpeg grandchild transcoding into <out>/.tmp/.
-    killJobChild(job);
+    if (job.cancelChild) job.cancelChild(); else killJobChild(job);
     // Rows this job had queued/in flight go back to their on-disk state at once,
     // or they would render "Queued…"/"Working…" (and read-only) forever.
     clearTransientStatuses(job.datasetId, job.sampleIds);
@@ -494,15 +665,24 @@ export function cancelJob(id: string): boolean {
     endStream(job);
     console.log(`[Training] Job ${id} cancelled`);
   }
-  // §2.8 — DELETE always removes the job from the map. The finished `_meta.json`
-  // keeps it visible in GET /jobs, and dropping it here bounds memory: every job
-  // holds up to MAX_EVENTS events, some carrying a full sample with lyrics.
-  jobs.delete(id);
+  // Finished metadata remains on disk. A graceful trainer keeps its admission
+  // reservation until the child exits and the engine restart settles.
+  if (!job.cleanupPending) jobs.delete(id);
+  releaseIfIdle(job);
   return true;
 }
 
 export function isCancelled(job: TrainingJob): boolean {
   return job.status === 'cancelled' || job.controller.signal.aborted;
+}
+
+export function releaseJobCleanup(job: TrainingJob): void {
+  job.cleanupPending = false;
+  if (isCancelled(job)) jobs.delete(job.id);
+  // The record stops saying cleanupPending before the claim goes, so the
+  // other copy never sees a released claim on a job it still thinks is busy.
+  if (job.status !== 'queued' && job.status !== 'running') persistMeta(job);
+  releaseIfIdle(job);
 }
 
 export function finishJob(job: TrainingJob, status: TrainingJobStatus, error?: string): void {
@@ -518,6 +698,7 @@ export function finishJob(job: TrainingJob, status: TrainingJobStatus, error?: s
   pushEvent(job, { type: 'status', status, ...(error ? { error } : {}) });
   persistMeta(job);
   endStream(job);
+  releaseIfIdle(job);
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────
@@ -694,19 +875,39 @@ function markLabeled(
 
 // ── Label job (§4.7) ─────────────────────────────────────────────────────
 
+/** audio path -> genreHint(the file's own genre tag), for the local captioners. */
+async function tagGenreHints(samples: TrainingSample[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  await Promise.all(samples.map(async s => {
+    try {
+      const hint = genreHint((await audioMeta.read(s.audioPath)).genre);
+      if (hint) out.set(s.audioPath, hint);
+    } catch { /* no tags: no hint */ }
+  }));
+  return out;
+}
+
 /** Does this label job have a per-sample cloud/GPU lane after the CPU pass? */
 function hasCloudLane(opts: LabelOptions): boolean {
-  return opts.useUnderstand === true || opts.useGenius === true || opts.useCaption === true;
+  return opts.useUnderstand === true || opts.useGenius === true || opts.useCaption === true
+    || opts.localLyrics === true;
+}
+
+/** Lead sheets from the key pass as they land: a file's promise settles when
+ *  its score is in, or when the pass is over without one. */
+interface SheetFeed {
+  scores: Map<string, string>;
+  ready(audioPath: string): Promise<void>;
 }
 
 interface PassAResult {
   duration: number;
   tags: { artist: string; title: string; album: string };
   tagGenre: string;
-  tagBpm: number | null;
-  essentiaBpm: number | null;
-  bpmFromTag: boolean;
-  essentiaKey: string;
+  bpm: number | null;
+  bpmSource: FieldSource;
+  key: string;
+  keySource: FieldSource;
 }
 
 async function runPassA(
@@ -716,6 +917,7 @@ async function runPassA(
   opts: LabelOptions,
   policy: MergePolicy,
   results: Map<string, PassAResult>,
+  sheets: SheetFeed,
 ): Promise<void> {
   // When a cloud lane runs concurrently it owns job.phase/currentSampleId
   // (that progress is what the user watches); the CPU lane reports per-sample only.
@@ -727,9 +929,28 @@ async function runPassA(
 
   const meta = await audioMeta.read(sample.audioPath);
 
-  // Essentia is deterministic — if we already analyzed this exact file
-  // (size+mtime unchanged since the cached run), reuse the raw result from the
-  // label store instead of re-running ffmpeg + Essentia on a re-label.
+  // beat_this tempo and SheetSage2 key are the defaults (HOTSTEP-730: they beat
+  // Essentia on 24 reference tracks); Essentia, then the file tags, fill in
+  // whatever they cannot answer.
+  const analyze = opts.useEssentia !== false;
+  const beatBpm = analyze && opts.tempoSource !== 'essentia'
+    ? await analyzeTempoWithBeatThis(sample.audioPath, job.controller.signal) : null;
+  const useSheet = analyze && opts.keySource !== 'essentia';
+  // The key pass runs beside this one; wait only for this file's lead sheet.
+  if (useSheet) await sheets.ready(sample.audioPath);
+  if (isCancelled(job)) return;
+  const sheetKey = useSheet ? abcKeyString(sheets.scores.get(sample.audioPath) || readAbcSidecar(sample.audioPath)) : '';
+  if (useSheet && beatBpm !== null) {
+    // The saved lead sheet carries the measured tempo, for covers and the rest.
+    const saved = readAbcSidecar(sample.audioPath);
+    const retimed = saved && withAbcTempo(saved, beatBpm);
+    // A score this job just transcribed has nothing worth a backup.
+    if (retimed && retimed !== saved) writeAbcSidecar(sample.audioPath, retimed, { keepBackups: !sheets.scores.has(sample.audioPath) });
+  }
+
+  // Essentia only answers what those two left open: its CPU pass is the
+  // slowest step on a big dataset. It is deterministic, so a result cached for
+  // this exact file (size+mtime unchanged) is reused instead of re-run.
   const cached = readLabel(ds.slug, sample.sampleId);
   const cacheFresh = (() => {
     if (!cached?.durationCache) return false;
@@ -741,7 +962,7 @@ async function runPassA(
       return false;
     }
   })();
-  const essentia = (opts.useEssentia !== false && essentiaAvailable())
+  const essentia = analyze && essentiaAvailable() && (beatBpm === null || !sheetKey)
     ? (cacheFresh && cached?.essentia
         ? cached.essentia
         : await analyzeWithEssentia(sample.audioPath, job.controller.signal, opts.essentiaTempo))
@@ -749,14 +970,15 @@ async function runPassA(
 
   const essentiaKey = essentia ? essentiaKeyString(essentia.key, essentia.scale) : '';
   const essentiaBpm = reconcileEssentiaBpm(essentia?.bpm ?? null, meta.bpm);
+  const bpmFromTag = essentiaBpm !== null && essentiaBpm === meta.bpm && essentiaBpm !== essentia?.bpm;
   const result: PassAResult = {
     duration: meta.duration,
     tags: { artist: meta.artist, title: meta.title, album: meta.album },
     tagGenre: meta.genre,
-    tagBpm: meta.bpm,
-    essentiaBpm,
-    bpmFromTag: essentiaBpm !== null && essentiaBpm === meta.bpm && essentiaBpm !== essentia?.bpm,
-    essentiaKey,
+    bpm: beatBpm !== null ? Math.round(beatBpm) : essentiaBpm ?? meta.bpm,
+    bpmSource: beatBpm !== null ? 'beat_this' : essentiaBpm !== null && !bpmFromTag ? 'essentia' : 'tags',
+    key: sheetKey || essentiaKey,
+    keySource: sheetKey ? 'sheetsage' : 'essentia',
   };
   results.set(sample.sampleId, result);
 
@@ -771,17 +993,16 @@ async function runPassA(
   patchLabel(ds.slug, sample.sampleId, {
     relPath: sample.relPath,
     tags: result.tags,
-    essentia: essentia ?? null,
-    essentiaTempo: opts.essentiaTempo ?? null,
+    // A skipped Essentia run keeps its cached result for a later re-label.
+    ...(essentia ? { essentia, essentiaTempo: opts.essentiaTempo ?? null } : {}),
     durationCache: meta.duration > 0 ? { seconds: meta.duration, sizeBytes, mtimeMs } : null,
   });
 
   // Interim sidecar write — a cancelled job still leaves usable BPM/key data.
   const incoming: Record<string, string> = {};
   const sources: Record<string, FieldSource> = {};
-  if (result.essentiaBpm !== null) { incoming.bpm = String(result.essentiaBpm); sources.bpm = result.bpmFromTag ? 'tags' : 'essentia'; }
-  else if (result.tagBpm !== null) { incoming.bpm = String(result.tagBpm); sources.bpm = 'tags'; }
-  if (essentiaKey) { incoming.key = essentiaKey; sources.key = 'essentia'; }
+  if (result.bpm !== null) { incoming.bpm = String(result.bpm); sources.bpm = result.bpmSource; }
+  if (result.key) { incoming.key = result.key; sources.key = result.keySource; }
   if (meta.genre) { incoming.genre = meta.genre; sources.genre = 'tags'; }
   if (ds.defaultLanguage) { sources.language = 'user'; }
   if (meta.duration > 0) incoming.duration = meta.duration.toFixed(2);
@@ -844,7 +1065,33 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
     emitLog(job, 'info', `Labeling ${job.total} file(s)`);
     emitProgress(job);
 
-    // ── Pass A: tags + Essentia (local CPU)  ──
+    // ── Key pass: SheetSage2 lead sheets for files that have none (GPU, one run) ──
+    // Runs beside everything below; Pass A waits only for its own file's score.
+    const sheets: SheetFeed = { scores: new Map(), ready: () => Promise.resolve() };
+    const sheetLane = (async () => {
+      if (opts.useEssentia === false || opts.keySource === 'essentia') return;
+      const release = new Map<string, () => void>();
+      const ready = new Map<string, Promise<void>>();
+      for (const t of targets) {
+        // A file that already has a lead sheet is not transcribed again.
+        if (readAbcSidecar(t.audioPath)) continue;
+        ready.set(t.audioPath, new Promise<void>(r => release.set(t.audioPath, r)));
+      }
+      sheets.ready = (audioPath) => ready.get(audioPath) ?? Promise.resolve();
+      try {
+        const { transcribeLabelSheets } = await import('./yue2ArTrainRunner.js');
+        await transcribeLabelSheets(job, targets.map(t => t.audioPath), (audioPath, abc) => {
+          sheets.scores.set(audioPath, abc);
+          release.get(audioPath)?.();
+        });
+      } catch (err: any) {
+        emitLog(job, 'warn', `SheetSage2 key pass failed: ${err?.message || err}; using Essentia's key.`);
+      } finally {
+        for (const r of release.values()) r();
+      }
+    })();
+
+    // ── Pass A: tags + beat_this/Essentia + key  ──
     // ── Pass B: Genius + LLM caption (network) ──
     // The two lanes run CONCURRENTLY — Essentia/ffmpeg never touch the network,
     // so Genius/caption start on file 1 as soon as its Pass A is done instead of
@@ -867,7 +1114,7 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
         if (index >= targets.length) return;
         const sample = targets[index];
         try {
-          await runPassA(job, ds, sample, opts, policy, passA);
+          await runPassA(job, ds, sample, opts, policy, passA, sheets);
         } catch (err: any) {
           if (!isCancelled(job)) {
             markError(job, ds, sample, err?.message || 'Analysis failed');
@@ -893,6 +1140,20 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
     //   → Genius lyrics → LLM caption+genre (audio-grounded on gemini).
     // All results accumulate into ONE sidecar write per sample.
     const cloudLane = hasCloudLane(opts);
+    // Genius needs only the file tags, so every lookup starts now (paced by its
+    // limiter) instead of queueing behind each file's analysis and caption.
+    const geniusHits = new Map<string, ReturnType<typeof enhanceGenius>>();
+    if (opts.useGenius === true) {
+      for (const t of targets) {
+        const hit = (async () => {
+          const m = await audioMeta.read(t.audioPath);
+          const tagged: TrainingSample = { ...t, tagArtist: m.artist || t.tagArtist, tagTitle: m.title || t.tagTitle, tagAlbum: m.album || t.tagAlbum };
+          return geniusLimiter.run(() => isCancelled(job) ? Promise.resolve(null) : enhanceGenius(tagged, ds, { sanitizeHeaders: true }));
+        })();
+        hit.catch(() => { /* surfaced when Pass B awaits it */ });
+        geniusHits.set(t.sampleId, hit);
+      }
+    }
     const passBLane = (async () => {
       if (!cloudLane) return;
       let engineFailures = 0;
@@ -938,10 +1199,9 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
         // Persisted onto the label record below — see SampleLabelRecord.lyricsError.
         let lyricsError: string | null = null;
 
-        // Local results first — Essentia wins bpm/key (§4.8), tags win genre.
-        if (a?.essentiaBpm != null) { incoming.bpm = String(a.essentiaBpm); sources.bpm = a.bpmFromTag ? 'tags' : 'essentia'; }
-        else if (a?.tagBpm != null) { incoming.bpm = String(a.tagBpm); sources.bpm = 'tags'; }
-        if (a?.essentiaKey) { incoming.key = a.essentiaKey; sources.key = 'essentia'; }
+        // Local results first — the analysis pass wins bpm/key (§4.8), tags win genre.
+        if (a?.bpm != null) { incoming.bpm = String(a.bpm); sources.bpm = a.bpmSource; }
+        if (a?.key) { incoming.key = a.key; sources.key = a.keySource; }
         if (a?.tagGenre) { incoming.genre = a.tagGenre; sources.genre = 'tags'; }
         if (ds.defaultLanguage) sources.language = 'user';
         if (a && a.duration > 0) incoming.duration = a.duration.toFixed(2);
@@ -961,7 +1221,7 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
               if (!incoming.bpm && result.bpm != null) { incoming.bpm = String(Math.trunc(result.bpm)); sources.bpm = 'understand'; }
               if (!incoming.key && result.keyscale) { incoming.key = result.keyscale; sources.key = 'understand'; }
               if (result.caption) { incoming.caption = result.caption; sources.caption = 'understand'; }
-              if (result.lyrics) { incoming.lyrics = result.lyrics; sources.lyrics = 'understand'; }
+              if (result.lyrics) { incoming.lyrics = normaliseLyricTags(result.lyrics); sources.lyrics = 'understand'; }
               if (result.timesignature) { incoming.signature = result.timesignature; sources.signature = 'understand'; }
               if (!ds.defaultLanguage && result.vocalLanguage) { incoming.language = result.vocalLanguage; sources.language = 'understand'; }
               // audio_codes NEVER enters the sidecar — it goes here (D7).
@@ -1003,11 +1263,8 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
             job.phase = 'genius';
             emitProgress(job);
             try {
-              // The limiter supplies both the courtesy spacing and the in-flight
-              // cap, so there is no sleep after the call any more — pacing is on
-              // call STARTS, which is what a quota bucket actually counts.
-              const hit = await geniusLimiter.run(
-                () => enhanceGenius(enriched, ds, { sanitizeHeaders: true }));
+              // Started at job start (geniusHits); the limiter paces call starts.
+              const hit = await geniusHits.get(sample.sampleId)!;
               if (hit) {
                 incoming.lyrics = hit.lyrics;
                 sources.lyrics = 'genius';
@@ -1025,6 +1282,45 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
                 : `genius: ${err?.message || 'failed'}`;
               failures.push(lyricsError);
               emitLog(job, 'warn', `${sample.filename}: Genius failed — ${err?.message || err}`);
+            }
+          }
+
+          // ── Step 2b: local lyrics where Genius left none (Music Flamingo) ──
+          // Per track, from a batch started at job start, so lyrics land as the
+          // job goes rather than after the whole dataset. Lyrics already in the
+          // sidecar (an earlier run, the user) and instrumental tracks are left
+          // alone. Before the caption step on purpose: the cloud caption prompt
+          // quotes the lyrics.
+          if (opts.localLyrics === true) {
+            const meta = loadSidecarMetadata(sample.audioPath);
+            // An overwrite policy re-transcribes lyrics already in the sidecar
+            // (how a dataset labelled from Genius moves to local lyrics).
+            const overwrite = policy === 'overwrite_lyrics' || policy === 'overwrite_all';
+            const has = !!incoming.lyrics || (!overwrite && !!(meta.lyrics ?? '').trim())
+              || meta.is_instrumental === 'true';
+            if (has) {
+              dropLocalLyrics(sample.audioPath);
+            } else {
+              job.phase = 'lyrics';
+              emitProgress(job);
+              try {
+                const lyrics = await takeLocalLyrics(sample.audioPath, {
+                  signal: job.controller.signal,
+                  log: (level, message) => emitLog(job, level, `${sample.filename}: ${message}`),
+                });
+                if (lyrics) {
+                  incoming.lyrics = lyrics;
+                  sources.lyrics = 'flamingo';
+                  lyricsError = null;
+                  emitLog(job, 'info', `${sample.filename}: lyrics transcribed locally (Music Flamingo)`);
+                } else {
+                  failures.push('local lyrics: Music Flamingo returned nothing');
+                }
+              } catch (err: any) {
+                if (err instanceof AbortError || isCancelled(job)) return;
+                failures.push(`local lyrics: ${err?.message || 'failed'}`);
+                emitLog(job, 'warn', `${sample.filename}: local lyrics failed — ${err?.message || err}`);
+              }
             }
           }
 
@@ -1120,9 +1416,26 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
       // progressively rather than all at once when the process exits.
       // Placed here, after passALane has already started, so Essentia (CPU) runs
       // concurrently with captioning (GPU) rather than queueing behind it.
-      if (opts.useCaption !== false && opts.caption?.provider === 'moss') {
+      const localModel = opts.useCaption !== false && isLocalCaptioner(opts.caption?.provider)
+        ? opts.caption!.provider as 'moss' | 'flamingo' : null;
+      if (localModel) {
         await prepareMossBatch(targets.map(t => t.audioPath), {
+          model: localModel,
           wantMm3: true,
+          // Same rule enhanceCaption applies: local unless a chat provider was named.
+          wantYue2: opts.caption?.wantYue2 !== false
+            && !(opts.caption?.yue2Provider && !isLocalCaptioner(opts.caption.yue2Provider)),
+          // One encode for captions AND lyrics when Flamingo does both.
+          wantLyrics: opts.localLyrics === true && localModel === 'flamingo',
+          hints: await tagGenreHints(targets),
+          signal: job.controller.signal,
+          log: (level, message) => emitLog(job, level, message),
+        });
+      }
+      if (opts.localLyrics === true) {
+        // Covers every track the caption batch did not (all of them, unless
+        // Flamingo is also the captioner). Genius hits are dropped per track.
+        prepareLocalLyrics(targets.map(t => t.audioPath), {
           signal: job.controller.signal,
           log: (level, message) => emitLog(job, level, message),
         });
@@ -1131,7 +1444,7 @@ async function runLabelJob(job: TrainingJob): Promise<void> {
       await Promise.all(Array.from({ length: passBPool }, () => passBWorker()));
     })();
 
-    await Promise.all([passALane, passBLane]);
+    await Promise.all([sheetLane, passALane, passBLane]);
 
     if (isCancelled(job)) return;
     if (job.status !== 'running') return;   // engine-unreachable already finished the job
@@ -1242,9 +1555,13 @@ async function runCaptionJob(job: TrainingJob): Promise<void> {
     // Scoped to this job, i.e. one dataset. A bulk run interleaves captioning
     // with LM/DiT training per dataset, and holding the captioner resident while
     // a trainer wants the card is the wrong trade — the process exits here.
-    if (opts.provider === 'moss') {
+    if (isLocalCaptioner(opts.provider)) {
       await prepareMossBatch(targets.map(s => s.audioPath), {
+        model: opts.provider,
         wantMm3: opts.wantMm3 !== false,
+        wantYue2: opts.wantYue2 !== false
+          && !(opts.yue2Provider && !isLocalCaptioner(opts.yue2Provider)),
+        hints: await tagGenreHints(targets),
         signal: job.controller.signal,
         log: (level, message) => emitLog(job, level, message),
       });
@@ -1367,6 +1684,96 @@ async function runBuildJob(job: TrainingJob): Promise<void> {
 export function startLabelJob(datasetId: string, sampleIds: string[], opts: LabelOptions): TrainingJob {
   const job = createJob('label', datasetId, sampleIds, opts);
   enqueue(job, runLabelJob);
+  return job;
+}
+
+// ── Normalise lyrics job ─────────────────────────────────────────────────
+
+/**
+ * Rewrite existing sidecar lyrics onto the one tag vocabulary (lyricTags.ts),
+ * with a .bak of each file it changes. With `retag`, lyrics that carry no
+ * section tags at all get them from a Music Flamingo transcript of the audio,
+ * aligned word by word (the sidecar's words are kept, only tags are added).
+ */
+async function runNormaliseLyricsJob(job: TrainingJob): Promise<void> {
+  if (isCancelled(job)) return;
+  const ds = getDataset(job.datasetId);
+  if (!ds) { finishJob(job, 'failed', 'Dataset not found'); return; }
+  const opts = (job.opts || {}) as NormaliseLyricsOptions;
+
+  job.status = 'running';
+  job.startedAt = Date.now();
+  job.phase = 'normalise';
+  emitJob(job);
+
+  try {
+    const { targets } = await loadTargets(job, ds);
+    job.total = targets.length;
+    markPending(job, ds, targets);
+    const lyricsOf = (s: TrainingSample) => (loadSidecarMetadata(s.audioPath).lyrics ?? '').trim();
+    const retag = opts.retag === true
+      ? targets.filter(s => { const l = lyricsOf(s); return !!l && !hasSectionTags(l) && !s.isInstrumental; })
+      : [];
+    const retagPaths = new Set(retag.map(s => s.audioPath));
+    pushLog(`[Training] Normalise-lyrics job ${job.id} started — ${job.total} files, ${retag.length} without section tags`);
+    if (retag.length > 0) {
+      emitLog(job, 'info', `Recovering sections from audio (Music Flamingo) for ${retag.length} track(s) with no tags`);
+      prepareLocalLyrics(retag.map(s => s.audioPath), {
+        signal: job.controller.signal,
+        log: (level, message) => emitLog(job, level, message),
+      });
+    }
+    emitProgress(job);
+
+    let changed = 0, recovered = 0;
+    await runPooled(job, targets, 4, async (sample) => {
+      job.currentSampleId = sample.sampleId;
+      markProcessing(job, ds, sample);
+      try {
+        const before = lyricsOf(sample);
+        let next = before;
+        if (before && retagPaths.has(sample.audioPath)) {
+          const tagged = await takeLocalLyrics(sample.audioPath, {
+            signal: job.controller.signal,
+            log: (level, message) => emitLog(job, level, `${sample.filename}: ${message}`),
+          });
+          const withTags = tagged ? transferTags(before, tagged) : before;
+          if (withTags !== before) recovered++;
+          else emitLog(job, 'warn', `${sample.filename}: no sections recovered (the transcript did not line up with the lyrics)`);
+          next = withTags;
+        }
+        next = normaliseLyricTags(next);
+        if (next && next !== before) {
+          await mergeIntoSidecar(sample, { lyrics: next }, 'overwrite_lyrics', true);
+          changed++;
+        }
+        clearTransientStatus(job.datasetId, sample.sampleId);
+        const fresh = refreshSample(ds, sample);
+        pushEvent(job, { type: 'sample', sampleId: sample.sampleId, status: fresh.labelStatus, sample: fresh });
+        job.done++;
+      } catch (err: any) {
+        if (err instanceof AbortError || isCancelled(job)) return;
+        markError(job, ds, sample, err?.message || 'Lyrics normalisation failed');
+      }
+      emitProgress(job);
+    });
+
+    if (isCancelled(job)) return;
+    emitLog(job, 'info', `Normalised ${changed}/${targets.length} track(s)`
+      + (retag.length ? `; sections recovered for ${recovered}/${retag.length}` : ''));
+    refreshCounters(ds, await buildSamples(ds, { withDuration: false }));
+    finishJob(job, 'done');
+  } catch (err: any) {
+    if (isCancelled(job)) return;
+    finishJob(job, 'failed', err?.message || 'Lyrics normalisation failed');
+  } finally {
+    clearMossBatch();
+  }
+}
+
+export function startNormaliseLyricsJob(datasetId: string, sampleIds: string[], opts: NormaliseLyricsOptions): TrainingJob {
+  const job = createJob('normalise-lyrics', datasetId, sampleIds, opts);
+  enqueue(job, runNormaliseLyricsJob);
   return job;
 }
 
@@ -1550,6 +1957,26 @@ export function startYue2TrainJob(datasetId: string, opts: unknown): TrainingJob
   return job;
 }
 
+/** HeartMuLa audio -> HeartCodec codes + prompt ids (heartmulaRunner.ts). */
+export function startHeartmulaPrepareJob(datasetId: string, opts: unknown): TrainingJob {
+  const job = createJob('heartmula-prepare', datasetId, [], opts);
+  enqueue(job, async (j) => {
+    const { runHeartmulaPrepareJob } = await import('./heartmulaRunner.js');
+    await runHeartmulaPrepareJob(j);
+  });
+  return job;
+}
+
+/** HeartMuLa backbone LoRA training; new run or resume (heartmulaRunner.ts). */
+export function startHeartmulaTrainJob(datasetId: string, opts: unknown): TrainingJob {
+  const job = createJob('heartmula-train', datasetId, [], opts);
+  enqueue(job, async (j) => {
+    const { runHeartmulaTrainJob } = await import('./heartmulaRunner.js');
+    await runHeartmulaTrainJob(j);
+  });
+  return job;
+}
+
 /** Explicit Native AI Toolkit YuE2 joint trainer. Never aliases a Legacy job. */
 export function startYue2JointTrainJob(datasetId: string, opts: unknown): TrainingJob {
   const job = createJob('yue2-joint-train', datasetId, [], opts);
@@ -1707,6 +2134,15 @@ export function startTrainDitJob(datasetId: string, opts: unknown): TrainingJob 
   enqueue(job, async (j) => {
     const { runTrainDitJob } = await import('./trainDitRunner.js');
     await runTrainDitJob(j);
+  });
+  return job;
+}
+
+export function startSa3TrainJob(datasetId: string, opts: unknown): TrainingJob {
+  const job = createJob('sa3-train', datasetId, [], opts);
+  enqueue(job, async j => {
+    const { runSa3TrainJob } = await import('./trainSa3Runner.js');
+    await runSa3TrainJob(j);
   });
   return job;
 }

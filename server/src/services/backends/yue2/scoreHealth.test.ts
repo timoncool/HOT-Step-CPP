@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { classifyYue2Score, hasSoundingVocalBar, yue2PlanDraws, yue2StyleNorms } from './scoreHealth.js';
+import { classifyYue2Score, hasSoundingScore, hasSoundingVocalBar, yue2PlanDraws, yue2StyleNorms } from './scoreHealth.js';
 import { scoreBarClock } from './scoreClock.js';
 import { scoreSections } from './scoreSections.js';
 
@@ -133,4 +133,12 @@ test('a check the dataset\'s own sheets fail is not held against its plans', () 
   // A sung album keeps the vocal checks.
   const sung = yue2StyleNorms([1, 2, 3].map(() => ({ abc: song(120, 2, ['verse', 'chorus', 'verse', 'chorus']) })));
   assert.ok(!sung.exempt.includes('silence') && !sung.exempt.includes('thin-vocal'));
+});
+
+test('hasSoundingScore lets an instrumental cover use Ins while vocal stays strict', () => {
+  const silentVocal = 'X:1\nV: Vocal\nZ4|\nV: Ins\nC4|';
+  assert.equal(hasSoundingScore(silentVocal), true);       // instrumental render accepts
+  assert.equal(hasSoundingVocalBar(silentVocal, true), false); // vocal render / training reject
+  assert.equal(hasSoundingScore('X:1\nV: Ins\nK:C\nGABc|'), true); // Ins-only
+  assert.equal(hasSoundingScore('X:1\nV: Vocal\nZ4|\nV: Ins\nzzzz|'), false);
 });

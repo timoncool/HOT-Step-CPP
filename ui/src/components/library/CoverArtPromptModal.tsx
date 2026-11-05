@@ -17,10 +17,10 @@ import { X, Image as ImageIcon, Loader2, Sparkles, RotateCcw } from 'lucide-reac
 import { useTranslation } from 'react-i18next';
 import type { Song } from '../../types';
 import { apiClient } from '../../services/httpClient';
+import { useCoverArtGeneration, songPromptInputs } from '../../hooks/useCoverArtGeneration';
 import { pollWhile } from '../../queries/contract';
-import { serverKey } from '../../queries/keys';
+import { coverArtJobOptions, type CoverArtJob } from '../../queries/shell-queue/queue';
 
-interface CoverArtJob { status: string; error?: string; result?: { coverUrl?: string } }
 const coverArtEnded = (job: CoverArtJob | undefined) => job?.status === 'succeeded' || job?.status === 'failed';
 /** Give up following a job after this long; the server keeps working. */
 const COVER_ART_FOLLOW_MS = 300_000;
@@ -37,62 +37,50 @@ export function openCoverArtPrompt(song: Song): void {
   }));
 }
 
-/** Build the metadata payload used for both preview and generation. */
-function songPromptInputs(song: Song) {
-  const params: any = song.generationParams || (song as any).generation_params || {};
-  return {
-    title: song.title || '',
-    style: song.style || params?.style || '',
-    lyrics: song.lyrics || params?.lyrics || '',
-    subject: (song as any).cover_art_subject || params?.coverArtSubject || params?.subject || '',
-  };
-}
-
 export const CoverArtPromptModal: React.FC = () => {
   const { t } = useTranslation();
   const [song, setSong] = useState<Song | null>(null);
   const [prompt, setPrompt] = useState('');
   const [defaultPrompt, setDefaultPrompt] = useState('');
   const [loadingPreview, setLoadingPreview] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [error, setError] = useState('');
-  // The generation being followed. Clearing it stops the poll.
-  const [jobId, setJobId] = useState<string | null>(null);
+  const { jobId, error, generating, generate, clearError, resetJob, fail } =
+    useCoverArtGeneration(song, prompt);
   const queryClient = useQueryClient();
 
   const close = useCallback(() => {
-    setJobId(null);
+    resetJob();
+    clearError();
     setSong(null);
     setPrompt('');
     setDefaultPrompt('');
-    setError('');
-    setGenerating(false);
-  }, []);
+  }, [resetJob, clearError]);
 
   // Listen for open requests
   useEffect(() => {
-    const onOpen = (e: Event) => {
+    const onOpen = async (e: Event) => {
       const detail = (e as CustomEvent<OpenCoverArtPromptDetail>).detail;
       if (!detail?.song) return;
       setSong(detail.song);
-      setError('');
-      setGenerating(false);
-      // Fetch the auto-assembled prompt to pre-fill
+      clearError();
+      // One-shot read that seeds the textarea — never cached, so it goes
+      // straight through the transport (the interceptor reports a failed
+      // preview; the modal opens with an empty prompt either way).
       setLoadingPreview(true);
       setPrompt('');
-      fetch('/api/cover-art/prompt-preview', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(songPromptInputs(detail.song)),
-      })
-        .then(r => (r.ok ? r.json() : Promise.reject()))
-        .then(d => { setPrompt(d.prompt || ''); setDefaultPrompt(d.prompt || ''); })
-        .catch(() => { setPrompt(''); setDefaultPrompt(''); })
-        .finally(() => setLoadingPreview(false));
+      try {
+        const d = await apiClient.post<{ prompt?: string }>('/cover-art/prompt-preview', songPromptInputs(detail.song));
+        setPrompt(d.prompt || '');
+        setDefaultPrompt(d.prompt || '');
+      } catch {
+        setPrompt('');
+        setDefaultPrompt('');
+      } finally {
+        setLoadingPreview(false);
+      }
     };
     window.addEventListener('open-cover-art-prompt', onOpen);
     return () => window.removeEventListener('open-cover-art-prompt', onOpen);
-  }, []);
+  }, [clearError]);
 
   // Follow the job: Query polls it, one request at a time, and stops at a
   // terminal status. Errors and non-OK replies keep polling (with backoff)
@@ -101,12 +89,10 @@ export const CoverArtPromptModal: React.FC = () => {
   useEffect(() => {
     if (!jobId || !song) return;
     const observer = new QueryObserver(queryClient, {
-      queryKey: serverKey('shell-queue/cover-art-job', { id: jobId }),
-      queryFn: ({ signal }) => apiClient.get<CoverArtJob>(`/cover-art/generate/${encodeURIComponent(jobId)}`, { signal }),
-      staleTime: 0,
+      ...coverArtJobOptions(jobId),
       refetchInterval: pollWhile<CoverArtJob>(j => !coverArtEnded(j), 2000),
     });
-    const timer = setTimeout(() => { setJobId(null); setGenerating(false); }, COVER_ART_FOLLOW_MS);
+    const timer = setTimeout(() => resetJob(), COVER_ART_FOLLOW_MS);
     const unsubscribe = observer.subscribe(({ data }) => {
       if (!coverArtEnded(data)) return;
       unsubscribe();
@@ -116,49 +102,11 @@ export const CoverArtPromptModal: React.FC = () => {
         }));
         close();
       } else {
-        setJobId(null);
-        setError(data!.error || 'Generation failed');
-        setGenerating(false);
+        fail(data!.error || 'Generation failed');
       }
     });
     return () => { unsubscribe(); clearTimeout(timer); };
-  }, [jobId, song, queryClient, close]);
-
-  const generate = useCallback(() => {
-    if (!song || !prompt.trim()) return;
-    setGenerating(true);
-    setError('');
-    fetch('/api/cover-art/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        songId: song.id,
-        ...songPromptInputs(song),
-        prompt: prompt.trim(),
-      }),
-    })
-      .then(async r => {
-        if (!r.ok) {
-          const d = await r.json().catch(() => ({}));
-          // 503 means the weights are absent, not that anything went wrong.
-          // "Cover art not installed" on its own sent people hunting through
-          // Settings and the Model Manager for a download that lives in the
-          // Post-Processing menu instead (issue #108), so say where it is and
-          // which files are missing.
-          if (r.status === 503) {
-            const missing: string[] = Array.isArray(d.missingFiles) ? d.missingFiles : [];
-            throw new Error(
-              'Cover art models are not downloaded yet. Open the Cover Art section '
-              + 'of the Post-Processing menu in the top bar and download a model there.'
-              + (missing.length ? ` Missing: ${missing.join(', ')}.` : '')
-            );
-          }
-          throw new Error(d.error || 'Failed to start generation');
-        }
-        setJobId((await r.json()).jobId);
-      })
-      .catch(err => { setError(err.message); setGenerating(false); });
-  }, [song, prompt]);
+  }, [jobId, song, queryClient, close, resetJob, fail]);
 
   if (!song) return null;
 

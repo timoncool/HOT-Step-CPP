@@ -24,5 +24,5 @@ export async function deleteCovers(ids: string[]) {
     await queryClient.cancelQueries({ queryKey });
     queryClient.setQueryData<{ songs: Song[] }>(queryKey, old => old && ({ songs: old.songs.filter(s => !ids.includes(s.id)) }));
     await songsChanged();
-  } finally { await queryManager.keys(queryClient, queryKey); }
+  } finally { await queryManager.invalidate(queryClient, queryKey); }
 }

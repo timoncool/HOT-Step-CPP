@@ -130,6 +130,11 @@ export interface GenerationParams {
   lmNegativePrompt: string;
   /** LM repetition penalty (>1 enables) + lookback window in codes. */
   lmRepPenalty?: number;
+  /** Code-phase min-p and opt-in CFG refinements (0/false = off). */
+  lmMinP?: number;
+  lmCfgMinP?: number;
+  lmCfgLogprob?: boolean;
+  lmCfgRescale?: number;
   lmRepWindow?: number;
   /** How the penalty is applied: 'presence' (legacy), 'frequency', or 'dry'. */
   lmRepMode?: LmRepMode;

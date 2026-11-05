@@ -5,7 +5,7 @@
 //   (cd server && node --import tsx --test ../ui/src/components/training-studio/ReviewPanel.test.ts)
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { selectFinishable } from './ReviewPanel.tsx';
+import { awaitingReview, selectFinishable } from './ReviewPanel.tsx';
 import type { Yue2ReviewRow } from '../../services/trainingApi.js';
 
 function row(over: Partial<Yue2ReviewRow>): Yue2ReviewRow {
@@ -16,6 +16,20 @@ function row(over: Partial<Yue2ReviewRow>): Yue2ReviewRow {
     decoderOnly: false, ...over,
   };
 }
+
+test('a completed joint run without previews stays visible awaiting review', () => {
+  const run = row({ baseMatched: true, previews: 0, scored: 0, unscored: 2, reviewed: false, best: null });
+  assert.equal(awaitingReview(run), true);
+  assert.deepEqual(selectFinishable([run], new Set()), []);
+});
+
+test('previews arriving do not remove the run; review completion does', () => {
+  const run = row({ unscored: 2, reviewed: false });
+  assert.equal(awaitingReview(run), true);
+  assert.equal(awaitingReview({ ...run, reviewed: true }), false);
+  assert.equal(awaitingReview({ ...run, finished: true }), false);
+  assert.equal(awaitingReview({ ...run, unscored: 0 }), false);
+});
 
 test('a scored, finished, worker-origin row is still finishable', () => {
   const out = selectFinishable([row({ origin: 'LivingRoom' })], new Set());

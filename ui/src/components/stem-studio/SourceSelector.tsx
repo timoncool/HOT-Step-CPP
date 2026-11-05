@@ -1,25 +1,11 @@
 import { useQuery } from '@tanstack/react-query';
-import { serverKey } from '../../queries/keys';
-import { apiClient } from '../../services/httpClient';
+import { studioRecentSongsOptions } from '../../queries/studios/resources';
 // SourceSelector.tsx — Upload or pick existing track for stem extraction
 import React, { useState, useCallback, useRef } from 'react';
 import { Upload, Music, Search, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../context/AuthContext';
 import { useUpload } from '../../queries/writes';
-
-interface Song {
-  id: string;
-  title: string;
-  audio_url: string;
-  mastered_audio_url?: string;
-  source: string;
-  created_at: string;
-  artist_name?: string;
-  style?: string;
-  lyrics?: string;
-  caption?: string;
-}
 
 interface SourceSelectorProps {
   sourceAudioUrl: string;
@@ -46,8 +32,7 @@ export const SourceSelector: React.FC<SourceSelectorProps> = ({ sourceAudioUrl, 
   const fileRef = useRef<HTMLInputElement>(null);
 
   const songsQuery = useQuery({
-    queryKey: serverKey('studios/recent-songs', { auth: true, filters: { source: filter === 'all' ? undefined : filter, limit: 50 } }),
-    queryFn: ({ signal }) => apiClient.get<{ songs: Song[] }>(`/songs/recent?limit=50${filter === 'all' ? '' : `&source=${encodeURIComponent(filter)}`}`, { signal }),
+    ...studioRecentSongsOptions(filter === 'all' ? 'all' : filter),
     enabled: showPicker && !!token,
   });
   const songs = songsQuery.data?.songs ?? [];

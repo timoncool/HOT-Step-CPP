@@ -1,5 +1,6 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { aceModelsOptions, localOptions, adapterScanOptions } from '../../queries/global-models/options';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { aceModelsOptions, lmAdaptersOptions } from '../../queries/global-models/options';
+import { QueryError } from '../shared/QueryError';
 import { queryManager } from '../../queries/invalidation';
 // AdaptersDropdown.tsx — Adapter configuration UI for the global param bar
 //
@@ -54,21 +55,28 @@ export const AdaptersDropdown: React.FC = () => {
 
   // Internal state
   const client = useQueryClient();
-  const [scanFolder, setScanFolder] = useState('');
-  const { data: scan } = useQuery({ ...adapterScanOptions(scanFolder), enabled: false });
-  const adapterFiles: AdapterFile[] = scan?.files ?? [];
   const [showGroupScales, setShowGroupScales] = usePersistedState('hs-adapterAccordion-groupScales', false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
-  const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
+  // The folder scan is a one-shot command, not an observed feed: it writes no
+  // server state and its answer only seeds this panel, so it is a mutation.
+  const scanMut = useMutation({
+    mutationFn: (dir: string) => adapterApi.scan(dir),
+    onMutate: () => setScanError(null),
+    onSuccess: (result) => {
+      if (result.files.length === 0) setScanError('No .safetensors files found in this folder');
+    },
+    onError: (err: Error) => setScanError(err.message || 'Failed to scan folder'),
+  });
+  const adapterFiles: AdapterFile[] = scanMut.data?.files ?? [];
+  const scanning = scanMut.isPending;
   const { data: models } = useQuery(aceModelsOptions());
   const ditModels = models?.models?.dit ?? [];
   const folder = gp.lmAdapterFolder || '';
-  const lmOptions = localOptions<Awaited<ReturnType<typeof adapterApi.lmList>>>(
-    'lm-adapters', `/adapters/lm${folder ? `?folder=${encodeURIComponent(folder)}` : ''}`, { folder });
+  const lmOptions = lmAdaptersOptions(folder);
   const lmQuery = useQuery(lmOptions);
   const lmAdapters = lmQuery.data?.adapters ?? [];
-  const refreshLmAdapters = useCallback(() => { void queryManager.keys(client, lmOptions.queryKey); }, [client, folder]);
+  const refreshLmAdapters = useCallback(() => { void queryManager.invalidate(client, lmOptions.queryKey); }, [client, folder]);
 
   const fileBrowserMode = gp.advancedAdapters ? 'folder' as const : 'file' as const;
   // In advanced mode the stack drives everything; in simple mode the single adapter does.
@@ -117,25 +125,11 @@ export const AdaptersDropdown: React.FC = () => {
     gp.setAdapterGroupScales({ ...gp.adapterGroupScales, [key]: value });
   };
 
-  const handleScan = useCallback(async (folder?: string) => {
+  const handleScan = useCallback((folder?: string) => {
     const dir = folder || gp.adapterFolder;
     if (!dir) return;
-    setScanning(true);
-    setScanError(null);
-    try {
-      setScanFolder(dir);
-      const key = adapterScanOptions(dir).queryKey;
-      await queryManager.keys(client, key);
-      const result = await client.query(adapterScanOptions(dir));
-      if (result.files.length === 0) {
-        setScanError('No .safetensors files found in this folder');
-      }
-    } catch (err: any) {
-      setScanError(err?.message || 'Failed to scan folder');
-    } finally {
-      setScanning(false);
-    }
-  }, [gp.adapterFolder, client]);
+    scanMut.mutate(dir);
+  }, [gp.adapterFolder, scanMut]);
 
   const handleBrowseSelect = (path: string) => {
     setFileBrowserOpen(false);
@@ -149,6 +143,7 @@ export const AdaptersDropdown: React.FC = () => {
 
   return (
     <div className="space-y-3">
+      {lmQuery.isError && <QueryError error={lmQuery.error} onRetry={() => void lmQuery.refetch()} compact />}
       <Toggle
         size="sm"
         checked={adapterRuntimeDora === true}
@@ -267,7 +262,7 @@ export const AdaptersDropdown: React.FC = () => {
             <div className="text-xs text-amber-400/70 px-1">{scanError}</div>
           )}
 
-          {adapterFiles.length > 0 && (
+          {adapterFiles.length > 0 && !scanError && (
             <div className="rounded-xl bg-zinc-50/80 dark:bg-zinc-900/50 border border-zinc-200 dark:border-white/5 overflow-hidden" style={{ maxHeight: '200px', overflowY: 'auto' }}>
               {adapterFiles.map((file) => {
                 const isActive = stack.some(a => a.path === file.path);
@@ -594,7 +589,7 @@ export const AdaptersDropdown: React.FC = () => {
             <ParamLabel label={t('adapter.loadingMode')} rootClassName="flex mb-1.5"
               className="text-xs font-medium text-zinc-500 uppercase tracking-wider"
               info={gp.adapterMode === 'runtime_lowrank'
-                ? "Applies raw adapter factors per step, never materializing full deltas — the lowest VRAM option (LoRA and LoKr; DoRA needs Merge). Basin re-base still works."
+                ? "Applies raw adapter factors per step instead of full deltas, the lowest VRAM option for LoRA and LoKr. DoRA magnitudes are skipped here unless Runtime DoRA magnitudes is on, which builds full-size deltas. Basin re-base still works."
                 : gp.adapterMode === 'runtime'
                 ? 'Keeps base weights intact and applies the adapter per step. Same quality, slower inference, saves VRAM.'
                 : 'Merges the adapter at F32 precision. Best quality and fast inference, but uses more VRAM during synthesis.'}

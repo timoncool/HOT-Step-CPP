@@ -21,6 +21,21 @@ import { CAPTION_DIMENSIONS } from '../training/captionPrompt.js';
 /** Loose profile shape — accepts both the app's LyricsProfile and the MCP's raw profile_data JSON. */
 export type PromptProfile = Record<string, any>;
 
+export const SCRATCH_LYRICS_SYSTEM_PROMPT = `Write an original, complete song from the user's brief.
+Use optional starter lyrics for their meaning and idea. Do not quote unrelated existing songs.
+Follow the requested language, style and structure. Label sections with square brackets, such as [Verse] and [Chorus].
+Return only a JSON object with title, lyrics (a string with newline escapes), caption (a short musical style description), bpm (a number from 30 to 300), and key (or an empty string if unspecified).
+No markdown fences, explanation or reasoning.`;
+
+export function buildScratchLyricsPrompt(input: {
+  theme: string; style: string; structure: string; existingLyrics: string;
+}): string {
+  return `Write a complete lyric using this brief:\n${JSON.stringify({
+    theme: input.theme, style: input.style, structure: input.structure,
+    starter_lyrics: input.existingLyrics,
+  }, null, 2)}`;
+}
+
 // ── Blueprint helpers ───────────────────────────────────────────────────────
 
 // ── Section-tag vocabulary ──────────────────────────────────────────────────

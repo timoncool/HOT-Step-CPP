@@ -4,7 +4,9 @@
 capture the selected worker in their canonical key and pass that worker and
 Query's abort signal to the transport. Local run indexes, review records,
 previews and worker administration retain their local routes. They omit the
-worker scope even when Train on points to a remote machine.
+worker scope even when Train on points to a remote machine. SA3 checkpoint
+previews live in their own folder, `../sa3-previews/`, but key into this area
+as `training-runs/sa3-previews` with the worker captured.
 
 GPU reads use `sharedKeys.gpus()`. Preparation detail and current job use
 `sharedKeys.preparation(id)` and `sharedKeys.preparationJob(id)`, sharing the
@@ -15,19 +17,26 @@ also invalidate shared preparation snapshots.
 `hooks.ts` retains only job/pipeline IDs and reload signals as client state.
 Job adoption is guarded by a selection generation, including a switch away
 and back to the same worker or dataset. Query owns the job object and polling.
-Read cancellation only cancels the HTTP read; it never cancels a server job.
+`useActiveTrainingJob()` reads the selected job from that one cache entry; the
+store keeps only `activeJobId`, the worker, and the sample/log/preview/metric
+reducers. Read cancellation only cancels the HTTP read; it never cancels a
+server job.
 
 `events.ts` shares the existing job EventSource with chart/log reducers.
-Terminal events invalidate snapshots once per job and captured worker, including
-replayed events. Reconnect invalidates authoritative snapshots. Teardown drops
+Job, progress and status frames merge through `jobFrame.ts`, the job cache's one
+rule; the store keeps no job copy. Terminal events invalidate snapshots once per job and
+captured worker, including replayed events. Reconnect invalidates authoritative snapshots. Teardown drops
 late frames. Metrics, preview rows received over SSE, form values, selections,
 score-note drafts, playback and wall-clock timers remain client state.
 
-Commands run from user actions or the existing explicit workflow executor.
-`runCommand` executes a command once and invalidates the captured scope after
-success. It never retries a submission. Training-store actions retain their
-published scoped signatures and their own cache invalidation. Recipe resolution,
-preset resolution and preparation context capture remain command-time operations.
+Commands run from user actions or the existing explicit workflow executor as
+component `useMutation` hooks whose success callback calls `trainingWritePlan`.
+A command executes once and invalidates the captured scope after success; it
+never retries a submission. `trainingWritePlan` accepts explicit keys for
+resources whose canonical key carries no worker scope (the unscoped workers
+list, per-dataset rows). Training-store actions retain their published scoped
+signatures and their own cache invalidation. Recipe resolution, preset
+resolution and preparation context capture remain command-time operations.
 Caption-before-training remains an explicit sequential workflow; its job reads
 use the canonical training-data job cache rather than a separate transport.
 
@@ -36,7 +45,10 @@ use the canonical training-data job cache rather than a separate transport.
 | Consumers | Snapshot owner |
 |---|---|
 | `useMm3Status`, `useYue2Status`, `useYue2ArStatus` | Worker-scoped Query status, invalidated by job events |
-| `TrainPanel` | Canonical training-data LM/DiT status queries; cached recipes seed untouched form fields |
+| `TrainPanel` | Phase host with no reads of its own: hands the section to the target's plug-in (`trainingPlugins.tsx`) and, for non-ACE targets, keeps the job stream and run-event bridge |
+| `plugins/ace.tsx` | Canonical training-data LM/DiT status queries; cached recipes seed untouched form fields; owns the ACE job stream and run events |
+| `Sa3TrainCard` | Worker-scoped `training-data/sa3-status` (built in the component, see tanstack-query.md F4#17) and `training-runs/sa3-previews` (`../sa3-previews/`); local `global-models/sa3-adapters`; audition renders follow `shell-queue/generation-status`; start, cancel, render and audition are `useMutation`s |
+| `TrainingPreviewPanel` | Shared checkpoint-preview view for the MM3, YuE2 and SA3 cards and the YuE2 ladder review; renders rows its caller has already read |
 | `MonitorPanel`, `Yue2BatchPanel` | Canonical training-data pipeline/batch/job queries; scoped store actions submit commands |
 | `Mm3RunsPanel`, `Yue2RunsList`, `Yue2ArRunsList` | Local Query run indexes, refreshed after job transitions |
 | `Yue2AitkTrainCard` | Query jobs, preparation defaults, local runs/previews, pipeline/job snapshots, GPU and worker lists |
@@ -46,7 +58,7 @@ use the canonical training-data job cache rather than a separate transport.
 | `Yue2OptimisePanel` | Worker-scoped Query optimise snapshot and job |
 | `WorkersPanel` | Canonical local worker list and Query update status per worker |
 | `TrainLmForm`, `TrainDitForm`, `Mm3TrainCard`, `Mm3CodesCard`, `Yue2TrainCard`, `Yue2StageCard`, `Yue2ArTrainCard`, `Yue2AitkBatchWizard` | Forms, pure estimates, cached status hooks and scoped training-store actions |
-| `TrainingRunStats`, `TrainingChart`, `Mm3PreviewStrip` | Scoped store compatibility projection and SSE reducers; elapsed-time/audio UI only |
+| `TrainingRunStats`, `TrainingChart`, `Mm3PreviewStrip` | Active job via `useActiveTrainingJob` (Query cache); charts, elapsed-time and audio UI stay client-owned |
 
 ## Endpoints and cadence for runtime acceptance
 
@@ -61,6 +73,8 @@ Other routes explicitly remain local.
 | Worker `pipelines` | 2 s while running/paused; stop when terminal |
 | Worker `yue2-batch` | 3 s while running/paused; stop when terminal |
 | Worker `datasets/:id/yue2-sheet` and source detail | List every 5 s while open and live; detail on selection |
+| Worker `datasets/:id/sa3-train` | Always fresh (`staleTime` 0); 1.5 s while its job is queued or running |
+| Worker `datasets/:id/sa3-previews?run=...` | 1.5 s while a cell is queued or rendering, or the training job is active; a render or retry invalidates that dataset's previews |
 | Local `datasets/:id/mm3-runs`, `yue2-runs`, `yue2-ar-runs` | 30 s freshness; job transitions invalidate |
 | Local `datasets/:id/yue2-joint-runs` | 5 s while a local run is live or the displayed job is active |
 | Local `datasets/:id/yue2-joint-previews?run=...` | 5 s while live; joint training retains the existing 30-minute drain window for parallel previews |

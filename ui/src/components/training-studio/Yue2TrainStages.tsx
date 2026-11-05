@@ -24,12 +24,12 @@
 // The preflight line is advisory; the server checks current artifacts before
 // each accepted stage. The status panel polls the durable command on reconnect.
 
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ListChecks, Loader2, XCircle } from 'lucide-react';
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { pollWhile } from '../../queries/contract';
-import { runCommand, runQueries } from '../../queries/training-runs/queries';
+import { runQueries, trainingWritePlan } from '../../queries/training-runs/queries';
 import type { Yue2PreparationSummary } from '../../services/trainingPreparationApi';
 
 import { commandYue2Preparation } from '../../services/trainingPreparationApi';
@@ -46,11 +46,10 @@ import { Yue2ClearPreparedCard } from './Yue2ClearPreparedCard';
 import { Yue2PreprocessCard } from './Yue2TrainCard';
 import { useYue2ArStatus } from './useYue2ArStatus';
 import { useYue2Status } from './useYue2Status';
+import { TrainingAllStagesCard, TrainingBatchCard } from './Yue2StageCard';
+import { useActiveTrainingJob } from '../../queries/training-runs/hooks';
 
 const CARD = 'rounded-xl border border-zinc-200 dark:border-white/5 bg-white dark:bg-suno-card p-4';
-const BTN_RUNALL = 'w-full px-4 py-2.5 rounded-lg text-sm font-semibold bg-amber-500 text-black '
-                  + 'hover:bg-amber-400 disabled:opacity-40 disabled:cursor-not-allowed transition-colors '
-                  + 'flex items-center justify-center gap-2';
 const LYRIC_TIMING_KEY = 'hs-yue2-aitk-lyric-timing:';
 const RunAllControl: React.FC<{
   datasetId: string;
@@ -87,30 +86,22 @@ const RunAllControl: React.FC<{
   };
 
   return (
-    <div className={CARD}>
-      <p className="text-[11px] text-zinc-500 leading-relaxed mb-1">
-        {skipLabels.length > 0
-          ? t('trainingStudio.yue2.runAllPreflightSkip',
-              'Runs every stage below that is not already complete, in order. Already done, so skipped: '
-              + '{{skip}}.', { skip: skipLabels.join(', ') })
-          : preflightAll ?? t('trainingStudio.yue2.runAllPreflight',
-              'Runs all seven stages below in order, from the latent cache through the AR LoRA.')}
-      </p>
-      <p className="text-[10px] text-zinc-500 leading-snug mb-3">
-        {t('trainingStudio.yue2.runAllReloadWarning',
-          'Preparation continues on the server if you close or reload this page. Return here to see its status.')}
-      </p>
-      <button
-        onClick={() => { if (onRun) onRun(); else void runYue2AllStages(datasetId, trigger); }}
-        disabled={disabled}
-        className={BTN_RUNALL}
-      >
-        {runAllActive ? <Loader2 size={15} className="animate-spin" /> : <ListChecks size={15} />}
-        {runAllActive && runAllStage
-          ? t('trainingStudio.yue2.runAllRunning', 'Running stage {{n}} of {{total}}: {{name}}',
-              { n: runAllStage, total, name: stageName(runAllStage) })
-          : t('trainingStudio.yue2.runAllStart', 'Perform all stages')}
-      </button>
+    <TrainingAllStagesCard
+      description={skipLabels.length > 0
+        ? t('trainingStudio.yue2.runAllPreflightSkip',
+            'Runs every stage below that is not already complete, in order. Already done, so skipped: '
+            + '{{skip}}.', { skip: skipLabels.join(', ') })
+        : preflightAll ?? t('trainingStudio.yue2.runAllPreflight',
+            'Runs all seven stages below in order, from the latent cache through the AR LoRA.')}
+      hint={t('trainingStudio.yue2.runAllReloadWarning',
+        'Preparation continues on the server if you close or reload this page. Return here to see its status.')}
+      onRun={() => { if (onRun) onRun(); else void runYue2AllStages(datasetId, trigger); }}
+      disabled={disabled}
+      icon={runAllActive ? <Loader2 size={15} className="animate-spin" /> : <ListChecks size={15} />}
+      label={runAllActive && runAllStage
+        ? t('trainingStudio.yue2.runAllRunning', 'Running stage {{n}} of {{total}}: {{name}}',
+            { n: runAllStage, total, name: stageName(runAllStage) })
+        : t('trainingStudio.yue2.runAllStart', 'Perform all stages')}>
       {!runAllActive && jobBusyElsewhere && (
         <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-2">
           {t('trainingStudio.yue2.runAllBusyElsewhere',
@@ -126,7 +117,7 @@ const RunAllControl: React.FC<{
       >
         <ListChecks size={12} /> {t('trainingStudio.yue2.batch.ctaInline', 'Queue several datasets…')}
       </button>
-    </div>
+    </TrainingAllStagesCard>
   );
 };
 
@@ -150,7 +141,7 @@ export const Yue2TrainStages: React.FC<{ datasetId: string; trigger?: string; se
   });
   const [, setTimingLocked] = useState(false);
   const storeError = useTrainingStore(s => s.error);
-  const activeJob = useTrainingStore(s => s.activeJob);
+  const activeJob = useActiveTrainingJob();
   const yue2RunAllActive = useTrainingStore(s => s.yue2RunAllActive);
   const yue2RunAllStage = useTrainingStore(s => s.yue2RunAllStage);
   const runYue2JointStages = useTrainingStore(s => s.runYue2JointStages);
@@ -165,11 +156,15 @@ export const Yue2TrainStages: React.FC<{ datasetId: string; trigger?: string; se
     refetchInterval: pollWhile<Yue2PreparationSummary[]>(data => yue2RunAllActive || !data
       || data.some(p => !['done', 'failed', 'cancelled', 'interrupted'].includes(p.status))) });
   const preparation = preparationQuery.data?.[0] ?? null;
-  const controlPreparation = async (action: 'pause' | 'resume' | 'cancel' | 'retry') => {
+  const controlMut = useMutation({
+    mutationFn: ({ id, action }: { id: string; action: 'pause' | 'resume' | 'cancel' | 'retry' }) => commandYue2Preparation(id, action),
+    onSuccess: () => void trainingWritePlan(client, null),
+    onError: error => setCaptureError(error instanceof Error ? error.message : String(error)),
+  });
+  const controlPreparation = (action: 'pause' | 'resume' | 'cancel' | 'retry') => {
     if (!preparation) return;
     setCaptureError(null);
-    try { await runCommand(client, null, () => commandYue2Preparation(preparation.id, action)); }
-    catch (error) { setCaptureError(error instanceof Error ? error.message : String(error)); }
+    controlMut.mutate({ id: preparation.id, action });
   };
   const startJointChain = async () => {
     setCaptureError(null);
@@ -295,10 +290,10 @@ export const Yue2TrainStages: React.FC<{ datasetId: string; trigger?: string; se
         </div>
         {preparation.error && <p className="mt-1 text-xs text-red-500">{preparation.error}</p>}
         <div className="mt-2 flex gap-2 text-xs">
-          {preparation.status === 'running' && <button className="text-amber-600 hover:underline" onClick={() => void controlPreparation('pause')}>{t('trainingStudio.yue2.preparationPause', 'Pause')}</button>}
-          {(preparation.status === 'paused' || preparation.status === 'pausing') && <button className="text-amber-600 hover:underline" onClick={() => void controlPreparation('resume')}>{t('trainingStudio.yue2.preparationResume', 'Resume')}</button>}
-          {['running', 'pausing', 'paused'].includes(preparation.status) && <button className="text-red-500 hover:underline" onClick={() => void controlPreparation('cancel')}>{t('trainingStudio.yue2.preparationCancel', 'Cancel')}</button>}
-          {['failed', 'interrupted'].includes(preparation.status) && <button className="text-amber-600 hover:underline" onClick={() => void controlPreparation('retry')}>{t('trainingStudio.yue2.preparationRetry', 'Retry')}</button>}
+          {preparation.status === 'running' && <button className="text-amber-600 hover:underline" disabled={controlMut.isPending} onClick={() => controlPreparation('pause')}>{t('trainingStudio.yue2.preparationPause', 'Pause')}</button>}
+          {(preparation.status === 'paused' || preparation.status === 'pausing') && <button className="text-amber-600 hover:underline" disabled={controlMut.isPending} onClick={() => controlPreparation('resume')}>{t('trainingStudio.yue2.preparationResume', 'Resume')}</button>}
+          {['running', 'pausing', 'paused'].includes(preparation.status) && <button className="text-red-500 hover:underline" disabled={controlMut.isPending} onClick={() => controlPreparation('cancel')}>{t('trainingStudio.yue2.preparationCancel', 'Cancel')}</button>}
+          {['failed', 'interrupted'].includes(preparation.status) && <button className="text-amber-600 hover:underline" disabled={controlMut.isPending} onClick={() => controlPreparation('retry')}>{t('trainingStudio.yue2.preparationRetry', 'Retry')}</button>}
         </div>
       </div>
     );
@@ -336,17 +331,8 @@ export const Yue2TrainStages: React.FC<{ datasetId: string; trigger?: string; se
       <div className="flex flex-col gap-4">
         {errorBanner}
         {preparationStatus}
-        <div className={CARD}>
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">{t('trainingStudio.yue2.aitkBatch.title', 'Train several datasets')}</h3>
-              <p className="text-[11px] text-zinc-500 mt-1">{t('trainingStudio.yue2.aitkBatch.short', 'Run preparation and joint AR + NAR training for multiple datasets in sequence.')}</p>
-            </div>
-            <button type="button" onClick={() => setAitkBatchOpen(true)} className="shrink-0 rounded-lg bg-amber-500 px-3 py-2 text-xs font-semibold text-black hover:bg-amber-400">
-              <ListChecks size={14} className="inline mr-1" />{t('trainingStudio.yue2.aitkBatch.open', 'Train multiple')}
-            </button>
-          </div>
-        </div>
+        <TrainingBatchCard onOpen={() => setAitkBatchOpen(true)}
+          description={t('trainingStudio.yue2.aitkBatch.short', 'Run preparation and joint AR + NAR training for multiple datasets in sequence.')} />
         {jointRunAllControl}
         <p className="text-[11px] text-zinc-500 -mt-2">{t('trainingStudio.yue2.prepareMoved', 'Latent cache, codes, lead sheets and lyric timing are on the Prepare page. Perform all stages still runs any of them that are missing before training.')}</p>
         <Yue2AitkTrainCard key={datasetId} datasetId={datasetId} legacyManifest={arStatus?.manifestPath || yue2Status?.manifestPath}

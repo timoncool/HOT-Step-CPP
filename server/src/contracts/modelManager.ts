@@ -10,18 +10,27 @@
 
 export type FileRole =
   | 'dit' | 'lm' | 'embedding' | 'vae' | 'pp-vae' | 'supersep' | 'whisper'
-  | 'stablestep' | 'runtime' | 'mm3' | 'moss' | 'yue2';
+  | 'stablestep' | 'runtime' | 'mm3' | 'moss' | 'yue2' | 'heartmula' | 'muscriptor';
 
 /** Which generation backend (or "shared" across several) a file belongs to.
  *  Absent on entries added before this field existed; the UI falls back to
  *  a role -> family mapping in that case. */
-export type FileFamily = 'as1.5' | 'mm3' | 'yue2' | 'shared';
+export type FileFamily = 'as1.5' | 'mm3' | 'yue2' | 'sa3' | 'heartmula' | 'shared';
 
 export interface RegistryCompanion {
   filename: string;
   /** Path within the HuggingFace repo; defaults to filename. */
   repoPath?: string;
+  /** Part of the install, not a side file: fetched with the HF token and
+   *  validated, its failure fails the job, and the entry is not installed
+   *  without it. Absent = best-effort extra (a LICENSE). */
+  required?: boolean;
 }
+
+/** MIDI Studio models (#228): the four weights folders under
+ *  <models>/muscriptor. An entry with this set is located, installed and
+ *  deleted through services/muscriptorPaths.ts, not by filename. */
+export type MuscriptorModelId = 'small' | 'medium' | 'large' | 'beat-this';
 
 /** One catalogue entry, before installed-status enrichment. */
 export interface RegistryFileEntry {
@@ -48,6 +57,7 @@ export interface RegistryFileEntry {
    *  (MAJOR*10+MINOR, e.g. 120 for Blackwell consumer). Absent otherwise. */
   sm?: number;
   family?: FileFamily;
+  muscriptorModel?: MuscriptorModelId;
 }
 
 /** What `GET /api/model-manager/registry` sends per file: the catalogue

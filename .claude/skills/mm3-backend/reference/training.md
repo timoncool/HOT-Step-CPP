@@ -43,6 +43,11 @@ on q8_0 via dequant+delta+requant — IQ types refused, need imatrix).
 LM reload (verified live under keep-loaded); staged mode reloads per gen
 anyway. Merge failure part-way drops LM residency — never leaves mixed
 weights serving.
+**DoRA LM adapters** (PEFT `lora_magnitude_vector`) run through `mm3-lm-dora.h`, a one-time
+column-norm pass for runtime mode; a file with a partial set of magnitudes is refused. The
+dial renorm that lets DoRA follow the six scale dials is opt-in: request field
+`adapter_runtime_dora: true` (the same key ACE reads, `mm3-request.h:1110-1121`), sent by the
+server only when `params.adapterRuntimeDora === true`.
 **Writing a checkpoint + a JSON sidecar into `<adapters>/mm3-lm-adapters/<run>/`
 is the entire publish step** — that is the contract the future native trainer
 targets (docs/plans/2026-08-20-mm3-training-server-design.md §5). r256 ≈ 1.4 GB
@@ -180,7 +185,7 @@ note here said it was, which wrongly made LM training look possible. Consequence
 1. **LM / planner adapters are BLOCKED.** ← **SUPERSEDED 2026-08-17+**: the community
    audio→codes encoders (SimpleTuner v4 lineage → PurpleOrc 53k → Mothersuperior
    53k-pooled, best-by-ear 2026-08-20) provide the codes; LM code-SFT WORKS (our lm_sft
-   line + SimpleTuner LM mode; Skiba timbre reached 2026-08-20 with r256 attn+MLP).
+   line + SimpleTuner LM mode; the target vocalist's timbre was reached 2026-08-20 with r256 attn+MLP).
    The native-GGML LM trainer is the open build (docs/plans/2026-08-20-mm3-training-studio.md).
 2. **DiT conditioning cannot be teacher-forced.** The only way to get `frame_hiddens` for a
    training clip is to AR-sample the LM from its caption/lyrics — so condition and target come
@@ -202,3 +207,16 @@ metadata. `convert-mm3.py:build_dit` already resolves both ComfyUI and diffusers
 
 Recommended first step is **load, don't train**: add an `mm3` target to the adapter system,
 train one LoRA in SimpleTuner, and hear whether it works before building a native trainer.
+
+**Where that stands now (2026-10-23).** Both halves exist, neither is in the app's UI:
+- **Load:** `engine/src/minimax/mm3-adapter.h` merges SimpleTuner flow-DiT LoRAs (ComfyUI
+  fused-`to_qkv` form or diffusers q/k/v form, SwiGLU order read from the
+  `swiglu_gate_first` metadata, DoRA magnitudes included) into the DiT at load time. The
+  adapter set comes from the environment only, `MM3_ADAPTER` (paths separated by `;` or `:`)
+  and `MM3_ADAPTER_SCALE` (`mm3_apply_adapters`, `mm3-model.h`), so it is fixed for the
+  process lifetime; a request field is the planned next increment. LoKr, basin re-base and
+  runtime mode are out of scope there.
+- **Train:** `ace-train mm3-train-dit --cache <dir from mm3-condition> --models <dir> --out <dir>`
+  trains a flow-DiT LoRA natively (DoRA since 68b81a30), fed by `mm3-preprocess` (dataset →
+  target latents) and `mm3-condition` (AR rollout → conditioning cache). The Training Studio
+  does not drive it.

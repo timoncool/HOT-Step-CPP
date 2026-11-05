@@ -174,6 +174,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -602,6 +603,12 @@ struct Yue2MmsfaOptions {
     // GELU flavour. false = exact erf, which is what the pin says and what the
     // fixtures confirm at conv0 AND at layer0. See trap 5 before flipping it.
     bool gelu_tanh = false;
+
+    // #242: locks held around the post-compute backend health probe so it
+    // never touches the shared backend while a job computes on it. Taken in
+    // order (probe_lock, then probe_lock2); null = none (offline tools).
+    std::mutex * probe_lock  = nullptr;
+    std::mutex * probe_lock2 = nullptr;
 
     // Attention score-tensor byte budget. A head's [T_k, T_q] score block is
     // split into query chunks so that no single one exceeds this. 0 = no
@@ -1132,6 +1139,37 @@ static bool yue2_mmsfa_emissions(const Yue2MmsfaModel & m, Yue2MmsfaGraph * g, c
     if (ggml_backend_sched_graph_compute(g->sched, g->graph) != GGML_STATUS_SUCCESS) {
         if (err) {
             *err = "MMS_FA graph compute failed";
+        }
+        return false;
+    }
+    backend_fault_point("align");
+    // On Metal the submit is async: a command buffer failure only shows at
+    // synchronize, inside the tensor read below, which carries no status and
+    // would hand back garbage logits as a success (#242). Probe first.
+    // The job locks are only tried: a running job holds them for its whole
+    // render, and the job path probes again before its own prefill, so a
+    // busy lane means skip the probe rather than block the align request.
+    bool healthy = true;
+    {
+        std::unique_lock<std::mutex> l1, l2;
+        bool                         got = true;
+        if (opt.probe_lock) {
+            l1  = std::unique_lock<std::mutex>(*opt.probe_lock, std::try_to_lock);
+            got = l1.owns_lock();
+        }
+        if (got && opt.probe_lock2) {
+            l2  = std::unique_lock<std::mutex>(*opt.probe_lock2, std::try_to_lock);
+            got = l2.owns_lock();
+        }
+        if (got) {
+            healthy = backend_healthy();
+        } else {
+            fprintf(stderr, "[YUE2-ALIGN] backend health unknown (job running), probe skipped\n");
+        }
+    }
+    if (!healthy) {
+        if (err) {
+            *err = "MMS_FA compute failed on the GPU backend (device error)";
         }
         return false;
     }

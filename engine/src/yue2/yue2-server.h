@@ -229,6 +229,10 @@ static void yue2_handle_props(const httplib::Request &, httplib::Response & res)
             yyjson_mut_obj_add_strcpy(doc, o, "path", me.path.c_str());
             yyjson_mut_obj_add_strcpy(doc, o, "family", me.family.c_str());
             yyjson_mut_obj_add_uint(doc, o, "tensors", (uint64_t) me.tensors);
+            // Basin re-base: trained on another variant ("" = the loaded one),
+            // and the file it was re-based onto ("" = not installed, none done).
+            yyjson_mut_obj_add_strcpy(doc, o, "rebase_variant", me.rebase_variant.c_str());
+            yyjson_mut_obj_add_strcpy(doc, o, "rebase_file", me.rebase_file.c_str());
             yyjson_mut_arr_add_val(ents, o);
         }
     }
@@ -316,7 +320,9 @@ static void yue2_handle_unload(const httplib::Request &, httplib::Response & res
 // defaults to 1.0 INDEPENDENTLY of "scale" (which is the master), so an entry
 // that names only "scale" behaves exactly as it did before they existed. A
 // stack covering both halves is the normal case now that the UI has an AR slot
-// and a NAR slot: two entries, each with its own six dials.
+// and a NAR slot: two entries, each with its own six dials. "rebase" (0 to 1,
+// default 0.75) is the basin re-base beta, read only for an adapter trained on
+// another YuE2 variant (yue2_apply_rebase).
 //
 // `*given` distinguishes an OMITTED field (leave the current pick alone) from
 // an explicit "" (clear it) — the same distinction lm_type already makes, and
@@ -385,6 +391,7 @@ static bool yue2_parse_adapter_field(yyjson_val * root, std::vector<Yue2AdapterS
             { "scale_early", &spec.scales.early  },
             { "scale_mid",   &spec.scales.mid    },
             { "scale_late",  &spec.scales.late   },
+            { "rebase",      &spec.scales.rebase },
         };
         for (const auto & d : dials) {
             yyjson_val * sv = yyjson_obj_get(e, d.key);
@@ -397,6 +404,7 @@ static bool yue2_parse_adapter_field(yyjson_val * root, std::vector<Yue2AdapterS
             }
             *d.dst = (float) yyjson_get_num(sv);
         }
+        spec.scales.rebase = std::min(1.0f, std::max(0.0f, spec.scales.rebase));
         if (!spec.path.empty()) {
             out->push_back(spec);
         }
@@ -884,7 +892,13 @@ static void yue2_handle_align(const httplib::Request & req, httplib::Response & 
 
     Yue2MmsfaGraph     g;
     std::vector<float> em;
-    bool ok = yue2_mmsfa_emissions(m, &g, pcm.data(), (int64_t) pcm.size(), &em, Yue2MmsfaOptions{}, nullptr, &err);
+    // The health probe after the forward try-locks the job locks (#242), in
+    // their order: g_yue2_mutex, then g_yue2_nar_mutex; a running job holds
+    // them, so the probe is skipped then. Neither is held here.
+    Yue2MmsfaOptions   mopt;
+    mopt.probe_lock  = &g_yue2_mutex;
+    mopt.probe_lock2 = &g_yue2_nar_mutex;
+    bool ok = yue2_mmsfa_emissions(m, &g, pcm.data(), (int64_t) pcm.size(), &em, mopt, nullptr, &err);
     const auto         t1     = std::chrono::steady_clock::now();
     const int64_t      frames = ok ? (int64_t) em.size() / C : 0;
     std::vector<float> rows5;

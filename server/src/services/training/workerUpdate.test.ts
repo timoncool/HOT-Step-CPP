@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import childProcess, { execFileSync } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -7,10 +8,64 @@ import path from 'node:path';
 import test from 'node:test';
 import { Readable } from 'node:stream';
 import { PROJECT_ROOT } from '../../config.js';
-import { changedSteps, command, currentCommit, getUpdate, ggmlPointerChanged, platformCommands, receiveUpdate, runUpdatePlan, startUpdate, updateGgml, workerUpdateGate } from './workerUpdate.js';
+import { changedSteps, command, createDirtyCheckout, currentCommit, dirtyCheckout, getUpdate, ggmlPointerChanged, platformCommands, receiveUpdate, runUpdatePlan, startUpdate, updateGgml, workerUpdateGate } from './workerUpdate.js';
 import { workerStatus } from './trainingWorkers.js';
 
 const git = (...args: string[]) => execFileSync('git', args, { cwd: PROJECT_ROOT, encoding: 'utf8' }).trim();
+
+test('updater dirty checkout checks git synchronously on every call', t => {
+  let calls = 0;
+  const check = t.mock.method(childProcess, 'execFileSync', (file: string, args: string[]) => {
+    assert.equal(file, 'git');
+    assert.equal(args[0], 'status');
+    return ++calls === 1 ? ' M tracked.txt\n' : '';
+  });
+  syncBuiltinESMExports();
+  try {
+    assert.equal(dirtyCheckout(), true);
+    assert.equal(dirtyCheckout(), false);
+    assert.equal(calls, 2, 'updater blocker checks must not reuse display state');
+  } finally {
+    check.mock.restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('dirty checkout caches the startup result and refreshes after 30 seconds without waiting', async () => {
+  let now = 0;
+  const pending: { resolve: (dirty: boolean) => void; reject: (error: Error) => void }[] = [];
+  const dirty = createDirtyCheckout(() => new Promise<boolean>((resolve, reject) => pending.push({ resolve, reject })), () => now);
+  assert.equal(pending.length, 1, 'starts a check at startup');
+  assert.equal(dirty(), false, 'returns immediately before the startup check completes');
+  pending[0].resolve(true);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(dirty(), true);
+  now = 29_999;
+  assert.equal(dirty(), true);
+  assert.equal(pending.length, 1);
+  now = 30_000;
+  assert.equal(dirty(), true, 'returns the cached value during refresh');
+  assert.equal(pending.length, 2);
+  now = 60_000;
+  assert.equal(dirty(), true);
+  assert.equal(pending.length, 2, 'only one refresh in flight');
+  pending[1].resolve(false);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(dirty(), false);
+  assert.equal(pending.length, 2, 'completed check stays cached for 30 seconds');
+  now = 90_000;
+  assert.equal(dirty(), false);
+  assert.equal(pending.length, 3);
+  pending[2].resolve(true);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  now = 120_000;
+  assert.equal(dirty(), true);
+  assert.equal(pending.length, 4);
+  pending[3].reject(new Error('git unavailable'));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(dirty(), true, 'failed refresh preserves the last known value');
+  assert.equal(pending.length, 4, 'failed checks are also throttled');
+});
 async function mockWorker(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
   const server = http.createServer(handler);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));

@@ -36,13 +36,13 @@ int main() {
     }
 
     // The guard the semantic stage applies, on the redraw batch.
-    const char * why = yue2_lyric_schedule_refusal(false, true, draws);
+    const char * why = yue2_lyric_schedule_refusal(true, draws);
     printf("redraw guard: %s\n", why ? why : "ok");
     if (why) fail++;
 
     // And the guard still refuses a draw with no score.
     std::vector<Yue2SongState> bare(1);
-    why = yue2_lyric_schedule_refusal(false, true, bare);
+    why = yue2_lyric_schedule_refusal(true, bare);
     if (!why || !strstr(why, "supplied score")) {
         printf("FAIL guard let a draw without a score through\n");
         fail++;

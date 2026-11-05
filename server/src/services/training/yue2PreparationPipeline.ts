@@ -13,7 +13,9 @@ import { activeJobForDataset, cancelJob } from './labelingQueue.js';
 import { hasActivePipeline, registerYue2PreparationActivity } from './pipelineRunner.js';
 import { hasActiveBatch } from './yue2BatchRunner.js';
 import { YUE2_CACHE_LUFS } from './yue2Train.js';
+import { yue2CodesReady, yue2TokenizerSetting } from './yue2Tokenize.js';
 import { pushDataset, workerFetch } from './trainingWorkers.js';
+import { describeOwner, isMine, owner, ownerAlive, type Owner } from '../instance.js';
 
 type Snapshot = TrainingSnapshot<Yue2PreparationPayload>;
 type Status = Yue2PreparationSummary['status'];
@@ -22,7 +24,7 @@ type JobState = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
 
 export interface Yue2PreparationArtifacts {
   preprocess: { done: boolean; captionModeOk: boolean; captionsStale?: boolean; loudnessLufs?: number | null };
-  tokenize: { done: boolean };
+  tokenize: { done: boolean; status?: { tokenizer?: string } | null };
   sheet: { done: boolean };
   align: { done: boolean; stemsReady: number };
   minted: { present: boolean };
@@ -47,6 +49,10 @@ interface RecordFile {
   trainBodies: Partial<Record<Yue2PreparationStage, Record<string, unknown>>>;
   pauseRequested: boolean;
   cancelRequested: boolean;
+  /** The process that last wrote the record, i.e. runs its loop (absent in
+   *  legacy files). The other copy of the app leaves a live owner's record
+   *  alone (services/instance.ts). */
+  owner?: Owner;
 }
 
 const ORDER: readonly Yue2PreparationStage[] = ['latents', 'codes', 'sheet', 'stems', 'align', 'nar', 'ar', 'joint'];
@@ -80,7 +86,7 @@ export class Yue2PreparationPipeline {
       try {
         const record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')) as RecordFile;
         if (!record.summary?.id || !record.snapshot?.operation) { this.unreadableRecord = true; continue; }
-        if (active(record.summary.status)) {
+        if (active(record.summary.status) && (isMine(record.owner) || !ownerAlive(record.owner))) {
           // A submitted stage may still have been running when Node died. Its
           // recorded jobId is retained for reconciliation, never replayed.
           record.summary.status = 'interrupted';
@@ -96,6 +102,7 @@ export class Yue2PreparationPipeline {
 
   private write(record: RecordFile): void {
     record.summary.updatedAt = Date.now();
+    record.owner = owner();
     const file = path.join(this.dir, `${record.summary.id}.json`);
     const temp = `${file}.${randomUUID()}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(record, null, 2));
@@ -189,9 +196,17 @@ export class Yue2PreparationPipeline {
     return record.summary;
   }
 
+  /** Refuse to touch a record another live process is running. */
+  private ownedHere(r: RecordFile): void {
+    if (active(r.summary.status) && !isMine(r.owner) && ownerAlive(r.owner)) {
+      throw new Yue2PreparationConflict(`This preparation is running in ${describeOwner(r.owner)}; control it there`);
+    }
+  }
+
   pause(id: string): Yue2PreparationSummary | null {
     const r = this.records.get(id);
     if (!r) return null;
+    this.ownedHere(r);
     if (active(r.summary.status) && !r.cancelRequested) {
       r.pauseRequested = true;
       r.summary.status = 'pausing';
@@ -203,6 +218,7 @@ export class Yue2PreparationPipeline {
   resume(id: string): Yue2PreparationSummary | null {
     const r = this.records.get(id);
     if (!r) return null;
+    this.ownedHere(r);
     if (r.summary.status === 'paused' || r.summary.status === 'pausing') {
       r.pauseRequested = false;
       r.summary.status = 'running';
@@ -214,6 +230,7 @@ export class Yue2PreparationPipeline {
   async cancel(id: string): Promise<Yue2PreparationSummary | null> {
     const r = this.records.get(id);
     if (!r) return null;
+    this.ownedHere(r);
     if (active(r.summary.status) && !r.cancelRequested) {
       r.cancelRequested = true;
       r.pauseRequested = false;
@@ -333,7 +350,7 @@ export class Yue2PreparationPipeline {
     switch (stage) {
       case 'latents': return a.preprocess.done && a.preprocess.captionModeOk && !a.preprocess.captionsStale
         && (lufs === undefined || a.preprocess.loudnessLufs === lufs);
-      case 'codes': return a.tokenize.done;
+      case 'codes': return yue2CodesReady(a.tokenize, yue2TokenizerSetting().training);
       case 'sheet': return a.sheet.done;
       case 'stems': return a.align.stemsReady > 0;
       case 'align': return a.align.done;
@@ -357,6 +374,8 @@ export class Yue2PreparationPipeline {
       ? { trigger } : { allowNoTrigger: true }),
       ...(a.minted.present ? {} : { allowNoMinted: true }) };
     if (stage === 'joint') return { ...r.trainBodies.joint };
+    // This server's choice travels with the request, so a remote worker uses it too.
+    if (stage === 'codes') return { tokenizer: yue2TokenizerSetting().training };
     return {};
   }
 }

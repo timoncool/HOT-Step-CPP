@@ -135,6 +135,8 @@ export interface TranscribeParams {
   sourceFileName: string;
   songId?: string;
   model: MuscriptorModel;
+  /** speculative decoding (large only; the server defaults it on) */
+  speculative?: boolean;
 }
 
 // ── API Functions ────────────────────────────────────────────────────────
@@ -144,14 +146,16 @@ export async function getMidiStatus(opts?: ReadOptions): Promise<MidiStudioStatu
   return apiClient.get<MidiStudioStatus>(`${P}/status`, opts);
 }
 
-/** Save (or clear, with '') the Hugging Face read token for gated weights. */
+/** Save (or clear, with '') the Hugging Face read token for gated weights.
+ *  Silent: MidiStudio renders failures itself (its inline error line). */
 export async function saveHfToken(token: string): Promise<void> {
-  await apiClient.post(`${P}/hf-token`, { token });
+  await apiClient.post(`${P}/hf-token`, { token }, { silent: true });
 }
 
-/** Begin downloading a model's gated weights. Poll getMidiStatus() for progress. */
+/** Begin downloading a model's gated weights. Poll getMidiStatus() for progress.
+ *  Silent: MidiStudio renders failures itself (its inline error line). */
 export async function startModelDownload(model: MuscriptorModel | typeof BEAT_MODEL): Promise<void> {
-  await apiClient.post(`${P}/models/${model}/download`);
+  await apiClient.post(`${P}/models/${model}/download`, undefined, { silent: true });
 }
 
 /** Poll a transcription job's progress. */
@@ -164,9 +168,10 @@ export function getMidiStreamUrl(jobId: string): string {
   return `${API_BASE}/${jobId}/stream`;
 }
 
-/** Queue a transcription job. Returns the job ID. */
+/** Queue a transcription job. Returns the job ID. Silent: MidiStudio renders
+ *  failures itself (its inline error line). */
 export async function submitTranscription(params: TranscribeParams): Promise<string> {
-  const data = await apiClient.post<{ id: string }>(`${P}/transcribe`, params);
+  const data = await apiClient.post<{ id: string }>(`${P}/transcribe`, params, { silent: true });
   return data.id;
 }
 
@@ -180,14 +185,16 @@ export async function listMidiJobs(opts?: ReadOptions): Promise<MidiJobSummary[]
   return apiClient.get<MidiJobSummary[]>(`${P}/jobs`, opts);
 }
 
-/** Cancel and/or delete a job. */
+/** Cancel and/or delete a job. Silent: MidiStudio renders failures itself
+ *  (its inline error line). */
 export async function deleteMidiJob(jobId: string): Promise<void> {
-  await apiClient.delete(`${P}/${jobId}`);
+  await apiClient.delete(`${P}/${jobId}`, { silent: true });
 }
 
-/** Rewrite a job's MIDI on a corrected and/or quantized grid. */
+/** Rewrite a job's MIDI on a corrected and/or quantized grid. Silent:
+ *  MidiExportPanel renders failures itself (its inline error line). */
 export async function exportMidi(jobId: string, options: MidiExportOptions): Promise<{ grid: MidiGrid | null; noteCount: number }> {
-  return apiClient.post(`${P}/${jobId}/export`, options);
+  return apiClient.post(`${P}/${jobId}/export`, options, { silent: true });
 }
 
 export interface MidiAbcResult {
@@ -197,7 +204,8 @@ export interface MidiAbcResult {
 
 /** The transcription as a YuE2 ABC lead sheet on the job's current grid. */
 export async function getMidiAbc(jobId: string, options: { ins?: number; melodyOnly?: boolean }): Promise<MidiAbcResult> {
-  return apiClient.post(`${P}/${jobId}/abc`, options);
+  // Silent: MidiExportPanel renders the failure in its inline error line.
+  return apiClient.post(`${P}/${jobId}/abc`, options, { silent: true });
 }
 
 /** Direct URL for downloading the .mid file of a completed job. */

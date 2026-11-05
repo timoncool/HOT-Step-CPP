@@ -7,10 +7,9 @@
 import React, { useState } from 'react';
 import { Scissors, X, RotateCcw, Check, AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { songApi } from '../../services/api';
-import { invalidateSongs } from '../../queries/shell-queue/songs';
-import { invalidateSidecars } from '../../queries/keys';
+import { invalidateEvents } from '../../queries/invalidation';
 import { useAuth } from '../../context/AuthContext';
 
 interface TrimControlsProps {
@@ -43,7 +42,6 @@ export const TrimControls: React.FC<TrimControlsProps> = ({
   const { t } = useTranslation();
   const { token } = useAuth();
   const queryClient = useQueryClient();
-  const [isCropping, setIsCropping] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,24 +50,25 @@ export const TrimControls: React.FC<TrimControlsProps> = ({
 
   const canCrop = trimInPoint !== null && trimOutPoint !== null && songId;
 
-  const handleCrop = async () => {
+  // Crop is a single user command: one mutation. songApi.crop is silent (its
+  // sole consumer renders an inline error), so this line is the only notifier
+  // on failure (R2). A successful crop rewrites the row's duration in every
+  // song view and cuts its lyric sidecars, so invalidate both via the manager.
+  const cropMut = useMutation({
+    mutationFn: () => songApi.crop(songId!, trimInPoint!, trimOutPoint!, audioUrl ?? undefined),
+    onMutate: () => { setError(null); },
+    onSuccess: result => {
+      if (!result.cropped) return;
+      onReload(result.newDuration);
+      void invalidateEvents(queryClient, ['song:written', 'sidecars:changed']);
+    },
+    onError: err => setError(err instanceof Error ? err.message : t('trim.cropFailed')),
+  });
+  const isCropping = cropMut.isPending;
+  const confirmCrop = () => {
     if (!canCrop || !token) return;
-    console.log('[TrimControls] Cropping:', { songId, trimInPoint, trimOutPoint, token: token?.slice(0, 8) + '...' });
-    setIsCropping(true);
-    setError(null);
-    try {
-      const result = await songApi.crop(songId!, trimInPoint!, trimOutPoint!, audioUrl ?? undefined);
-      if (result.cropped) {
-        onReload(result.newDuration);
-        // The row's duration and file changed under every song view, and
-        // the lyric sidecars were cut with it.
-        void invalidateSongs(queryClient);
-        void invalidateSidecars(queryClient);
-      }
-    } catch (err: any) {
-      setError(err.message || t('trim.cropFailed'));
-      setIsCropping(false);
-    }
+    setShowConfirm(false);
+    cropMut.mutate();
   };
 
   // Instruction text based on state
@@ -170,7 +169,7 @@ export const TrimControls: React.FC<TrimControlsProps> = ({
               <AlertTriangle size={12} className="text-amber-400" />
               <span className="text-[10px] text-amber-400">{t('trim.cantUndo')}</span>
               <button
-                onClick={() => { setShowConfirm(false); handleCrop(); }}
+                onClick={confirmCrop}
                 className="flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-green-500/15 text-green-400 hover:bg-green-500/25 transition-colors"
                 disabled={isCropping}
               >

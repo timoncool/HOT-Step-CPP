@@ -62,7 +62,10 @@ export interface DataChildren {
   training: string;
   /** MuScriptor working data (<library>/muscriptor). */
   muscriptor: string;
+  /** Where MuScriptor downloads go: MUSCRIPTOR_MODELS_DIR, else <models>/muscriptor. */
   muscriptorModels: string;
+  /** Pre-#228 <library>/models/muscriptor, still read when complete; null under an override. */
+  muscriptorLegacyModels: string | null;
   plugins: string | null;
   envFile: string;
 }
@@ -114,7 +117,8 @@ function children(root: string | null, checkout: string, env: NodeJS.ProcessEnv)
       models, adapters,
       training: pick('TRAINING_DIR', path.join(library, 'training')),
       muscriptor: path.join(library, 'muscriptor'),
-      muscriptorModels: pick('MUSCRIPTOR_MODELS_DIR', path.join(library, 'models', 'muscriptor')),
+      muscriptorModels: pick('MUSCRIPTOR_MODELS_DIR', path.join(models, 'muscriptor')),
+      muscriptorLegacyModels: val('MUSCRIPTOR_MODELS_DIR') ? null : path.join(library, 'models', 'muscriptor'),
       plugins: l ? l.plugins : null,
       envFile,
     },
