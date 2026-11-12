@@ -141,6 +141,11 @@ endif()
 if(NOT DEFINED GGML_CUDA_GRAPHS)
     set(GGML_CUDA_GRAPHS_DEFAULT ON)
 endif()
+# tinyBLAS (llamafile sgemm) default on: standalone ggml ships it off, llama.cpp ships it on. It is the CPU matrix
+# kernel for F32, F16, BF16, Q8_0 and Q4_0 weights. Overridable with -DGGML_LLAMAFILE=OFF.
+if(NOT DEFINED GGML_LLAMAFILE)
+    set(GGML_LLAMAFILE_DEFAULT ON)
+endif()
 # ── HOT-Step's ggml fork ─────────────────────────────────────────────────────
 # engine/ggml is pinned to HOT-ggml's hot-step-neutral branch, which carries the ggml
 # changes the engine needs (training ops, BF16 out_prod, quant copies ...) as
