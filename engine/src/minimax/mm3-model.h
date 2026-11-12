@@ -182,14 +182,19 @@ static inline int mm3_cfg_rows(const MM3LmConfig & c) {
 #define MM3_MAX_BATCH_ROWS 8
 
 // Largest K the row budget allows for this checkpoint. 4 normally, 8 at CFG 1.0.
-static inline int mm3_max_takes(const MM3LmConfig & c) {
-    const int r = mm3_cfg_rows(c);
-    return r > 0 ? MM3_MAX_BATCH_ROWS / r : 1;
+// `plan_rows`: the plan dial's base rows double every take's rows, so the
+// budget halves (2 takes with a CFG pair). Measured on a 5090, 300 s cap:
+// 3 takes with base rows want a 14.3 GB KV cache, filled the card and ran
+// ~10x slower (spilling to system RAM); within the budget the dial never
+// needs more VRAM than 4 takes do without it, and stays on MMVQ.
+static inline int mm3_max_takes(const MM3LmConfig & c, bool plan_rows = false) {
+    const int r = mm3_cfg_rows(c) * (plan_rows ? 2 : 1);
+    return r > 0 && r <= MM3_MAX_BATCH_ROWS ? MM3_MAX_BATCH_ROWS / r : 1;
 }
 
 // Clamp a requested take count into what the kernels can actually serve.
-static inline int mm3_clamp_takes(const MM3LmConfig & c, int takes) {
-    const int hi = mm3_max_takes(c);
+static inline int mm3_clamp_takes(const MM3LmConfig & c, int takes, bool plan_rows = false) {
+    const int hi = mm3_max_takes(c, plan_rows);
     if (takes < 1) {
         return 1;
     }
@@ -498,6 +503,10 @@ struct MM3Model {
     std::string    dit_backend    = "ggml";
     // Depth decoder fused frame graph (mm3-depth-graph.h note E); per request.
     bool           depth_fused    = true;
+    // TensorRT FP8 MLP engine (mm3-dit-trt.h) and its calibration file; per
+    // request (dit_precision, dit_fp8_calib). Empty calib = <models>/mm3/.
+    bool           dit_fp8        = false;
+    std::string    dit_fp8_calib;
     mutable std::shared_ptr<MM3DitRuntime> dit_runtime;
     size_t         vram_lm        = 0;
     size_t         vram_depth     = 0;
@@ -1345,6 +1354,84 @@ static bool mm3_load_depth_tensors(MM3Model * m, const GGUFModel & gf, std::vect
     return errs->empty();
 }
 
+// The vocoder tensors: channel ladder hidden_dim >> B, strides from upsample_rates.
+// ld carries the file (gf) and WeightCtx; shared by the stage-2 bundle load below
+// and the refiner's vocoder-only load (mm3_refvoc_load).
+static void mm3_load_voc_tensors(MM3Model * m, MM3Loader & ld) {
+    const MM3VocConfig & v  = m->synth_cfg.voc;
+    const int            NB = (int) v.upsample_rates.size();
+    const int            NR = (int) v.res_dilations.size();
+
+    m->synth.voc.dec_in_w  = ld.req("voc.dec_in.weight", 1, v.fold_channels, v.dec_in_dim);
+    m->synth.voc.dec_in_b  = ld.req("voc.dec_in.bias", v.dec_in_dim);
+    m->synth.voc.conv_in_w = ld.req("voc.conv_in.weight", 7, v.dec_in_dim, v.hidden_dim);
+    m->synth.voc.conv_in_b = ld.req("voc.conv_in.bias", v.hidden_dim);
+
+    m->synth.voc.blk.assign((size_t) NB, MM3VocBlock{});
+    int64_t cin = (int64_t) v.hidden_dim;
+    for (int b = 0; b < NB && ld.errors->empty(); b++) {
+        const int64_t cout   = cin / 2;
+        const int64_t stride = v.upsample_rates[(size_t) b];
+        MM3VocBlock & vb     = m->synth.voc.blk[(size_t) b];
+
+        vb.snake_alpha = ld.req(mm3_fmt("voc.blk.%d.snake.alpha", b), 1, cin, 1);
+        vb.convt_w     = ld.req(mm3_fmt("voc.blk.%d.convt.weight", b), stride * 2, cout, cin);
+        vb.convt_b     = ld.req(mm3_fmt("voc.blk.%d.convt.bias", b), cout);
+
+        vb.res.assign((size_t) NR, MM3VocResUnit{});
+        for (int r = 0; r < NR && ld.errors->empty(); r++) {
+            MM3VocResUnit & ru = vb.res[(size_t) r];
+            ru.snake1_alpha    = ld.req(mm3_fmt2("voc.blk.%d.res.%d.snake1.alpha", b, r), 1, cout, 1);
+            ru.conv1_w         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv1.weight", b, r), 7, cout, cout);
+            ru.conv1_b         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv1.bias", b, r), cout);
+            ru.snake2_alpha    = ld.req(mm3_fmt2("voc.blk.%d.res.%d.snake2.alpha", b, r), 1, cout, 1);
+            ru.conv2_w         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv2.weight", b, r), 1, cout, cout);
+            ru.conv2_b         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv2.bias", b, r), cout);
+        }
+        cin = cout;
+    }
+
+    m->synth.voc.snake_out_alpha = ld.req("voc.snake_out.alpha", 1, cin, 1);
+    m->synth.voc.conv_out_w      = ld.req("voc.conv_out.weight", 7, cin, 1);
+    m->synth.voc.conv_out_b      = ld.req("voc.conv_out.bias", 1);
+}
+
+// The flow-DiT tensors. Shared by the stage-2 load below and by the TensorRT
+// renderer, which stages them only when it has to refit (mm3-dit-trt.h).
+static void mm3_load_dit_tensors(const MM3DitConfig & t, MM3DitWeights * w, MM3Loader & ld) {
+    const int64_t        E  = t.embedding_length;
+    const int64_t        CC = t.concat_channels;
+    const int64_t        IC = t.in_channels;
+    const int64_t        FI = t.ff_inner;
+    const int            L  = (int) t.block_count;
+
+    w->preprocess_conv  = ld.req("dit.preprocess_conv.weight", 1, CC, CC);
+    w->postprocess_conv = ld.req("dit.postprocess_conv.weight", 1, IC, IC);
+    w->time_fourier     = ld.req("dit.time_fourier.weight", 1, t.fourier_dim / 2);
+    w->time_embd_w[0]   = ld.req("dit.time_embd.0.weight", t.fourier_dim, E);
+    w->time_embd_b[0]   = ld.req("dit.time_embd.0.bias", E);
+    w->time_embd_w[1]   = ld.req("dit.time_embd.1.weight", E, E);
+    w->time_embd_b[1]   = ld.req("dit.time_embd.1.bias", E);
+    w->proj_in          = ld.req("dit.proj_in.weight", CC, E);
+    w->proj_out         = ld.req("dit.proj_out.weight", E, IC);
+    w->rope_inv_freq    = ld.req("dit.rope_inv_freq", t.rope_dim / 2);
+
+    w->blk.assign((size_t) L, MM3DitBlock{});
+    for (int i = 0; i < L && ld.errors->empty(); i++) {
+        MM3DitBlock & b = w->blk[(size_t) i];
+        b.attn_norm_w   = ld.req(mm3_fmt("dit.blk.%d.attn_norm.weight", i), E);
+        b.attn_norm_b   = ld.req(mm3_fmt("dit.blk.%d.attn_norm.bias", i), E);
+        b.attn_qkv      = ld.req(mm3_fmt("dit.blk.%d.attn_qkv.weight", i), E, E * 3);
+        b.attn_output   = ld.req(mm3_fmt("dit.blk.%d.attn_output.weight", i), E, E);
+        b.ffn_norm_w    = ld.req(mm3_fmt("dit.blk.%d.ffn_norm.weight", i), E);
+        b.ffn_norm_b    = ld.req(mm3_fmt("dit.blk.%d.ffn_norm.bias", i), E);
+        b.ffn_in_w      = ld.req(mm3_fmt("dit.blk.%d.ffn_in.weight", i), E, FI * 2);
+        b.ffn_in_b      = ld.req(mm3_fmt("dit.blk.%d.ffn_in.bias", i), FI * 2);
+        b.ffn_out_w     = ld.req(mm3_fmt("dit.blk.%d.ffn_out.weight", i), FI, E);
+        b.ffn_out_b     = ld.req(mm3_fmt("dit.blk.%d.ffn_out.bias", i), E);
+    }
+}
+
 // The stage-2 parts: condition encoder + flow DiT + vocoder, one shared
 // backend buffer (they load and evict together), each read from its own
 // resolved file. In legacy bundle mode all three GGUFModel refs alias the same
@@ -1372,87 +1459,25 @@ static bool mm3_load_rest_tensors(MM3Model * m, const GGUFModel & gf_cond, const
     }
 
     // ── dit ──
+    // TensorRT keeps the DiT on the CPU only as a refit source. Without a DiT
+    // adapter to merge, the refit (a refit-cache miss) stages its own copy,
+    // so a cache hit reads just the Fourier basis instead of ~2.5 GB.
     ld.gf = &gf_dit;
     if (m->dit_backend == "tensorrt") {
         wctx_init(&m->wctx_dit_cpu, n_dit);
         ld.wctx = &m->wctx_dit_cpu;
     }
-    {
-        const MM3DitConfig & t  = c.dit;
-        const int64_t        E  = t.embedding_length;
-        const int64_t        CC = t.concat_channels;
-        const int64_t        IC = t.in_channels;
-        const int64_t        FI = t.ff_inner;
-        const int            L  = (int) t.block_count;
-
-        m->synth.dit.preprocess_conv  = ld.req("dit.preprocess_conv.weight", 1, CC, CC);
-        m->synth.dit.postprocess_conv = ld.req("dit.postprocess_conv.weight", 1, IC, IC);
-        m->synth.dit.time_fourier     = ld.req("dit.time_fourier.weight", 1, t.fourier_dim / 2);
-        m->synth.dit.time_embd_w[0]   = ld.req("dit.time_embd.0.weight", t.fourier_dim, E);
-        m->synth.dit.time_embd_b[0]   = ld.req("dit.time_embd.0.bias", E);
-        m->synth.dit.time_embd_w[1]   = ld.req("dit.time_embd.1.weight", E, E);
-        m->synth.dit.time_embd_b[1]   = ld.req("dit.time_embd.1.bias", E);
-        m->synth.dit.proj_in          = ld.req("dit.proj_in.weight", CC, E);
-        m->synth.dit.proj_out         = ld.req("dit.proj_out.weight", E, IC);
-        m->synth.dit.rope_inv_freq    = ld.req("dit.rope_inv_freq", t.rope_dim / 2);
-
-        m->synth.dit.blk.assign((size_t) L, MM3DitBlock{});
-        for (int i = 0; i < L && errs->empty(); i++) {
-            MM3DitBlock & b = m->synth.dit.blk[(size_t) i];
-            b.attn_norm_w   = ld.req(mm3_fmt("dit.blk.%d.attn_norm.weight", i), E);
-            b.attn_norm_b   = ld.req(mm3_fmt("dit.blk.%d.attn_norm.bias", i), E);
-            b.attn_qkv      = ld.req(mm3_fmt("dit.blk.%d.attn_qkv.weight", i), E, E * 3);
-            b.attn_output   = ld.req(mm3_fmt("dit.blk.%d.attn_output.weight", i), E, E);
-            b.ffn_norm_w    = ld.req(mm3_fmt("dit.blk.%d.ffn_norm.weight", i), E);
-            b.ffn_norm_b    = ld.req(mm3_fmt("dit.blk.%d.ffn_norm.bias", i), E);
-            b.ffn_in_w      = ld.req(mm3_fmt("dit.blk.%d.ffn_in.weight", i), E, FI * 2);
-            b.ffn_in_b      = ld.req(mm3_fmt("dit.blk.%d.ffn_in.bias", i), FI * 2);
-            b.ffn_out_w     = ld.req(mm3_fmt("dit.blk.%d.ffn_out.weight", i), FI, E);
-            b.ffn_out_b     = ld.req(mm3_fmt("dit.blk.%d.ffn_out.bias", i), E);
-        }
+    const char * adapter = getenv("MM3_ADAPTER");
+    if (m->dit_backend == "tensorrt" && !(adapter && *adapter)) {
+        m->synth.dit.time_fourier = ld.req("dit.time_fourier.weight", 1, c.dit.fourier_dim / 2);
+    } else {
+        mm3_load_dit_tensors(c.dit, &m->synth.dit, ld);
     }
 
-    // ── voc ── channel ladder hidden_dim >> B, strides from upsample_rates
-    ld.gf = &gf_voc;
+    // ── voc ──
+    ld.gf   = &gf_voc;
     ld.wctx = &m->wctx_synth;
-    {
-        const MM3VocConfig & v  = c.voc;
-        const int            NB = (int) v.upsample_rates.size();
-        const int            NR = (int) v.res_dilations.size();
-
-        m->synth.voc.dec_in_w  = ld.req("voc.dec_in.weight", 1, v.fold_channels, v.dec_in_dim);
-        m->synth.voc.dec_in_b  = ld.req("voc.dec_in.bias", v.dec_in_dim);
-        m->synth.voc.conv_in_w = ld.req("voc.conv_in.weight", 7, v.dec_in_dim, v.hidden_dim);
-        m->synth.voc.conv_in_b = ld.req("voc.conv_in.bias", v.hidden_dim);
-
-        m->synth.voc.blk.assign((size_t) NB, MM3VocBlock{});
-        int64_t cin = (int64_t) v.hidden_dim;
-        for (int b = 0; b < NB && errs->empty(); b++) {
-            const int64_t cout   = cin / 2;
-            const int64_t stride = v.upsample_rates[(size_t) b];
-            MM3VocBlock & vb     = m->synth.voc.blk[(size_t) b];
-
-            vb.snake_alpha = ld.req(mm3_fmt("voc.blk.%d.snake.alpha", b), 1, cin, 1);
-            vb.convt_w     = ld.req(mm3_fmt("voc.blk.%d.convt.weight", b), stride * 2, cout, cin);
-            vb.convt_b     = ld.req(mm3_fmt("voc.blk.%d.convt.bias", b), cout);
-
-            vb.res.assign((size_t) NR, MM3VocResUnit{});
-            for (int r = 0; r < NR && errs->empty(); r++) {
-                MM3VocResUnit & ru = vb.res[(size_t) r];
-                ru.snake1_alpha    = ld.req(mm3_fmt2("voc.blk.%d.res.%d.snake1.alpha", b, r), 1, cout, 1);
-                ru.conv1_w         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv1.weight", b, r), 7, cout, cout);
-                ru.conv1_b         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv1.bias", b, r), cout);
-                ru.snake2_alpha    = ld.req(mm3_fmt2("voc.blk.%d.res.%d.snake2.alpha", b, r), 1, cout, 1);
-                ru.conv2_w         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv2.weight", b, r), 1, cout, cout);
-                ru.conv2_b         = ld.req(mm3_fmt2("voc.blk.%d.res.%d.conv2.bias", b, r), cout);
-            }
-            cin = cout;
-        }
-
-        m->synth.voc.snake_out_alpha = ld.req("voc.snake_out.alpha", 1, cin, 1);
-        m->synth.voc.conv_out_w      = ld.req("voc.conv_out.weight", 7, cin, 1);
-        m->synth.voc.conv_out_b      = ld.req("voc.conv_out.bias", 1);
-    }
+    mm3_load_voc_tensors(m, ld);
 
     return errs->empty();
 }

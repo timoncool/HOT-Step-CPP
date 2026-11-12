@@ -217,6 +217,8 @@ export const BackendModelsDropdown: React.FC = () => {
                 ditRuntime={ditRuntime}
                 value={ditBackend}
                 onChange={(v) => setBackendParam('mm3DitBackend', v)}
+                precision={backendParams?.mm3DitPrecision === 'bf16' ? 'bf16' : 'fp8'}
+                onPrecisionChange={(v) => setBackendParam('mm3DitPrecision', v)}
                 onOpenModelManager={() => setShowModelManager(true)}
               />
             )}

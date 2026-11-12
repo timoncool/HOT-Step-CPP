@@ -38,6 +38,9 @@ import {
 import { modelDownloadService } from '../services/modelDownloadService.js';
 import { parseMidiFile } from '../services/midiParser.js';
 import { engineFormatPath } from '../services/audioConvert.js';
+import { exportMidiAbc, MidiAbcError, coverMidiModel } from '../services/midiAbc.js';
+import { tryAbcCoverLeadSheet } from '../services/coverLeadSheet.js';
+import { yue2CoverService } from '../services/yue2Cover.js';
 import { addMidiLyrics } from '../services/midiLyrics.js';
 import { registerJobsBusyCheck, trackBusy } from '../dataroot/pointer.js';
 import { runOnGpuLane } from '../services/generation/gpuLane.js';
@@ -607,38 +610,12 @@ router.post('/:jobId/abc', async (req: Request, res: Response) => {
   let opts: MidiExportOptions = {};
   try { opts = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf-8')).export || {}; } catch { /* detected grid */ }
   const ins = Number(req.body?.ins);
-  const abcPath = path.join(dir, 'score.abc');
-  const tmpMid = path.join(dir, 'abc.export.tmp');
   try {
-    let stdout = '';
-    const stderr: string[] = [];
-    const code: number | null = await new Promise((resolve, reject) => {
-      const child = spawn(exe, [
-        '--export', eventsPath(jobId), '--beats-in', beatsPath(jobId), '--out', tmpMid, '--abc-out', abcPath,
-        ...exportArgs(opts),
-        ...(Number.isInteger(ins) && ins >= 0 && ins < 128 ? ['--abc-ins', String(ins)] : []),
-        ...(req.body?.melodyOnly ? ['--abc-melody-only'] : []),
-      ], { windowsHide: true });
-      child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf-8'); });
-      child.stderr?.on('data', (b: Buffer) => stderr.push(b.toString('utf-8')));
-      child.on('error', reject);
-      child.on('close', c => resolve(c));
-    });
-    fs.rmSync(tmpMid, { force: true });
-    const line = stdout.split(/\r?\n/).find(l => l.startsWith('{"type":"abc"'));
-    const summary = line ? JSON.parse(line) : null;
-    if (code !== 0 || !summary) {
-      throw new Error(`ace-midi failed (${code}): ${stderr.join('').trim().split(/\r?\n/).slice(-3).join(' | ')}`);
-    }
-    if (!summary.ok) {
-      res.status(422).json({ error: summary.error || 'The notes could not be written as ABC', summary });
-      return;
-    }
-    res.json({ abc: fs.readFileSync(abcPath, 'utf-8'), summary });
+    res.json(await exportMidiAbc(dir, opts, ins, !!req.body?.melodyOnly));
   } catch (err: any) {
-    fs.rmSync(tmpMid, { force: true });
-    console.error(`[MidiStudio] Job ${jobId}: ABC FAILED — ${err.message}`);
-    res.status(500).json({ error: err.message });
+    console.error(`[MidiStudio] Job ${jobId}: ABC FAILED: ${err.message}`);
+    res.status(err instanceof MidiAbcError ? err.status : 500).json({ error: err.message,
+      ...(err instanceof MidiAbcError && err.summary ? { summary: err.summary } : {}) });
   }
 });
 
@@ -679,3 +656,24 @@ router.delete('/:jobId', (req: Request, res: Response) => {
 });
 
 export default router;
+
+/** Cover Prepare reuses MIDI Studio's lane, cancellation and Beat This! export. */
+export async function transcribeCoverMidi(url: string, signal: AbortSignal) {
+  if (signal.aborted) throw new Error('Cancelled');
+  const model = coverMidiModel(yue2CoverService.readiness('muscriptor'));
+  const job: MidiJob = { id: randomUUID(), status: 'queued', sourceAudioUrl: url,
+    sourceFileName: path.basename(url), model, speculative: true, events: [], chunksDone: 0,
+    chunksTotal: 0, noteCount: 0, createdAt: Date.now(), listeners: new Set() };
+  jobs.set(job.id, job);
+  const cancel = () => { job.status = 'cancelled'; job.child?.kill(); };
+  signal.addEventListener('abort', cancel, { once: true });
+  try {
+    await trackBusy('MIDI', runOnMidiLane(job.id, () => runTranscription(job)));
+    if (signal.aborted) throw new Error('Cancelled');
+    if (job.status !== 'done') throw new Error(job.error || `Transcription ${job.status}`);
+    const result = await exportMidiAbc(jobDir(job.id), {}, undefined, false, signal);
+    const sheet = tryAbcCoverLeadSheet(result.abc, 'muscriptor');
+    if (sheet) sheet.timing.grid = { identity: job.id, data: JSON.parse(fs.readFileSync(beatsPath(job.id), 'utf8')) };
+    return { abc: result.abc, scoreSource: 'muscriptor' as const, leadSheet: sheet };
+  } finally { signal.removeEventListener('abort', cancel); }
+}

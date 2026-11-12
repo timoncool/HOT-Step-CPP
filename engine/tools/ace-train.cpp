@@ -14,6 +14,7 @@
 #include "minimax/mm3-tokenizer.h"
 #include "minimax/mm3-request.h"
 #include "minimax/mm3-ar-loop.h"
+#include "minimax/mm3-hiddens-file.h"
 #include "minimax/mm3-cond-graph.h"
 #include "minimax/mm3-rvq-encode.h"  // audio -> RVQ codes (open-RVQ 169M)
 #include "minimax/mm3-rec7.h"        // audio -> LM frame hiddens (rec7 state encoder)
@@ -68,6 +69,7 @@
 #include "train/heartmula-prepare.h"  // HeartMuLa: audio + text -> codes + prompt ids
 #include "train/heartmula-train-run.h"  // HeartMuLa backbone LoRA trainer
 
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -224,7 +226,8 @@ static void print_usage(void) {
             "                written back into the base, because there is nowhere to put\n"
             "                an F32 residual on a quantized base. Exports a plain rank-2r\n"
             "                LoRA: s(BA - B0A0) = s[B,-B0][A;A0], so no loader learns\n"
-            "                anything. Plain LoRA only, and NOT resumable.\n"
+            "                anything. Plain LoRA only. Resumable: the init is rebuilt\n"
+            "                and checked against the hash in the resume state.\n"
             "                [--pissa-oversample n] default 8, [--pissa-iters n] default 2.\n"
             "                [--hra] Householder Reflection Adaptation: --rank (even)\n"
             "                reflections on each site's INPUT, y = W(Rx). Its own\n"
@@ -236,7 +239,7 @@ static void print_usage(void) {
             "                mode refuses them by name rather than loading an adapter it\n"
             "                would then silently ignore. Mutually exclusive with --dora\n"
             "                and with each other.\n"
-            "                [--attn exact|flash|flash-f32] default exact. flash swaps\n"
+            "                [--attn exact|flash|flash-f32|flash-bf16] default exact. flash swaps\n"
             "                the manual attention chain for the fused\n"
             "                FLASH_ATTN_TRAIN/_BACK pair, so the [S_kv,S,Nh] softmax is\n"
             "                never materialised and attention memory is LINEAR in S\n"
@@ -248,7 +251,17 @@ static void print_usage(void) {
             "                rectangular (exit 2). flash-f32 pins the same ops to strict\n"
             "                f32 (the v1 scalar kernels) — slower, and the mode\n"
             "                --fd-check should use. Gradients under flash are NOT\n"
-            "                bit-identical to exact.\n"
+            "                bit-identical to exact. flash-bf16 casts Q/K/V to BF16\n"
+            "                (BF16 kernels, causal tile skip); CUDA sm_80+ only.\n"
+            "                [--tf32 on|off] default off: F32 GEMMs run strict FP32\n"
+            "                (SIMT). on lets cuBLAS use TF32 tensor cores.\n"
+            "                [--pissa-fold on|off] default off. With --weights bf16 on a\n"
+            "                q8_0 base (CUDA) and --pissa/--hot-pizza: each layer's BF16\n"
+            "                weights are built as W - s B0 A0, so the frozen branch\n"
+            "                leaves the graph (~11 % per step). Not bit-identical.\n"
+            "                [--ckpt-offload on|off] default off. The per-layer\n"
+            "                activation checkpoints live in pinned host RAM, two on\n"
+            "                the GPU: less VRAM for PCIe copies. Bit-identical.\n"
             "  mm3-lm-loss   Teacher-forced training forward, scored. --lm --depth --codes\n"
             "                --caption [--lyrics] [--max-frames N] [--crop-offset N]\n"
             "                [--target-shift N] [--no-prompt]  (falsification diagnostics).\n"
@@ -258,8 +271,9 @@ static void print_usage(void) {
             "  mm3-lm-probe  Wiring gate for the MM3 LM trainer: load the MM3 LM into the\n"
             "                ACE LM trainer's struct and compare its cache-free forward\n"
             "                against the engine's own prefill. --lm <mm3-lm-*.gguf>\n"
-            "                [--tokens a,b,c] [--layers N] [--depth <mm3-depth-*.gguf>].\n"
-            "                Runs the two sides\n"
+            "                [--tokens a,b,c] [--layers N] [--depth <mm3-depth-*.gguf>]\n"
+            "                [--weights f32-window|bf16] [--attn exact|flash|flash-bf16]\n"
+            "                (the trainer's arithmetic). Runs the two sides\n"
             "                SEQUENTIALLY: two 17 GB copies do not fit on one card.\n"
             "  mm3-retarget  Rescue dataset tracks over MM3's 6:00 cap by removing one\n"
             "                repeated section, keeping the intro and the real ending.\n"
@@ -279,6 +293,11 @@ static void print_usage(void) {
             "                golden window from engine/tools/rvq-encoder-fixture.py.\n"
             "                Writes <out>/codes/<id>.codes, int32 [frames+1, 8], row 0 the\n"
             "                duplicated warm-up row. Replaces the WSL python exporter.\n"
+            "                [--guide-k N] also writes <id>.guide: the encoder's top-N\n"
+            "                semantic codes and log-softmax per frame (Y2GD), for the\n"
+            "                synth request's lm_guide_file. mm3-launder takes it too,\n"
+            "                plus [--keep-wav <dir>] to keep its render as <id>.wav and\n"
+            "                [--keep-hiddens <dir>] to keep its condition as <id>.mm3hiddens.\n"
             "  mm3-preprocess  MiniMax-Music3 dataset -> flow-DiT target latents.\n"
             "                --dataset <dataset.json> --enc <mm3-enc-*.gguf> --out <dir>\n"
             "                [--ffmpeg <path>] [--max-duration <sec>] [--tf32 on|off]\n"
@@ -356,11 +375,11 @@ static void print_usage(void) {
             "                [0, --prefix-frames], so a real ending is learned as a state rather\n"
             "                than one memorised frame. Off = the pinned end crop.\n"
             "                [--weights f32-window|bf16] default f32-window. `bf16` is\n"
-            "                Lever A: the raw BF16 weight goes to mul_mat and the\n"
+            "                Lever A: the BF16 weight goes to mul_mat and the\n"
             "                backward's out_prod nodes are rewritten to mul_mat, so both\n"
-            "                directions reach the tensor cores instead of TF32. Needs CUDA\n"
-            "                and a BF16-native base (convert-mm3.py --quant bf16); falls\n"
-            "                back with a warning otherwise. It CHANGES the trained weights\n"
+            "                directions reach the BF16 tensor cores. Needs CUDA (falls\n"
+            "                back with a warning otherwise); a q8_0/quant/F16 base is\n"
+            "                cast to BF16 in-graph. It CHANGES the trained weights\n"
             "                — activation gradients are BF16-rounded at every layer.\n"
             "                [--depth-loss-weight 1.0] the acoustic loss: teacher-forced CE\n"
             "                through the FROZEN depth decoder, gradient into the adapter via\n"
@@ -2339,6 +2358,9 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--drop-over-frames")) a.drop_over_frames = atoll(next("--drop-over-frames"));
         else if (!strcmp(argv[i], "--crop-mode"))     a.crop_mode    = next("--crop-mode");
         else if (!strcmp(argv[i], "--weights"))       a.weights      = next("--weights");
+        else if (!strcmp(argv[i], "--tf32"))          a.tf32         = !strcmp(next("--tf32"), "on");
+        else if (!strcmp(argv[i], "--pissa-fold"))    a.pissa_fold   = !strcmp(next("--pissa-fold"), "on");
+        else if (!strcmp(argv[i], "--ckpt-offload"))  a.ckpt_offload = !strcmp(next("--ckpt-offload"), "on");
         else if (!strcmp(argv[i], "--depth-loss-weight")) a.depth_loss_weight = atof(next("--depth-loss-weight"));
         else if (!strcmp(argv[i], "--depth-loss-frames")) a.depth_loss_frames = atoi(next("--depth-loss-frames"));
         else if (!strcmp(argv[i], "--crop-start-frac")) a.crop_start_frac = atof(next("--crop-start-frac"));
@@ -2432,8 +2454,8 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     // of the validation below it: the gate runs the same graphs under the same
     // flag, so a typo that silently fell through to "exact" there would report a
     // PASS for a formulation the run never used.
-    if (a.attn != "exact" && a.attn != "flash" && a.attn != "flash-f32") {
-        fprintf(stderr, "ace-train mm3-lm-train: --attn must be exact|flash|flash-f32\n");
+    if (a.attn != "exact" && a.attn != "flash" && a.attn != "flash-f32" && a.attn != "flash-bf16") {
+        fprintf(stderr, "ace-train mm3-lm-train: --attn must be exact|flash|flash-f32|flash-bf16\n");
         return 2;
     }
     // Parameterization exclusivity, the same block train-dit carries
@@ -2459,14 +2481,9 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
                         "parameterization only\n");
         return 2;
     }
-    // The SVD basis and its frozen negative copy are derived from the base at
-    // step 0. Resuming would rebuild them against a base the trained factors
-    // were never fitted against, and the state file does not carry A0/B0.
-    if (a.pissa && !a.resume_path.empty()) {
-        fprintf(stderr, "ace-train mm3-lm-train: --pissa cannot --resume: the resume state carries the trainable "
-                        "factors but not the frozen PiSSA init they are measured against\n");
-        return 2;
-    }
+    // --pissa --resume is allowed: the frozen A0/B0 are rebuilt from the base
+    // at init (deterministic SVD, or its cache / residual file), and the
+    // resume state's v5 init hash refuses a rebuild that came out different.
     if (a.loha && (a.adapter_type != "lora" || a.dora || a.hira)) {
         fprintf(stderr, "ace-train mm3-lm-train: --loha applies to the LoRA parameterization only and cannot "
                         "combine with --dora or --hira\n");
@@ -2581,6 +2598,10 @@ static int cmd_mm3_lm_train(int argc, char ** argv) {
     }
     if (a.weights != "f32-window" && a.weights != "bf16") {
         fprintf(stderr, "ace-train mm3-lm-train: --weights must be f32-window or bf16\n");
+        return 2;
+    }
+    if (a.pissa_fold && (a.weights != "bf16" || !(a.pissa || a.hot_pizza))) {
+        fprintf(stderr, "ace-train mm3-lm-train: --pissa-fold on needs --weights bf16 and --pissa or --hot-pizza\n");
         return 2;
     }
     if (a.depth_loss_weight < 0.0 || a.depth_loss_frames < 1 || a.depth_loss_frames > 1024) {
@@ -2978,6 +2999,9 @@ static int cmd_mm3_lm_probe(int argc, char ** argv) {
     std::string          lm_path, depth_path;
     std::vector<int32_t> ids;
     int                  layers = 0;   // 0 = all
+    // The trainer's arithmetic options, so the probe can measure what the
+    // BF16 levers do to the forward: --weights bf16, --attn flash|flash-bf16.
+    std::string          weights = "f32-window", attn = "exact";
 
     for (int i = 1; i < argc; i++) {
         auto next = [&](const char * what) -> const char * {
@@ -2987,6 +3011,8 @@ static int cmd_mm3_lm_probe(int argc, char ** argv) {
         if      (!strcmp(argv[i], "--lm"))     lm_path    = next("--lm");
         else if (!strcmp(argv[i], "--depth"))  depth_path = next("--depth");
         else if (!strcmp(argv[i], "--layers")) layers     = atoi(next("--layers"));
+        else if (!strcmp(argv[i], "--weights")) weights   = next("--weights");
+        else if (!strcmp(argv[i], "--attn"))   attn       = next("--attn");
         else if (!strcmp(argv[i], "--tokens")) {
             std::string v = next("--tokens");
             size_t      a = 0;
@@ -3122,12 +3148,17 @@ static int cmd_mm3_lm_probe(int argc, char ** argv) {
 
     ggml_tensor * t_tok = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
     ggml_tensor * t_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
-    ggml_tensor * t_msk = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S * S);
+    LmLayerOpts popts;
+    popts.weights_bf16  = weights == "bf16";
+    popts.attn_flash    = attn != "exact";
+    popts.attn_prec     = mm3_lm_attn_prec(attn);
+    ggml_tensor * t_msk = lm_mask_alloc(ctx, S * S, popts.attn_flash);
     ggml_set_input(t_tok);
     ggml_set_input(t_pos);
     ggml_set_input(t_msk);
+    fprintf(stderr, "[mm3-lm-probe] trainer side: --weights %s --attn %s\n", weights.c_str(), attn.c_str());
 
-    ggml_tensor * hidden = lm_build_trunk(ctx, &t.lm, t_tok, t_pos, t_msk, (int) S, 0, L);
+    ggml_tensor * hidden = lm_build_trunk(ctx, &t.lm, t_tok, t_pos, t_msk, (int) S, 0, L, popts);
     // The UNTIED head — the one wiring difference from ACE that a copy-paste of
     // the trainer's `mul_mat(lm.embed_tokens, h)` would get silently wrong.
     ggml_tensor * logits = ggml_mul_mat(ctx, t.lm_head, hidden);          // [V, S]
@@ -3144,11 +3175,9 @@ static int cmd_mm3_lm_probe(int argc, char ** argv) {
     }
     std::vector<int32_t> pos((size_t) S);
     for (int64_t i = 0; i < S; i++) pos[(size_t) i] = (int32_t) i;
-    std::vector<float> msk;
-    lm_causal_mask((int) S, &msk);
     ggml_backend_tensor_set(t_tok, ids.data(), 0, (size_t) S * sizeof(int32_t));
     ggml_backend_tensor_set(t_pos, pos.data(), 0, (size_t) S * sizeof(int32_t));
-    ggml_backend_tensor_set(t_msk, msk.data(), 0, msk.size() * sizeof(float));
+    lm_mask_set_causal(t_msk, 0, 0, (int) S, 0);
 
     if (ggml_backend_graph_compute(t.lm.backend, gf2) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[mm3-lm-probe] forward compute failed\n");
@@ -3230,6 +3259,26 @@ static int cmd_mm3_retarget(int argc, char ** argv) {
     return mm3_retarget_run(a);
 }
 
+// One source-guide frame (yue2-guide.h layout, MM3ArOptions::guide): the k
+// best semantic ids of an [SV] encoder logits row, best first, with their
+// log-softmax over all SV codes. Written next to the argmax that becomes the
+// .codes file, so the guide and the plank describe the same frames.
+static void mm3_guide_topk(const float * row, int64_t SV, int64_t k, int32_t * ids, float * lp) {
+    float mx = row[0];
+    for (int64_t v = 1; v < SV; v++) mx = std::max(mx, row[v]);
+    double z = 0.0;
+    for (int64_t v = 0; v < SV; v++) z += std::exp((double) (row[v] - mx));
+    const float lse = mx + (float) std::log(z);
+    std::vector<int32_t> order((size_t) SV);
+    for (int64_t v = 0; v < SV; v++) order[(size_t) v] = (int32_t) v;
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                      [&](int32_t a, int32_t b) { return row[a] > row[b] || (row[a] == row[b] && a < b); });
+    for (int64_t j = 0; j < k; j++) {
+        ids[j] = order[(size_t) j];
+        lp[j]  = row[order[(size_t) j]] - lse;
+    }
+}
+
 // ─── mm3-codes ──────────────────────────────────────────────────────────────
 //
 // Audio -> RVQ codes, the input side of MM3 LM training. Replaces the WSL
@@ -3245,7 +3294,7 @@ static int cmd_mm3_retarget(int argc, char ** argv) {
 // DUPLICATED warm-up row the cache format carries and the LM path expects.
 static int cmd_mm3_codes(int argc, char ** argv) {
     std::string ds_path, rvq_path, enc_path, out_dir, fixture, ffmpeg = "ffmpeg";
-    int         max_duration = 0;
+    int         max_duration = 0, guide_k = 0;
     bool        tf32 = false;
 
     for (int i = 1; i < argc; i++) {
@@ -3258,6 +3307,7 @@ static int cmd_mm3_codes(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--enc"))          enc_path     = next("--enc");
         else if (!strcmp(argv[i], "--out"))          out_dir      = next("--out");
         else if (!strcmp(argv[i], "--fixture"))      fixture      = next("--fixture");
+        else if (!strcmp(argv[i], "--guide-k"))      guide_k      = atoi(next("--guide-k"));
         else if (!strcmp(argv[i], "--ffmpeg"))       ffmpeg       = next("--ffmpeg");
         else if (!strcmp(argv[i], "--max-duration")) max_duration = atoi(next("--max-duration"));
         else if (!strcmp(argv[i], "--tf32"))         tf32         = !strcmp(next("--tf32"), "on");
@@ -3475,7 +3525,7 @@ static int cmd_mm3_codes(int argc, char ** argv) {
     }
 
     const std::string tmp_wav = out_dir + "/_mm3_codes_tmp.wav";
-    size_t            idx = 0, ok_n = 0, fail_n = 0;
+    size_t            idx = 0, ok_n = 0, fail_n = 0, missing_n = 0;
     const size_t      n_samples = yyjson_arr_size(samples);
 
     yyjson_val *    s2;
@@ -3484,12 +3534,21 @@ static int cmd_mm3_codes(int argc, char ** argv) {
         idx++;
         const std::string id       = jstr(s2, "id");
         const std::string filename = jstr(s2, "filename");
-        const std::string audio    = jstr(s2, "audio_path");
+        const std::string audio    = pm_resolve_audio(jstr(s2, "audio_path"), ds_path);
         if (audio.empty()) {
             fprintf(stderr, "[mm3-codes] %zu/%zu SKIP %s: no audio_path\n", idx, n_samples, filename.c_str());
             fail_n++;
             continue;
         }
+        if (!pm_file_exists(audio)) {
+            fprintf(stderr, "[mm3-codes] %zu/%zu FAIL %s: audio file not found: %s\n", idx, n_samples,
+                    filename.c_str(), audio.c_str());
+            fail_n++;
+            missing_n++;
+            continue;
+        }
+
+        const auto t_dec0 = std::chrono::steady_clock::now();
 
         // --ffmpeg none: the caller already wrote a stereo WAV at the encoder's
         // rate, and it is read as it stands.
@@ -3540,6 +3599,7 @@ static int cmd_mm3_codes(int argc, char ** argv) {
             continue;
         }
 
+        const auto t_enc0 = std::chrono::steady_clock::now();
         const float *      chans[2] = { planar, planar + T };
         std::vector<float> lat;
         int64_t            L = 0;
@@ -3582,6 +3642,14 @@ static int cmd_mm3_codes(int argc, char ** argv) {
         std::vector<int32_t> sem((size_t) n_frames, 0);
         std::vector<char>    done((size_t) n_frames, 0);
         bool                 song_ok = true;
+        const int64_t        GK = std::min<int64_t>(guide_k, SV);
+        Yue2Guide            guide;
+        if (GK > 0) {
+            guide.T = n_frames;
+            guide.K = GK;
+            guide.ids.resize((size_t) (n_frames * GK));
+            guide.lp.resize((size_t) (n_frames * GK));
+        }
 
         for (size_t wi = 0; wi < win.size() && song_ok; wi++) {
             const int64_t        t0   = win[wi];
@@ -3622,6 +3690,10 @@ static int cmd_mm3_codes(int argc, char ** argv) {
                 memcpy(&feats[(size_t) (t * D)], &wfeats[(size_t) (j * D)], (size_t) D * sizeof(float));
                 sem[(size_t) t]  = argmax_sem(wlogits.data(), j);
                 done[(size_t) t] = 1;
+                if (GK > 0) {
+                    mm3_guide_topk(wlogits.data() + (size_t) (j * SV), SV, GK, &guide.ids[(size_t) (t * GK)],
+                                   &guide.lp[(size_t) (t * GK)]);
+                }
             }
         }
         if (!song_ok) { fail_n++; continue; }
@@ -3659,9 +3731,19 @@ static int cmd_mm3_codes(int argc, char ** argv) {
         if (!cf) { fprintf(stderr, "[mm3-codes] cannot write %s\n", cp.c_str()); fail_n++; continue; }
         fwrite(rows.data(), sizeof(int32_t), rows.size(), cf);
         fclose(cf);
+        if (GK > 0 && !yue2_guide_write(out_dir + "/codes/" + stem + ".guide", guide, &err)) {
+            fprintf(stderr, "[mm3-codes] %s\n", err.c_str());
+            fail_n++;
+            continue;
+        }
         ok_n++;
         fprintf(stderr, "[mm3-codes] %zu/%zu %s  %lld frames -> %s\n", idx, n_samples, stem.c_str(),
                 (long long) n_frames, cp.c_str());
+        const auto t_end = std::chrono::steady_clock::now();
+        fprintf(stderr, "[mm3-codes] %zu/%zu OK %s: decode %lld ms, encode %lld ms\n", idx, n_samples,
+                stem.c_str(),
+                (long long) std::chrono::duration_cast<std::chrono::milliseconds>(t_enc0 - t_dec0).count(),
+                (long long) std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_enc0).count());
         jl("{\"type\":\"progress\",\"completed\":%zu,\"total\":%zu,\"failed\":%zu,\"phase\":\"codes\"}",
            idx, n_samples, fail_n);
     }
@@ -3693,7 +3775,12 @@ static int cmd_mm3_codes(int argc, char ** argv) {
     mm3_enc_free(&enc);
     mm3_rvq_free(&rvq);
     fprintf(stderr, "[mm3-codes] done: %zu ok, %zu failed\n", ok_n, fail_n);
-    if (ok_n == 0 && fail_n > 0) {
+    if (ok_n == 0 && missing_n == fail_n && fail_n > 0) {
+        // The job card shows only this line, so say why rather than send the
+        // user digging through train-console.log.
+        jl("{\"type\":\"fatal\",\"message\":\"every track failed to encode: no audio file found at the "
+           "paths in dataset.json or beside it. Rebuild the dataset if its audio moved.\"}");
+    } else if (ok_n == 0 && fail_n > 0) {
         jl("{\"type\":\"fatal\",\"message\":\"every track failed to encode\"}");
     } else {
         jl("{\"type\":\"done\",\"ok\":%zu,\"failed\":%zu}", ok_n, fail_n);
@@ -3822,7 +3909,7 @@ static int cmd_mm3_preprocess(int argc, char ** argv) {
         idx++;
         const std::string id       = jstr(s, "id");
         const std::string filename = jstr(s, "filename");
-        const std::string audio    = jstr(s, "audio_path");
+        const std::string audio    = pm_resolve_audio(jstr(s, "audio_path"), ds_path);
         if (audio.empty()) {
             fprintf(stderr, "[mm3-preprocess] %zu/%zu SKIP %s: no audio_path\n", idx, n_samples, filename.c_str());
             fail_n++;
@@ -6130,10 +6217,12 @@ static int cmd_train_dit(int argc, char ** argv) {
 //
 // Output: the standard mm3-codes cache layout (<out>/codes/<id>.codes, warm-up
 // row 0), so the trainer consumes a laundered cache with zero changes.
+// --guide-k N adds <id>.guide beside it (mm3_guide_topk); --keep-wav <dir>
+// keeps the launder render that is otherwise discarded.
 static int cmd_mm3_launder(int argc, char ** argv) {
     std::string ds_path, rvq_path, enc_path, rec7_path, models_dir, out_dir, ffmpeg = "ffmpeg";
-    std::string lm_quant = "q8_0";
-    int         max_duration = 359, steps = 30;
+    std::string lm_quant = "q8_0", keep_wav, keep_hiddens;
+    int         max_duration = 359, steps = 30, guide_k = 0;
     uint64_t    seed = 42;
 
     for (int i = 1; i < argc; i++) {
@@ -6152,6 +6241,9 @@ static int cmd_mm3_launder(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--max-duration")) max_duration = atoi(next("--max-duration"));
         else if (!strcmp(argv[i], "--steps"))        steps        = atoi(next("--steps"));
         else if (!strcmp(argv[i], "--seed"))         seed         = (uint64_t) atoll(next("--seed"));
+        else if (!strcmp(argv[i], "--guide-k"))      guide_k      = atoi(next("--guide-k"));
+        else if (!strcmp(argv[i], "--keep-wav"))     keep_wav     = next("--keep-wav");
+        else if (!strcmp(argv[i], "--keep-hiddens")) keep_hiddens = next("--keep-hiddens");
         else if (!strcmp(argv[i], "--jsonl"))        g_jsonl      = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { print_usage(); return 0; }
         else { fprintf(stderr, "ace-train: unknown option %s\n", argv[i]); return 2; }
@@ -6229,7 +6321,8 @@ static int cmd_mm3_launder(int argc, char ** argv) {
         if (doc) yyjson_doc_free(doc);
         return 1;
     }
-    if (!pm_mkdir_p(out_dir) || !pm_mkdir_p(out_dir + "/codes")) {
+    if (!pm_mkdir_p(out_dir) || !pm_mkdir_p(out_dir + "/codes") || (!keep_wav.empty() && !pm_mkdir_p(keep_wav)) ||
+        (!keep_hiddens.empty() && !pm_mkdir_p(keep_hiddens))) {
         yyjson_doc_free(doc);
         fprintf(stderr, "cannot create %s\n", out_dir.c_str());
         return 1;
@@ -6256,7 +6349,7 @@ static int cmd_mm3_launder(int argc, char ** argv) {
         idx++;
         const std::string id      = jstr(s2, "id");
         const std::string fname   = jstr(s2, "filename");
-        const std::string audio   = jstr(s2, "audio_path");
+        const std::string audio   = pm_resolve_audio(jstr(s2, "audio_path"), ds_path);
         const std::string caption = jstr(s2, "caption");
         const std::string stem    = id.empty() ? std::to_string(idx) : id;
         const std::string cp      = out_dir + "/codes/" + stem + ".codes";
@@ -6367,6 +6460,19 @@ static int cmd_mm3_launder(int argc, char ** argv) {
             memcpy(dst + H, fr.hiddens.data(), (size_t) (NC * H) * sizeof(float));
         }
         if (!song_ok) { fail_n++; continue; }
+        if (!keep_hiddens.empty()) {
+            // The renderer condition itself, for state-swap probes. "external":
+            // rec7 read it from audio, no LM made it (mm3-job.h accepts that key).
+            MM3HiddensFile hf;
+            hf.frames        = T;
+            hf.num_codebooks = LAY;
+            hf.embedding_len = H;
+            hf.model_key     = "external";
+            const std::string hp = keep_hiddens + "/" + stem + ".mm3hiddens";
+            if (!mm3_hiddens_write(hp, hf, cond.data(), &err)) {
+                fprintf(stderr, "[mm3-launder] %s: %s\n", hp.c_str(), err.c_str());
+            }
+        }
 
         // ── 5. the flow DiT, stage 1 skipped, window latents kept ──
         MM3GenRequest greq;
@@ -6387,6 +6493,13 @@ static int cmd_mm3_launder(int argc, char ** argv) {
                     err.c_str());
             fail_n++;
             continue;
+        }
+        if (!keep_wav.empty()) {
+            // The launder render itself: the ceiling for anything built on its codes.
+            const std::string wp = keep_wav + "/" + stem + ".wav";
+            if (!audio_write_wav(wp.c_str(), gres.audio.data(), (int) gres.n_samples, gres.sample_rate)) {
+                fprintf(stderr, "[mm3-launder] cannot write %s\n", wp.c_str());
+            }
         }
         const int64_t NW = (int64_t) gres.window_latents.size();
         if (NW == 0 || gres.window_L.size() != gres.window_latents.size()) {
@@ -6446,6 +6559,14 @@ static int cmd_mm3_launder(int argc, char ** argv) {
         std::vector<float>   feats((size_t) (n_frames * D));
         std::vector<int32_t> sem((size_t) n_frames, 0);
         std::vector<char>    done((size_t) n_frames, 0);
+        const int64_t        GK = std::min<int64_t>(guide_k, SV);
+        Yue2Guide            guide;
+        if (GK > 0) {
+            guide.T = n_frames;
+            guide.K = GK;
+            guide.ids.resize((size_t) (n_frames * GK));
+            guide.lp.resize((size_t) (n_frames * GK));
+        }
         for (size_t wi = 0; wi < win.size() && song_ok; wi++) {
             const int64_t        t0   = win[wi];
             const int64_t        base = starts[(size_t) t0];
@@ -6482,6 +6603,9 @@ static int cmd_mm3_launder(int argc, char ** argv) {
                 }
                 sem[(size_t) t]  = (int32_t) best;
                 done[(size_t) t] = 1;
+                if (GK > 0) {
+                    mm3_guide_topk(row, SV, GK, &guide.ids[(size_t) (t * GK)], &guide.lp[(size_t) (t * GK)]);
+                }
             }
         }
         if (!song_ok) { fail_n++; continue; }
@@ -6509,6 +6633,11 @@ static int cmd_mm3_launder(int argc, char ** argv) {
         if (!cf) { fprintf(stderr, "[mm3-launder] cannot write %s\n", cp.c_str()); fail_n++; continue; }
         fwrite(rows.data(), sizeof(int32_t), rows.size(), cf);
         fclose(cf);
+        if (GK > 0 && !yue2_guide_write(out_dir + "/codes/" + stem + ".guide", guide, &err)) {
+            fprintf(stderr, "[mm3-launder] %s\n", err.c_str());
+            fail_n++;
+            continue;
+        }
         ok_n++;
         fprintf(stderr, "[mm3-launder] %zu/%zu %s  %lld frames in %.0f s -> %s\n", idx, n_samples,
                 stem.c_str(), (long long) n_frames, (double) (ggml_time_ms() - t_song) / 1000.0,

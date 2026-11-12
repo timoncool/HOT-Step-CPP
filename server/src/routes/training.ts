@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import { yue2OptimRequest } from '../services/training/yue2Optim.js';
 import { selectYue2Audio, YUE2_AUDIO_EXTS, yue2SeparationAudioDir } from '../services/training/yue2AudioStaging.js';
 // training.ts — Dataset Studio HTTP surface (Training Studio phase 1)
@@ -55,6 +56,8 @@ import { selectYue2Audio, YUE2_AUDIO_EXTS, yue2SeparationAudioDir } from '../ser
 //   GET    /datasets/:id/mm3                            — MM3 codes cache + model readiness
 //   POST   /datasets/:id/mm3-codes                      — audio -> RVQ codes (MM3)
 //   POST   /datasets/:id/mm3-train-lm                   — start an MM3 LM LoRA training job
+//   GET    /datasets/:id/mm3-previews?run=              — an MM3 run's checkpoint ladder (saved previews per step)
+//   POST   /datasets/:id/mm3-previews/render            — render one more take of a saved step (0 = base)
 //   GET    /datasets/:id/yue2                           — YuE2 latent cache + model readiness
 //   POST   /datasets/:id/yue2-preprocess                — audio -> cached YuE2 VAE latents
 //   POST   /datasets/:id/yue2-train                     — start a YuE2 NAR LoRA training job
@@ -127,8 +130,8 @@ import {
   availableMm3Bases, MM3_VRAM_MODEL, mm3FlashVramCalibrated, recommendMm3Config,
   MM3_LM_DEFAULTS, MM3_LM_PRESETS, MM3_LM_DEFAULT_PRESET, applyMm3Preset,
   missingMm3TrainModels, mm3AdapterRunDir, mm3CodesDir, mm3PriorDir,
-  mm3RunName,
-  type Mm3BasePrecision,
+  mm3RunName, isMm3TrainPrecision, countMm3Captions, mm3CkptOffloadPlan,
+  type Mm3BasePrecision, type Mm3TrainPrecision,
 } from '../services/training/mm3Train.js';
 import {
   listMm3Runs, mm3AdapterRoot, readMm3Run, resolveMm3RunDir, resumeOptionsFor,
@@ -228,11 +231,14 @@ import {
 } from '../services/training/lyricStudioExport.js';
 import { datasetLanguage } from '../services/languageCodes.js';
 import { getGenerations, getLyricsSet } from '../db/lireekDb.js';
-import { trainingOperationsRouter } from '../services/training/operations.js';
+import { trainingOp, TrainingOperationFailure, trainingOperationsRouter } from '../services/training/operations.js';
 // Training operation domains register themselves at import (operations.ts).
 import '../services/training/recipes/operations.js';
 import '../services/training/review/operations.js';
 import '../services/training/yue2PreparationOperations.js';
+import { deleteMm3Run, mm3Ladder, mm3ReviewRows, renderMm3LadderTake, setMm3ReviewComplete } from '../services/training/mm3Ladder.js';
+import { listAllMm3RungScores, mm3RungScoresCsv } from '../services/training/mm3Review.js';
+import { mm3RunOrigin } from '../services/training/yue2Mirror.js';
 import type {
   AuditionListResponse, AuditionOptions, AuditionSideSpec,
   BulkSetInput, CaptionOptions, CreateDatasetInput, FieldSource, GeniusOptions, LabelOptions, LmSize, NormaliseLyricsOptions,
@@ -808,6 +814,19 @@ router.post('/heartmula-batch', (req: Request, res: Response) => {
     if ('error' in result) { res.status(409).json(result); return; }
     res.status(202).json({ batch: result });
   } catch (err: any) { res.status(400).json({ error: err.message }); }
+});
+router.post('/mm3-batch', (req: Request, res: Response) => {
+  try {
+    const b = req.body;
+    if (!b || !Array.isArray(b.datasetIds) || !b.datasetIds.length || b.datasetIds.some((id: unknown) => typeof id !== 'string' || !id)
+      || !b.recipe || typeof b.recipe !== 'object' || Array.isArray(b.recipe)) {
+      res.status(400).json({ error: 'Expected datasetIds and an MM3 training request in recipe' }); return;
+    }
+    // Same body as POST /datasets/:id/mm3-train-lm, which validates it per dataset when each run starts.
+    const result = startYue2Batch({ family: 'mm3', datasetIds: b.datasetIds, lyricTiming: false, clearCache: b.clearCache === true, recipe: b.recipe });
+    if ('error' in result) { res.status(result.error.includes('already running') ? 409 : 400).json({ error: result.error }); return; }
+    res.status(202).json({ batch: result });
+  } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
 router.get('/yue2-batch', (_req: Request, res: Response) => {
   try { res.json({ batches: listYue2Batches() }); } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
@@ -2169,26 +2188,17 @@ function mm3Preflight(req: Request, res: Response): TrainingDatasetRow | null {
   return ds;
 }
 
-/** How many manifest rows have a `<stem>.mm3.txt` beside their audio. Mirrors
- *  the trainer's own rule (mm3-lm-train-run.h): stem = filename minus its last
- *  extension, caption = `<captionsDir>/<stem>.mm3.txt`. Never throws. */
-function countMm3Captions(manifest: string, captionsDir: string): { total: number; captioned: number } {
-  let rows: unknown[] = [];
+/** This machine's GPU memory in MB: the engine's reading, else nvidia-smi's
+ *  first card (a batch stops the engine between its stages), else 0 = unknown. */
+async function trainingGpuTotalMb(): Promise<number> {
   try {
-    const parsed = JSON.parse(fs.readFileSync(manifest, 'utf-8'));
-    rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.samples) ? parsed.samples : [];
-  } catch {
-    return { total: 0, captioned: 0 };
-  }
-  let total = 0, captioned = 0;
-  for (const raw of rows) {
-    const filename = (raw as { filename?: unknown })?.filename;
-    if (typeof filename !== 'string' || !filename) continue;
-    total++;
-    const stem = filename.replace(/\.[^.]*$/, '');
-    if (fs.existsSync(path.join(captionsDir, `${stem}.mm3.txt`))) captioned++;
-  }
-  return { total, captioned };
+    const r = await fetch(`${config.aceServer.url}/vram`, { signal: AbortSignal.timeout(1500) });
+    if (r.ok) { const v: any = await r.json(); if (Number(v?.total_mb) > 0) return Number(v.total_mb); }
+  } catch { /* engine down */ }
+  try {
+    const out = execFileSync('nvidia-smi', ['--query-gpu=memory.total', '--format=csv,noheader,nounits'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+    return Number(out.trim().split(/\r?\n/)[0]) || 0;
+  } catch { return 0; }
 }
 
 /** GET /datasets/:id/mm3 — codes cache state + which model files are missing.
@@ -2310,7 +2320,16 @@ router.post('/datasets/:id/mm3-codes', (req: Request, res: Response) => {
   try {
     const ds = mm3Preflight(req, res);
     if (!ds) return;
-    const body = (req.body || {}) as { maxDuration?: unknown; launder?: unknown };
+    const body = (req.body || {}) as { maxDuration?: unknown; launder?: unknown; force?: unknown; only?: unknown; limit?: unknown };
+    if (body.only !== undefined && typeof body.only !== 'string') {
+      res.status(400).json({ error: 'only must be a string' });
+      return;
+    }
+    const limit = Number(body.limit ?? 0);
+    if (!Number.isInteger(limit) || limit < 0 || limit > 100000) {
+      res.status(400).json({ error: 'limit must be a whole number from 0 to 100000' });
+      return;
+    }
     // The launder gate. Off (absent/false) = plain mm3-codes into mm3-codes/,
     // byte-identical to the pipeline before the gate existed. On = ace-train
     // mm3-launder into mm3-codes-laundered/ — a SEPARATE cache, so the toggle
@@ -2328,6 +2347,9 @@ router.post('/datasets/:id/mm3-codes', (req: Request, res: Response) => {
       outDir: mm3CodesDir(ds.slug, launder),
       maxDuration: Number.isFinite(maxDuration) && maxDuration > 0 ? maxDuration : undefined,
       launder,
+      force: body.force === true,
+      only: body.only?.trim() || undefined,
+      limit: limit || undefined,
     });
     res.json({ jobId: job.id, kind: job.kind });
   } catch (err: any) {
@@ -2510,6 +2532,45 @@ router.get('/mm3/preview', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'audio/wav');
   res.setHeader('Cache-Control', 'no-store');
   res.sendFile(full);
+});
+
+/** GET /datasets/:id/mm3-previews?run=<runName> — the run's checkpoints, its
+ *  saved previews and the adapter the album presets use (mm3Ladder.ts). */
+router.get('/datasets/:id/mm3-previews', trainingOp(async req =>
+  mm3Ladder(String(req.params.id), String(req.query.run || ''))));
+
+/** POST /datasets/:id/mm3-previews/render — body { run, step, seconds?,
+ *  scaleMlp? }; step 0 = base. Absent seconds or scale = the run's own. */
+router.post('/datasets/:id/mm3-previews/render', trainingOp(async req => {
+  const b = (req.body || {}) as Record<string, unknown>;
+  const step = Number(b.step);
+  if (!Number.isSafeInteger(step) || step < 0) throw new TrainingOperationFailure(400, { error: 'step must be a whole number' });
+  const seconds = b.seconds === undefined ? undefined : Number(b.seconds);
+  const scaleMlp = b.scaleMlp === undefined ? undefined : Number(b.scaleMlp);
+  if (seconds !== undefined && !(Number.isFinite(seconds) && seconds >= 4 && seconds <= 600)) throw new TrainingOperationFailure(400, { error: 'seconds must be between 4 and 600' });
+  if (scaleMlp !== undefined && !(Number.isFinite(scaleMlp) && scaleMlp >= 0 && scaleMlp <= 4)) throw new TrainingOperationFailure(400, { error: 'scaleMlp must be between 0 and 4' });
+  return { previews: await renderMm3LadderTake(String(req.params.id), String(b.run || ''), step, { seconds, scaleMlp }) };
+}));
+
+/** DELETE /datasets/:id/mm3-runs/:run — the run folder and its mirror record
+ *  (mm3Ladder.ts deleteMm3Run). */
+router.delete('/datasets/:id/mm3-runs/:run', trainingOp(async req =>
+  deleteMm3Run(String(req.params.id), String(req.params.run), req.query.purge === '1')));
+
+/** POST /datasets/:id/mm3-review-complete — body { run, complete }. */
+router.post('/datasets/:id/mm3-review-complete', trainingOp(async req =>
+  setMm3ReviewComplete(String(req.params.id), String(req.body?.run || ''), req.body?.complete !== false)));
+
+/** GET /mm3-rung-scores/export?format=csv|json — every saved MM3 rung score. */
+router.get('/mm3-rung-scores/export', (req: Request, res: Response) => {
+  try {
+    const rows = listAllMm3RungScores();
+    if (req.query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="mm3-rung-scores.csv"');
+      res.send(mm3RungScoresCsv(rows));
+    } else res.json({ scores: rows });
+  } catch (err: any) { res.status(500).json({ error: err?.message || String(err) }); }
 });
 
 /** POST /datasets/:id/mm3-train-lm */
@@ -2758,6 +2819,14 @@ router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) =>
       attnBackendResolved = 'exact';
     }
     void framesWillBeEmitted;
+    // Refused, not coerced: a typo silently training at full precision would
+    // look like the speed-up simply did not work.
+    if (b.trainPrecision !== undefined && b.trainPrecision !== null && !isMm3TrainPrecision(b.trainPrecision)) {
+      res.status(400).json({ error: 'trainPrecision must be full, fast or fastest' });
+      return;
+    }
+    const trainPrecisionResolved: Mm3TrainPrecision =
+      isMm3TrainPrecision(b.trainPrecision) ? b.trainPrecision : D.trainPrecision;
     // HOT-PiZZA is the default method, so an ABSENT method block must resolve to
     // it rather than to a plain LoRA — but an explicit `pissa: false` has to turn
     // its own variant off too, or unticking PiSSA in the form would leave
@@ -2783,12 +2852,33 @@ router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) =>
       return;
     }
 
+    // Fit the card this run trains on without touching the recipe: when the
+    // VRAM model says the run would spill, its activation checkpoints move to
+    // host RAM (--ckpt-offload, bit-identical). A request can force it either
+    // way. The window is the longest track the run keeps, as the engine sizes
+    // its buffers.
+    const rankResolved = num('rank', D.rank, 1, 512);
+    const keptFrames = longTracksResolved === 'exclude'
+      ? (await buildSamples(ds)).filter(s => !s.excluded && !s.fileMissing && s.duration > 0)
+          .map(s => Math.ceil(s.duration * 25)).filter(f => f <= maxFramesResolved)
+      : [];
+    const offloadPlan = mm3CkptOffloadPlan({
+      basePrecision, rank: rankResolved, optimizer, attn: attnBackendResolved, prefixFrames: prefixFramesResolved,
+      trainPrecision: trainPrecisionResolved, frames: keptFrames.length ? Math.max(...keptFrames) : maxFramesResolved,
+    }, process.platform === 'darwin' ? 0 : await trainingGpuTotalMb());  // unified memory: nothing to move
+    const ckptOffload = typeof b.ckptOffload === 'boolean' ? b.ckptOffload : offloadPlan.offload;
+    if (offloadPlan.offload) {
+      console.log(`[Training] mm3-train-lm ${runName}: predicted ${offloadPlan.peakMb} MB against a ${offloadPlan.budgetMb} MB budget; `
+                + `${ckptOffload ? '' : 'NOT '}moving ~${offloadPlan.offloadedMb} MB of checkpoints to host RAM`);
+    }
+
     const job = queue.startMm3TrainLmJob(ds.id, {
       manifest:    ds.datasetJsonPath,
       captionsDir,
       codesDir:    codesInner,
       outDir:      mm3AdapterRunDir(runName),
-      rank:        num('rank', D.rank, 1, 512),
+      rank:        rankResolved,
+      ckptOffload,
       alpha:       num('alpha', D.alpha, 1, 2048),
       lr:          num('lr', D.lr, 1e-7, 1e-2),
       steps:       num('steps', stepsDefault, 1, 100000),
@@ -2838,6 +2928,7 @@ router.post('/datasets/:id/mm3-train-lm', async (req: Request, res: Response) =>
       // has no control for it, so every Training Studio run trained without the
       // 0.6 GB saving the shipped recipe was rated with).
       attnBackend: attnBackendResolved,
+      trainPrecision: trainPrecisionResolved,
       rslora: bool('rslora', D.rslora),
       dora:   bool('dora', D.dora),
       hira:   bool('hira', D.hira),
@@ -2917,11 +3008,12 @@ router.get('/datasets/:id/mm3-runs', (req: Request, res: Response) => {
     const active = queue.activeJobForDataset(ds.id);
     const activeDir = active && active.kind === 'mm3-train-lm'
       ? String((active.opts as { outDir?: string } | undefined)?.outDir || '') : '';
-    const out = runs.map(r => (
-      activeDir && path.resolve(activeDir) === path.resolve(r.dir)
+    const out = runs.map(r => ({
+      ...(activeDir && path.resolve(activeDir) === path.resolve(r.dir)
         ? { ...r, outcome: 'unknown' as const, running: true }
-        : { ...r, running: false }
-    ));
+        : { ...r, running: false }),
+      origin: mm3RunOrigin(r.runName),
+    }));
     res.json({ runs: out, busy: !!active });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || String(err) });
@@ -3036,21 +3128,9 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
       return;
     }
 
-    // PiSSA is not resumable, and the failure mode is silent rather than loud:
-    // the exported/held A and B have the same names and shapes with and without
-    // it, so a leg that dropped --pissa would load them cleanly and then train
-    // against y = Wx + s*BAx where y = Wx + s*(BA - B0A0)x was fitted — the top-r
-    // singular energy counted twice from step 1. ace-train refuses --pissa
-    // --resume outright; refuse here so the user gets a sentence instead of a
-    // failed job.
-    if (opts.pissa) {
-      res.status(400).json({
-        error: 'This run was trained with PiSSA, which cannot be continued: the exported factors have '
-             + 'already absorbed the frozen SVD init they were measured against, and there is nothing '
-             + 'to re-derive it from. Start a fresh run instead.',
-      });
-      return;
-    }
+    // PiSSA runs resume like any other: --pissa stays on the resume leg (see
+    // buildMm3TrainLmArgs), the engine rebuilds the frozen A0/B0 from the base,
+    // and the state file's init hash refuses a rebuild that came out different.
 
     // How much further. `addSteps` is the natural way to ask ("another 250");
     // `steps` sets the new total outright. Either way the cap has to be ahead
@@ -3102,6 +3182,9 @@ router.post('/datasets/:id/mm3-resume-lm', (req: Request, res: Response) => {
     // stays fixed to whatever `base` recovered from the manifest or the log —
     // there is no override for it here, on purpose.
     if (b.attnBackend === 'exact' || b.attnBackend === 'flash') opts.attnBackend = b.attnBackend;
+    // Precision is a recipe knob too (the adapter's tensors are the same), so a
+    // resume may change it; absent = whatever the run recorded.
+    if (isMm3TrainPrecision(b.trainPrecision)) opts.trainPrecision = b.trainPrecision;
     if (Number.isFinite(Number(b.prefixN))) {
       opts.prefixN = Math.min(64, Math.max(0, Math.trunc(Number(b.prefixN))));
     }
@@ -4432,7 +4515,8 @@ router.get('/datasets/:id/yue2-joint-previews', (req: Request, res: Response) =>
 
 /** GET /yue2-review — every refinement ladder (a run with KL-rung
  * checkpoints) across datasets, with preview and score counts. The
- * "Awaiting review" page. */
+ * "Awaiting review" page. MM3 runs come in the same list with
+ * `family: 'mm3'` (mm3ReviewRows); the page shows the engine's own. */
 router.get('/yue2-review', (_req: Request, res: Response) => {
   try {
     const rows: Array<Record<string, unknown>> = [];
@@ -4458,8 +4542,9 @@ router.get('/yue2-review', (_req: Request, res: Response) => {
           live, rungs: rungs.length, previews: previews.length, scored: scored.size,
           unscored: rungs.filter(r => !scored.has(r.step)).length, reviewed: yue2ReviewComplete(run.output), best: best ? { step: best.step, overall: best.overall, blindLabel: run.blindLabels?.[best.step] ?? '' } : null,
           decoderOnly: (run.options as Record<string, unknown>)?.freezePlannerNow === true, klMin: kls.length ? Math.min(...kls) : null, klMax: kls.length ? Math.max(...kls) : null,
-          baseMatched: isCheckpointLadder(run.options), finished: yue2RunFinished(run.output) });
+          baseMatched: isCheckpointLadder(run.options), finished: yue2RunFinished(run.output), family: 'yue2' });
       }
+      rows.push(...mm3ReviewRows(ds));
     }
     rows.sort((a, b) => (b.createdAt as number) - (a.createdAt as number));
     res.json({ rows });

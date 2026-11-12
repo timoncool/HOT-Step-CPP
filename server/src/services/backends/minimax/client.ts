@@ -168,6 +168,10 @@ export interface Mm3SynthRequest {
   adapter_runtime_dora?: boolean;
   /** DiT renderer. GGML is the portable default; TensorRT needs a prepared engine. */
   dit_backend?: 'ggml' | 'tensorrt' | 'auto';
+  /** TensorRT DiT precision. 'fp8' = the experimental FP8 MLP engine; default 'bf16'. */
+  dit_precision?: 'bf16' | 'fp8';
+  /** FP8 activation calibration JSON; the engine defaults to <models>/mm3/mm3-dit-trt.fp8.json. */
+  dit_fp8_calib?: string;
   /** Depth decoder: fused one-graph frame with GPU sampling (default true). */
   depth_fused?: boolean;
   /** REQUIRED, non-blank. The Structured Caption (see .claude/skills/mm3-captioning). */
@@ -223,6 +227,9 @@ export interface Mm3SynthRequest {
    *  only on the warmup steps, the final step, and every Nth step, holding the
    *  guidance delta in between — N=2 removes ~22% of the flow forwards. */
   flow_uncond_interval?: number;
+  /** Flow window hop in frames, 100..160. Absent = the checkpoint's 100, the
+   *  exact reference; longer hops overlap less and cut the flow stage. */
+  flow_hop_frames?: number;
   /** 16 | 24 | 32, default 16. */
   get_wav_bits?: number;
   /** Emit LRC lyric timestamps from the LM's alignment heads. Since the
@@ -243,6 +250,15 @@ export interface Mm3SynthRequest {
    *  a flow-stage A/B comparison valid. */
   forced_semantic?: number[];  // [I], entry 0 is the un-emitted iteration
   forced_acoustic?: number[];  // [I * 7], flat, iteration-major
+  /** Audio to audio: the source's DAV latents steer the flow (engine
+   *  mm3-pipeline.h MM3A2aWindow). Absolute WAV/MP3 path; strength 0..1 is
+   *  where the flow starts (1 = the source back), hold 0..1 the fraction of the
+   *  remaining steps that re-impose it. Without forced codes the engine caps
+   *  the length to the source. */
+  a2a_source?: string;
+  a2a_strength?: number;
+  a2a_hold?: number;
+  a2a_source_seconds?: number;
 
   // ── AR cache (engine: minimax/mm3-ar-cache.h) ─────────────────────────────
   /** Reuse the previous render's AR (planner) output when every AR-affecting

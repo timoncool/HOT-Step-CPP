@@ -64,10 +64,13 @@
 
 #include "hot-step-fsutf8.h"  // hs_stat / HS_STAT_T
 #include "mm3-ar-cache.h"
+#include "mm3-dav-encode.h"
 #include "mm3-hiddens-file.h"
 #include "mm3-lm-merge.h"
 #include "mm3-request.h"
 #include "mm3-server.h"
+#include "audio-resample.h"
+#include "model-store.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -304,15 +307,15 @@ static std::shared_ptr<MM3JobState> mm3_job_state_get(const std::string & id) {
 
 // ── VRAM arbitration ────────────────────────────────────────────────────────
 
-// Exact KV-cache cost for this run: one [key_length, n_ctx, head_count_kv, 2]
-// F16 tensor per block (mm3-lm-graph.h:190-196), n_ctx bucketed the same way
-// mm3_lm_prepare() buckets it.
-static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed) {
+// Exact KV-cache cost per row: K and V [key_length, n_ctx, head_count_kv]
+// F16 tensors per block, multiplied by cfg_rows * n_takes for this run.
+// n_ctx is bucketed the same way mm3_lm_prepare() buckets it.
+static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed, int rows) {
     const MM3LmConfig & c = m.lm_cfg;
     const int64_t       b = MM3_LM_KV_BUCKET;
     const int64_t       n = ((n_ctx_needed + b - 1) / b) * b;
     return (size_t) c.block_count * (size_t) c.key_length * (size_t) c.head_count_kv * 2 /*K+V*/ * 2 /*f16*/ *
-           (size_t) n;
+           (size_t) n * (size_t) rows;
 }
 
 // Weights + KV + compute headroom. Distinct files only — in bundle mode the
@@ -321,7 +324,7 @@ static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed) {
 // `stage2_only` is the AR-cache-hit shape: the LM is never loaded and there is
 // no KV cache, so asking for the full figure would evict the ACE side for
 // VRAM this run will not touch.
-static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, bool stage2_only = false) {
+static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, int rows, bool stage2_only = false) {
     uint64_t weights = mm3_total_tensor_bytes(m);
     // TensorRT uses BF16 weights plus its execution context; reserve additional
     // workspace before deciding whether planner/render streaming can co-reside.
@@ -330,7 +333,7 @@ static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, bool stage
         weights -= m.lm_file.found ? m.lm_file.tensor_bytes : 0;  // the LM is never a role file
         return (size_t) weights + MM3_VRAM_COMPUTE_HEADROOM;
     }
-    return (size_t) weights + mm3_kv_bytes_estimate(m, n_ctx_needed) + MM3_VRAM_COMPUTE_HEADROOM;
+    return (size_t) weights + mm3_kv_bytes_estimate(m, n_ctx_needed, rows) + MM3_VRAM_COMPUTE_HEADROOM;
 }
 
 static bool mm3_cuda_free_bytes(size_t * free_b, size_t * total_b) {
@@ -366,12 +369,12 @@ static bool mm3_cuda_free_bytes(size_t * free_b, size_t * total_b) {
 // Non-CUDA builds cannot measure free VRAM; there the eviction is
 // unconditional whenever ACE modules are resident and MM3 is cold, which is
 // the conservative choice.
-static void mm3_arbitrate_vram(const MM3Model & m, int64_t n_ctx_needed, MM3JobState * st,
+static void mm3_arbitrate_vram(const MM3Model & m, int64_t n_ctx_needed, int rows, MM3JobState * st,
                                bool stage2_only = false) {
     if (m.loaded) {
         return;  // already resident: whatever fit before still fits
     }
-    const size_t need = mm3_vram_need(m, n_ctx_needed, stage2_only);
+    const size_t need = mm3_vram_need(m, n_ctx_needed, rows, stage2_only);
 
     size_t free_b = 0, total_b = 0;
     const bool have_cuda = mm3_cuda_free_bytes(&free_b, &total_b);
@@ -475,6 +478,15 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         const MM3LmAdapterScales & s = req.lm_adapter_scales;
         add_f("ad_g", s.global); add_f("ad_a", s.attn);  add_f("ad_m", s.mlp);
         add_f("ad_e", s.early);  add_f("ad_i", s.mid);   add_f("ad_l", s.late);
+        // Only when on, so every key from before the schedule existed still hits.
+        const MM3LmAdapterSchedule & f = req.lm_adapter_sched;
+        if (f.active()) {
+            add_f("fd_in", f.in_sec);  add_f("fd_out", f.out_sec); add_f("fd_len", f.out_len_sec);
+            add_f("fd_fl", f.floor);   add_f("fd_st", f.step_sec);
+        }
+        if (req.lm_adapter_plan < 1.0f) {
+            add_f("ad_p", req.lm_adapter_plan);
+        }
     }
 
     // The two models that produce the block. Quant flips borderline codes, so
@@ -548,6 +560,39 @@ static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & 
     if (!req.forced_semantic.empty()) {
         add_codes("fs", req.forced_semantic);
         add_codes("fa", req.forced_acoustic);
+        // Soft forcing samples around the plank. Only written when set, so
+        // hard-pin keys stay what they were.
+        if (req.gen.lm_force_bias >= 0.0f) {
+            add_s("fb", std::to_string(req.gen.lm_force_bias));
+        }
+    }
+    // The source guide steers every draw. Only written when set.
+    if (req.gen.lm_guide.T > 0) {
+        add_codes("gi", req.gen.lm_guide.ids);
+        add_s("gp", std::to_string(req.gen.lm_guide_p.scale) + "," + std::to_string(req.gen.lm_guide_p.k) + "," +
+                        std::to_string(req.gen.lm_guide_p.outside));
+        if (req.gen.lm_depth_greedy || req.gen.lm_state_fix) {
+            add_s("gx", std::to_string(req.gen.lm_depth_greedy ? 1 : 0) + "," + std::to_string(req.gen.lm_state_fix));
+        }
+        if (req.gen.lm_guide_product >= 0.0f) {
+            add_s("gm", std::to_string(req.gen.lm_guide_product));
+        }
+        std::vector<int32_t> gate_bits(req.gen.lm_guide_gate.size());
+        if (!gate_bits.empty()) {
+            memcpy(gate_bits.data(), req.gen.lm_guide_gate.data(), gate_bits.size() * sizeof(float));
+        }
+        add_codes("gg", gate_bits);
+    }
+    // The blend is applied to the hiddens the cache stores. Path and size name
+    // the block; a re-encode writes a new file name.
+    if (!req.gen.lm_blend_file.empty()) {
+        long long sz = -1;
+        if (FILE * f = hs_fopen(req.gen.lm_blend_file, "rb")) {
+            MM3_FSEEK(f, 0, SEEK_END);
+            sz = (long long) MM3_FTELL(f);
+            fclose(f);
+        }
+        add_s("bl", req.gen.lm_blend_file + "," + std::to_string(sz) + "," + std::to_string(req.gen.lm_blend_amount));
     }
 
     // The models and the adapter — the half a saved file is checked against.
@@ -575,6 +620,61 @@ static std::string mm3_b64_encode(const std::string & in) {
 }
 
 // ── The worker ──────────────────────────────────────────────────────────────
+
+// Route B: the source through the DAV encoder, the refiner's encode phase
+// (mm3-refiner.h step 1) with its loader: 44.1 kHz stereo, zero-padded to the
+// 512-sample hop, then [128, L] latents at 86.1328125 Hz into gen.a2a_src.
+// Runs once at job start; the handle is released before the MM3 stack loads,
+// and arbitration evicts the module if keep-loaded parked it.
+static bool mm3_a2a_encode(MM3SynthRequest * req, std::string * err) {
+    std::string path;
+    for (const std::string & d : g_mm3.search_dirs) {
+        const std::string p = d + MM3_SEP "mm3-enc-f16.gguf";
+        HS_STAT_T         sb{};
+        if (hs_stat(p, &sb) == 0) {
+            path = p;
+            break;
+        }
+    }
+    if (path.empty()) {
+        *err = "a2a needs the DAV encoder mm3-enc-f16.gguf in " + g_mm3.models_dir + MM3_SEP "mm3";
+        return false;
+    }
+    const int64_t      hop = 512;
+    std::vector<float> wav;
+    int64_t            n = req->a2a_n;
+    if (req->a2a_rate == 44100) {
+        wav.swap(req->a2a_audio);
+    } else {
+        int     n_rs = 0;
+        float * rs   = audio_resample(req->a2a_audio.data(), (int) n, req->a2a_rate, 44100, 2, &n_rs);
+        if (!rs) {
+            *err = "a2a: resample to 44.1 kHz failed";
+            return false;
+        }
+        wav.assign(rs, rs + 2 * (int64_t) n_rs);
+        free(rs);
+        n = n_rs;
+    }
+    req->a2a_audio = std::vector<float>();
+    const int64_t padded = (n + hop - 1) / hop * hop;
+    std::vector<float> pad((size_t) (2 * padded), 0.0f);
+    for (int ch = 0; ch < 2; ch++) {
+        memcpy(pad.data() + ch * padded, wav.data() + ch * n, (size_t) n * sizeof(float));
+    }
+    ModelKey k{};
+    k.kind          = MODEL_MM3_ENC;
+    k.path          = path;
+    k.adapter_scale = 1.0f;
+    MM3Enc * enc = store_require_mm3_enc(g_store, k);
+    if (!enc) {
+        *err = "a2a DAV encoder: " + store_mm3_last_error();
+        return false;
+    }
+    ModelHandle   h(g_store, enc);
+    const float * ch[2] = { pad.data(), pad.data() + padded };
+    return mm3_enc_encode(enc, ch, padded, &req->gen.a2a_src, &req->gen.a2a_cols, err);
+}
 
 static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobState> st, MM3SynthRequest req) {
     auto set_stage = [&](const char * stage, int64_t window, int64_t n_windows, int64_t step, int64_t n_steps) {
@@ -678,12 +778,36 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         return;
     }
 
+    // Route B: encode the source once, before anything MM3 loads.
+    if (!req.a2a_audio.empty()) {
+        set_stage("a2a encode", -1, 0, 0, 0);
+        const auto t_enc = std::chrono::steady_clock::now();
+        std::string aerr;
+        if (!mm3_a2a_encode(&req, &aerr)) {
+            fprintf(stderr, "[MM3-Job] %s: %s\n", job->id.c_str(), aerr.c_str());
+            fail(2, "failed", aerr);
+            return;
+        }
+        fprintf(stderr, "[MM3-Job] %s: a2a source encoded - %lld latent columns (%.1f s) in %.0f ms\n", job->id.c_str(),
+                (long long) req.gen.a2a_cols, (double) req.gen.a2a_cols * 512.0 / 44100.0,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_enc).count());
+    }
+
     // Serialise against the bring-up /mm3/* endpoints, which still run on
     // httplib threads. Two MM3 jobs can never contend here — they are both on
     // the one worker thread.
     std::lock_guard<std::mutex> mm3_lock(g_mm3_mutex);
     holds_mm3_lock = true;
 
+    // FP8 vs BF16 TensorRT engine: a different base engine and refit cache, so
+    // a change drops a kept-loaded runtime. The host plan slot keys on the
+    // refit-cache file, which already hashes the precision and calibration.
+    const bool want_fp8 = req.dit_backend == "tensorrt" && req.dit_precision == "fp8";
+    if (g_mm3.dit_fp8 != want_fp8 || g_mm3.dit_fp8_calib != req.dit_fp8_calib) {
+        g_mm3.dit_runtime.reset();
+        g_mm3.dit_fp8       = want_fp8;
+        g_mm3.dit_fp8_calib = req.dit_fp8_calib;
+    }
     if (req.dit_backend == "tensorrt") {
         std::string reason;
         // Any DiT quant works: the loader dequantizes to BF16 for the refit.
@@ -694,10 +818,14 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         mm3_cond_free(&g_mm3_cond);
         mm3_dit_free(&g_mm3_dit);
         mm3_free_rest(&g_mm3);
+        if (req.dit_backend != "tensorrt") {
+            mm3_trt_plan_drop("renderer switched to GGML");
+        }
         g_mm3.dit_backend = req.dit_backend;
     }
     g_mm3.depth_fused = req.depth_fused;
-    fprintf(stderr, "[MM3-Job] %s: renderer=%s, depth=%s\n", job->id.c_str(), g_mm3.dit_backend.c_str(),
+    fprintf(stderr, "[MM3-Job] %s: renderer=%s%s, depth=%s\n", job->id.c_str(), g_mm3.dit_backend.c_str(),
+            g_mm3.dit_backend == "tensorrt" && mm3_trt_fp8(g_mm3) ? " fp8" : "",
             req.depth_fused ? "fused" : "stepped");
 
     // ── AR cache lookup ─────────────────────────────────────────────────────
@@ -841,9 +969,14 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // n_ctx the AR stage will want: prompt + every frame it may emit, plus the
     // slack mm3_lm_prepare() adds for the feedback position.
     const int64_t n_ctx_needed = req.n_tokens + req.max_frames + 8;
+    // The plan dial doubles the LM rows (base pairs). Counted whenever it could
+    // apply; the AR loop may still stand it down (soft prompt), which only
+    // over-reserves.
+    const bool plan_rows = req.lm_adapter_plan < 1.0f && !req.lm_adapter.empty() && req.lm_adapter_mode != "merge";
+    const int  rows      = mm3_cfg_rows(g_mm3.lm_cfg) * st->n_takes * (plan_rows ? 2 : 1);
 
     const auto t_arb = std::chrono::steady_clock::now();
-    mm3_arbitrate_vram(g_mm3, n_ctx_needed, st.get(), /*stage2_only=*/ar_hit);
+    mm3_arbitrate_vram(g_mm3, n_ctx_needed, rows, st.get(), /*stage2_only=*/ar_hit);
     const double arb_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_arb).count();
 
     if (job->cancel.load()) {
@@ -894,7 +1027,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             // The co-resident figure is what mm3_vram_need already computes with
             // stage2_only=false: every role file + this run's KV + compute
             // headroom. Whatever is already ours does not need finding again.
-            const size_t need     = mm3_vram_need(g_mm3, n_ctx_needed, /*stage2_only=*/false);
+            const size_t need     = mm3_vram_need(g_mm3, n_ctx_needed, rows, /*stage2_only=*/false);
             const size_t resident = mm3_vram_bytes(g_mm3);
             const size_t want     = need > resident ? need - resident : 0;
             size_t       free_b = 0, total_b = 0;
@@ -1201,6 +1334,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             fail(2, "failed", err.empty() ? "MM3 generation failed" : err);
         }
         return;
+    }
+    if (!req.gen.a2a_src.empty()) {
+        fprintf(stderr, "[MM3-Flow] a2a: strength %.2f hold %.2f src %lld cols windows %lld\n",
+                (double) req.gen.a2a_strength, (double) req.gen.a2a_hold, (long long) req.gen.a2a_cols,
+                (long long) rs[0].n_windows);
     }
     // Natural-ending candidates: the capped takes were never rendered; take
     // them out of the job here so everything downstream (take 0 = the primary
@@ -1540,7 +1678,11 @@ static void mm3_handle_synth(const httplib::Request & hreq, httplib::Response & 
     // so `takes` reflects what will actually be rendered — a reader asking for
     // take 3 on a checkpoint that only allows two must 404 now, not silently
     // wait forever on a queue nothing will ever push to.
-    st->n_takes = mm3_clamp_takes(g_mm3.lm_cfg, req.takes);
+    // The plan dial halves the budget (mm3_max_takes). The adapter is not
+    // loaded yet, so a soft-prompt adapter (which ignores the dial) is clamped
+    // too: fewer takes than allowed, never more.
+    st->n_takes = mm3_clamp_takes(g_mm3.lm_cfg, req.takes,
+                                  req.lm_adapter_plan < 1.0f && !req.lm_adapter.empty() && req.lm_adapter_mode != "merge");
     st->takes.resize((size_t) st->n_takes);
     for (int t = 0; t < st->n_takes; t++) {
         st->takes[(size_t) t].seed = req.gen.seed + (uint64_t) t;

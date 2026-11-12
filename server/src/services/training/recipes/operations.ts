@@ -117,6 +117,7 @@ export function mm3ExecutionBody(form: Record<string, any>, activePreset: string
         optimizer: form.optimizer, muonLrScale: form.muonLrScale,
         adapterType: form.adapterType, lokrFactor: form.lokrFactor,
         gradAccum: form.gradAccum, seed: form.seed,
+        warmup: form.warmup, lyricsDropout: form.lyricsDropout, lrEndFrac: form.lrEndFrac,
         basePrecision: form.basePrecision, holdout: form.holdout, evalEvery: form.evalEvery,
         cropAnchor: form.cropAnchor,
         stopMode: form.stopMode,
@@ -147,11 +148,15 @@ export function mm3ExecutionBody(form: Record<string, any>, activePreset: string
             baseline: form.previewBaseline,
             scaleMlp: form.previewScaleMlp,
             ...(form.previewCaption.trim() ? { caption: form.previewCaption.trim() } : {}),
+            ...(form.previewLyrics?.trim() ? { lyrics: form.previewLyrics?.trim() } : {}),
             ...(!form.previewCaption.trim() && form.previewSongId
               ? { previewSongId: form.previewSongId } : {}),
           },
         } : {}),
         attnBackend: flashSupported ? form.attnBackend : 'exact',
+        // Always sent when the form has one: Full is no longer the server
+        // default, so omitting it would train at Fastest.
+        ...(form.trainPrecision ? { trainPrecision: form.trainPrecision } : {}),
         dora:   form.adapterType === 'lora' && form.dora,
         hira:   form.adapterType === 'lora' && form.hira,
         loha:   form.adapterType === 'lora' && form.loha,

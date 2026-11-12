@@ -392,7 +392,7 @@ interface TrainingState {
   /** HeartMuLa: checkpoint the running trainer and stop; the run stays resumable. */
   requestHeartmulaCheckpoint(run: string): Promise<void>;
   /** MiniMax-Music3: audio -> RVQ codes. */
-  startMm3Codes(opts?: { launder?: boolean }): Promise<void>;
+  startMm3Codes(opts?: trainingApi.Mm3CodesRequest): Promise<void>;
   /** MiniMax-Music3: codes + captions -> an LM LoRA. */
   startMm3TrainLm(opts: trainingApi.Mm3TrainLmRequest): Promise<void>;
   /** MiniMax-Music3: carry on training into an existing run directory. Same
@@ -443,6 +443,8 @@ interface TrainingState {
   setTrainingWorker(name: string | null): Promise<void>;
   loadYue2Batches(): Promise<void>;
   startYue2Batch(input: { datasetIds: string[]; lyricTiming: boolean; clearCache?: boolean; recipe: Partial<trainingApi.Yue2JointTrainRequest> }): Promise<trainingApi.Yue2BatchSummary>;
+  /** MM3: the same server-side queue, one recipe for every ticked dataset. */
+  startMm3Batch(datasetIds: string[], recipe: trainingApi.Mm3TrainLmRequest, clearCache?: boolean): Promise<trainingApi.Yue2BatchSummary>;
   pauseYue2Batch(id: string): Promise<void>;
   resumeYue2Batch(id: string): Promise<void>;
   cancelYue2Batch(id: string): Promise<void>;
@@ -901,8 +903,8 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     catch (err) { if (isCurrent(get, worker, id)) set({ error: errMessage(err) }); }
   },
 
-  startMm3Codes: async (opts?: { launder?: boolean }) => {
-    await startJob(set, get, (id, t) => trainingApi.startMm3Codes(id, opts?.launder ? { launder: true } : {}, t));
+  startMm3Codes: async (opts?: trainingApi.Mm3CodesRequest) => {
+    await startJob(set, get, (id, t) => trainingApi.startMm3Codes(id, opts ?? {}, t));
   },
 
   // MM3 reports STEPS, not epochs, so the epoch series stays empty and the
@@ -1132,6 +1134,16 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
     }
     return batch;
   },
+  startMm3Batch: async (datasetIds, recipe, clearCache) => {
+    const worker = get().trainingWorker;
+    const batch = await writeAndInvalidate(queryClient, () => trainingApi.startMm3Batch(datasetIds, recipe, { worker }, clearCache),
+      keysPlan(resourceKey(TD.yue2Batches, { worker })));
+    if (get().trainingWorker === worker) {
+      set({ yue2BatchDraft: null });
+      await get().loadYue2Batches();
+    }
+    return batch;
+  },
   pauseYue2Batch: (id) => workerCommand(set, get, t => trainingApi.pauseYue2Batch(id, t), 'loadYue2Batches'),
   resumeYue2Batch: (id) => workerCommand(set, get, t => trainingApi.resumeYue2Batch(id, t), 'loadYue2Batches'),
   addToYue2Batch: async (id, datasetIds) => {
@@ -1204,8 +1216,10 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
         // Append-and-dedupe: the whole SSE buffer replays on every reconnect,
         // and the id (step + kind, or base + kind) is stable per render.
         const cur = get().trainPreviews;
-        if (cur.some(p => p.id === ev.preview.id && p.run === ev.run)) break;
-        const next = [...cur, { ...ev.preview, run: ev.run }];
+        // A later frame for the same take carries its measured pause (pauseMs): replace, don't skip.
+        const seen = cur.find(p => p.id === ev.preview.id && p.run === ev.run);
+        if (seen && (seen.pauseMs !== undefined || ev.preview.pauseMs === undefined)) break;
+        const next = [...cur.filter(p => p !== seen), { ...ev.preview, run: ev.run }];
         // Oldest first, base pinned to the front — the reference belongs at the
         // start of the strip, and it is the only row with step 0.
         next.sort((a, b) => (a.step - b.step) || a.kind.localeCompare(b.kind));
@@ -1376,7 +1390,7 @@ export const useTrainingStore = create<TrainingState>((set, get) => ({
             const path = typeof ev.path === 'string' ? ev.path : '';
             const known = get().trainMilestones;
             if (path && !known.some(m => m.path === path)) {
-              set({ trainMilestones: [...known, { epoch: ev.epoch ?? 0, loss: ev.loss ?? 0, path }] });
+              set({ trainMilestones: [...known, { epoch: ev.epoch ?? ev.step ?? 0, loss: ev.loss ?? 0, path }] });
             }
           }
         }

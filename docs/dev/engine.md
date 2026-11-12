@@ -51,6 +51,7 @@ All targets are defined in `engine/CMakeLists.txt`.
 | `vst-host` | `tools/vst-host.cpp` | VST3 host: `--scan`, `--gui`, `--process`, `--process-chain`, `--monitor`. Each plugin gets a 10 s warm-up pre-roll of the track's opening, fed time-reversed so plugin buffers hold the song's own start when the real pass begins. `--monitor` (Windows, WASAPI) plays a track through the chain live, driven by a control file the server rewrites atomically with an increasing `seq`; see the note below |
 | `yue2-probe` | `tools/yue2-probe.cpp` | YuE2 bring-up and parity CLI (`--info`, `--load`, `--tokenize`, `--ar-parity` and more) |
 | `heartmula-generate` | `tools/heartmula-generate.cpp` | HeartMuLa text-to-music CLI using the same pipeline as `/heartmula/synth`, with seed, cancellation and audio checks |
+| `mulacover-check` | `tools/mulacover-check.cpp` | MuLaCover port checks: Qwen style vector against capture-layout fixtures, the converted pair through discovery and load, refusals of bad cover tensors, and conditioning, GACA and prefill/decode parity against the 2c captures ([MuLaCover](#mulacover-cover-model)) |
 | `sa3-ggml-test`, `fattn-train-test`, `moss-ggml-test`, `bs-roformer-test`, `mdx23c-test` | `tools/*-test.cpp` | Parity tests against reference outputs |
 | `yue2-train-gemm-precision-test` | `tools/yue2-train-gemm-precision-test.cpp` | The YuE2 trainer's BF16 GEMMs against `YUE2_AITK_PRECISION=strict-f32`, forward and backward, at YuE2 shapes on the first GPU |
 | `yue2-convrot8-cpu-numeric-test`, `yue2-*-metal-*-test` | `tools/yue2-*.cpp` | YuE2 training-op gates: the CPU ConvRot8 kernels bit for bit against a scalar oracle, and each Metal training kernel against the CPU backend or the Metal kernel it replaced. The Metal ones skip without a Metal device |
@@ -177,10 +178,75 @@ the `heartmula_register_routes()` call. Synth jobs use the shared worker and
 `node tools/engine-smoke.mjs` includes a fixed-seed HeartMuLa render when its
 models are installed.
 
+### MuLaCover cover model
+
+MuLaCover is the HeartMuLa 3B/300M stack fine-tuned for covers from a lead sheet.
+Its weights are CC BY-NC 4.0 with a non-commercial model licence, and so are its
+outputs. `engine/tools/convert-mulacover.py` converts the checkpoint into
+`heartmula-mulacover-global-BF16.gguf` and `heartmula-mulacover-local-BF16.gguf`,
+using the HeartMuLa component contract with the variant `MuLaCover`. Discovery and
+the LM loader therefore treat it as one more variant. Tensors with two or more
+dimensions stay BF16 bit for bit, and 1-D tensors widen to F32, so no value
+changes. Nothing in the checkpoint is dropped. The converter takes the installed
+`heartmula-tokenizer.gguf` and `heartcodec-rvq-F32.gguf` as dependencies, and
+refuses unless the tokenizer is identical and the RVQ came from the HeartCodec
+checkpoint MuLaCover pins.
+
+The global file also holds the cover modules of backbone layers 20 to 27 (upstream
+`peft_layers`; these are full modules, not LoRA factors). Each layer has a
+symbolic adaptor for the melody, drum and chord rolls, gated adaptive cross
+attention and a tag MLP. The file also has `qwen_linear` for the style slot.
+`heartmula_cover_load` (`heartmula/model.h`) checks every one of these tensors'
+names, shapes and types from the header before it allocates anything, and names
+the first bad tensor. `heartmula_load_lm` loads them whenever the variant is
+MuLaCover.
+
+The style condition comes from Qwen3-Embedding-0.6B through the ACE text encoder
+(`qwen3_style_vector` in `qwen3-enc.h`). The input is the lowercased, trimmed tag
+line with no chat template, ending in the EOS token that upstream's tokenizer
+also adds. The function pools the last hidden row, applies an L2 norm in float,
+and refuses more than 8192 tokens. The parity reference is FP32, upstream's
+default for this model: with the BF16 text encoder the vector is within 1e-3 of it.
+The Q8_0 encoder is about 6e-3 away. Both registry files are tensor-identical to the
+pinned Qwen checkpoint (the Q8_0 one after re-quantisation).
+
+The conditioning path is split between two files. `heartmula/mulacover.h` builds
+the prompt: tags, a style slot, a MuQ slot, then the lyrics, with upstream's
+special ids. It also runs the context graph once per request. The input is four
+rows on the source's sixteenth-note grid: the melody roll (onset and sustain per
+pitch, 256 wide), the drum roll (128), the chord chroma (12) and a padding mask,
+at most 5000 steps. Key positions are the row index, with no BPM scaling. Each
+cover layer's adaptor projects the rolls to 24 wide each, fuses them to 512 and
+runs two bidirectional Llama layers, then projects to 3072. Layer N's context is
+the running sum of adaptor outputs 20 to N. The graph writes every layer's roped
+cross-attention and gate keys and values into an F16 cache, which is about 940 MiB
+at 5000 steps with CFG. `heartmula/lm-graph.h` note G adds the per-step half while
+a cover is bound. Before each adapted layer, a tag MLP scales and shifts the hidden
+state from the style vector. After the layer, gated cross attention (8 heads x 384,
+gate one head x 12) reads that cache, with queries at the backbone positions. The
+style slot gets `qwen_linear` of the style vector. On the unconditioned CFG row the
+rolls and the tag-MLP input are all -1, and both slots take the unconditional
+embedding. Without a bound cover the graph is the plain HeartMuLa graph.
+
+`mulacover-check` checks this path against the five 2c capture cases, comparing
+every captured key. Token ids, rolls, CFG rows, masks and positions match exactly.
+Teacher-forced codes all fall inside the engine's top-250. The captures ran torch
+under BF16 autocast, and torch itself in FP32 misses them by as much as the engine
+does. So the float tensors are gated against the same run in torch FP32:
+`fp32_ref.py`, beside the capture script, writes it to each case's `fp32/`
+folder, and a case without one fails. The engine must stay within twice torch's
+own FP32-to-BF16 drift on every float tensor, in relative L2 and in max abs. On
+logits it must also flip no more argmaxes than torch BF16 does, and only on
+near-ties. At the fed codes, its cross-entropy may sit no further from FP32's
+than torch BF16's does. These are the rules `heartmula-probe` uses for the plain
+model. The original rules are still evaluated and shown per key. A manifest that is
+unreadable, has fewer than 98 keys or lacks a key the engine produces fails the
+case.
+
 ## How ace-server is organised
 
 One process, one port, one GPU worker thread. `POST /lm`, `/synth`, `/understand`,
-`/vae`, `/codes-decode`, `/warm`, `/mm3/synth` and `/yue2/synth` create a job, push
+`/vae`, `/codes-decode`, `/warm`, `/mm3/synth`, `/mm3/refine` and `/yue2/synth` create a job, push
 it onto a FIFO queue and return `{"id":"..."}` straight away. Clients poll
 `GET /job?id=` and fetch the result with `GET /job?id=&result=1`. ACE-Step, MM3 and
 YuE2 jobs share that queue, so they never run on the GPU at the same time. The job
@@ -288,7 +354,7 @@ caption + lyrics -> prompt assembly and caption cleaning (mm3-request.h)
   -> AR planning loop (mm3-ar-loop.h): global LM (mm3-lm-graph.h) emits one semantic
      code per 25 fps frame; the RVQ depth decoder (mm3-depth-graph.h) adds 7 acoustic
      codebooks per frame -> frame hiddens
-  -> per 200-frame window, 100-frame hop (mm3-pipeline.h):
+  -> per 200-frame window, 100-frame hop by default, `flow_hop_frames` up to 160 (mm3-pipeline.h):
        condition encoder (mm3-cond-graph.h)
        flow DiT, Euler (mm3-dit-graph.h), or the TensorRT DiT (mm3-dit-trt.h)
        vocoder (mm3-vocoder-graph.h), 44.1 kHz
@@ -301,6 +367,81 @@ load. `mm3-plugins.h` lets the same Lua solvers, schedulers and guidance run on 
 MM3 flow stage. `mm3-ar-cache.h` and `mm3-hiddens-file.h` cache the planner output
 so a re-render can skip stage 1. Deeper notes, including the trap list, are in
 `.claude/skills/mm3-backend/SKILL.md`.
+
+### MM3 latent refiner: audio in, audio out
+
+An optional post-process stage, `POST /mm3/refine`, runs the terminusresearch
+minimax-music3-latent-refiner v0.10 on any finished render, not only MM3's. It is the
+package's `MiniMaxMusic3RefinerPipeline` plus the loudness convention of the runner we
+validated it with. Request and wire contract: [engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md#mm3-latent-refiner-request-post-mm3refine).
+
+```
+audio (any rate, mono or stereo) -> 44.1 kHz stereo, zero-padded to the 512-sample DAV hop
+  -> windows (30 s, 2 s overlap by default; window 0 = the whole clip as one sequence)
+  -> DAV encoder (mm3-dav-encode.h)               audio -> latents [128, L], 86.13 Hz
+  -> MERT-v1-95M (mm3-refiner-mert.h)             13 hidden states, resampled to L frames
+  -> refiner DiT bridge (mm3-refiner-dit.h)       32 deterministic Euler steps from the input latents
+  -> linear-fade overlap stitch (mm3-refiner.h)
+  -> DAV decoder (mm3-vocoder-graph.h)            latents -> 44.1 kHz stereo
+  -> trim, match the input's integrated loudness, clip, back to the input rate, mix
+```
+
+`mm3-refiner.h` holds the pipeline (`mm3_refiner_run`), the window plan, the overlap-add and a
+port of pyloudnorm's K-weighted integrated loudness; `mm3-refiner-job.h` is the route and job.
+Windowing, hop rounding (python's half-to-even `round`), the `torch.linspace` fades and the
+trim follow `pipeline.py` exactly. `mix` blends in the audio domain after the loudness match,
+and `mix=0` returns the input untouched without loading anything (the route answers it
+without queueing). A mono source (identical channels) comes back mono: the refiner is not
+channel-symmetric, so its two outputs differ slightly.
+
+**Residency.** All five modules go through `ModelStore` (`MODEL_MM3_ENC`,
+`MODEL_MM3_REFINER_MERT`, `MODEL_MM3_REFINER_CLAP`, `MODEL_MM3_REFINER_DIT`,
+`MODEL_MM3_REFINER_VOC`; labels `MM3-DAV-Enc`, `MM3-Refiner-MERT`, `MM3-Refiner-CLAP`,
+`MM3-Refiner-DiT`, `MM3-Refiner-Voc`). Under `EVICT_STRICT` only one GPU module is resident, so
+the run is phased: every window is encoded, then every window gets its MERT states, then its
+CLAP style vector, then every window is bridged, then the stitched latents are decoded. Each module is required once and released before the next (RAII handles, so success,
+error and cancel all unload; under keep-loaded they stay for the next job). Conditioning stays on
+the host between phases: about 100 MB per 30 s window of MERT states, freed as each window's
+bridge finishes. The decoder is `Mm3RefVoc`, the `voc.*` tensors loaded on their own with their
+own graph state, so the 12 to 23 GB MM3 model need not be warm. All five files are opened
+before any module loads (four when the style override below is set), so a missing or unreadable file fails fast and names its role.
+
+**Precision.** The DAV encoder (`strict_f32`, set by the store; training leaves it off) and MERT
+run their GEMMs with `GGML_HINT_STRICT_F32`: on ggml-cuda's default TF32 the DAV latents and
+MERT states miss the frozen parity gates. The refiner DiT and the decoder run on the default.
+
+**Cost.** A 30 s window peaks at about 2.3 GB of VRAM beyond the idle baseline, the DiT's dense
+attention being most of it. The DiT attends over 2L tokens, so memory grows with the square of
+the sequence L: 60 s peaks at about 6.3 GB. L is the whole clip in direct mode (`window=0`), the
+window in windowed mode, or the clip when it is shorter than the window; it is limited to 5168
+frames (60 s) in every case, answered with 413 before anything queues. Measured on an RTX 5090 with the GPU idle and all four modules cold-loaded
+(F32 refiner and MERT, F16 encoder and decoder): a 34 s clip at 32 steps takes 6.5 s, a 60 s clip
+(three windows) 8.9 s; the bridge is about two thirds of that.
+
+**Style vector.** The DiT takes a 512-d CLAP vector per window, made by the CLAP audio tower
+(`mm3-refiner-clap.h`, `mm3-refiner-clap-*.gguf`): channel mean, centre crop of at most 10 s,
+48 kHz, mel, HTSAT, projection, L2 norm, as `pipeline.py` does. `mm3_refiner_run` computes all
+windows' vectors in one CLAP phase after MERT (reported as `refine_condition`) and keeps them on
+the host. A missing CLAP file answers 501 like any other pack file; nothing falls back to zeros
+or a constant. For testing, `HOTSTEP_MM3_REFINE_TEST_STYLE=<raw float32 file of 512 values>`
+supplies one vector for every window instead (`mm3_refiner_style_override()`; the CLAP file is
+then not needed); the probe passes the torch fixtures' vectors per window through the same
+`Mm3StyleFn`.
+
+**Checks.** `mm3-refiner-probe` (`engine/tools/mm3-refiner-probe.cpp`) runs the whole pipeline
+against the torch fixtures (window starts, overlap weights, DAV latents, stitched latents, raw and
+final audio, loudness gain) and the behaviour tests; `tools/mm3-refiner/check-integration.ps1`
+runs it for steps 1, 8 and 32 on all twelve clips, then drives `POST /mm3/refine` on throwaway
+engines (400, 413, 501, bypass, phases, cancel, FIFO, 48 kHz, mono, VRAM growth, and the ten
+native clips end to end with the real CLAP style against the torch `final.wav`). It needs the
+ignored fixtures from `tools/mm3-refiner/README.md` and a `tools/mm3-refiner/artifacts/models/mm3/`
+folder holding `mm3-refiner-refiner-f32`, `mm3-refiner-mert-f32`, `mm3-refiner-clap-f32`,
+`mm3-enc-f16` and `mm3-voc-f16`.
+
+Two header quirks: `mm3-refiner.h` hides the `MM3_DIT_MAX_NODES` macro of `mm3-dit-graph.h`
+while it reads `mm3-refiner-dit.h`, which declares a constant of that name; and
+`mm3-refiner-job.h` has its own error helper because `json_error()` is defined after its
+include point in `hot-step-server.cpp`.
 
 ### YuE2: plan, compose, render
 
@@ -523,9 +664,9 @@ The HOT-Step files these hooks bring in:
 - `hot-step-build-flags.h` carries `HOT_STEP_DISABLE_FA` for the Volta build.
 
 `hot-step-server.cpp` wires the model families in with one include and one
-registration call each: `minimax/mm3-server.h` plus `minimax/mm3-job.h`
-(`mm3_register_routes`, `mm3_register_job_routes`) and `yue2/yue2-server.h`
-(`yue2_register_routes`). SA3 has no subtree hook; its routes are written in
+registration call each: `minimax/mm3-server.h`, `minimax/mm3-job.h` and
+`minimax/mm3-refiner-job.h` (`mm3_register_routes`, `mm3_register_job_routes`,
+`mm3_refiner_register_routes`) and `yue2/yue2-server.h` (`yue2_register_routes`). SA3 has no subtree hook; its routes are written in
 `hot-step-server.cpp` itself.
 
 `engine/verify-hooks.ps1` checks the four hooks, the sentinel, `hot-step-server.cpp`'s own
@@ -724,7 +865,13 @@ Other adapter paths:
 - MM3 LM adapters are runtime or merge (`mm3-lm-adapter.h`, `mm3-lm-merge.h`). A
   runtime DoRA gets a one-time norm pass (`mm3-lm-dora.h`), and `adapter_runtime_dora`
   re-normalises it for the request's scale dials. MM3 DiT LoRAs and DoRAs merge at
-  load (`mm3-adapter.h`).
+  load (`mm3-adapter.h`). A runtime MM3 LM adapter can change strength along the
+  song (`lm_adapter_fade_*`, `MM3LmAdapterSchedule` in `mm3-lm-adapter.h`): the AR
+  loop re-sets the scales between iterations, which rebuilds the decode graph and
+  keeps the KV cache. The plan dial (`lm_adapter_plan` < 1) adds a base copy of every
+  take's CFG pair (`MM3LmGraph::base_rows`), masks the adapter delta off on those rows
+  with a resident `[1, 1, B]` tensor in the KV buffer, and mixes the two models' logits
+  before the semantic draw (`mm3-ar-loop.h`).
 - YuE2 adapters merge at load (`yue2-adapter.h`): AR (composer) and NAR files in
   LoRA, LoKr or DoRA form (`yue2-{ar,nar}-{lora,lokr,dora}-v1`), chosen with
   `POST /yue2/select-model`. On a ConvRot INT8 base the LoRA factors are applied at
@@ -750,7 +897,27 @@ MM3 the request's `dit_backend` does.
     `-DHOT_STEP_TRTLLM_ENABLE=ON`.
   - MM3 DiT: `"dit_backend": "tensorrt"` on `/mm3/synth` uses `mm3-dit-trt.h`, which
     builds a base engine per GPU under `<models>/mm3/mm3-trt-cache/` and refits it
-    per DiT GGUF and adapter stack.
+    per DiT GGUF and adapter stack. With keep-loaded off the runtime is freed after
+    every job, but the refitted plan's bytes (~4.5 GB) stay in host RAM
+    (`g_mm3_trt_plan`), so the next job only deserializes (~0.5 s) instead of
+    reading the file again. `POST /mm3/unload` (without `keep_ar_cache`), a model
+    selection change and a switch to the GGML renderer drop them; `/mm3/props`
+    reports the size as `dit_runtime.host_plan_mb`. The DiT GGUF is staged on the
+    CPU only as a refit source: on a refit-cache miss `Runtime::refit` stages it
+    for the refit and frees it after. The rest load stages the whole DiT only when
+    `MM3_ADAPTER` is set, because the adapter merge patches that copy.
+    FP8 (experimental, default off): request `"dit_precision": "fp8"` sets
+    `MM3Model::dit_fp8` and builds a separate base engine with FP8 Q/DQ on the MLP
+    GEMMs of blocks 2..33 (weight scales computed at refit, activation scales from
+    the request's `dit_fp8_calib`, else `<models>/mm3/mm3-dit-trt.fp8.json`), with
+    its own refit cache key. The server ships the calibration as
+    `server/src/data/mm3-dit-trt.fp8.json` and sends its path; it is made by
+    `tools/mm3-trt-export/fp8_lab.py calib`. A job whose precision or calibration
+    differs from the loaded runtime drops it (`mm3-job.h`); the host plan slot keys
+    on the refit-cache file, so switching costs one plan read (~0.5-2 s) and no
+    refit. Dev env: `MM3_DIT_TRT_FP8=1` forces FP8 on for every TensorRT job;
+    `MM3_DIT_TRT_DUMP=<dir>` writes every forward's input and velocity for the lab
+    tool. Measurements: `mm3-backend` skill, `reference/performance.md`.
 
 ONNX Runtime is gone from the engine: no build links it, and there is no CMake option
 for it. What used to run on it:
@@ -807,7 +974,8 @@ are not covered. The code is `engine/src/train/roundtrip-run.h`.
 `ace-train` links no `acestep-core`. The trainers are headers under `engine/src/train/`;
 the one compiled piece is `yue2-aitk-kernels` (`train/aitk-runtime.cmake`), the YuE2
 joint trainer's runtime, which on a CUDA build adds the 8-bit AdamW, fused head-loss and
-gradient-clip kernels. It writes machine-readable JSONL on stdout with `--jsonl` and
+gradient-clip kernels, and the LM trainers' q8_0 to BF16 weight stage (`q8_bf16_cuda.cu`,
+used by `--weights bf16` on a q8_0 base). It writes machine-readable JSONL on stdout with `--jsonl` and
 human logs on stderr, and exits 0 on success, 1 on a runtime failure and 2 on bad
 usage. `ace-train --help` prints the full option list.
 
@@ -940,6 +1108,7 @@ response details are in [the endpoint reference](../../engine/docs/ARCHITECTURE.
 | `POST /spectral-lifter` | Spectral Lifter clean-up (CPU) |
 | `GET /mm3/props`, `POST /mm3/warm`, `POST /mm3/unload`, `POST /mm3/select-model` | MM3 status, residency and quant selection |
 | `POST /mm3/synth`, `GET /mm3/job`, `GET /mm3/take`, `GET /mm3/stream` | MM3 generation, progress, ensemble takes, live audio |
+| `POST /mm3/refine` | MM3 latent refiner on any audio (progress and result through `/job`; see [MM3 latent refiner](#mm3-latent-refiner-audio-in-audio-out)) |
 | `POST /mm3/tokenize-check`, `POST /mm3/imatrix` | MM3 prompt token count, imatrix collection for `quantize` |
 | `POST /mm3/voc-decode`, `/mm3/dit-forward`, `/mm3/flow-sample`, `/mm3/depth-frame`, `/mm3/cond-encode`, `/mm3/lm-plan`, `/mm3/synth-e2e` | MM3 bring-up and parity endpoints. They run GPU work outside the job queue; do not build features on them |
 | `GET /yue2/props`, `POST /yue2/warm`, `POST /yue2/unload`, `POST /yue2/select-model` | YuE2 status, residency, quant and adapter selection |

@@ -26,7 +26,7 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
     import { pollUntilDone } from './src/services/generation/pollUntilDone.js';
     const calls = [];
     let rejectPick = false, failJob = false, cancelOnSubmit = false, cancelOnPoll = false, rejectUnload = false, polls = 0;
-    let controller;
+    let controller, residentBytes;
     const wav = Buffer.alloc(48);
     wav.write('RIFF'); wav.writeUInt32LE(40, 4); wav.write('WAVE', 8);
     wav.write('fmt ', 12); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20);
@@ -46,7 +46,8 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
         global: [{type: 'Q8_0', variant: '3B', compatible: true, bytes: 123}, {type: 'F16', variant: '3B', compatible: false, error: 'RVQ mismatch'}],
         local: [{type: 'Q4_K_M', variant: '3B', compatible: true}], flow: [], scalar_decoder: [],
       }});
-      if (route === '/heartmula/props') return Response.json({ synth_ready: true, available: true, encode_ready: false });
+      if (route === '/heartmula/props') return Response.json({ synth_ready: true, available: true, encode_ready: false,
+        ...(residentBytes === undefined ? {} : { vram: { resident_bytes: residentBytes } }) });
       if (route === '/heartmula/synth') {
         if (cancelOnSubmit) controller.abort();
         return Response.json({ id: 'engine-fixture' });
@@ -113,7 +114,11 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
         {heartmulaGlobalModel: 8}, {batchSize: 2}, {randomSeed: 'yes'},
         {tags: '界'.repeat(1366)}, {lyrics: '界'.repeat(10923)},
       ]) assert.throws(() => heartmulaBackend.resolveRequest({...raw, ...bad}), undefined, JSON.stringify(bad));
-      assert.throws(() => buildEnvelope({...raw, backendOverride: 'heartmula', taskType: 'cover'}, 'fixture-user', 'other', Date.now()), /does not support/);
+      assert.equal((await heartmulaBackend.capabilities()).features.cover, true);
+      const callsBeforeCover = calls.length;
+      assert.throws(() => buildEnvelope({...raw, backendOverride: 'heartmula', taskType: 'cover'}, 'fixture-user', 'other', Date.now()), /HeartMuLa covers are not available yet/);
+      assert.throws(() => heartmulaBackend.resolveRequest({...raw, heartmulaCover: {}}), /HeartMuLa covers are not available yet/);
+      assert.equal(calls.length, callsBeforeCover, 'cover must not call a missing endpoint or fall back to synth');
       assert.equal(heartmulaBackend.resolveRequest({...raw, instrumental: true}).common.lyrics, '');
       // Adapter dials ride on the wire only with an adapter; plugin picks only with the toggle on.
       const dialled = heartmulaBackend.resolveRequest({...raw, heartmulaAdapter: adapter, heartmulaAdapterScaleMlp: 0, heartmulaAdapterScaleLate: 1.5}).options;
@@ -182,6 +187,15 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
       await assert.rejects(awaitBackendRelease(), /not confirmed it freed/);
       rejectUnload = false;
       await awaitBackendRelease();
+      // Nothing resident: no unload, which would queue on the engine's GPU worker (GH #341).
+      residentBytes = 0;
+      const idle = calls.length;
+      await heartmulaBackend.releaseVram();
+      assert.ok(calls.slice(idle).some(c => c.route === '/heartmula/props'));
+      assert.ok(!calls.slice(idle).some(c => c.route === '/heartmula/unload'));
+      residentBytes = 1;
+      await heartmulaBackend.releaseVram();
+      assert.ok(calls.slice(idle).some(c => c.route === '/heartmula/unload'));
     } finally { closeDb(); }
   `;
   try { execFileSync(process.execPath, ['--import', 'tsx/esm', '--eval', script], {

@@ -1,4 +1,6 @@
 import { z } from 'zod/v4';
+import fs from 'node:fs';
+import path from 'node:path';
 import { parseFile } from 'music-metadata';
 import { config } from '../../config.js';
 import { getDb } from '../../db/database.js';
@@ -18,9 +20,14 @@ import type { WorkflowDocuments } from './revisions.js';
 import {
   coverDraftRefSchema as ref, coverOpenSchema as open, coverTranscribeSchema as transcribe,
   coverCaptionSchema as captionInput, coverRenderSchema as render,
+  coverSourceSchema, type CoverLeadSheetSource, type CoverLeadSheetResult,
   type CoverRenderInput, type CoverDraft,
 } from '../../contracts/studioWorkflows.js';
 import { instrumentalConflict, preparedPair } from '../../contracts/yue2Prepare.js';
+import { tryAbcCoverLeadSheet, coverRenderRolls, clearCoverScore } from '../coverLeadSheet.js';
+import { sheetTranscriberSetting } from '../training/yue2Sheet.js';
+import { heartmulaCoverLyrics, heartmulaCoverTags } from '../backends/heartmula/cover.js';
+import { mm3PlankDir, mm3PlankSiblings, readMm3PlankMeta } from '../backends/minimax/plank.js';
 
 export type { CoverRenderInput, CoverDraft };
 
@@ -48,10 +55,50 @@ export function coverScoreDetails(abc: string, factor: number): { bpm: number; k
 function coverTitle(i: CoverRenderInput) {
   return i.artistName ? `${i.title || 'Cover'} (${i.artistName} Cover)` : (i.title || 'Cover');
 }
+/** The plank sidecar's launder record as generation params. A plank without a
+ *  sidecar, or one captured from a render, reports nothing. */
+export function mm3PlankProvenance(plank: string): Record<string, unknown> {
+  const meta = readMm3PlankMeta(plank);
+  if (typeof meta?.laundered !== 'boolean') return {};
+  return { mm3PlankLaundered: meta.laundered,
+    ...(meta.laundered ? {
+      mm3PlankLaunderModels: [meta.rec7, meta.encoder].filter(Boolean).join(', '),
+      ...(meta.launderSteps !== undefined ? { mm3PlankLaunderSteps: meta.launderSteps } : {}),
+      ...(meta.launderSeed !== undefined ? { mm3PlankLaunderSeed: meta.launderSeed } : {}),
+      ...(meta.launderCaption !== undefined ? { mm3PlankLaunderCaption: meta.launderCaption } : {}),
+    } : {}) };
+}
+
+const MM3_STATE_FIX = { off: 0, depth: 1, stream: 2, both: 3 } as const;
+
+/** The guided cover modes (round 9 of the cover probe): the planner picks from
+ *  the plank's guide instead of being pinned to it. Null for Pin. Refuses with
+ *  "Re-encode" when the plank predates the guide or the launder state, rather
+ *  than falling back to Pin. */
+export function mm3CoverModeParams(m: NonNullable<CoverRenderInput['mm3Cover']>): Record<string, unknown> | null {
+  const mode = m.mode ?? 'pin';
+  if (mode === 'pin') return null;
+  if (!m.plank) throw new WorkflowError(400, 'Encode the source first');
+  const sib = mm3PlankSiblings(m.plank);
+  const has = (file: string) => fs.existsSync(path.join(mm3PlankDir(), file));
+  if (!has(sib.guide) || (mode === 'blend' && !has(sib.state))) {
+    throw new WorkflowError(409, 'This source was encoded before cover modes. Re-encode it to use this mode.');
+  }
+  const fix = mode === 'follow-depth' ? 'depth' : mode === 'follow-stream' ? 'stream' : 'off';
+  return {
+    mm3CoverMode: mode, mm3CoverPlank: m.plank,
+    mm3GuidePath: sib.guide, mm3GuideScale: m.strength ?? 0.9, mm3GuideK: m.candidates ?? 32, mm3GuideOutside: -100,
+    mm3GuideSeconds: m.trimSeconds ?? '',
+    ...(mode === 'product' ? { mm3GuideProduct: m.weight ?? 1 } : { mm3GuideStateFix: MM3_STATE_FIX[m.stateFix ?? fix] }),
+    ...(mode === 'blend' ? { mm3BlendPath: sib.state, mm3BlendAmount: (m.blend ?? 25) / 100 } : {}),
+  };
+}
+
 export function effectiveCoverRequest(i: CoverRenderInput, d: CoverDraft, url: string): Record<string, unknown> {
-  if (i.expectedBackend === 'heartmula') throw new WorkflowError(400, 'HeartMuLa covers are not available yet');
   const c = i.controls, e = i.engineParams, s = i.settings;
   const analysis = i.analysis ?? d.analysis;
+  const scoreSource = d.scoreSource || i.scoreSource;
+  const scoreMetadata = scoreSource ? { scoreSource: scoreSource === 'dataset' ? 'dataset-sidecar' : scoreSource } : {};
   if (i.expectedBackend === 'ace') {
     const bpm = c.bpmOverride ?? ((analysis?.bpm || 120) * c.bpmCorrection);
     const key = c.keyOverride || analysis?.key || 'C major';
@@ -105,6 +152,47 @@ export function effectiveCoverRequest(i: CoverRenderInput, d: CoverDraft, url: s
       sa3Cover: { transform: i.strength ?? c.sa3Transform ?? 0.3,
         adapters: i.adapter ?? c.sa3Adapters ?? '' } };
   }
+  if (i.expectedBackend === 'minimax-m3') {
+    const m = i.mm3Cover;
+    if (!m || (!m.plank && !m.soundStrength)) throw new WorkflowError(400, 'Turn on Plan (encode or pick a reference) or Sound');
+    // The global bar's MM3 settings (LM knobs, adapter, flow) ride along; the
+    // plank or the source pins the length, so takes, endings and saved plans stand down.
+    const mm3 = Object.fromEntries(Object.entries(e).filter(([key]) => key.startsWith('mm3')));
+    const guided = mm3CoverModeParams(m);
+    return { ...shared, ...mm3, backend: 'minimax-m3', expectedBackend: 'minimax-m3', taskType: 'text2music',
+      customMode: true, caption: i.caption, style: i.caption, title: coverTitle(i),
+      lyrics: i.instrumental ? '' : i.lyrics, instrumental: i.instrumental, batchSize: 1,
+      source: 'cover-studio', sourceAudioUrl: url,
+      artistName: i.targetArtistName || i.artistName, sourceArtist: i.artistName,
+      ...(i.seed !== undefined ? { seed: i.seed, randomSeed: i.seed < 0 } : {}),
+      mm3PlankPath: guided ? '' : m.plank ?? '', mm3PlankSemanticOnly: m.semanticOnly,
+      ...guided,
+      // Provenance for the song facts: a laundered plank sounds different, and
+      // A/Bs need to know which kind they rendered from.
+      ...(m.plank ? mm3PlankProvenance(m.plank) : {}),
+      // Sound: the source's latents in the flow. Trim covers both when both are on.
+      mm3A2aStrength: m.soundStrength ?? '', mm3A2aHold: m.soundStrength ? m.soundHold ?? 0 : '',
+      mm3A2aSourceSeconds: m.soundStrength && m.plank ? m.trimSeconds ?? '' : '',
+      mm3ForceBias: m.forceBias ?? '', mm3ForcePattern: m.pattern ?? undefined,
+      mm3PlankTrimSeconds: m.trimSeconds ?? undefined, mm3ArSeed: m.arSeed >= 0 ? m.arSeed : '',
+      mm3Takes: 1, mm3HiddensPath: '', mm3SaveHiddens: false };
+  }
+  if (i.expectedBackend === 'heartmula') {
+    if (!d.approvedAbc) throw new WorkflowError(409, 'Review and approve the score first');
+    try {
+      const { rolls, path } = coverRenderRolls(d);
+      const tags = heartmulaCoverTags(i.heartmulaTags);
+      return { ...shared, ...Object.fromEntries(Object.entries(e).filter(([key]) => key.startsWith('heartmula'))),
+        backend: 'heartmula', expectedBackend: 'heartmula', taskType: 'cover', customMode: true,
+        heartmulaCover: rolls, leadSheetRenderingPath: path,
+        ...scoreMetadata, heartmulaTags: tags, caption: tags, style: tags,
+        lyrics: heartmulaCoverLyrics(i.instrumental ? '' : i.lyrics), instrumental: i.instrumental,
+        duration: -1, batchSize: 1, title: coverTitle(i), sourceAudioUrl: url, source: 'cover-studio',
+        artistName: i.targetArtistName || i.artistName, sourceArtist: i.artistName,
+        ...(i.seed !== undefined ? { seed: i.seed, randomSeed: i.seed < 0 } : {}),
+        heartmulaTopK: e.heartmulaTopK ?? 250 };
+    } catch (error) { throw new WorkflowError(400, error instanceof Error ? error.message : String(error)); }
+  }
   if (i.expectedBackend !== 'yue2') throw new WorkflowError(400, 'Backend does not support covers');
   if (!d.approvedAbc) throw new WorkflowError(409, 'Review and approve the score first');
   if (c.pairMode === 'pair' && (!c.lmAdapterAr || !c.lmAdapterNar)) throw new WorkflowError(400, 'Choose both YuE2 adapter halves');
@@ -121,7 +209,8 @@ export function effectiveCoverRequest(i: CoverRenderInput, d: CoverDraft, url: s
     yue2CfgScale: c.cfgScale, yue2LyricSchedule: c.lyricSchedule, customMode: true, taskType: 'text2music',
     title: coverTitle(i), caption, style: caption, lyrics: i.instrumental ? '' : i.lyrics,
     ...(i.lyricsSource ? { lyricsSource: i.lyricsSource } : {}),
-    ...(i.scoreSource === 'dataset' || d.scoreSource === 'dataset' ? { scoreSource: 'dataset-sidecar' } : {}),
+    ...scoreMetadata,
+    leadSheetRenderingPath: d.leadSheet && d.leadSheet.abc !== d.approvedAbc ? 'abc-edited' : 'abc',
     instrumental: i.instrumental, source: 'cover-studio', sourceAudioUrl: url,
     // The covering band names the saved file and tags it, as on the ACE path.
     artistName: i.targetArtistName || i.artistName, sourceArtist: i.artistName,
@@ -141,10 +230,12 @@ export interface CoverDeps {
   analyze?: (path: string, signal: AbortSignal) => Promise<{ bpm: number | null; key: string; scale: string } | null>;
   datasetAnalysis?: (path: string) => { bpm: number; key: string; scale: string } | null;
   metadata?: (path: string) => Promise<{ artist: string; title: string; album: string; duration: number | null }>;
-  transcribe?: (url: string, label: string, user: string, signal: AbortSignal, force: boolean) => Promise<{ abc: string; scoreSource?: string }>;
+  transcribe?: (url: string, label: string, user: string, signal: AbortSignal, force: boolean, source?: CoverLeadSheetSource) => Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult }>;
+  leadSheetDefault?: () => CoverLeadSheetSource;
   capability?: (backend: string) => Promise<boolean>;
   caption?: (artistId: number, provider: string, model: string, force: boolean, signal: AbortSignal) => Promise<{ text: string; generatedProfileId?: number }>;
 }
+const defaultLeadSheetSource = (): CoverLeadSheetSource => sheetTranscriberSetting().refined ? 'sheetsage2-refined' : 'sheetsage2';
 const defaultAsset = (id: string, user: string) => resolveAudioAsset(getDb(), id, user, config.data.dir);
 async function defaultMetadata(path: string) {
   try {
@@ -152,13 +243,18 @@ async function defaultMetadata(path: string) {
     return { artist: m.common.artist || '', title: m.common.title || '', album: m.common.album || '', duration: m.format.duration ?? null };
   } catch { return { artist: '', title: '', album: '', duration: null }; }
 }
-async function defaultTranscribe(url: string, label: string, user: string, signal: AbortSignal, force: boolean) {
-  const started = await yue2CoverService.start({ sourceAudioUrl: url, sourceLabel: label.slice(0, 120), force }, user);
+async function defaultTranscribe(url: string, label: string, user: string, signal: AbortSignal, force: boolean, source: CoverLeadSheetSource = 'sheetsage2'): Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult }> {
+  if (source === 'yourmt3-chordnet') throw new WorkflowError(400, yue2CoverService.readiness(source).message!);
+  if (source === 'muscriptor') {
+    const { transcribeCoverMidi } = await import('../../routes/midiStudio.js');
+    return transcribeCoverMidi(url, signal);
+  }
+  const started = await yue2CoverService.start({ sourceAudioUrl: url, sourceLabel: label.slice(0, 120), force, transcriber: source }, user);
   if (signal.aborted) {
     if (started.jobId) yue2CoverService.cancel(started.jobId, user);
     throw new Error('Cancelled');
   }
-  if (started.abc) return { abc: started.abc, scoreSource: started.scoreSource };
+  if (started.abc) return { abc: started.abc, scoreSource: started.scoreSource || 'sheetsage2' };
   const id = started.jobId;
   if (!id) throw new Error('Transcription returned no score or job');
   const cancel = () => { try { yue2CoverService.cancel(id, user); } catch { /* already final */ } };
@@ -167,7 +263,7 @@ async function defaultTranscribe(url: string, label: string, user: string, signa
     for (;;) {
       if (signal.aborted) throw new Error('Cancelled');
       const result = yue2CoverService.find(id, user);
-      if (result.abc) return { abc: result.abc };
+      if (result.abc) return { abc: result.abc, scoreSource: 'sheetsage2' };
       if (result.job?.status === 'done') throw new Error('Transcription finished without a score');
       if (result.job?.status === 'failed' || result.job?.status === 'cancelled') throw new Error(result.job.error || `Transcription ${result.job.status}`);
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -252,9 +348,21 @@ export function createCoverKinds(deps: CoverDeps = {}): WorkflowKind<any>[] {
       : null);
     const document = docs().create(ctx.userId, 'cover-draft', {
       assetId, sha256: source.sha256, sourceLabel: source.filename, metadata, analysis,
-      abc: '', approvedAbc: '',
+      abc: '', approvedAbc: '', leadSheetSource: input.leadSheetSource || (dep('leadSheetDefault') || defaultLeadSheetSource)(),
     });
-    return { documentId: document.id, revision: document.revision, metadata, analysis };
+    return { documentId: document.id, revision: document.revision, metadata, analysis, leadSheetSource: document.data.leadSheetSource };
+  } }, { kind: 'cover-source', input: coverSourceSchema, async run(ctx) {
+    const input = ctx.input as z.infer<typeof coverSourceSchema>;
+    const data = draft(docs(), input.documentId, input.revision, ctx.userId);
+    const selected = asset(input.assetId || data.assetId, ctx.userId);
+    const changed = selected.sha256 !== data.sha256 || (input.assetId || data.assetId) !== data.assetId;
+    const next = changed || input.leadSheetSource !== data.leadSheetSource
+      ? clearCoverScore(data, input.leadSheetSource) : data;
+    const updated = docs().update(input.documentId, ctx.userId, input.revision, {
+      ...next, assetId: input.assetId || data.assetId, sha256: selected.sha256,
+      ...(changed ? { sourceLabel: selected.filename, analysis: null, metadata: null } : {}),
+    });
+    return { documentId: updated.id, revision: updated.revision, leadSheetSource: input.leadSheetSource };
   } }, { kind: 'cover-caption', input: captionInput, async run(ctx) {
     const input = ctx.input as z.infer<typeof captionInput>;
     const data = draft(docs(), input.documentId, input.revision, ctx.userId);
@@ -280,20 +388,23 @@ export function createCoverKinds(deps: CoverDeps = {}): WorkflowKind<any>[] {
     const data = draft(docs(), input.documentId, input.revision, ctx.userId);
     const source = asset(data.assetId, ctx.userId);
     if (source.sha256 !== data.sha256) throw new WorkflowError(409, 'Cover source changed');
+    const leadSheetSource = data.leadSheetSource || (dep('leadSheetDefault') || defaultLeadSheetSource)();
     ctx.emit('stage', { stage: 'Transcribing score' });
     const result = await (dep('transcribe') || defaultTranscribe)(source.url, data.sourceLabel || source.filename,
-      ctx.userId, ctx.signal, input.force);
+      ctx.userId, ctx.signal, input.force, leadSheetSource);
     ctx.throwIfCancelled();
     const updated = docs().update(input.documentId, ctx.userId, input.revision, current => {
       if (current.assetId !== data.assetId) throw new WorkflowError(409, 'Cover source changed');
-      return { ...current, abc: result.abc, approvedAbc: '', scoreSource: result.scoreSource || '' };
+      if (asset(data.assetId, ctx.userId).sha256 !== data.sha256) throw new WorkflowError(409, 'Cover source changed');
+      const scoreSource = result.scoreSource || (leadSheetSource === 'sheetsage2-refined' ? 'sheetsage2' : leadSheetSource);
+      const sheet = result.leadSheet || tryAbcCoverLeadSheet(result.abc, leadSheetSource, scoreSource as CoverLeadSheetResult['scoreSource']);
+      return { ...current, leadSheetSource, abc: result.abc, approvedAbc: '', scoreSource, leadSheet: sheet };
     });
-    return { documentId: updated.id, revision: updated.revision, abc: result.abc, scoreSource: result.scoreSource };
+    return { documentId: updated.id, revision: updated.revision, abc: result.abc, scoreSource: updated.data.scoreSource, leadSheet: updated.data.leadSheet };
   } }, { kind: 'cover-render', input: render, async run(ctx) {
     let input = ctx.input as CoverRenderInput;
     const data = draft(docs(), input.documentId, input.revision, ctx.userId);
-    if (input.expectedBackend === 'heartmula') throw new WorkflowError(400, 'HeartMuLa covers are not available yet');
-    if (input.prepare !== undefined && input.expectedBackend === 'yue2') {
+    if (input.prepare !== undefined && (input.expectedBackend === 'yue2' || input.expectedBackend === 'heartmula')) {
       const pair = preparedPair(input.prepare, data.approvedAbc || undefined);
       if ('error' in pair) throw new WorkflowError(409, pair.error);
       const conflict = instrumentalConflict(pair, input.instrumental);

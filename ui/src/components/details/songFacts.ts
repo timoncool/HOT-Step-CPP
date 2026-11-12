@@ -10,6 +10,7 @@
 
 import type { Song } from '../../types';
 import { formatDitModel, formatLmModel } from '../global-bar/modelLabels';
+import { seedText } from '../../utils/seed';
 
 export type Backend = 'ace' | 'minimax-m3' | 'yue2' | 'sa3';
 
@@ -97,7 +98,9 @@ const STAGE_REASON: Record<string, { text: string; tone?: Fact['tone'] }> = {
 };
 
 function num(value: unknown): string {
-  return value === undefined || value === null || value === '' ? '' : String(value);
+  if (value === undefined || value === null || value === '') return '';
+  // Seeds past 2^53: print the exact integer, not "...570000".
+  return typeof value === 'number' ? seedText(value) : String(value);
 }
 
 /** Push a fact only when it has a value — keeps every builder below flat. */
@@ -205,8 +208,53 @@ function mm3Facts(gp: any): FactGroup[] {
   }
   if (adapter.length) groups.push({ title: 'Adapter', facts: adapter });
 
+  // Cover Studio (code forcing): which plank, and how hard it was held.
+  const cover: Fact[] = [];
+  const plank = gp.mm3PlankPath || gp.mm3CoverPlank;
+  if (plank) {
+    // Cover modes (Cover Studio): Pin forces the plank; the others follow its guide.
+    const MODES: Record<string, string> = { follow: 'Follow source', 'follow-depth': 'Follow source, depth fix',
+      'follow-stream': 'Follow source, stream fix', product: 'Product rule', blend: 'State blend' };
+    add(cover, 'Mode', MODES[String(gp.mm3CoverMode)] ?? 'Pin');
+    add(cover, 'Plank', String(plank).replace(/\.mm3plank$/, '').slice(0, 8), { mono: true, title: String(plank) });
+    if (gp.mm3PlankLaundered !== undefined) {
+      add(cover, 'Laundered', gp.mm3PlankLaundered ? 'Yes' : 'No',
+        gp.mm3PlankLaunderModels ? { title: String(gp.mm3PlankLaunderModels) } : undefined);
+    }
+    if (gp.mm3PlankLaunderSteps !== undefined) add(cover, 'Launder steps', num(gp.mm3PlankLaunderSteps));
+    if (gp.mm3PlankLaunderSeed !== undefined) add(cover, 'Launder seed', String(gp.mm3PlankLaunderSeed));
+    if (gp.mm3PlankLaunderCaption !== undefined) add(cover, 'Source caption', String(gp.mm3PlankLaunderCaption));
+    if (gp.mm3CoverMode) {
+      if (gp.mm3GuideProduct !== undefined) add(cover, 'Weight', num(gp.mm3GuideProduct));
+      else add(cover, 'Strength', num(gp.mm3GuideScale));
+      add(cover, 'Candidates', num(gp.mm3GuideK));
+      const FIX = ['Off', 'Depth', 'Stream 0', 'Both'];
+      if (gp.mm3GuideStateFix !== undefined) add(cover, 'State fix', FIX[Number(gp.mm3GuideStateFix)] ?? String(gp.mm3GuideStateFix));
+      if (gp.mm3BlendAmount !== undefined) add(cover, 'Blend', `${Math.round(Number(gp.mm3BlendAmount) * 100)}%`);
+      if (Number(gp.mm3GuideSeconds) > 0) add(cover, 'Trim', `${num(gp.mm3GuideSeconds)} s`);
+    } else add(cover, 'Forcing', gp.mm3PlankSemanticOnly ? 'Semantic only' : 'Full replay');
+    if (gp.mm3PlankSemanticOnly && !gp.mm3CoverMode) {
+      add(cover, 'Bias', gp.mm3ForceBias === '' || gp.mm3ForceBias === undefined ? 'Hard pin' : num(gp.mm3ForceBias));
+      const p = gp.mm3ForcePattern;
+      if (p) {
+        const rules = [p.prefixSeconds && `prefix ${p.prefixSeconds} s`, p.anchorEvery && `every ${p.anchorEvery} frames`,
+          p.pinnedRanges?.length && p.pinnedRanges.map((r: number[]) => `${r[0]}-${r[1]}`).join(', ')].filter(Boolean);
+        add(cover, 'Pattern', `${rules.join(' + ')}${p.invert ? ' (inverted)' : ''}`);
+      }
+    }
+    if (gp.mm3PlankTrimSeconds && !gp.mm3CoverMode) add(cover, 'Trim', `${num(gp.mm3PlankTrimSeconds)} s`);
+  }
+  // Sound: the source's latents blended into the flow (audio to audio).
+  if (Number(gp.mm3A2aStrength) > 0) {
+    add(cover, 'Sound', num(gp.mm3A2aStrength));
+    if (Number(gp.mm3A2aHold) > 0) add(cover, 'Hold', num(gp.mm3A2aHold));
+    if (Number(gp.mm3A2aSourceSeconds) > 0) add(cover, 'Source trim', `${num(gp.mm3A2aSourceSeconds)} s`);
+  }
+  if (cover.length) groups.push({ title: 'Cover', facts: cover });
+
   const seeds: Fact[] = [];
   add(seeds, 'Seed', num(gp.seed), { mono: true });
+  if (gp.mm3ArSeed !== undefined && gp.mm3ArSeed !== '') add(seeds, 'Planner seed', num(gp.mm3ArSeed), { mono: true });
   if (gp.mm3Takes > 1) {
     add(seeds, 'Take', `${Number(gp.mm3Take) + 1} of ${gp.mm3Takes}`);
     add(seeds, 'Base seed', num(gp.mm3BaseSeed), { mono: true });
@@ -316,11 +364,11 @@ function yue2Facts(gp: any): FactGroup[] {
   // index, or a re-plan seed). Rows before baseSeed existed show only one.
   const base = gp.baseSeed;
   add(seeds, 'Seed', num(base ?? seed), { mono: true });
-  if (base !== undefined && seed !== undefined && String(base) !== String(seed)) {
+  if (base !== undefined && seed !== undefined && num(base) !== num(seed)) {
     add(seeds, 'Rendered seed', num(seed), { mono: true });
   }
   // Only worth a line when it is actually a second seed.
-  if (noise !== undefined && String(noise) !== String(seed)) {
+  if (noise !== undefined && num(noise) !== num(seed)) {
     add(seeds, 'Noise seed', num(noise), { mono: true });
   }
   if (y.song !== undefined) add(seeds, 'Variation', `${Number(y.song) + 1}.${Number(y.variation) + 1}`);

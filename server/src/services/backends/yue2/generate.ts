@@ -1399,6 +1399,7 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
 function yue2FinishNeedsGpu(params: any): boolean {
   const pp = params.postProcessingEnabled !== false;
   return (pp && !!(params.stableStepOn ?? params.stableStep))
+    || (pp && !!params.mm3RefinerEnabled && params.mm3RefinerMix !== 0)
     || !!params.whisperLyricsEnabled || !!params.yue2AlignLyrics || !!params.coverArtEnabled;
 }
 
@@ -1552,8 +1553,9 @@ async function finishYue2Job(
           await import('../../whisperTranscribe.js');
         const { reconcileLyrics } = await import('../../lyricsReconcile.js');
 
-        if (!(await ensureWhisperCli())) {
-          log('WARNING', '[Whisper] whisper-cli unavailable — skipping');
+        const whisperCli = await ensureWhisperCli();
+        if (!whisperCli.ok) {
+          log('WARNING', `[Whisper] whisper-cli unavailable — skipping: ${whisperCli.reason}`);
         } else if (!findWhisperModel(job.params.whisperModel)) {
           log('WARNING', '[Whisper] no Whisper model installed — skipping');
         } else {

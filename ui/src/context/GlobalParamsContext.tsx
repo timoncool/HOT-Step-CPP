@@ -73,7 +73,7 @@ export interface GlobalParams {
   inferMethod: string; setInferMethod: (v: string) => void;
   scheduler: string; setScheduler: (v: string) => void;
   guidanceMode: string; setGuidanceMode: (v: string) => void;
-  seed: number; setSeed: (v: number) => void;
+  seed: number | string; setSeed: (v: number | string) => void;
   randomSeed: boolean; setRandomSeed: (v: boolean) => void;
   // LM Seed — independent from seed/randomSeed above; drives LM-phase
   // sampling. When lmSeedFollowsDit is true, it's tied to `seed` instead.
@@ -158,6 +158,11 @@ export interface GlobalParams {
   ppVaeReencode: boolean; setPpVaeReencode: (v: boolean) => void;
   ppVaeBlend: number; setPpVaeBlend: (v: number) => void;
   // StableStep (SA3 refine)
+  mm3RefinerEnabled: boolean; setMm3RefinerEnabled: (v: boolean) => void;
+  mm3RefinerSteps: number; setMm3RefinerSteps: (v: number) => void;
+  mm3RefinerWindowSeconds: number; setMm3RefinerWindowSeconds: (v: number) => void;
+  mm3RefinerOverlapSeconds: number; setMm3RefinerOverlapSeconds: (v: number) => void;
+  mm3RefinerMix: number; setMm3RefinerMix: (v: number) => void;
   stableStepOn: boolean; setStableStepOn: (v: boolean) => void;
   stableStepStrength: number; setStableStepStrength: (v: number) => void;
   stableStepBackend: 'auto' | 'gguf'; setStableStepBackend: (v: 'auto' | 'gguf') => void;

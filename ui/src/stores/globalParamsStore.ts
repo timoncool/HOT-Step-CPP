@@ -10,6 +10,9 @@ import { create } from 'zustand';
 import type { GenerationParams, LmRepMode, StableStepBackend, StableStepBlendMode } from '../types';
 import { DEFAULT_SETTINGS, type AppSettings } from '../components/settings/SettingsPanel';
 import { useBackendStore } from './backendStore';
+import { normalizeSeed, type Seed } from '../utils/seed';
+
+const STRING_SEED_BACKENDS = new Set(['heartmula', 'yue2']);
 import { apiClient } from '../services/httpClient';
 
 // -- Types --
@@ -34,6 +37,24 @@ function readKey<T>(key: string, fallback: T): T {
 
 function writeKey<T>(key: string, value: T): void {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* full */ }
+}
+
+type Mm3RefinerSettings = Pick<GenerationParams, 'mm3RefinerEnabled' | 'mm3RefinerSteps'
+  | 'mm3RefinerWindowSeconds' | 'mm3RefinerOverlapSeconds' | 'mm3RefinerMix'>;
+
+/** Use the same bounds for committed settings, profiles and request assembly. */
+export function normalizeMm3RefinerSettings(raw: Mm3RefinerSettings): Required<Mm3RefinerSettings> {
+  const number = (v: number | undefined, fallback: number) =>
+    typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  const window = Math.max(0, number(raw.mm3RefinerWindowSeconds, GLOBAL_PARAM_DEFAULTS.mm3RefinerWindowSeconds));
+  const overlap = Math.max(0, number(raw.mm3RefinerOverlapSeconds, GLOBAL_PARAM_DEFAULTS.mm3RefinerOverlapSeconds));
+  return {
+    mm3RefinerEnabled: raw.mm3RefinerEnabled === true,
+    mm3RefinerSteps: Math.max(1, Math.min(64, Math.round(number(raw.mm3RefinerSteps, GLOBAL_PARAM_DEFAULTS.mm3RefinerSteps)))),
+    mm3RefinerWindowSeconds: window,
+    mm3RefinerOverlapSeconds: window > 0 && overlap >= window ? Math.max(0, window - 0.1) : overlap,
+    mm3RefinerMix: Math.max(0, Math.min(1, number(raw.mm3RefinerMix, GLOBAL_PARAM_DEFAULTS.mm3RefinerMix))),
+  };
 }
 
 // -- Default values --
@@ -153,6 +174,11 @@ export const GLOBAL_PARAM_DEFAULTS = {
   natTransitionSmooth: 1.0,
   ppVaeReencode: false,
   ppVaeBlend: 0.0,
+  mm3RefinerEnabled: false,
+  mm3RefinerSteps: 32,
+  mm3RefinerWindowSeconds: 30,
+  mm3RefinerOverlapSeconds: 2,
+  mm3RefinerMix: 1,
   stableStepOn: false,
   stableStepStrength: 0.3,
   stableStepBackend: 'auto' as StableStepBackend,
@@ -247,6 +273,13 @@ function activeBackendId(): string {
 export function scopedKey(base: string, backendId: string = activeBackendId()): string {
   if (!BACKEND_SCOPED_KEYS.includes(base)) return base;
   return backendId === 'ace' ? base : `${base}@${backendId}`;
+}
+
+/** setBackendParam for `backendId`'s bag, whichever backend is active: a
+ *  training ladder's "Use this checkpoint" sets MM3's adapter from any mode. */
+export function setBackendParamFor(backendId: string, key: string, v: unknown): void {
+  if (activeBackendId() === backendId) { useGlobalParamsStore.getState().setBackendParam(key, v); return; }
+  writeKey(scopedKey('hs-backendParams', backendId), { ...readScoped<Record<string, unknown>>('hs-backendParams', {}, backendId), [key]: v });
 }
 
 /** The YuE2 LM tab's planner/composer sampler settings and CFG, whichever
@@ -379,7 +412,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   // re-read on every backend switch by the subscription at the bottom of this
   // file. Changing a solver in MiniMax-Music3 mode must not touch ACE-Step's.
   ...hydrateBackendScoped(),
-  seed: readKey("hs-seed", GLOBAL_PARAM_DEFAULTS.seed),
+  seed: normalizeSeed(readKey<Seed>("hs-seed", GLOBAL_PARAM_DEFAULTS.seed)),
   randomSeed: readKey("hs-randomSeed", GLOBAL_PARAM_DEFAULTS.randomSeed),
   // `backendParams` -- backend-declared knobs (capabilities().extensions),
   // keyed by the schema's `key`. One persisted bag rather than a named field
@@ -458,6 +491,13 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   natTransitionSmooth: readKey("hs-natTransitionSmooth", GLOBAL_PARAM_DEFAULTS.natTransitionSmooth),
   ppVaeReencode: readKey("hs-ppVaeReencode", GLOBAL_PARAM_DEFAULTS.ppVaeReencode),
   ppVaeBlend: readKey("hs-ppVaeBlend", GLOBAL_PARAM_DEFAULTS.ppVaeBlend),
+  ...normalizeMm3RefinerSettings({
+    mm3RefinerEnabled: readKey('hs-mm3RefinerEnabled', GLOBAL_PARAM_DEFAULTS.mm3RefinerEnabled),
+    mm3RefinerSteps: readKey('hs-mm3RefinerSteps', GLOBAL_PARAM_DEFAULTS.mm3RefinerSteps),
+    mm3RefinerWindowSeconds: readKey('hs-mm3RefinerWindowSeconds', GLOBAL_PARAM_DEFAULTS.mm3RefinerWindowSeconds),
+    mm3RefinerOverlapSeconds: readKey('hs-mm3RefinerOverlapSeconds', GLOBAL_PARAM_DEFAULTS.mm3RefinerOverlapSeconds),
+    mm3RefinerMix: readKey('hs-mm3RefinerMix', GLOBAL_PARAM_DEFAULTS.mm3RefinerMix),
+  }),
   stableStepOn: readKey("hs-stableStepOn", GLOBAL_PARAM_DEFAULTS.stableStepOn),
   stableStepStrength: readKey("hs-stableStepStrength", GLOBAL_PARAM_DEFAULTS.stableStepStrength),
   // Engine backend for the SA3 refine: 'auto' or 'gguf', both using GGML.
@@ -589,7 +629,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   setInferMethod: (v: any) => { set({ inferMethod: v }); writeKey(scopedKey("hs-inferMethod"), v); },
   setScheduler: (v: any) => { set({ scheduler: v }); writeKey(scopedKey("hs-scheduler"), v); },
   setGuidanceMode: (v: any) => { set({ guidanceMode: v }); writeKey(scopedKey("hs-guidanceMode"), v); },
-  setSeed: (v: any) => { set({ seed: v }); writeKey("hs-seed", v); },
+  setSeed: (v: any) => { const seed = normalizeSeed(v); set({ seed }); writeKey("hs-seed", seed); },
   setBackendParam: (key: string, v: any) => {
     const next = { ...(get().backendParams || {}), [key]: v };
     set({ backendParams: next });
@@ -669,6 +709,16 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   setNatTransitionSmooth: (v: any) => { set({ natTransitionSmooth: v }); writeKey("hs-natTransitionSmooth", v); },
   setPpVaeReencode: (v: any) => { set({ ppVaeReencode: v }); writeKey("hs-ppVaeReencode", v); },
   setPpVaeBlend: (v: any) => { set({ ppVaeBlend: v }); writeKey("hs-ppVaeBlend", v); },
+  setMm3RefinerSettings: (patch: Mm3RefinerSettings) => {
+    const next = normalizeMm3RefinerSettings({ ...get(), ...patch });
+    set(next);
+    for (const [key, value] of Object.entries(next)) writeKey(`hs-${key}`, value);
+  },
+  setMm3RefinerEnabled: (v: boolean) => get().setMm3RefinerSettings({ mm3RefinerEnabled: v }),
+  setMm3RefinerSteps: (v: number) => get().setMm3RefinerSettings({ mm3RefinerSteps: v }),
+  setMm3RefinerWindowSeconds: (v: number) => get().setMm3RefinerSettings({ mm3RefinerWindowSeconds: v }),
+  setMm3RefinerOverlapSeconds: (v: number) => get().setMm3RefinerSettings({ mm3RefinerOverlapSeconds: v }),
+  setMm3RefinerMix: (v: number) => get().setMm3RefinerSettings({ mm3RefinerMix: v }),
   setStableStepOn: (v: any) => { set({ stableStepOn: v }); writeKey("hs-stableStepOn", v); },
   setStableStepStrength: (v: any) => { set({ stableStepStrength: v }); writeKey("hs-stableStepStrength", v); },
   setStableStepBackend: (v: any) => { const backend = normalizeModelSelection('stableStepBackend', v); set({ stableStepBackend: backend }); writeKey("hs-stableStepBackend", backend); },
@@ -741,6 +791,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   // up by both paths automatically.
   getGlobalParams: (overrides?: Record<string, any>): Partial<GenerationParams> => {
     const s = overrides ? { ...get(), ...overrides } : get();
+    const refiner = normalizeMm3RefinerSettings(s);
     const settings: AppSettings = readKey('ace-settings', DEFAULT_SETTINGS);
     const backendState = useBackendStore.getState();
     const heartmulaModels = backendState.activeBackendId === 'heartmula'
@@ -883,7 +934,10 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       lmCfgCutoffRatio: s.lmCfgCutoffRatio < 1.0 ? s.lmCfgCutoffRatio : undefined,
       cacheRatio: s.cacheRatio > 0 ? s.cacheRatio : undefined,
       inferMethod: s.inferMethod, scheduler: s.scheduler, guidanceMode: s.guidanceMode,
-      seed: s.seed, randomSeed: s.randomSeed,
+      // HeartMuLa and YuE2 take a uint64 seed as a decimal string; ACE and MM3
+      // read only JSON numbers and would treat the string as "random".
+      seed: STRING_SEED_BACKENDS.has(backendState.activeBackendId) ? s.seed : Number(s.seed),
+      randomSeed: s.randomSeed,
       lmSeed: s.lmSeed, lmSeedFollowsDit: s.lmSeedFollowsDit,
       batchSize: Math.min(s.batchSize, backendState.capabilities[backendState.activeBackendId]?.core.batch.max ?? s.batchSize),
       storkSubsteps: (s.inferMethod === 'stork2' || s.inferMethod === 'stork4') ? s.storkSubsteps : undefined,
@@ -950,6 +1004,11 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       natTransitionSmooth: (s.postProcessingEnabled && s.vocalNaturalizerEnabled) ? s.natTransitionSmooth : undefined,
       ppVaeReencode: (s.postProcessingEnabled && s.ppVaeReencode) || undefined,
       ppVaeBlend: (s.postProcessingEnabled && s.ppVaeReencode && s.ppVaeBlend > 0) ? s.ppVaeBlend : undefined,
+      mm3RefinerEnabled: (s.postProcessingEnabled && s.mm3RefinerEnabled) || undefined,
+      mm3RefinerSteps: (s.postProcessingEnabled && s.mm3RefinerEnabled) ? refiner.mm3RefinerSteps : undefined,
+      mm3RefinerWindowSeconds: (s.postProcessingEnabled && s.mm3RefinerEnabled) ? refiner.mm3RefinerWindowSeconds : undefined,
+      mm3RefinerOverlapSeconds: (s.postProcessingEnabled && s.mm3RefinerEnabled) ? refiner.mm3RefinerOverlapSeconds : undefined,
+      mm3RefinerMix: (s.postProcessingEnabled && s.mm3RefinerEnabled) ? refiner.mm3RefinerMix : undefined,
       stableStepOn: (s.postProcessingEnabled && s.stableStepOn) || undefined,
       stableStepStrength: (s.postProcessingEnabled && s.stableStepOn) ? s.stableStepStrength : undefined,
       stableStepBackend: (s.postProcessingEnabled && s.stableStepOn && s.stableStepBackend === 'gguf')

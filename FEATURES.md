@@ -31,7 +31,7 @@ Pick the backend from the Generation engine box at the top of the sidebar; it ap
 | Feature | What it does |
 |---|---|
 | Native port | 8B planner LM, depth decoder, condition encoder, flow-matching DiT and vocoder, all in C++/GGML, producing 44.1 kHz stereo. |
-| Split model format | Five GGUFs, each selectable at its own quantisation, so a high-precision planner can pair with a compact DiT. |
+| Split model format | Five GGUFs, each selectable at its own quantisation, so a high-precision planner can pair with a compact DiT. Unpicked, the planner runs at Q8_0 and the depth decoder at NVFP4 on RTX 50-series cards. |
 | Importance-matrix quants | Planner quants below Q8 are built against an importance matrix measured from the full-precision model. |
 | Structured Caption | Global Metadata, Vocal Details and Arrangement sections, with tempo and key in the prose. Compose Caption builds one from a plain description with no AI model. |
 | Natural endings | The planner decides where the song stops (ceiling 300 s), planning several candidates and keeping the first to end. |
@@ -39,6 +39,7 @@ Pick the backend from the Generation engine box at the top of the sidebar; it ap
 | Play While Rendering | Playback starts a few seconds in while later windows are still rendering. The full file saves as usual. |
 | Plan cache | Changing only flow-stage settings replays the saved plan instead of planning again. |
 | Saved plans | Save AR Plan (Plank) keeps a render's planner codes so flow-stage settings can be compared on the same plan. Save Plan To Disk keeps the planner output as a file that skips the planner on replay and survives a restart. |
+| Fast defaults | 20 flow steps, a 150-frame window hop and TensorRT FP8, each ear-tested against the reference settings with no audible loss. [Details](docs/user/backends.md) |
 | Low-step compensation | Below 30 flow steps the schedule reshapes so short renders keep their low end and stereo image. |
 | Planner adapters | LoRA adapters with Strength, Attention, MLP and depth-thirds dials, in runtime or merge mode. |
 | LRC from the planner | Line-level lyric timestamps read from the planner's attention. |
@@ -114,6 +115,7 @@ Everything runs on a copy of the render, in a fixed order, under one master swit
 | Feature | What it does |
 |---|---|
 | StableStep | Re-renders the instrumental through Stable Audio 3 and remixes the untouched vocal at its original balance. Optional adapters, crossover or mix blending, and its own sampler. |
+| MM3 Latent Refiner | Optional, default-off whole-mix refinement with steps, window/direct mode, overlap and dry/wet mix. Model pack unlisted pending licensing and publication. [Controls and limits](docs/user/generation.md#mm3-latent-refiner). |
 | PP-VAE re-encode | Second autoencoder pass against fizz, with an original-blend slider. |
 | Spectral Lifter | Denoise, noise floor, high-frequency extension, transient boost and shimmer reduction. |
 | Vocal Naturalizer | Experimental five-stage DSP pass against robotic vocal artefacts, skipped on instrumentals. |
@@ -186,10 +188,11 @@ Every render and import lands here. Details: [Library](docs/user/studios/library
 | Cover lyric drift | Measures sung section timing against vocal notes; sections without lyrics or vocal notes show Instrumental / N/A and leave the scoring count. |
 | Streaming rows | A MiniMax-Music3 render in progress shows in the list and plays before its file exists. |
 | Tagged downloads | Metadata and cover art embedded in downloaded files, in the format chosen in Settings. |
+| Synced lyric export | Download .LRC saves a track's timings as a sidecar named like the audio, optionally with enhanced word stamps; a folder-mode audio download writes it too. |
 | Global player | Transport, repeat modes, spectrum analyzer, disco mode and volume, visible in every view. |
 | Rate and pitch preview | Playback speed from 0.5x to 2x, and a 48k/44.1k toggle that hears a render clocked at 44.1 kHz. |
 | Variant switch | No Adapter, Unmastered and Mastered versions, each with its own download. |
-| Waveform tools | Trim and crop in and out points, section markers and a synced LRC lyrics bar. |
+| Waveform tools | Trim and crop in and out points, section markers, and a synced LRC lyrics bar that highlights each Whisper word with a tick per syllable on the waveform. An Edit button on the open strip opens a lyric editor modal: transport, speed, volume, the waveform, a 30 to 600 px/s zoom, one row per line with a draggable chip per word, word nudge, loop and split, whole-track nudge, undo and redo, optional autosave, and revision-checked saves that rebuild the `.lrc`. Unsaved edits can be discarded on close. |
 | Playlist queue | One browser-local play queue with reorder, Play All and Download All. Ordered playlist snapshots save with server revisions. A browser playlist can be imported explicitly; a failed save keeps the local edit visible for reapplication. |
 
 ## Lyric Studio
@@ -224,6 +227,10 @@ AI-assisted lyric writing from a learned style profile, plus per-album render pr
 Re-style a recording with ACE-Step's audio-conditioned cover or YuE2's reviewed
 lead-sheet workflow, reusing dataset metadata and scores when available.
 Stable Audio 3 audio transform with caption, Transform strength, seed and an optional DoRA adapter; instrumental output from the full source.
+MiniMax-Music3 covers show target artists and albums with assigned MM3 adapters, with track captions or a Custom caption.
+
+HeartMuLa's MuLaCover mode shares Prepare and saves four style tag fields and
+a seed. Rendering and its separate CC BY-NC model pack are pending.
 
 Details: [Cover Studio](docs/user/studios/cover-studio.md)
 
@@ -237,18 +244,21 @@ Details: [Cover Studio](docs/user/studios/cover-studio.md)
 | Target artist (ACE-Step) | Fills the style description from an artist profile, or drafts one with an LLM, and loads a matching album adapter preset. |
 | Structure Fidelity (ACE-Step) | Controls how closely the output follows the source arrangement. |
 | Source Preservation and noise method (ACE-Step) | Starts from source audio with Classic or Full Denoise noise methods. |
+| MiniMax-Music3 cover | Launders the source into a reusable plank with steps, seed and source caption controls, then covers its semantic codes under a target caption. Launder settings appear in song facts. |
 | NoFSQ mode (ACE-Step) | Skips FSQ quantisation in the cover path. |
 | Tempo and pitch (ACE-Step) | 0.5x to 2x tempo and -12 to +12 semitones, with the target key shown. |
 | Timbre reference (ACE-Step) | A second reference track for the DiT's timbre conditioning. |
 | Stem mix | Split the source with SuperSep and mute or lower stems before generating. |
 | Lead-sheet review (YuE2) | Transcribe the full melody and chord score with optional SheetSage2, or paste ABC without it. Prepare it in two confirmed steps before rendering. A 2/4 score converts to 4/4 with a preview, an optional pickup bar and undo, and A beat earlier or A beat later moves every bar line by a beat; every note keeps its pitch and timing. The score player's Bar click marks beat 1 of every bar, and MIDI downloads the score with vocal, instrumental and chord tracks. The ABC/Chart switch shows the score as a song chart with bar cards per section, where chords and tempo are edited in place and a click on a bar plays from it. |
-| Prepare: fix structure, assign lyrics (YuE2) | Step 1 fixes the score: merge, split, rename or move section boundaries, split it into sections from the tagged lyrics with Sections from lyrics, regroup bars (such as 3/4 + 4/4 + 1/4 into two 4/4 bars, with preview and clear refusals), hear a selection from the score or, approximately, the recording, then confirm. Step 2 assigns pasted lyric blocks to the locked sections by hand or from tag-and-order suggestions, with opt-in recording alignment and chorus reuse as independent copies, and re-paste that keeps unchanged assignments. Generate and Build use the confirmed pair, and the server checks it. Older drafts migrate without re-transcribing. [Details](docs/user/studios/cover-studio.md#prepare-fix-the-structure-then-assign-lyrics) |
+| Prepare: fix structure, assign lyrics (YuE2 and HeartMuLa) | Step 1 fixes the score: merge, split, rename or move section boundaries, split it into sections from the tagged lyrics with Sections from lyrics, regroup bars (such as 3/4 + 4/4 + 1/4 into two 4/4 bars, with preview and clear refusals), hear a selection from the score or, approximately, the recording, then confirm. Step 2 assigns pasted lyric blocks to the locked sections by hand or from tag-and-order suggestions, with opt-in recording alignment and chorus reuse as independent copies, and re-paste that keeps unchanged assignments. Generate and Build use the confirmed pair, and the server checks it. Older drafts migrate without re-transcribing. [Details](docs/user/studios/cover-studio.md#prepare-fix-the-structure-then-assign-lyrics) |
 | Section and lyric aid (YuE2) | Prepare shows each score section with its label, bars and duration, and Assign lyrics shows the exact tagged lyrics a render will receive, in score order. Edits stay in the cover draft; dataset files are not changed. |
 | Build by section (YuE2) | Compare up to ten takes in groups of four with shared progress. Cancel stops the current group and skips the rest. A successful render starts a fresh build; a failed one keeps it. Cover has its own AR strength (0 to 10, default 0.6). A settings row on the Build page changes voices, tempo, pitch, condition strength and AR strength until the first keep; after that, a change starts a fresh build. Take previews pause, resume, seek by tapping or dragging along the waveform, and stop on keep, delete or undo. A source bar shows the score and a song bar, empty at first, shows the output: add any section, repeat it, reorder or remove planned ones, add 2 to 16 bars the model makes up without the score (+ Improv), mark where the song ends; until then each take runs a few seconds into the section that follows it in the source; built sections stay locked until undone, and the plan survives a reload. Each chosen section's lyrics are editable beside the takes, for that section only, so a repeated chorus can sing new words; Prepare and the dataset keep theirs, and old takes can no longer be kept. A take is cropped with End at playhead before it is kept, and the last kept take can be cropped with an undo. A cut inside a section asks whether the next take composes that section again from the cut or moves on; either answer keeps the take, and composing again queues new takes from the cut with that take's caption. Each section's caption starts as the build's and can be edited for that section: it changes what is composed, while previews and the final render use one caption for the sound. Render Final Song appears in the Takes box once every section is built. Delete build (Build actions) removes the whole build and its takes from disk, refused while takes or a Save song render are in flight. |
+| Lead-sheet sources (YuE2 and HeartMuLa) | Shared Prepare picker for SheetSage2, SheetSage2-Refined, MuScriptor and YourMT3+/ChordNet, with readiness per source. Drafts keep their choice; changing source or audio clears approval. MuScriptor chords are labelled as estimates. Native models are not installed yet and have no download entry. [Details](docs/user/studios/cover-studio.md) |
 | Score conditioning (YuE2) | Render both vocal and instrumental score lines by default, or choose vocal melody only. Chord symbols are off by default; the source recording does not condition the audio renderer. |
 | Instrumental melody mode (YuE2) | With Instrumental on, choose Vocal wins (the melody moves to Ins and cuts overlapping Ins notes) or Resting Ins bars only (the melody moves only into bars where Ins is silent, as in the YuE2 instrumental ComfyUI node). Vocal is muted either way. |
 | Follow source (YuE2) | Optionally let the recording steer the composer through the real-audio tokenizer's codes, with an adherence dial, candidate count, hard restriction, an adherence curve over the song and a periodic wobble. Off while the pitch is shifted or a BPM is set. [Details](docs/user/studios/cover-studio.md) |
 | Adapter pair (YuE2) | Render with the base model or an explicit AR/NAR pair captured when you queue the cover. Custom starts from the model picker's pair, and Base notes when it ignores a picked adapter. |
+| HeartMuLa lead-sheet cover | Approved Prepare ABC, explicit topic/genre/instrument/mood tags, section-marked lyrics and seed; 240-second ceiling. MuLaCover weights and outputs are CC BY-NC 4.0. Engine support and downloads pending. |
 | Serial cover queue | Queue more covers while one renders. |
 
 ## Repaint Studio
@@ -372,16 +382,16 @@ Build datasets from your own audio and train adapters on your GPU, for ACE-Step,
 | Training backend | The active global backend drives the phase tabs, dataset chips, Train page and checkpoint previews; a running job keeps its target. [Details](docs/user/studios/training-studio.md) |
 | Preprocess and codes | Encodes audio for ACE-Step, or RVQ codes for MiniMax-Music3 with an optional cover-laundering pass. |
 | ACE-Step adapters | Planner LM adapters (0.6B, 1.7B, 4B) and DiT adapters, as LoRA or LoKr. There are no automatic checkpoint previews; Audition compares adapters and saved milestones. |
-| MiniMax-Music3 adapters | Planner LM LoRA trained from RVQ codes. |
+| MiniMax-Music3 adapters | Planner LM LoRA trained from RVQ codes, at a BF16 training precision about 2.6x faster than FP32 by default. |
 | HeartMuLa adapters | A native backbone LoRA trained on the 3B model, with HeartCodec preparation, recipe presets, a default 30-epoch budget capped at 480 updates, a durable multi-dataset queue, Prepare-then-Train chains, scoped cache reset and checkpoint Review. Needs a CUDA build and about 12 GB of VRAM. [Details](docs/user/training/heartmula.md) |
 | HeartMuLa checkpoint previews | Training pauses every N steps, renders a full song from the saved checkpoint, with the tags and lyrics taken from the dataset, then resumes; the base model and the final adapter are rendered too. [Details](docs/user/training/heartmula.md#checkpoint-previews) |
-| MiniMax-Music3 checkpoint previews | Render previews during training pauses the trainer at checkpoints to render samples beside the base model, then resumes it. |
+| MiniMax-Music3 checkpoint previews | Render previews during training pauses the trainer at checkpoints to render samples beside the base model, then resumes it. The previews sit in the same checkpoint ladder as YuE2's, kept after a reload, with YuE2's blind rungs, rung and album scores, Render more, and Use this checkpoint, which records the dataset's pick, sets the LM adapter and any existing album presets to that step, and offers cleanup even without an album preset. [Details](docs/user/training/minimax-music3.md#picking-a-checkpoint) |
 | YuE2 adapters | Five-stage chain with Perform all stages, Joint Training of the AR and NAR pair as LoKr (the default), LoRA or DoRA with Prodigy, AdamW or Muon, checkpoint losses averaged over the last 20 logged steps, a visible live loss graph, and Review entries for unscored runs even without previews. |
 | YuE2 run review | Train keeps completed charts without replaying them again; finished and approved runs leave "Scored or finished". Delete run confirms removal of the joint run folder, checkpoints, previews and MP3 cache; archived logs and checkpoints saved outside that folder stay. Live runs cannot be deleted. Ladder playback uses cached MP3, with WAV fallback. [Details](docs/user/studios/training-studio.md) |
 | YuE2 training GPU | Choose an NVIDIA card per Joint Training job, or use the GPU selected in Settings. [Details](docs/user/training/yue2.md#recommended-settings) |
 | YuE2 held-out planner gate | Optional in Joint Training: hold a few songs out, score the planner on them as it trains, and freeze it when that loss stops improving so the decoder can train on. The card shows the held-out songs before Start. Off by default; the settings are starting points, not validated ones. [Details](docs/user/training/yue2.md#recommended-settings) |
 | Optimise phase (YuE2) | Measure a prepared album before training, starting with the base model's loss per song; results saved in the dataset folder. [Details](docs/user/training/yue2.md#optimise-optional) |
-| Training on another PC | Send YuE2 batches to a second PC's GPU, then follow, listen, score and fetch the adapters from this one. [Details](docs/user/training/yue2.md#training-on-another-pc) |
+| Training on another PC | Send YuE2 or MiniMax-Music3 batches to a second PC's GPU, then follow, listen, score and fetch the adapters from this one. Details: [YuE2](docs/user/training/yue2.md#training-on-another-pc), [MiniMax-Music3](docs/user/training/minimax-music3.md#training-on-another-pc) |
 | Quality presets | Fast, Balanced and Thorough presets on the training forms. |
 | Stable Audio 3 training | Independent SA3 Medium DoRA-rows target with SuperSep level 5 vocal stripping, saved-run resume, adapter picker and checkpoint previews rendered during training (the YuE2 preview view), a four-chip dataset card and fixed-seed SA3 auditions regardless of the selected backend. [Details](docs/user/training/sa3.md) |
 | YuE2 checkpoint previews | Adjustable music adapter scale, default 0.6, with sound adapter strength fixed at 1.0 for training and manual previews. [Details](docs/user/training/yue2.md#recommended-settings) |
@@ -396,7 +406,7 @@ Build datasets from your own audio and train adapters on your GPU, for ACE-Step,
 | Audition | Same-seed A/B of base and adapter planner, optionally rendered through the DiT. |
 | Adapter scoring | Evaluation passes put an artist-match score in the planner adapter picker. |
 | YuE2 Review | The YuE2 phases are Dataset, Prepare, Optimise, Train and Review. Review lists the checkpoint ladders awaiting your scores and opens faster with one run catalogue read per request for all datasets; score them by ear and a scoreboard ranks the rungs by likeness, corruption and re-plans. Refine, which pushed a planner adapter up KL rungs, is no longer a tab and opens only from Review for ladders made with the earlier recipe. |
-| Batch pipeline | Import multiple folders and run label, build, preprocess and train unattended; YuE2's Train multiple chains its stages over several datasets. |
+| Batch pipeline | Import multiple folders and run label, build, preprocess and train unattended; Train multiple (YuE2 and MiniMax-Music3) chains each dataset's stages with one recipe. |
 | Send to Lyric Studio | Export a dataset's artist and album with its trained adapters as a preset. |
 
 ## Settings

@@ -142,6 +142,9 @@ export interface Mm3TrainLmRequest {
   preview?: Mm3PreviewOptions;
   /** Prior preservation. Omitted or `every: 0` = off. */
   regularisation?: Mm3RegularisationOptions;
+  /** 'full' (default) | 'fast' (--weights bf16) | 'fastest' (also --attn
+   *  flash-bf16 under flash). Anything else is a 400. */
+  trainPrecision?: 'full' | 'fast' | 'fastest';
 }
 
 /** Prior preservation: train some steps against the FROZEN BASE MODEL'S OWN
@@ -240,6 +243,10 @@ export interface TrainingPreview {
   bytes: number;
   /** Wall time of the render itself. */
   ms: number;
+  /** Wall time the training pause around this take cost: trainer exit, engine
+   *  restart, render, reload up to the next step. Set on the last take of a
+   *  checkpoint, by a second frame once training has resumed. */
+  pauseMs?: number;
   ts: number;
 }
 
@@ -431,7 +438,10 @@ export interface TrainingDatasetDetail extends TrainingDatasetSummary {
 }
 
 // ─── Jobs ─────────────────────────────────────────────────────────────────
+export interface Mm3CoverPrepResult { lyrics?: string; mm3Caption?: string }
+
 export interface TrainingJobSummary {
+  result?: Mm3CoverPrepResult;
   id: string;
   datasetId: string;
   kind: TrainingJobKind;
@@ -528,6 +538,9 @@ export interface TrainingMetricEvent {
   narMse?: number;
   /** YuE2 joint: true on decoder-only steps after the planner froze. */
   plannerFrozen?: boolean;
+  /** YuE2 joint: the `loss` above is the decoder's alone (planner frozen) and
+   *  is not comparable with the composite a planner step reports. */
+  decoderOnly?: boolean;
   /** YuE2 joint, at a checkpoint: the decoder's reconstruction meter and its
    *  drift from base (meters.json). */
   narRecon?: number;
@@ -1052,7 +1065,7 @@ export interface TrainDitOptions {
   hira?: boolean;
   /** LoHa (LyCORIS): two LoRA pairs, Hadamard-combined. LoRA type only; not with dora/hira. */
   loha?: boolean;
-  /** PiSSA init: A/B start on the weight's principal directions; exported as a rank-2r LoRA. Plain LoRA only; not resumable. */
+  /** PiSSA init: A/B start on the weight's principal directions; exported as a rank-2r LoRA. Plain LoRA only. */
   pissa?: boolean;
   /** HRA: orthogonal fine-tuning by `rank` Householder reflections (even); exported as an exact rank-r LoRA. Plain LoRA slot only. */
   hra?: boolean;

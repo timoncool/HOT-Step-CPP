@@ -2,6 +2,19 @@
   "version": 1,
   "packs": [
     {
+      "id": "mm3-latent-refiner",
+      "family": "mm3",
+      "name": "MiniMax-Music3 Latent Refiner",
+      "description": "MERT-v1-95M weights are non-commercial (CC-BY-NC-4.0). Optional deterministic audio post-process on any backend; quality on other backends is untested.",
+      "fileIds": [
+        "mm3-refiner-refiner-f32",
+        "mm3-refiner-mert-f32",
+        "mm3-refiner-clap-f32",
+        "mm3-enc-f16",
+        "mm3-voc-f16"
+      ]
+    },
+    {
       "id": "quick-start",
       "family": "as1.5",
       "name": "Quick Start",
@@ -112,11 +125,12 @@
       "id": "minimax-music3-q8",
       "family": "mm3",
       "name": "MiniMax-Music3 (Q8_0)",
-      "description": "LM, DiT and depth decoder at Q8_0 with the frontends near-native — near-lossless, about half the size and a faster LM step. Recommended. ~13 GB download.",
+      "description": "LM, DiT and depth decoder at Q8_0 with the frontends near-native — near-lossless, about half the size and a faster LM step. Also brings the NVFP4 depth decoder, which the app uses by default on RTX 50-series cards. Recommended. ~13 GB download.",
       "fileIds": [
         "mm3-lm-q8_0",
         "mm3-lm-q8_0-pissa-r128",
-        "mm3-synth-q8_0"
+        "mm3-synth-q8_0",
+        "mm3-depth-NVFP4"
       ],
       "components": [
         "mm3-lm-q8_0",
@@ -270,6 +284,16 @@
       ]
     },
     {
+      "id": "flamingo-captioning",
+      "family": "shared",
+      "name": "Local Captioning and Lyrics (Music Flamingo)",
+      "description": "NVIDIA Music Flamingo, local: captions your tracks and transcribes lyrics with section tags in the Training Studio, and captions or transcribes MM3 cover sources in Cover Studio. Non-commercial, academic use only (NVIDIA OneWay Noncommercial License).",
+      "fileIds": [
+        "flamingo-lm-q8_0",
+        "flamingo-aud-f16"
+      ]
+    },
+    {
       "id": "yue2-recommended",
       "family": "yue2",
       "name": "YuE2 Recommended",
@@ -307,11 +331,30 @@
       "id": "yue2-rs-4-0x0-7",
       "family": "yue2",
       "name": "YuE2-RS 4.0x0.7 (Ruach Studio)",
-      "description": "Ruach Studio's YuE2-RS 4.0x0.7 fine-tune of YuE2-3B (Q8_0 LM) plus the standard VAE and the companion decoder adapter. ~4.6 GB total. License: CC BY-NC-SA 4.0 (the fine-tune's own licence, share-alike), unlike the CC BY-NC of the other YuE2 packs. Credit: Ruach Studio, goldhub/YuE2-RS-Finetunes.",
+      "description": "Ruach Studio's YuE2-RS 4.0x0.7 fine-tune of YuE2-3B (Q8_0 LM) plus the standard VAE (fine-tunes render without the companion decoder adapter). ~4.4 GB total. License: CC BY-NC-SA 4.0 (the fine-tune's own licence, share-alike), unlike the CC BY-NC of the other YuE2 packs. Credit: Ruach Studio, goldhub/YuE2-RS-Finetunes.",
       "fileIds": [
         "yue2-lm-rs-4.0x0.7-q8_0",
-        "yue2-vae-standard-f32",
-        "yue2-nar-companion-v9"
+        "yue2-vae-standard-f32"
+      ]
+    },
+    {
+      "id": "yue2-rs-tw-2-0x0-75",
+      "family": "yue2",
+      "name": "YuE2-RS Tsunami Wave 2.0x0.75 (Ruach Studio)",
+      "description": "Ruach Studio's YuE2-RS Tsunami Wave 2.0x0.75 fine-tune of YuE2-3B (Q8_0 LM), Ruach Studio's default Tsunami Wave merge, their safe balance, plus the standard VAE (fine-tunes render without the companion decoder adapter). ~4.4 GB total. License: CC BY-NC-SA 4.0 (the fine-tune's own licence, share-alike), unlike the CC BY-NC of the other YuE2 packs. Credit: Ruach Studio, goldhub/YuE2-RS-Finetunes.",
+      "fileIds": [
+        "yue2-lm-rs-tw-2.0x0.75-q8_0",
+        "yue2-vae-standard-f32"
+      ]
+    },
+    {
+      "id": "yue2-rs-tw-2-0x0-9",
+      "family": "yue2",
+      "name": "YuE2-RS Tsunami Wave 2.0x0.9 (Ruach Studio)",
+      "description": "Ruach Studio's YuE2-RS Tsunami Wave 2.0x0.9 fine-tune of YuE2-3B (Q8_0 LM), the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability, plus the standard VAE (fine-tunes render without the companion decoder adapter). ~4.4 GB total. License: CC BY-NC-SA 4.0 (the fine-tune's own licence, share-alike), unlike the CC BY-NC of the other YuE2 packs. Credit: Ruach Studio, goldhub/YuE2-RS-Finetunes.",
+      "fileIds": [
+        "yue2-lm-rs-tw-2.0x0.9-q8_0",
+        "yue2-vae-standard-f32"
       ]
     },
     {
@@ -473,6 +516,76 @@
     }
   ],
   "files": [
+    {
+      "id": "mm3-refiner-refiner-f32",
+      "filename": "mm3-refiner-refiner-f32.gguf",
+      "role": "mm3",
+      "family": "mm3",
+      "subdir": "mm3",
+      "displayName": "MM3 Latent Refiner (F32)",
+      "variant": "refiner",
+      "quant": "F32",
+      "sizeBytes": 549104864,
+      "licence": "MiniMax-Music3 Community License",
+      "description": "Deterministic latent refiner with embedded normalization statistics. Code is Apache-2.0; weights use the MiniMax-Music3 Community License. Requires the MERT and CLAP conditioners.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-mm3-refiner-weights",
+          "required": true
+        },
+        {
+          "filename": "LICENSE-mm3-refiner-code",
+          "required": true
+        }
+      ],
+      "repo": "scragnog/MiniMax-Music3-GGUF",
+      "sha256": "a36410867b4e0a89b829a8923b70b4f081c2223c65a4237d670ba9bb915e30c3"
+    },
+    {
+      "id": "mm3-refiner-mert-f32",
+      "filename": "mm3-refiner-mert-f32.gguf",
+      "role": "mm3",
+      "family": "mm3",
+      "subdir": "mm3",
+      "displayName": "MERT-v1-95M (F32, non-commercial)",
+      "variant": "refiner-mert",
+      "quant": "F32",
+      "sizeBytes": 377505664,
+      "licence": "CC-BY-NC-4.0 (non-commercial)",
+      "description": "Non-commercial weights (CC-BY-NC-4.0) by the m-a-p MERT authors. Required audio conditioner for the latent refiner, converted to GGUF F32.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-mm3-refiner-mert",
+          "required": true
+        }
+      ],
+      "repo": "scragnog/MiniMax-Music3-GGUF",
+      "sha256": "1d69950856b145c5a9dcd6642d2b40e8b91677ed315124bb15b1b6d6e0329c98"
+    },
+    {
+      "id": "mm3-refiner-clap-f32",
+      "filename": "mm3-refiner-clap-f32.gguf",
+      "role": "mm3",
+      "family": "mm3",
+      "subdir": "mm3",
+      "displayName": "CLAP Audio Tower (F32)",
+      "variant": "refiner-clap",
+      "quant": "F32",
+      "sizeBytes": 274780768,
+      "licence": "Apache-2.0",
+      "description": "laion/larger_clap_music audio tower and projection, converted to GGUF F32. Gives the latent refiner its per-window style vector.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-mm3-refiner-clap",
+          "required": true
+        }
+      ],
+      "repo": "scragnog/MiniMax-Music3-GGUF",
+      "sha256": "9fca3996fe0f1459fac976b6e1585afd7c348cb02a45e062ad6b6eee74efe385"
+    },
     {
       "id": "dit-std-base-bf16",
       "filename": "acestep-v15-base-BF16.gguf",
@@ -5243,6 +5356,79 @@
       ]
     },
     {
+      "id": "flamingo-lm-q8_0",
+      "filename": "flamingo-lm-q8_0.gguf",
+      "role": "moss",
+      "family": "shared",
+      "subdir": "flamingo",
+      "displayName": "Music Flamingo LM (Q8_0, non-commercial)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q8_0",
+      "sizeBytes": 8095527936,
+      "licence": "NVIDIA OneWay Noncommercial License (academic use only)",
+      "repo": "scragnog/Music-Flamingo-2601-GGUF",
+      "sha256": "b56e0d2428f6f61982df384fb28685b8fec4741c42da581643266c389af8b965",
+      "description": "NVIDIA Music Flamingo 7B language model (Qwen2) — writes captions and section-tagged lyric transcripts from what the audio encoder heard. The stronger lyric transcriber of the two local captioners. Near-lossless and half the size of F16; the recommended default. Requires flamingo-aud-f16 as well; this file is ~7.5 GB. Non-commercial, academic use only (NVIDIA OneWay Noncommercial License).",
+      "tags": [
+        "recommended"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "flamingo-lm-f16",
+      "filename": "flamingo-lm-f16.gguf",
+      "role": "moss",
+      "family": "shared",
+      "subdir": "flamingo",
+      "displayName": "Music Flamingo LM (F16, non-commercial)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "F16",
+      "sizeBytes": 15232221696,
+      "licence": "NVIDIA OneWay Noncommercial License (academic use only)",
+      "repo": "scragnog/Music-Flamingo-2601-GGUF",
+      "sha256": "4fb7a000cae7ec6441033126f959a079c6527af409aed46542c265907ac3079c",
+      "description": "NVIDIA Music Flamingo 7B language model at full precision — the reference quality bar. Requires flamingo-aud-f16 as well; this file is ~14.2 GB. Non-commercial, academic use only (NVIDIA OneWay Noncommercial License).",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "flamingo-aud-f16",
+      "filename": "flamingo-aud-f16.gguf",
+      "role": "moss",
+      "family": "shared",
+      "subdir": "flamingo",
+      "displayName": "Music Flamingo Audio Encoder (F16, non-commercial)",
+      "scale": null,
+      "variant": "aud",
+      "quant": "F16",
+      "sizeBytes": 1313695008,
+      "licence": "NVIDIA OneWay Noncommercial License (academic use only)",
+      "repo": "scragnog/Music-Flamingo-2601-GGUF",
+      "sha256": "4a7440abdaea9c242f1b324353038ecca097d17e6d8b57fa6f8ff4b103962c3e",
+      "description": "Music Flamingo audio encoder — Whisper-large (AF-Whisper) with its learned positions, plus the 2-layer projector into the LM. F16 only, never quantised. Required by every flamingo-lm file; ~1.2 GB. Non-commercial, academic use only (NVIDIA OneWay Noncommercial License).",
+      "tags": [
+        "required"
+      ],
+      "companions": [
+        {
+          "filename": "LICENSE",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
       "id": "yue2-aitk-convrot-checkpoint",
       "filename": "yue2_3b_int8_convrot.safetensors",
       "role": "yue2",
@@ -5903,6 +6089,270 @@
       ]
     },
     {
+      "id": "yue2-lm-rs-tw-2.0x0.75-bf16",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-bf16.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (BF16)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "BF16",
+      "sizeBytes": 7267839232,
+      "sha256": "9b06cc42c07761336acba3d7e475a7cde272fb83b6965c66a4cecbd0cb6399b5",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance). Source-precision conversion of the fine-tune. Needs one of the VAE decoders below; this file is ~7.3 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.75-q8_0",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-q8_0.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (Q8_0)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q8_0",
+      "sizeBytes": 3916164448,
+      "sha256": "f0110c0dcf16a280139e5108437e0171c739a006fade45b53648cd2b299e2ff4",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance). Near-lossless quant. Needs one of the VAE decoders below; this file is ~3.9 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.75-Q6_K",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-Q6_K.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (Q6_K)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q6_K",
+      "sizeBytes": 3050315104,
+      "sha256": "25fbafa99994de4e3df198b06deb37070c0bc812c80f017abffafa3d11c81141",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance). Still very close to source. Needs one of the VAE decoders below; this file is ~3.1 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.75-Q5_K_M",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-Q5_K_M.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (Q5_K_M)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q5_K_M",
+      "sizeBytes": 2730564960,
+      "sha256": "d8b90d3a82d21f0f850c6247ca36b3d78bb8c295ff0bcf025f689718b2148855",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance). Good quality/size balance. Needs one of the VAE decoders below; this file is ~2.7 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.75-NVFP4",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-NVFP4.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (NVFP4)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "NVFP4",
+      "sizeBytes": 2506878304,
+      "sha256": "8aba963d73cf2c1bb47af94d3a367f4c4023c16532facea290e3784c3f47caf0",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance), NVFP4 quant. Needs one of the VAE decoders below; this file is ~2.5 GB. Quality is not benchmarked for this fine-tune; lower-bit quants lose more fidelity (see the base YuE2 ladder for the trend). Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.75-MXFP4",
+      "filename": "yue2-lm-rs-tw-2.0x0.75-MXFP4.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.75 LM (MXFP4)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "MXFP4",
+      "sizeBytes": 2418797920,
+      "sha256": "478b7cd2ace0fe339e8cf54e581ff13acdc4e8edef4655728ea7c41867b44729",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.75 fine-tune (Ruach Studio's default Tsunami Wave merge, their safe balance), MXFP4 quant. Needs one of the VAE decoders below; this file is ~2.4 GB. Quality is not benchmarked for this fine-tune; lower-bit quants lose more fidelity (see the base YuE2 ladder for the trend). Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.75 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-bf16",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-bf16.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (BF16)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "BF16",
+      "sizeBytes": 7267839232,
+      "sha256": "e921e38bbe4dfab4a435acf2e192a0efda6ca22c887a025bd44e95cb0ab9da4c",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability). Source-precision conversion of the fine-tune. Needs one of the VAE decoders below; this file is ~7.3 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-q8_0",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-q8_0.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (Q8_0)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q8_0",
+      "sizeBytes": 3916164448,
+      "sha256": "0bcb0e696b33468391feea36614844fb50e4427ab2cca67592e6cda6bc8813d5",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability). Near-lossless quant. Needs one of the VAE decoders below; this file is ~3.9 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-Q6_K",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-Q6_K.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (Q6_K)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q6_K",
+      "sizeBytes": 3050315104,
+      "sha256": "7ef7e97de8733322cf3292d09d3cd05bb3f9c2bfe268c4069f37a2ed6961201d",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability). Still very close to source. Needs one of the VAE decoders below; this file is ~3.1 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-Q5_K_M",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-Q5_K_M.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (Q5_K_M)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "Q5_K_M",
+      "sizeBytes": 2730564960,
+      "sha256": "4342608a05231911fbb749c2658987cb8a913ecd3af2a850ab064526968608c7",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability). Good quality/size balance. Needs one of the VAE decoders below; this file is ~2.7 GB. Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files. Quant quality is not benchmarked for this fine-tune.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-NVFP4",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-NVFP4.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (NVFP4)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "NVFP4",
+      "sizeBytes": 2506878304,
+      "sha256": "3d161f5004e646235209f6e9968309e4d73357df22bbb9ab4d287eac497fb45f",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability), NVFP4 quant. Needs one of the VAE decoders below; this file is ~2.5 GB. Quality is not benchmarked for this fine-tune; lower-bit quants lose more fidelity (see the base YuE2 ladder for the trend). Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
+      "id": "yue2-lm-rs-tw-2.0x0.9-MXFP4",
+      "filename": "yue2-lm-rs-tw-2.0x0.9-MXFP4.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2-RS TW 2.0x0.9 LM (MXFP4)",
+      "scale": null,
+      "variant": "lm",
+      "quant": "MXFP4",
+      "sizeBytes": 2418797920,
+      "sha256": "c1d4aa0da1770346f39f5dc4036de66550b14ec713aa05f78ba92b481de451f2",
+      "repo": "scragnog/YuE2-RS-TW-GGUF",
+      "description": "YuE2 autoregressive language model, Ruach Studio YuE2-RS Tsunami Wave 2.0x0.9 fine-tune (the \"tectonic\" Tsunami Wave merge, the most energetic in Ruach Studio's listening tests, with no promise of stability), MXFP4 quant. Needs one of the VAE decoders below; this file is ~2.4 GB. Quality is not benchmarked for this fine-tune; lower-bit quants lose more fidelity (see the base YuE2 ladder for the trend). Ruach Studio's YuE2-RS Tsunami Wave fine-tune (goldhub/YuE2-RS-Finetunes, TW 2.0 at 0.9 over their First Wave 2.4x0.75 merge of m-a-p/YuE2-3B), converted and quantized by HOT-Step. Licensed CC BY-NC-SA 4.0 (share-alike), not the CC BY-NC of the base YuE2 files.",
+      "tags": [],
+      "companions": [
+        {
+          "filename": "LICENSE-YuE2-RS-TW",
+          "repoPath": "LICENSE"
+        }
+      ]
+    },
+    {
       "id": "yue2-vae-standard-f32",
       "filename": "yue2-vae-standard-f32.gguf",
       "role": "yue2",
@@ -5967,6 +6417,40 @@
           "repoPath": "LICENSE"
         }
       ]
+    },
+    {
+      "id": "yue2-wannabe-v2-f16",
+      "filename": "yue2-wannabe-v2-f16.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2 WannabeTokenizer V2 (F16)",
+      "scale": null,
+      "variant": "wannabe-v2",
+      "quant": "F16",
+      "sizeBytes": 870945408,
+      "sha256": "9c7a2c3c722754253ecbea0a37cda21bf0b7dba156a675541b38671b4c76bdf3",
+      "repo": "scragnog/YuE2-WannabeTokenizer-GGUF",
+      "description": "WannabeTokenizer V2 by ManyOtherFunctions (original: https://huggingface.co/ManyOtherFunctions/Yue2-WannabeTokenizer), an alternative to the v9 tokenizer for turning real audio into YuE2 semantic codes. Optional. Pick it on the YuE2 Codes card in Training Studio, or under Follow source in Cover Studio. Adapters trained on its codes train and render without the v9 companion decoder adapter, automatically. One file holds a fine-tuned causal MERT2 encoder (14 blocks) and a cosine-VQ head. In blind listening tests on real tracks it was preferred to v9 on simpler mixes, and the two were within noise on dense mixes. Not needed to generate music. The original repository states no licence and all rights stay with its author; the encoder is fine-tuned from MERT-v2-FullSong, licensed CC BY-NC 4.0.",
+      "tags": [],
+      "companions": []
+    },
+    {
+      "id": "yue2-wannabe-v1-f16",
+      "filename": "yue2-wannabe-v1-f16.gguf",
+      "role": "yue2",
+      "family": "yue2",
+      "subdir": "yue2",
+      "displayName": "YuE2 WannabeTokenizer V1 (F16)",
+      "scale": null,
+      "variant": "wannabe-v1",
+      "quant": "F16",
+      "sizeBytes": 870945344,
+      "sha256": "a63d10e851aa504ce1cd2b01852d19449c4524e6fc66649031d89e8d09c56736",
+      "repo": "scragnog/YuE2-WannabeTokenizer-GGUF",
+      "description": "WannabeTokenizer V1 by ManyOtherFunctions (original: https://huggingface.co/ManyOtherFunctions/Yue2-WannabeTokenizer), the earlier checkpoint of the alternative YuE2 real-audio tokenizer. Optional; V2 is the author's current release. Pick it on the YuE2 Codes card or under Follow source. Adapters trained on its codes train and render without the v9 companion decoder adapter, automatically. Not needed to generate music. The original repository states no licence and all rights stay with its author; the encoder is fine-tuned from MERT-v2-FullSong, licensed CC BY-NC 4.0.",
+      "tags": [],
+      "companions": []
     },
     {
       "id": "yue2-sheetsage2-f16",
@@ -6287,7 +6771,7 @@
       "quant": "F16",
       "sizeBytes": 89466528,
       "repo": "scragnog/MiniMax-Music3-GGUF",
-      "description": "MiniMax-Music3 DAV audio encoder — 44.1 kHz stereo into the 128-channel flow latents. TRAINING ONLY: it is the input stage of the Training Studio's MM3 codes job, paired with the RVQ encoder. Generation does not use it. This file is ~0.1 GB.",
+      "description": "MiniMax-Music3 DAV audio encoder, 44.1 kHz stereo into the 128-channel flow latents. Used by the Training Studio's MM3 codes job with the RVQ encoder, and by the optional latent refiner post-process. Ordinary generation does not use it. This file is ~0.1 GB.",
       "tags": [
         "required"
       ],

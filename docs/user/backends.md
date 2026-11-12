@@ -12,7 +12,12 @@ Their capability manifests also declare which Create and Lyric Studio caption so
 picker applies (`none`, MM3 tracks, or YuE2 dataset).
 ACE-Step 1.5 is the default and the only backend that supports every studio.
 YuE2 also supports Cover Studio, through a reviewed lead sheet rather than audio
-conditioning. MiniMax-Music3 and Stable Audio 3 are text-to-music only.
+conditioning. Stable Audio 3 also offers an instrumental source-audio refine
+in Cover Studio. HeartMuLa's MuLaCover mode uses the approved Prepare ABC lead
+sheet, four style tag fields and lyrics; its engine route and separate CC BY-NC
+model pack are pending. MiniMax-Music3 covers in Cover Studio by forcing the
+source's encoded codes on its planner, blending the source audio into its flow
+stage, or both.
 
 For which quant and settings give the best output on each backend, see
 [Getting higher quality output](quality.md), which has a per-backend cheat sheet. This
@@ -36,7 +41,7 @@ the server, and is hidden when there is only one.
   LM / Thinking clusters show that backend's own controls, and controls that do nothing
   on it are hidden.
 - The sidebar lists only the studios the active backend can use. Cover Studio is listed
-  under ACE-Step and YuE2; Repaint, Stem Builder and Song Builder under ACE-Step
+  under ACE-Step, YuE2, Stable Audio 3 and HeartMuLa; Repaint, Stem Builder and Song Builder under ACE-Step
   only; STORM under ACE-Step and YuE2. The rest, Training included, are always listed.
   If the open studio is not listed for the backend you switch to, the app moves to
   Custom-Gen.
@@ -61,7 +66,7 @@ A small text encoder model conditions the DiT on the caption.
 
 What sets it apart from the others:
 
-- It is the only backend with source-audio-conditioned covers, repaint
+- It supports source-audio-conditioned covers, repaint
   (Repaint) and stem generation (Stem Builder). It also supports continuous streaming in STORM.
 - BPM, key, time signature and duration are real input fields. Duration is a target the
   planner aims for, from 10 to 600 seconds.
@@ -113,9 +118,15 @@ What sets it apart:
   usual.
 - Variations Per Render (1 to 4) renders several different songs from one prompt in a
   single pass, sharing the planner. Each request is otherwise one take.
-- Flow Steps (default 30, range 2 to 60) is the main speed control. Below 30, Low-Step
+- Flow Steps (default 20, range 2 to 60) is the main speed control. The checkpoint's
+  own value is 30; an ear test heard no difference at 20. Below 30, Low-Step
   Compensation reshapes the schedule so short renders keep their low end and stereo
   image.
+- Window Hop (default 150 frames, range 100 to 160) sets how far apart the flow
+  stage's 8-second windows start. The checkpoint's 100 overlaps them by half, so most
+  of the song is rendered twice; 150 needs about a third fewer windows, and an ear test
+  heard no difference at the seams. 100 is the reference. Above 150 the seams get less
+  shared context still, so listen at the joins.
 - The Lua solver, scheduler and guidance plugins can drive its flow DiT, behind the
   Sampler Plugins toggle, which is off by default and marked experimental. Postprocess
   plugins do not apply.
@@ -131,10 +142,19 @@ What sets it apart:
 - Renderer (in the Models cluster, under the Flow DiT picker) switches the DiT between
   GGML and TensorRT. TensorRT needs the MM3 TensorRT DiT pack plus one builder DLL for
   your GPU, and the first render builds an engine once, which takes a few minutes.
+  With TensorRT on, a TensorRT precision choice appears below it. FP8 is the default:
+  it runs part of the DiT in 8-bit, so on an RTX 5090 the flow stage is about 27%
+  faster (a 60 s song renders about 5 s sooner) and uses about 1.5 GB less VRAM. In an
+  ear test it was indistinguishable from BF16; one of three held-out test prompts sits
+  slightly below our latent-parity target, so BF16 stays available as the exact path.
+  The first render at each precision builds its own engine once.
 
 Models: five GGUFs (planner LM, depth decoder, condition encoder, flow DiT, vocoder), each
 selectable at its own quantisation in the Models cluster. Picking a quant loads it into
-the engine and the choice is remembered across restarts. The packs:
+the engine and the choice is remembered across restarts. Until you pick one, the app runs
+the planner LM at Q8_0 and the depth decoder at NVFP4 on RTX 50-series cards or Q8_0 on
+others, falling back to the best installed file when that quant is missing; the other
+three keep the best installed file. The packs:
 
 | Pack | Precision | Download |
 |---|---|---|
@@ -142,7 +162,7 @@ the engine and the choice is remembered across restarts. The packs:
 | MiniMax-Music3 (NVFP4) | LM and DiT NVFP4, for RTX 50-series cards | ~7.7 GB |
 | MiniMax-Music3 (Q6_K) | LM and DiT Q6_K, depth Q8_0 | ~9.9 GB |
 | MiniMax-Music3 (Balanced mix) | LM Q8_0, DiT Q4_K_M, depth Q8_0 | ~12.2 GB |
-| MiniMax-Music3 (Q8_0) | Q8_0 throughout, recommended | ~13.4 GB |
+| MiniMax-Music3 (Q8_0) | Q8_0 throughout plus the NVFP4 depth decoder, recommended | ~13.8 GB |
 | MiniMax-Music3 (F16) | Full precision | ~23.6 GB |
 
 Training an adapter also needs the MiniMax-Music3 Training pack (~2.8 GB) on top of a
@@ -160,8 +180,10 @@ A native C++/GGML port of YuE2. Its language model has two halves that share no 
    and decides where the song ends.
 2. The NAR half renders those frames into audio latents with a flow-matching solver.
 
-A VAE decoder then produces 48 kHz stereo. Every GGUF generation also applies a small
-companion decoder adapter to the NAR half, which ships in each YuE2 pack.
+A VAE decoder then produces 48 kHz stereo. Every GGUF generation on the base model also
+applies a small companion decoder adapter to the NAR half, which ships in each YuE2 pack.
+Fine-tunes such as the YuE2-RS merges render without it: they retrained the NAR half,
+and the companion, trained on the base model's NAR, garbles their vocals.
 
 What sets it apart:
 
@@ -404,10 +426,10 @@ controls the UI shows for it. "?" means not yet confirmed.
 | Caption format | Free text, plus BPM, key and time signature fields | Structured Caption | Free text; BPM and key folded into the style | Free text, up to 256 tokens |
 | Duration | Set by you, 10 to 600 s | Model-ended, ceiling 300 s | Model-ended, up to 360 s, no control | Set by you, up to 600 s; Auto gives 30 s |
 | Songs per request | Up to 9 | 1, or up to 4 with Variations Per Render | Up to 4 with Batch Size | 1 |
-| Cover Studio | Yes, source-audio conditioning | No | Yes, reviewed ABC composition conditioning | No |
+| Cover Studio | Yes, source-audio conditioning | Yes, planner code forcing and source-audio blend | Yes, reviewed ABC composition conditioning | Yes, source-audio refine |
 | Repaint | Yes (Repaint) | No | No | No |
 | Extend | Yes, in Song Builder | No | No | No |
-| Adapters at generation | DiT LoRA and LoKr, planner LM LoRA and LoKr | Planner LM LoRA and LoKr, runtime or merge, applied per render | AR and NAR LoRA and LoKr, merged at load; ComfyUI joint files via import | DoRA-rows, in Training Studio auditions only |
+| Adapters at generation | DiT LoRA and LoKr, planner LM LoRA and LoKr | Planner LM LoRA and LoKr, runtime or merge, applied per render | AR and NAR LoRA and LoKr, merged at load; ComfyUI joint files via import | DoRA-rows in Cover Studio, plus Training Studio auditions |
 | Training in Training Studio | Yes | Yes | Yes | Yes |
 | Streaming playback | Continuous streaming in STORM; no per-render preview | Play While Rendering | Continuous streaming in STORM | STORM slots, with no sidebar entry |
 | STORM Directed Drift | Caption, seed, guidance, LSS, steps, BPM and duration | No | Caption, seed, CFG scale, ODE steps and NAR cache ratio | Caption, seed, guidance, steps and duration |
@@ -477,7 +499,8 @@ component and adapter choices when the picker changes or another backend is sele
 | Post-processing | Shared chain, including VST, mastering and StableStep |
 | Shared Lua sampler plugins | Solvers, schedulers and guidance on the codec decode, opt-in |
 | PP-VAE, Spectral Lifter | No |
-| Covers, repaint, streaming, training, lyric alignment | No |
+| Cover Studio | Yes, lead-sheet conditioning from approved Prepare ABC; engine route pending |
+| Repaint, streaming, training, lyric alignment | No |
 | Output | 48 kHz stereo |
 
 The server maps `heartmulaTags` or the shared caption to `tags`. Optional request

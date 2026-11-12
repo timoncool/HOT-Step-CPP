@@ -145,6 +145,8 @@ export interface BackendFeatureCapabilities {
   cover: boolean;
   /** Audio-to-audio transform without a lead sheet or vocal conditioning. */
   coverAudioTransform?: boolean;
+  /** Cover by replaying a reference's encoded codes (MM3 planks). */
+  coverCodeForcing?: boolean;
   repaint: boolean;
   lego: boolean;
   extract: boolean;
@@ -257,6 +259,18 @@ interface BackendState {
   switchBackend: (id: string) => Promise<void>;
 }
 
+// One entry per selectModels call still in flight, in call order. Each call
+// removes only its own entry: two saves may carry the same value for a key, so
+// value equality cannot say whose it is.
+const _pending = new Map<string, Array<Record<string, string>>>();
+
+/** Selections posted by selectModels whose refetch has not landed yet, later
+ *  calls winning, so a reader of `defaults` can lay them over the stale
+ *  values. Empty otherwise. */
+export function pendingSelection(backendId: string): Readonly<Record<string, string>> {
+  return Object.assign({}, ...(_pending.get(backendId) ?? []));
+}
+
 export const useBackendStore = create<BackendState>((set, get) => ({
   backends: [],
   // Last known active id (mirrored to localStorage, see above) so the
@@ -314,6 +328,10 @@ export const useBackendStore = create<BackendState>((set, get) => ({
   selectModels: async (selection, id) => {
     const backendId = id || get().activeBackendId;
     if (!backendId) return false;
+    // Until the refetch lands, `defaults` still holds the previous pick; a job
+    // queued in that window must see this selection (pendingSelection).
+    const mine = { ...selection };
+    _pending.set(backendId, [...(_pending.get(backendId) ?? []), mine]);
     try {
       await queryClient.cancelQueries({ queryKey: backendModelsOptions(backendId).queryKey });
       // Re-read rather than trusting the request: the engine may fall back to
@@ -330,6 +348,10 @@ export const useBackendStore = create<BackendState>((set, get) => ({
       // No global toast — the write is silent and every caller owns its own
       // inline note (or swallows deliberately).
       return false;
+    } finally {
+      const rest = (_pending.get(backendId) ?? []).filter(p => p !== mine);
+      if (rest.length) _pending.set(backendId, rest);
+      else _pending.delete(backendId);
     }
   },
 

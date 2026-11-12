@@ -135,6 +135,160 @@ WDDM — measured at 12–14 s/step against q8_0's 3.75 on the same 12 steps.
    byte-identical graphs. Keep it that way — that file is what makes ACE 4B
    training fit.
 
+### Where a whole-song step goes (measured 2026-11-06)
+
+The in-app recipe (q8_0, `--weights f32-window`, HOT-PiZZA r16, `--attn flash`,
+whole-song crops, S up to 7,178), 20 steps on a 13-track album, RTX 5090:
+
+- **Phase timer** (`HOTSTEP_LM_PHASE_TIMER=1`, prints a `[phase0]` line every
+  20 micro-steps): 6.55 s per micro-step, 94.5 % GPU (`gpu_sync`), 4.2 % host
+  graph build and input uploads, 1.2 % kernel submit, 0.05 % planning. About
+  106 graphs per step. Since 2026-11-06 the clock starts before the mask and
+  token uploads, so `build(host)` really includes them.
+- **Kernels** (Nsight Systems, 8 steps, 51.3 s of kernel time): GEMM 63.7 %,
+  flash attention 24.1 % (fwd 7.5, dQ 7.7, dK/dV 8.8), elementwise 9.0 % (mostly
+  `add`/`sub` over `[out, S]`), q8_0 to F32 weight copies 3.1 %. **Every big
+  GEMM is `cutlass_80_simt_sgemm`: plain FP32 SIMT, no tensor cores.** That is
+  57.8 % of kernel time, and the place to look for a BF16 or TF32 win.
+  Adapter-sized GEMMs (small tiles, all four LoRA/PiSSA products forward and
+  backward) are 4.8 %.
+
+**The causal mask was rebuilt twice per step.** Whole-song crops change S on
+almost every step, and the MM3 loop and `lm_ckpt_upload_mask` each kept their
+own last-S cache over the same buffer, so each one built the S x S mask in F32,
+converted it to F16 one element at a time, and uploaded it. That took about
+104 ms of host time per build at S = 7,178. Now it is built once, with
+row fills straight in the buffer's type (`lm_mask_set_causal`, `lm-common.h`),
+and the loop marks the checkpointed path's cache. A fill takes 10.5 ms. Bytes
+are unchanged (`engine/tests/test-lm-causal-mask.cpp`). Two interleaved
+20-step pairs gave identical losses, gradient norms and resume state; the patched
+binary was faster on 20 of 20 steps in both pairs, by 1.4 % and 3.2 % in
+total (about 90 ms a step, more on longer songs).
+
+**Flash still needs the full mask.** The fused op's causal hint
+(`ggml_flash_attn_train_set_causal`) is only read by the BF16 CUDA kernels and
+Metal, and is ignored when no mask is attached. The TF32 kernels the recipe
+runs read the mask, and CUDA requires it contiguous, so a strided view of one
+S_max mask is not an option without a fork change.
+
+**Stacking [A; A0] into one matmul was measured and not built.** HOT-PiZZA's
+frozen branch reads x a second time per site, but all adapter-sized GEMMs
+together are 4.8 % of kernel time, so merging the A-side read would save
+under 1 %, below the 3 % bar for kernel churn. The larger cost of that branch
+is the `[out, S]` output of `B0 (A0 x)` and the `sub` after it. Merging that
+needs a differentiable concat, and ggml's `CONCAT` has no backward.
+
+**Why the GEMMs were SIMT: `NVIDIA_TF32_OVERRIDE=0`.** ggml-cuda puts every
+cuBLAS handle in TF32 mode, but `mm3_lm_train_main` sets the override before
+the backend starts (TF32 was judged "a few percent"), so every F32 GEMM ran
+`cutlass_80_simt_sgemm`. The override does not reach the custom `fa_train`
+TF32 kernels or BF16 `GemmEx`.
+
+**Three opt-in levers (2026-11-06), all off by default.** Same recipe, 20
+steps, seed 42, app shut down, no Unreal. ms is the phase timer's
+per-micro-step total; VRAM is device peak minus idle; loss deltas are per step
+against the f32-window run:
+
+| flags | ms/step | speedup | peak VRAM | max / mean loss delta |
+|---|---|---|---|---|
+| f32-window, flash (in-app today) | 6,643 | 1.00x | 19,105 MB | (losses identical to the pre-change binary) |
+| `--tf32 on` | 4,791 | 1.39x | 19,054 MB | 0.29 % / 0.06 % |
+| `--attn flash-bf16` | 5,554 | 1.19x | 18,959 MB | 0.84 % / 0.12 % |
+| `--weights bf16` | 4,043 | 1.65x | 19,200 MB | 0.32 % / 0.07 % |
+| `--weights bf16 --attn flash-bf16` | 2,861 | 2.32x | 19,163 MB | 0.57 % / 0.08 % |
+| the two plus `--tf32 on` | 2,821 | 2.35x | 19,214 MB | 0.80 % / 0.11 % |
+
+- `--weights bf16` now takes any base. `lm_linear` casts a q8_0 (or other
+  quant, or F16) projection to BF16 in-graph (q8_0 goes through F32: the fork
+  has no direct quant-to-BF16 copy), and Lever A's rewrite is keyed by the
+  cast. The S18 tripwire (7 rewrites per segment) still holds.
+- `--attn flash-bf16` is the YuE2 trainer's attention: Q/K/V cast to BF16,
+  `GGML_PREC_BF16`, and causal hint 0 when there is no prefix, so the BF16
+  kernels skip reading the mask.
+- After both (Nsight, 8 steps): kernel time 51.3 s to 22.9 s. BF16
+  tensor-core GEMMs (`cutlass_80_tensorop_s16816gemm_bf16`) 41.6 %,
+  elementwise 17.9 %, FP32 SIMT left (adapter, head, depth) 9.9 %, F32 to BF16
+  and other copies 9.7 %, q8_0 to F32 7.5 %, flash 10.7 %. The phase timer
+  then read host build at 9.7 % of the step, but most of that was the
+  acoustic-loss head's GPU time, which ran outside the timer (next block).
+  Next candidate: a direct q8_0 to BF16 copy in HOT-ggml (most of the 17 % of
+  casts).
+
+**Later the same night: the host share was the depth head.** Per-phase
+timers inside the micro-step (BF16 levers, 20 steps): forward 795 ms, CE head
+85, acoustic-loss head 198, backward segments 1,736, and building all 36
+backward graphs only 2.5 ms. The acoustic-loss head (`mm3_depth_train_head`)
+called `ggml_backend_sched_graph_compute` directly, so its 161 ms of GPU work
+landed in `build(host)`. It now counts as `gpu_sync`; real host time is about
+85 ms a step (3 %), and an overlap that built graph i+1 while graph i ran
+measured 0.3 %, so it was dropped. Graph reuse and Lever B are closed for MM3.
+The head itself was slow for a fixable reason: its frozen-weight GEMMs took
+`[in, 8, K]` activations, which ggml-cuda runs as K batched 8-column products
+(`mul_mat_f` forward, cuBLAS `gemmSN_NN` backward, 5.3 % of kernel time
+together), re-reading each F32 weight per frame. As one 2D GEMM the head takes
+65 ms instead of 161: 2.85 to 2.70 s a step under the levers, 6.69 to 6.54 s
+with the default flags. Not bit-identical (summation order), loss within
+0.18 % over 20 steps, the head's fd tripwire passes. Also bit-identical and
+small: HOT-PiZZA's frozen branch now adds `B0 (-s A0 x)` instead of
+subtracting, which drops a NEG over `[out, S]` per site from the backward
+(1.2 % of kernel time).
+
+**q8_0 to BF16 without the F32 copy.** Under `--weights bf16` on q8_0, the
+in-graph weight cast (q8_0 to F32 to BF16, 12.5 % of kernel time) is replaced
+by a one-layer BF16 stage that an engine-side kernel (`q8_bf16_cuda.cu`,
+compiled into `yue2-aitk-kernels`) fills before each layer graph, with the
+same arithmetic as the two ggml copies. Bit-identical 20-step losses; 2.70 to
+2.48 s a step; +378 MB peak VRAM (the stage itself). Together with the depth
+head fix, the whole-song step under `--weights bf16 --attn flash-bf16` went
+from 2.85 to 2.48 s (1.15x) tonight, 2.68x against the f32-window default.
+A direct q8_0 to BF16 copy in HOT-ggml would give the same win in-graph, but
+it is no longer needed for this path.
+
+**`--pissa-fold on` (opt-in, not heard).** The stage kernel can also subtract
+HOT-PiZZA's frozen term, writing `bf16(W - s B0 A0)`, and the graph then drops
+the frozen branch (two adapter GEMMs, an `[out, S]` add per site and their
+backward). 2.47 to 2.25 s a step (1.10x on top of everything above; removing
+the branch outright measured 2.19 s, so the fold kernel costs about 30 ms).
+Not bit-identical: against the f32-window run the 20-step loss is within
+0.34 % (the unfolded BF16 run: 0.65 %). Needs an A/B by ear before any default.
+
+After tonight, whole-song micro-step on the 5090: default 6.54 s, `--weights
+bf16` 3.71 s, plus `--attn flash-bf16` 2.48 s, plus `--pissa-fold on` 2.25 s,
+plus `--tf32 on` 2.20 s (3.0x the 6.64 s default at the start of the night;
+loss within 0.25 % of the f32-window run over 20 steps).
+Kernel time under the last (Nsight, 8 steps, 2.18 s a step): BF16
+tensor-core GEMMs 47 %, elementwise, norms and RoPE 21 % (mostly the residual
+and adapter adds and gradient accumulation, which cannot go without changing
+the summation order), flash attention 15 %, FP32 GEMMs 10 % (the rank-16
+adapter products and the depth head), copies and casts 7 % (activation casts
+to BF16 inside ggml's BF16 matmul, Q/K/V casts, the transposed weights, the
+stage). The adds run at about 0.8 TB/s against the card's 1.8
+(`k_bin_bcast_unravel`, one element per thread), so a contiguous vectorised
+add in HOT-ggml is the next lead: up to about 7 % of the step, a fork change.
+
+Gates. `mm3-lm-probe` on f16 (it now takes `--weights` and `--attn`) passes
+every arm; `--weights bf16 --attn flash-bf16` gives cos 0.999999898, rel
+9.5e-4 against the 1e-3 bar (f32-window exact: 0.999999951, 3.5e-4). On q8_0
+every arm misses the rel bar, the unchanged one included (4.5e-3), so probe on
+f16. `--fd-check 8 --f32-layers 2`: the F32-isolated layers take the shipped
+path, so it cannot test `--weights bf16`. With `--attn flash-bf16` the route
+check passes (2.75e-4) but finite differences fail on the q_proj probes
+(worst 0.64 at the default eps, 0.068 at `--fd-eps 0.2`, where TF32 flash
+gives 0.002). The analytic gradients match TF32 flash within 0.15 % on all 8
+probes, so the BF16-rounded forward is too coarse for central differences on
+attention-side factors.
+
+Matched 150-step adapters (same recipe and seed): f32-window 1,024 s,
+`--weights bf16` 625 s (1.64x), plus `--attn flash-bf16` 440 s (2.34x).
+Per-step losses drift apart over 150 steps (mean 2 %, single steps up to 20 %),
+but held-out loss at step 150 is 3.026 / 3.033 / 3.044. Two 60 s renders per
+adapter are staged under
+`D:\Ace-Step-Latest\_experiments\_LISTENING\2026-11-06-mm3-speed\bf16-train\`
+for the ear test. Heard 2026-11-06: no audible loss at either level, so the
+app's `trainPrecision` default is `fastest` (`--weights bf16 --attn
+flash-bf16`). The CLI flags themselves stay off by default. Since 2026-11-08 the
+app's `fast` and `fastest` also pass `--tf32 on`; `full` does not.
+
 ## Native codes export: `ace-train mm3-codes` (SHIPPED 2026-08-20)
 
 Audio -> RVQ codes, natively. `engine/src/minimax/mm3-rvq-encode.h` ports

@@ -7,12 +7,12 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   yue2ResolvePick, yue2PickFromModels, yue2CoverFromSubmission, yue2CoverPickBase,
-  yue2PlanStackFrom, yue2PlanScaleDiffers, yue2LmVariant, yue2AdapterHome,
+  yue2PlanStackFrom, yue2PlanScaleDiffers, yue2LmVariant, yue2AdapterHome, slotDefaults,
   type Yue2PersistedSelection,
 } from './index.js';
 import { yue2CoalesceKey } from './generate.js';
 import type { GenerationJob } from '../../generation/jobTypes.js';
-import type { Yue2SynthRequest } from './client.js';
+import type { Yue2Props, Yue2SynthRequest } from './client.js';
 
 // #204: a job renders with the pick captured when it was submitted.
 
@@ -327,4 +327,41 @@ test('base-mode cover (no explicit pair) clears both AR and NAR slots, unlike an
 test('a pair explicitly chosen on a cover submission still renders, base-mode clearing does not override it', () => {
   const pick = yue2ResolvePick({ yue2Pick: { lmAdapterNar: fileA } }, yue2CoverPickBase(defaults));
   assert.equal(pick.adapters.nar.path, fileA);
+});
+
+// GH #325: "in force" means the file and every dial, not just the file.
+test('slotDefaults: a slot is in force only when the engine merged its file at its dials', () => {
+  const narEntry = { path: fileA, family: 'nar' };
+  const props = (merged: string, entries = [narEntry]) =>
+    ({ synth_ready: true, adapter: { merged, entries, in_force: !!merged } }) as unknown as Yue2Props;
+  const key = `${fileA}@0.8000,a1.0000,m0.5000,e1.0000,i1.0000,l1.0000`;
+  assert.equal(slotDefaults(defaults, props(key)).lmAdapterNarInForce, true);
+  assert.equal(slotDefaults(defaults, props(`other.safetensors@1.0000; ${key}`)).lmAdapterNarInForce, true);
+  // Same file, merged at the strength it had before the user moved the dial.
+  assert.equal(slotDefaults(defaults, props(key.replace('@0.8000', '@1.0000'))).lmAdapterNarInForce, false);
+  assert.equal(slotDefaults(defaults, props(key.replace(fileA, fileB))).lmAdapterNarInForce, false);
+  assert.equal(slotDefaults(defaults, props('')).lmAdapterNarInForce, false);
+  assert.equal(slotDefaults(defaults, null).lmAdapterNarInForce, false);
+  // Nothing picked is never in force, whatever is resident.
+  assert.equal(slotDefaults(defaults, props(key)).lmAdapterArInForce, false);
+  // An engine older than the group dials spells only the master strength.
+  // An engine older than the group dials spells only the master strength, and
+  // one older than `entries` falls back to the aggregate flag.
+  const preDials = (inForce: boolean) => ({ adapter: { merged: `${fileA}@0.8000`, in_force: inForce } }) as unknown as Yue2Props;
+  assert.equal(slotDefaults(defaults, preDials(true)).lmAdapterNarInForce, true);
+  assert.equal(slotDefaults(defaults, preDials(false)).lmAdapterNarInForce, false);
+});
+
+// `merged` spells the whole requested stack; `entries` says which halves landed.
+test('slotDefaults: a requested half that did not merge is not in force', () => {
+  const both: Yue2PersistedSelection = { ...defaults, adapters: {
+    ar: { path: fileB, scales: { global: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1 } },
+    nar: defaults.adapters.nar,
+  } };
+  const merged = `${fileB}@1.0000,a1.0000,m1.0000,e1.0000,i1.0000,l1.0000; `
+    + `${fileA}@0.8000,a1.0000,m0.5000,e1.0000,i1.0000,l1.0000`;
+  const arOnly = { synth_ready: true, adapter: { merged, in_force: true, entries: [{ path: fileB, family: 'ar' }] } } as unknown as Yue2Props;
+  const out = slotDefaults(both, arOnly);
+  assert.equal(out.lmAdapterArInForce, true);
+  assert.equal(out.lmAdapterNarInForce, false);
 });

@@ -1,4 +1,5 @@
 import { config } from '../../../config.js';
+import type { HeartmulaCoverRolls } from '../../../contracts/studioWorkflows.js';
 
 export const HEARTMULA_ROLES = ['global', 'local', 'flow', 'scalar_decoder'] as const;
 export type HeartmulaRole = typeof HEARTMULA_ROLES[number];
@@ -34,6 +35,12 @@ export interface HeartmulaRequest extends HeartmulaPick {
   cfg_scale: number;
   codec_steps: number;
   codec_guidance: number;
+}
+/** Stage 3c's /heartmula/cover body. The Node submission's heartmulaCover
+ * becomes rolls; tags and sectioned lyrics use the ordinary top-level fields.
+ * Submission remains disabled in mapHeartmulaRequest until that route exists. */
+export interface HeartmulaCoverRequest extends HeartmulaRequest {
+  rolls: HeartmulaCoverRolls;
 }
 export interface HeartmulaProps {
   synth_ready: boolean;
@@ -109,6 +116,12 @@ export const heartmulaClient = {
     return (await request('/heartmula/select-model', pick)).json();
   },
   async unload(): Promise<void> {
+    // /heartmula/unload waits in the engine's GPU worker queue, behind whatever
+    // runs there (an inline YuE2 render, say), so skip it when nothing is
+    // resident (GH #341). Props answers off the worker; no answer = unload anyway.
+    const props = await request('/heartmula/props', undefined, 3000)
+      .then(res => res.json() as Promise<{ vram?: { resident_bytes?: number } }>).catch(() => null);
+    if (props?.vram?.resident_bytes === 0) return;
     // Older engine builds have no HeartMuLa residency to release.
     try {
       const result = await (await request('/heartmula/unload', {})).json() as { unloaded?: boolean };

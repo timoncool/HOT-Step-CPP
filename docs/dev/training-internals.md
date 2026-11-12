@@ -128,9 +128,26 @@ form engine.
 
 The preview view is shared. `TrainingPreviewPanel.tsx` holds the settings
 block, field, checkpoint card and take rows (presentation only, no server
-state). YuE2's ladder, MM3's strip and the SA3 card all draw it and keep their
-own actions and scoring. `previewSource` records where each target's previews
-come from: `yue2-ladder`, `mm3-records`, `sa3-previews` or `none`. ACE is
+state). YuE2's ladder, MM3's ladder and the SA3 card all draw it and keep their
+own scoring. YuE2's and MM3's ladders are one component,
+`CheckpointLadder.tsx` (the rung loop, Render, Use this rung or checkpoint);
+YuE2's blind labels, scores, album score and cleanup ride in its slots. MM3's ladder
+(`Mm3CheckpointLadder.tsx`) reads `GET /datasets/:id/mm3-previews?run=`, the
+WAVs in `<run>/previews` with a `<file>.json` record beside each. Render more
+uses the preview prompt the run recorded in `hotstep-run.json`
+(`previewPlan`), so a caption edit or a cleared codes cache does not change
+or break it; a run from before that resolves it once and records it. "Use this
+checkpoint" is the `mm3/select` operation (`services/training/mm3Ladder.ts`),
+which records the dataset slug's chosen reference in `<training>/mm3-linked.json`
+using YuE2's atomic JSON pattern, updates any existing album presets
+(`pointMm3PresetsAt`, the same function the local runner and worker mirror use
+at run end), and sets the global LM adapter. Like YuE2, a linked album without
+a preset row gets a durable record but no new preset row. The record drives
+`inUse`, cleanup eligibility and run deletion; presets are also checked
+independently so cleanup never removes a checkpoint they use. Older datasets
+fall back to their existing preset reference until their next pick. `previewSource`
+records where each target's previews come from: `yue2-ladder`, `mm3-ladder`,
+`sa3-previews` or `none`. ACE is
 `none`: it has no checkpoint exports or renderer, so it keeps Audition. SA3
 previews are read through `ui/src/queries/sa3-previews/`.
 
@@ -274,6 +291,11 @@ step went from 4.24 to 3.31 s on an RTX 5090 (4.30 to 3.38 s with the companion)
 `joint` line in `train.jsonl` records `gemm` plus how many GEMMs took each path
 (`gemm_bf16`, `gemm_f32`). The casts need the HOT-ggml `bf16-mul-mat-grad` change.
 `yue2-train-gemm-precision-test` checks both paths against each other at YuE2 shapes.
+Since 2026-11-08 bf16 mode no longer sets `NVIDIA_TF32_OVERRIDE=0`, so the F32 GEMMs
+that remain (quantized bases, the companion decoder) run on TF32 tensor cores on sm_80+:
+2008 to 1880 ms a step on an RTX 5090 over 20 steps, loss within 0.025 %. strict-f32
+still sets it, and an inherited `NVIDIA_TF32_OVERRIDE=0` turns TF32 off for an A/B. The
+start-up log says which is in force (`[yue2-aitk] F32 GEMMs: ...`).
 
 `YUE2_AITK_HOST_PROFILE=1` adds one `{"stage":"host_profile","step":N,"ms":{...}}` line per
 step on stderr: host wall time per trainer phase (block executor phases, constants, gradient
@@ -719,6 +741,37 @@ boot before the server listens. It is idempotent.
 `startYue2Mirror()` awaits it before the first pass, so no pass writes into a folder about
 to move. The first mirror pass then fills in the rung weights the worker still holds.
 
+#### MM3 on a worker
+
+`POST /api/workers/:name/mm3-dispatch` (body `{ datasetIds, clearCache, recipe }`, the
+`mm3-batch` body) runs the same dispatch as `yue2-dispatch` with `family: 'mm3'`: no
+captioning, a check that the dataset is built with its manifest at
+`<sourceDir>/dataset.json` (the only path `upsertPushedDataset` adopts on the worker) and
+has at least one `.mm3.txt`, then the push, then `POST /api/training/mm3-batch` on the
+worker. A dispatch or a worker batch of the other family is never joined. The pushed
+manifest keeps this machine's absolute `audio_path`s; `pm_resolve_audio` in
+`preprocess-io.h` falls back to the file beside the manifest.
+
+MM3 runs need no index: a run is its folder, attributed by `hotstep-run.json`. The worker
+offers `GET /api/training/worker/mm3-mirror` (`workerMm3MirrorManifest`: runs of datasets
+whose `sourceDir` is under `worker-datasets/`, with `live` while a job for the dataset or
+the GPU lane is busy) and `mm3-mirror-file?run=&rel=` (same headers as
+`yue2-mirror-file`). Files offered: `hotstep-run.json`, `train-log.jsonl`,
+`train-console.log`, every file of a `ckpt-N/` once its weights' `.json` sidecar exists
+(the engine writes the folder in place and the sidecar last) and `previews/*.wav|json`.
+Never `resume-state.*`.
+
+`mirrorMm3Runs` in `yue2Mirror.ts` runs inside each pass and lands a run at
+`mm3-lm-adapters/<run>` with the same `.mirror.json` ledger. A file is fetched again when
+the worker's size or mtime moves past the ledger's; a file in the ledger but gone from
+disk was cleaned up here and stays gone. A fetched `hotstep-run.json` keeps the local
+`blindLabels`. `<training dir>/mm3-mirror.json` records each `{ worker, run }`: a recorded
+run whose folder is gone is marked `discarded` and never copied again, and a run name that
+already exists here without a record is refused. Once a run seen `live` by a pass is no
+longer live and fully copied, `linkMirroredMm3Run` points the dataset's album presets at
+its last checkpoint (`pointMm3PresetsAt`, as `refreshLinkedMm3Presets` does locally),
+once. Nothing is deleted on the worker.
+
 ## YuE2 NAR audio-domain loss
 
 `yue2-nar-train` gained two flags on 2026-10-17. `--companion` merges the
@@ -838,6 +891,118 @@ top of the 16 GB f16 base — so flash is proven correct only on an F32-isolated
 2-layer slice, not the full model. Full per-frame numbers and fitting caveats:
 `.claude/skills/flash-attn-training/SKILL.md` §3/§7.
 
+### Attention mask upload and the step profile (2026-11-06)
+
+`lm_ckpt_upload_mask` and the MM3 loop now build the causal mask with
+`lm_mask_set_causal` (`train/lm-common.h`): row fills written straight in the
+buffer's type (F16 under flash, F32 under exact), with no F32 staging vector
+or per-element conversion. The same bytes as before, checked by
+`engine/tests/test-lm-causal-mask.cpp`. The MM3 loop also marks the
+checkpointed path's last-S cache, because both wrote the same `t_msk` and each
+rebuilt it when S changed. Whole-song crops change S on almost every step, so
+that was two ~100 ms host builds per step at S 7,178. The ACE trainer's naive
+path (`upload_mask` in `train/lm-train-run.h`) uses the same call since later
+that day; it already kept one last-S cache, so there it only drops the F32
+staging. `HOTSTEP_LM_PHASE_TIMER`
+now starts its clock before the mask and token uploads. The measured step
+breakdown (FP32 SIMT GEMMs are 58 % of kernel time, flash attention 24 %) is in
+[.claude/skills/mm3-backend/reference/training.md](../../.claude/skills/mm3-backend/reference/training.md).
+
+### BF16 and TF32 levers on `mm3-lm-train` (2026-11-06)
+
+Three opt-in flags, all off by default, so a default run is unchanged (a
+flags-off 20-step run reproduced the earlier binary's losses exactly):
+
+- **`--weights bf16` on any base.** Lever A used to need a BF16-native base.
+  `lm_linear` now casts a non-BF16 projection to BF16 in-graph (a quant goes
+  through F32, since ggml-cuda has no quant-to-BF16 copy) and keys the
+  out_prod rewrite by the cast, so the shipped q8_0 base reaches
+  `cublasGemmEx(CUDA_R_16BF)` in both directions. 1.65x per step, VRAM level.
+- **`--attn flash-bf16`.** `lm_attn_flash` casts Q/K/V to BF16 with
+  `GGML_PREC_BF16` and sets causal hint 0 when there is no KV prefix, as
+  `yue2-aitk-graph.h` does. 1.19x. `dit_flash_probe` (`flash-prec.h`) takes
+  the precision so the probe asks about the BF16 kernels.
+- **`--tf32 on`.** The trainer sets `NVIDIA_TF32_OVERRIDE=0` before the CUDA
+  backend starts, which is why every F32 GEMM ran `cutlass_80_simt_sgemm`.
+  The flag skips it. 1.39x alone, +1.4 % on top of the other two.
+
+`--weights bf16 --attn flash-bf16` measured 2.32x (6.64 to 2.86 s per
+micro-step) on a whole-song recipe, max per-step loss delta 0.57 % over 20
+steps. `mm3-lm-probe` accepts `--weights` and `--attn` and passes on f16 for
+every arm. The `--fd-check` finite differences fail for `flash-bf16` on
+attention-side probes while the route check passes; the full table, the
+kernel split after the change and the gate numbers are in
+[.claude/skills/mm3-backend/reference/training.md](../../.claude/skills/mm3-backend/reference/training.md).
+
+The server exposes the first two as one request field, `trainPrecision`
+(`fastest` default since 2026-11-06, `fast` = `--weights bf16`, `fastest` =
+`--weights bf16` plus `--attn flash-bf16` when the resolved attention is
+flash, `full` = FP32). The recipe projection always sends the form's value, so
+an explicit Full is not lost to the server default; a run manifest without
+the field resumes as `full`. `recommendMm3Config` adds the BF16 weight stage
+(`MM3_VRAM_MODEL.bf16StageMb`) for the default precision on a non-BF16 base. The mapping is
+in `buildMm3TrainLmArgs`; the run manifest records the field, so a preview
+relaunch and the resume route keep it, and the resume route accepts it as an
+override. Since 2026-11-08 `fast` and `fastest` also pass `--tf32 on` (their
+big GEMMs already round to BF16, so TF32 on the leftover F32 GEMMs is the
+smaller rounding; 1.09x on a 4090) and `full` keeps strict FP32.
+
+### Step cost after the BF16 levers (2026-11-06)
+
+- **The PiSSA frozen branch adds a negated term instead of subtracting.**
+  `lm_linear` scales `A0 x` by `-s` and adds `B0` times it, where it used to
+  scale by `s` and subtract. The bits are the same (negation is exact in
+  IEEE arithmetic and a GEMM of a negated input is the negated GEMM), but the
+  backward of SUB is a NEG over `[out, S]` at every site, about 1.2 % of an
+  MM3 step's kernel time under `--weights bf16 --attn flash-bf16`, and ADD's
+  is nothing. 20-step losses, gradient norms and depth losses are identical to
+  the previous binary with and without the BF16 flags.
+- **The acoustic-loss head runs its weight GEMMs in 2D.** `mm3_depth_train_head`
+  fed the frozen depth decoder `[in, 8, K]` activations, which ggml-cuda runs
+  as K batched products of 8 columns, re-reading each F32 weight per frame.
+  Reshaped to one `[in, 8K]` GEMM, the head's compute at K = 128 fell from
+  161 to 65 ms per micro-step. The products are the same, but the kernel sums
+  them in another order, so results are not bit-identical: over 20 steps,
+  loss within 0.18 % (mean 0.02 %), depth loss within 0.06 %, step 1's loss
+  unchanged; the head's finite-difference tripwire passes as before.
+  Whole-song recipe: 2.85 to 2.70 s per micro-step with
+  `--weights bf16 --attn flash-bf16` (1.05x), 6.69 to 6.54 s with the
+  default flags.
+- **`--weights bf16` on a q8_0 base converts each layer's weights once per
+  graph, outside it.** The in-graph cast went q8_0 to F32 to BF16, writing and
+  re-reading a full F32 copy of every projection (12.5 % of kernel time). On a
+  CUDA build `lm_ckpt_alloc` now keeps a one-layer BF16 stage (368 MB on MM3)
+  and `lm_ckpt_layer_w` fills it from layer l with `q8_bf16_cuda.cu` before
+  each layer graph, which then reads it as a BF16 base. The kernel does what
+  the two ggml copies do (F16 scale to float, times the int8, round to BF16
+  nearest-even), so the 20-step run reproduces the previous commit's losses,
+  gradient norms and depth losses exactly. 2.70 to 2.48 s per micro-step
+  (1.09x), peak VRAM 19,087 to 19,465 MB (the stage; the compute buffer's
+  peak is elsewhere in the graph, so the dropped F32 copies do not lower it).
+  Other bases and other backends keep the in-graph cast.
+- **`--pissa-fold on` (opt-in, `mm3-lm-train`).** With the stage in place, the
+  frozen PiSSA/HOT-PiZZA term can go into the weights: the stage kernel writes
+  `bf16(W - s B0 A0)` and `lm_linear` skips the frozen branch
+  (`LmLayerOpts::pissa_folded`, set only in `lm_ckpt_micro_step`, never for an
+  adapter-off pass and never for the KV-prefix builders, which read the
+  unstaged base). That removes the `A0 x` and `B0 t0` GEMMs, an `[out, S]` add
+  per site and their backward: 2.47 to 2.25 s per micro-step (1.10x) under
+  `--weights bf16 --attn flash-bf16`. It is the same function, but
+  `W - s B0 A0` is rounded to BF16 instead of `W`, so it is not bit-identical.
+  Against the f32-window run over 20 steps it is no further off than the
+  unfolded BF16 path (loss max 0.34 % / mean 0.06 %, unfolded 0.65 % / 0.07 %).
+  The fd gate cannot test it (the F32-isolated layers never take the BF16
+  path) and it has not been heard, so it stays off; the server does not pass
+  it. Refused for DoRA, HRA, HiRA, LoHa, LoKr and plain PiSSA under rank
+  dropout, where the frozen term is not constant.
+- **`HOTSTEP_LM_PHASE_TIMER` now sees that head.** It ran outside the timer,
+  so its GPU time was reported as `build(host)`: of the 274 ms "host" per
+  micro-step, 161 ms was this head on the GPU. True host time is about 85 ms
+  (3 % under the BF16 levers), and graph construction in the 36 backward
+  segments is about 2.5 ms of it. Building graph i+1 while graph i ran was
+  tried and measured 0.3 % (noise), so it was not kept; graph reuse and
+  Lever B have nothing left to amortise here.
+
 ### HOT-PiZZA — the MM3 default method (2026-09-06)
 
 HOT-PiZZA is PiSSA with principal-subspace dropout. It was called HOT-PiSSA on
@@ -863,7 +1028,7 @@ beside the base, or an ordinary rank-2r LoRA (F16, 1.4 GB) when none does or
 Training loss reads high under it by construction (the trailing mean sat at
 2.7–5 where LoRA reads 1.8–3), so stop on steps: the in-app recipes stop on
 steps (`stopMode: 'steps'`), and the checkpoint rated by ear that day was the
-step-500 one. Not resumable, like `--pissa`.
+step-500 one. Resumes the same way `--pissa` does (resume format v5).
 
 #### PiSSA residual: the frozen half shipped once (2026-09-09)
 
@@ -1044,8 +1209,10 @@ has been measured.
 
 MM3's binary resume format is now v4 and refuses a checkpoint whose
 parameterization or rsLoRA bit disagrees with the run being continued
-(`mm3-lm-resume.h`); `--pissa` cannot be resumed on either trainer (refused at
-the CLI). `hra`+`rslora` and `--prefix-n` combined with prior preservation
+(`mm3-lm-resume.h`). Format v5 lets `mm3-lm-train --pissa` resume: the frozen
+A0/B0 are rebuilt at init, and the state carries an FNV-1a hash of them (as F32,
+so `--pissa-frozen-f16` does not change it) that the load compares. A v4 PiSSA
+state has no hash and is trusted. `train-dit --pissa` still refuses `--resume`. `hra`+`rslora` and `--prefix-n` combined with prior preservation
 (`--reg-*`) are both refused with a 400 from the training routes rather than
 failing after the model loads.
 

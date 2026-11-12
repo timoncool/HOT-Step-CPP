@@ -485,41 +485,94 @@ function mm3RunOf(ref: string): string {
   return String(ref ?? '').split(/[\\/]/).filter(Boolean)[0]?.toLowerCase() ?? '';
 }
 
-/**
- * An MM3 training run on dataset `ds` just finished with its final checkpoint
- * at `newRef` (relative to the mm3-lm-adapters root, the reference the
- * mm3LmAdapter request param carries). Point the album presets that belong to
- * this dataset at it (2026-09-11, Rob: "just like AS1.5 training does"):
+/** True when an album preset should follow dataset `ds` to the MM3 adapter
+ *  `ref` (relative to the mm3-lm-adapters root, the reference the mm3LmAdapter
+ *  request param carries):
  *   - the preset of the lyrics set this dataset exported to (the direct link,
  *     `training_datasets.lyrics_set_id`), whatever it held before;
- *   - any preset whose MM3 column points at an OLDER run of the same dataset
- *     (run dirs are `<slug>-<stamp>`), so re-exports and hand-linked albums
- *     follow the newest training too.
- * Presets pointing at other datasets' adapters are never touched. Returns the
- * number updated; never throws (called from a job's success path).
+ *   - any preset whose MM3 column points at another checkpoint of any run of
+ *     this dataset (run dirs are `<slug>-<stamp>`), so re-exports and
+ *     hand-linked albums follow too.
+ *  A preset already on `ref`, or on another dataset's adapter, is left alone. */
+export function mm3PresetFollows(preset: { lyrics_set_id?: unknown; mm3_adapter_path?: unknown },
+                                 ds: { slug: string; lyricsSetId?: number }, ref: string): boolean {
+  const norm = (v: string) => v.replace(/\\/g, '/').toLowerCase();
+  const stored = typeof preset.mm3_adapter_path === 'string' ? preset.mm3_adapter_path : '';
+  if (stored && norm(stored) === norm(ref)) return false;
+  if (ds.lyricsSetId && preset.lyrics_set_id === ds.lyricsSetId) return true;
+  const slugLower = String(ds.slug || '').toLowerCase();
+  return !!stored && !!slugLower && mm3RunOf(stored).startsWith(slugLower + '-');
+}
+
+/**
+ * Point the album presets that belong to dataset `ds` at the MM3 adapter
+ * `ref` (see mm3PresetFollows for which). Called when a run finishes, with its
+ * final checkpoint (2026-09-11, Rob: "just like AS1.5 training does"), and by
+ * "Use this checkpoint" on the ladder with the chosen one. Idempotent; picking
+ * another checkpoint moves the same presets again. Records the dataset's
+ * selection first, even without presets, using YuE2's atomic JSON pattern.
+ * Returns the number of presets updated; throws if the link cannot be saved.
  */
-export function refreshMm3PresetsForNewRun(ds: { slug: string; lyricsSetId?: number }, newRef: string): number {
+export function pointMm3PresetsAt(ds: { slug: string; lyricsSetId?: number }, ref: string): number {
+  // As with YuE2, a successful link must survive without any album presets.
+  const slug = ds.slug.toLowerCase();
+  if (!slug) throw new Error('Dataset has no slug');
+  const all = readMm3Linked();
+  all[slug] = { ref, at: new Date().toISOString() };
+  writeMm3Linked(all);
   let updated = 0;
   try {
-    const newRun = mm3RunOf(newRef);
-    const slugLower = String(ds.slug || '').toLowerCase();
-    const isRunOfDataset = (run: string) => !!slugLower && run.startsWith(slugLower + '-');
     for (const preset of getAllPresets()) {
-      const stored = typeof preset.mm3_adapter_path === 'string' ? preset.mm3_adapter_path : '';
-      if (stored && stored.replace(/\\/g, '/').toLowerCase() === newRef.replace(/\\/g, '/').toLowerCase()) continue;
-      const direct = !!ds.lyricsSetId && preset.lyrics_set_id === ds.lyricsSetId;
-      const older  = !!stored && mm3RunOf(stored) !== newRun && isRunOfDataset(mm3RunOf(stored));
-      if (!direct && !older) continue;
+      if (!mm3PresetFollows(preset, ds, ref)) continue;
       const data = presetDataFromRow(preset);
-      data.mm3AdapterPath = newRef;
+      data.mm3AdapterPath = ref;
       upsertPreset(preset.lyrics_set_id, data);
       updated++;
-      console.log(`[Training] Album preset (lyrics set ${preset.lyrics_set_id}) mm3_adapter_path → ${newRef}`);
+      console.log(`[Training] Album preset (lyrics set ${preset.lyrics_set_id}) mm3_adapter_path → ${ref}`);
     }
   } catch (err: any) {
-    console.warn(`[Training] MM3 preset refresh after training failed: ${err?.message ?? err}`);
+    console.warn(`[Training] MM3 preset update failed: ${err?.message ?? err}`);
   }
   return updated;
+}
+
+/** MM3 counterpart of yue2-linked.json, keyed by dataset slug. */
+export interface Mm3LinkedCheckpoint { ref: string; at: string }
+const mm3LinkedFile = () => path.join(config.training.dir, 'mm3-linked.json');
+export function readMm3Linked(): Record<string, Mm3LinkedCheckpoint> {
+  try { return JSON.parse(fs.readFileSync(mm3LinkedFile(), 'utf-8')); }
+  catch (err: any) { if (err.code === 'ENOENT') return {}; throw err; }
+}
+function writeMm3Linked(all: Record<string, Mm3LinkedCheckpoint>): void {
+  fs.mkdirSync(path.dirname(mm3LinkedFile()), { recursive: true });
+  const tmp = `${mm3LinkedFile()}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(all, null, 2), 'utf-8');
+    fs.renameSync(tmp, mm3LinkedFile());
+  } finally { fs.rmSync(tmp, { force: true }); }
+}
+export function clearMm3LinkedRun(runName: string): void {
+  const all = readMm3Linked();
+  for (const [slug, pick] of Object.entries(all)) {
+    if (mm3RunOf(pick.ref) === runName.toLowerCase()) delete all[slug];
+  }
+  writeMm3Linked(all);
+}
+/** Older installations retain their preset selection until the next pick. */
+export function mm3LinkedRefFor(ds: { slug: string; lyricsSetId?: number }): string | null {
+  return readMm3Linked()[ds.slug.toLowerCase()]?.ref ?? mm3PresetRefFor(ds);
+}
+
+/** The MM3 adapter the dataset's album presets use now: the direct preset's
+ *  when it holds one of this dataset's runs, else the first preset that does.
+ *  Null when no preset links one. */
+export function mm3PresetRefFor(ds: { slug: string; lyricsSetId?: number }): string | null {
+  const slugLower = String(ds.slug || '').toLowerCase();
+  if (!slugLower) return null;
+  const ours = getAllPresets()
+    .filter(p => typeof p.mm3_adapter_path === 'string' && mm3RunOf(p.mm3_adapter_path).startsWith(slugLower + '-'));
+  const direct = ours.find(p => ds.lyricsSetId && p.lyrics_set_id === ds.lyricsSetId);
+  return (direct ?? ours[0])?.mm3_adapter_path ?? null;
 }
 
 /** Windows-safe path identity for run-dir comparison. */

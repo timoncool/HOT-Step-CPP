@@ -6,6 +6,190 @@ can place individual children elsewhere.
 
 > Reference for the `mm3-backend` skill. Read only when the task needs it.
 
+## TensorRT DiT: where the time goes, and the default FP8 MLP (measured 2026-11-06)
+
+**Profile of the BF16 engine** (TRT layer profiler, B=2 L=689, q8_0 DiT, RTX
+5090): 38.1 ms per enqueue, of which GEMMs are 91%. The 72 MLP GEMMs
+(ff_in, ff_out) take 25.5 ms, the 72 qkv/out GEMMs 9.2 ms, fused MHA 2.3 ms,
+casts 1.4 ms, norms/RoPE/GLU kernels ~1.8 ms. The GEMM kernels are
+`sm80_xmma_gemm_bf16bf16_bf16f32_f32` at ~190 TFLOPS, near the BF16 peak.
+
+**kREFIT costs nothing here (closed).** A BF16 engine built without kREFIT,
+weights baked in, ran 37.9 ms against 38.1 ms, and a standalone 30-step window
+through both matched at latent corr 1.000000. A per-stack non-refit engine
+cache is not worth building.
+
+**FP8 refit works on TRT 10.16.** Q/DQ on a BF16 weight constant with a named
+per-channel scale refits (weights and scales), and the refitted plan stores
+FP8 weights (4.88 GB plan -> 3.07 GB). No pre-quantization needed.
+
+**FP8 MLP engine (the app default since 2026-11-06, ear-tested as
+indistinguishable from BF16).** Selected per job by `"dit_precision": "fp8"` on
+`/mm3/synth` (UI: Models > Flow DiT > TensorRT precision > "FP8 (default)";
+server param `mm3DitPrecision`, absent = fp8, `bf16` omits the field); the
+engine's own default without the field is still BF16;
+`MM3_DIT_TRT_FP8=1` stays as a dev override that forces it on.
+`mm3-dit-trt.h` inserts FP8 E4M3 Q/DQ on the ff_in and ff_out GEMMs of blocks
+2..33 after parsing the shipped ONNX: per-output-channel weight scales computed
+at refit from the merged weights (so adapters are covered), per-tensor static
+activation scales from the request's `dit_fp8_calib` (the server ships
+`server/src/data/mm3-dit-trt.fp8.json`; fallback `<models>/mm3/`). The GLU feeding
+ff_out (value * silu(gate)) is recomputed in FP32, cast to BF16, then
+quantized; Myelin rejects a GEMM whose two operand scales differ in type, so
+the activation scale is BF16. Separate base engine (`base-fp8-*.engine`) and
+refit cache keys (variant + calibration file identity). The default path,
+ONNX and manifest are untouched: default renders keep sha
+`045092857b873ef7`.
+
+Calibration: run a BF16 render with `MM3_DIT_TRT_DUMP=<dir>` (every forward's
+input and velocity as `call_<n>.bin`), then
+`tools/mm3-trt-export/fp8_lab.py calib` replays it through a BF16 engine with
+the MLP inputs exposed and writes max |activation| x 2 per GEMM. The replay
+matched the C++ velocities at corr 1.000000. Margin did not matter: x0.5, x1,
+x2 and x8 gave the same parity to within run noise.
+
+| | ms / B=2 enqueue (lab) | flow per 200-frame window (app) | flow, 60 s bench |
+|---|---|---|---|
+| BF16 (default) | 38.1 | 1250 ms | 17.2-17.5 s |
+| FP8 MLP, all 36 blocks | 26.2 | 846 ms (with dump) | 11.9 s |
+| FP8 MLP, blocks 2..33 (shipped, default) | 27.5 | 920 ms | 12.5-12.8 s |
+| FP8 ff_in only | 30.1 | | |
+
+Bench: lm q8_0, depth f16, dit q8_0, 30 steps, 60 s, seed 4242; the FP8 job
+total is 35.5-36.0 s against 40.7-41.2 s. FP8 sha `439277255828e2a3`, stable
+across runs. VRAM resident 3.4 GB against ~4.9 GB; the host plan slot shrinks
+the same way.
+
+Parity against the BF16 TensorRT engine, same seed and plan (`fp8_lab.py
+compare` on two dumps; final latent of each window from its last forward):
+
+- All 36 blocks in FP8: full-clip latent corr 0.99925, worst window 0.99827.
+  Standalone windows showed the first two blocks matter most, then the last two.
+- Blocks 2..33: full clip 0.99944, mean window 0.99944, worst window 0.99883
+  (window 8, the most sensitive one in every variant). Per-step velocity corr
+  on identical input 0.9993-0.9999.
+- WAV, 3 seeds (4242, 7, 1234): waveform corr 0.9976-0.9986, side/mid ratio
+  within 0.11 dB, L/R corr within 0.004, 1/3-octave-ish band energy within
+  0.24 dB. FP8 is consistently +0.06-0.10 dB louder, most in the top band.
+
+A/B WAVs for listening: `_experiments/_LISTENING/2026-11-06-mm3-speed/fp8/`.
+
+**Six-prompt calibration and held-out parity (2026-11-06, shipped file).** The
+numbers above used a one-prompt calibration (the bench prompt). The shipped
+`server/src/data/mm3-dit-trt.fp8.json` takes, per GEMM, the max |activation| over
+six BF16 renders (bench synth-pop, pop rock, nu-disco, ambient instrumental,
+boom-bap rap, thrash metal; 60 s, seed 4242, 2280 forwards) x 2. Per-GEMM amax
+varies across prompts by a median 1.47x (max 3.18x); the ambient instrumental
+sets the max on the most GEMMs. Held-out parity against the BF16 TensorRT engine
+(q8_0 DiT, 60 s, 30 steps, seed 7, `fp8_lab.py compare`):
+
+| held-out prompt | merge | full-clip corr | worst window |
+|---|---|---|---|
+| indie folk (vocal) | max x2 (shipped) | 0.99947 | 0.99897 |
+| vocal jazz ballad | max x2 (shipped) | 0.99917 | **0.99758** |
+| techno (instrumental) | max x2 (shipped) | 0.99943 | **0.99849** |
+| indie folk | median over prompts x2 | 0.99953 | 0.99919 |
+| vocal jazz ballad | median x2 | 0.99899 | **0.99519** |
+| techno | median x2 | 0.99948 | 0.99925 |
+| vocal jazz ballad | old one-prompt file | 0.99910 | **0.99757** |
+| techno | old one-prompt file | 0.99946 | 0.99901 |
+
+**Ship blocker: two of three held-out prompts miss the 0.9988 worst-window
+gate** with the shipped calibration, and the jazz ballad misses it with every
+calibration tried, so it is not a calibration problem; the full clip stays
+above 0.9989 everywhere. Max x2 was kept: it has the best worst case
+(0.99758 against 0.99519 for the median) and cannot clip an activation seen in
+calibration. The worst-window number moves non-monotonically with the scales
+(per-window trajectories diverge), so treat single-window gaps of ~0.001 as
+noise around a real shortfall. It was kept opt-in until the ear test
+(2026-11-06), which heard no difference; the held-out shortfall stays a known
+caveat and BF16 stays selectable as the exact path. A/B WAVs (BF16 vs FP8, seed 7, plus the bench prompt in FP8):
+`_experiments/_LISTENING/2026-11-06-mm3-speed/fp8-calib/`.
+
+Bench with the shipped file (same setup as above, per-job field): BF16
+`045092857b873ef7` before and after FP8 jobs; FP8 flow 12.5-13.2 s against
+17.0-17.6 s (-25%), total 36.5-36.7 s against 40.5-41.7 s, sha `8c4b362857152d25`
+stable over 4 runs and across a deleted-and-rebuilt refit cache. The first FP8
+job builds its refit cache (+18 s). Switching bf16 -> fp8 -> bf16 drops the
+kept runtime and re-reads the other plan (0.5-2 s), no refit.
+
+**CLOSED NEGATIVE for now: NVFP4 MLP by post-training quantization.** Lab only
+(`fp8_lab.py build --variant nvfp4mlp`, blocks 2..33): weights quantized on the
+CPU at refit (E2M1, E4M3 block-16 scales, FP32 global) and refit as FP4
+constants, activations by dynamic FP4 quantize. It builds and refits on 10.16
+(the block-scale DQ must output BF16; FP32 fails type inference) and runs at
+**20.7 ms** per enqueue (0.62 s per window). But standalone-window latent corr
+against BF16 is 0.9923-0.9969, far under the 0.9988 gate. NVFP4 ff_in with FP8
+ff_out: 23.8 ms, 0.9962-0.9980, still under. The ~9.5% FP4 weight rounding
+error is the cause; it needs QAT or an SVDQuant-style low-rank branch, not a
+different calibration. Not in the engine.
+
+## TensorRT DiT per-job load cost (measured 2026-11-06)
+
+With keep-loaded off, `mm3_unload()` frees the TensorRT runtime after every
+job, so each job loads the refitted engine again
+(`mm3-trt-cache/<hash>.engine`, 4.54 GB). The log now splits the load:
+`[MM3-TRT] Engine plan file read|from host copy N ms, deserialize N ms` and
+`Context and buffers N ms`. Bench (`tools/mm3-bench`, TensorRT, lm q8_0,
+depth f16, dit q8_0, 30 steps, 60 s, seed 4242, RTX 5090, page-cached file):
+
+| build | read | deserialize | context | engine total | job total (runs 2-3) |
+|---|---|---|---|---|---|
+| before (ifstream into a zero-filled vector) | 3194-3382 ms | 401-491 ms | 212-238 ms | 3.9-4.1 s | 45.9-46.3 s |
+| chunked unbuffered read + host plan slot | 1422 ms (job 1), 0 after | 414-597 ms | 209-277 ms | 0.4-0.5 s from job 2 | 42.1-42.9 s |
+| + no DiT CPU staging on a cache hit | 990 ms (job 1), 0 after | 325-422 ms | 208-239 ms | 0.36-0.42 s from job 2 | 40.5-40.7 s |
+
+The sha stayed `045092857b873ef7` throughout. The first commit made two fixes:
+
+- **The read.** `std::ifstream::read` into `std::vector<char>(n, 0)` took
+  3.2 s for a file Node reads in 0.65 s. `fread` in 64 MB chunks with
+  `_IONBF` into an uninitialised buffer takes 1.4 s.
+- **The host plan slot** (`g_mm3_trt_plan`, `mm3-dit-trt.h`). It keeps the
+  bytes of the last refit-cache plan in host RAM, keyed by
+  path+size+mtime. The file name already hashes the full refit identity. A
+  later job only deserializes. Nothing stays on the GPU between jobs, so
+  keep-loaded off still frees all VRAM. Like the AR slot, it is not dropped by
+  `mm3_unload()`. It is dropped by `POST /mm3/unload` (unless
+  `keep_ar_cache`), a select-model change, and a switch to the GGML renderer.
+  Cost: ~4.5 GB of host RAM. The size is shown as
+  `dit_runtime.host_plan_mb` in `/mm3/props`. Keep-loaded on already keeps
+  the whole runtime resident, so this path never runs then.
+
+**No DiT CPU staging on a cache hit.** The stage-2 load used to stage the
+whole DiT GGUF (2.47 GB for q8_0) into a CPU buffer as the refit source,
+even when the refit cache hit and nothing read it. `[MM3] Loaded
+cond/dit/voc` took 1.6-2.5 s at the staged handover, on the critical path.
+Now, without `MM3_ADAPTER`, the rest load stages only `dit.time_fourier`, and
+`Runtime::refit` stages its own copy through `mm3_load_dit_tensors` on a miss,
+freed once the refit is done. That load is now 86-215 ms. A forced miss (cache
+file moved aside) refit from the lazily staged copy, rendered the same sha,
+and wrote a cache file byte-identical to the original. With `MM3_ADAPTER` set,
+the rest load still stages and merges the full DiT, as before. Note that the
+DiT on the TensorRT path was never on the GPU: `synth 0.25 GB` in the load
+line is cond + voc.
+
+The remaining per-job warm (3.6-4.5 s) is the LM + depth upload,
+`[MM3] Loaded lm depth: 9.70 GB in ~4 s`.
+
+**CLOSED NEGATIVE: pinned bounce buffer in `wctx_alloc`.** Tried two 64 MB
+pinned slots, memcpy from the mmapped GGUF overlapped with
+`ggml_backend_tensor_set_async`. LM + depth stayed at 3.5-4.0 s (steady
+3521/3520 ms against 3589/3604 ms before), with the same sha. Reverted, because
+the shared loader is not worth touching for that. 9.7 GB in 3.5 s is about
+2.8 GB/s, the rate of soft page faults on a mapped view (~2.4 M 4 KB pages),
+not of the H2D copy. A real gain would need `ReadFile` straight into pinned
+memory instead of copying out of the mapping. That changes `gf_load` and
+`PendingCopy` for every backend, so it was not attempted.
+
+**The 37-44 s loads (2026-11-05 23:12-23:59 sessions).** The same file loaded
+in 3.5 s at 22:35 and again from 00:05 on, with the same exe. That rate is
+~130 MB/s on an SN850X that `cat` reads in 2.4 s. Deserialize is in-memory and
+measured at 0.4-0.6 s, so the lost time was in the read. It could not be
+reproduced afterwards, so the cause is open. On-access AV scanning of a 4.5 GB
+file runs at about that rate, and so would small synchronous reads from a cold
+cache. Either way the host slot means only the first job after an unload pays
+the read.
+
 ## Alternative composer LMs (depth-pruned + guidance-distilled) — 2026-08-22
 
 The composer LM is **independently swappable**: the 5-way split means a variant replaces
@@ -99,6 +283,10 @@ never perturb a default render. Lives in `mm3LowStepShift()`
 extension (default ON). It forces **scheduler + shift only** — forwarding the shared
 `inferMethod`/`guidanceMode` pickers would silently swap MM3 onto ACE's APG default.
 
+**App default 20 steps (2026-11-06, shift 1.53), ear-tested against 30 with no audible
+difference.** `MM3_DEFAULT_STEPS` in generate.ts; the server always sends `steps`, so the
+GGUF's `mm3.flow.steps = 30` only applies to direct engine calls.
+
 **EAR-VALIDATED at 10 steps (shift 3.2).** 8–29 is interpolation on a curve anchored at
 both ends. **Below 8 is extrapolation** — the first-step match is bought with an
 ever-larger final leap to clean (0.54 @ 6 steps, 0.86 @ 2), which must break down
@@ -117,9 +305,36 @@ correcting after the vocoder. Analysis scripts + A/B renders:
 
 Capture the AR stage's output codes on one render, replay them on later ones.
 Opt in per request: `get_ar_codes: true` captures; `forced_semantic` +
-`forced_acoustic` replay. The blob comes back from `GET /mm3/job?id=<id>&ar=1`
+`forced_acoustic` replay. `forced_semantic` alone pins content and lets the
+depth decoder sample the acoustic codes from the new caption (cover probe,
+HOTSTEP-1048). Two softer forms, semantic-only (HOTSTEP-1051): a `-1` entry
+is a free frame (sampled, EOS masked inside the span), and `lm_force_bias`
+adds a bias to the forced code's CFG-guided logit, before temperature, and
+samples instead of pinning. The engine log prints the logit scale per run
+(`[MM3-AR] Soft forcing:`). Measured with an LM adapter: the top-1/top-2 margin
+is about 1 logit, but the source code sits about 6 below the top pick while the
+LM tracks and about 30 below once it has lost the source. So the response is a
+cliff, not a slope: bias 12 or less matched the source on under 3% of frames,
+16 on 46%, 20 on 93%, 24 or more on 99%. The free and soft paths draw the
+semantic code from the same RNG the depth decoder uses, so even 100% agreement
+is a different acoustic take from the hard pin. The blob comes back from `GET /mm3/job?id=<id>&ar=1`
 as little-endian i32 — `[n_sem][sem…][n_ac][ac…]` — and is stored as
 `<uuid>.mm3plank` beside a `.mm3plank.json` sidecar in `<data>/mm3-planks/`.
+
+**Route B: the source's sound in the flow (HOTSTEP-1056).** The Plank steers the
+plan; `a2a_source` + `a2a_strength` steer the sound. The job DAV-encodes the source
+once through the refiner's encoder (`mm3_a2a_encode` in `mm3-job.h`, ModelStore
+`mm3-enc-f16`, released before the MM3 stack loads). Window k reads source columns
+from `round(k * hop * 3.4453125)`; `mm3_flow_sample_chunk` starts at the first
+scheduled t >= strength from the noised source and skips the steps before it, so
+strength 0.5 costs half the flow forwards. `a2a_hold` re-imposes the source over
+`[overlap, L)` for that fraction of the remaining steps. A window the source ends
+inside runs the full schedule with the source imposed on its covered columns
+(inpainting the rest), and later windows render normally. Strength 1 returns the
+source at 0.93 to 0.998 per-segment correlation. The stitch advances 345 latents
+per window against 344.53 true, so the output drifts one column (512 samples)
+about every two windows against the source; that drift predates Route B. Absent
+fields keep the old path bit-identical.
 
 **Read this before building on it: replay is NOT a speedup.** The AR loop still
 executes every per-frame forward pass, so the planning progress bar still runs
@@ -313,6 +528,43 @@ check, `GET /mm3/stream`) -> `minimax/client.ts`
 `components/player/Mm3StreamStatus.tsx`, shown in the active queue card
 (`InlineAudioQueue.tsx`).
 
+## Flow window hop: `flow_hop_frames` (built + measured 2026-11-06, app default 150)
+
+The flow stage renders 200-frame windows on a 100-frame hop, so every kept frame is
+denoised twice. `flow_hop_frames` (request field, 100..160, absent = the checkpoint's
+`mm3.dit.hop_frames`) lengthens the hop. UI: **Window Hop** (`mm3FlowHop`, Generation cluster, default 150 since 2026-11-06; the
+server always sends the field, so an explicit 100 takes the derived-geometry path, which is
+bit-identical to the reference).
+
+**The carry/crop literals are one number.** diffusers hard-codes 172 / 86 / 258, but
+they all follow from the latent span two windows share, `span = L - round(hop * 3.4453125)`
+(689 - 345 = 344): carry = span/2, crop left = span/4, crop right = span - span/4.
+`mm3_window_geom()` in mm3-pipeline.h. Round, not truncate: `L - span` is where the stitch
+puts the next window's origin, and rounding keeps it within half a latent of the true one
+(the reference itself sits 0.47 off); truncating `(win - hop)` also gives 344 at the default
+but drifts up to a whole latent at 120/140/160. The window starts became
+`range(0, F - (win - hop), hop)`: the reference's `F - 100` is the overlap, not the hop,
+and `F - hop` leaves the tail unrendered once hop > win/2.
+
+**Default is untouched by construction and by measurement.** With no field the pipeline
+uses the literal `MM3WindowGeom{}`; `flow_hop_frames: 100` sent explicitly goes through the
+derivation. Both give the baseline sha `045092857b873ef7` (TRT, lm q8_0, depth f16, dit
+q8_0, 30 steps, 60 s, seed 4242). `check-mm3-stream.mjs --extra '{"flow_hop_frames":N}'`
+passes 8/8 at 100, 133 and 150: streamed bytes equal saved bytes at any hop.
+
+| 60 s, TRT, same config | windows | flow | total (engine) |
+|---|---|---|---|
+| hop 100 (reference) | 14 | 16.4-17.0 s | 39.8-43.6 s |
+| hop 133 | 11 | 13.2 s | 36.0 s |
+| hop 150 | 10 | 11.8-12.0 s | 34.5 s |
+| hop 160 | 10 | 11.4 s | 34.1 s |
+
+Flow scales with the window count, plus a smaller last window (-27 % at 150); AR (21 s) is the bigger stage and is
+untouched. Seams get half as much shared context at 150 (carry 86 latents, crop 43/129).
+Blind A/B/C renders, 3 seeds x 75 s with lyrics, staged in
+`_experiments/_LISTENING/2026-11-06-mm3-speed/hop/` (score sheet + KEY.txt). Scored
+2026-11-06: no audible seam difference at 150, which became the default.
+
 ## MM3 AR cache: the speedup the Plank is not (built + measured 2026-08-21)
 
 `engine/src/minimax/mm3-ar-cache.h`. One slot holding the previous render's
@@ -481,6 +733,14 @@ mystery 2× LM slowdown that looked exactly like CUDA-graph thrash until the loa
 (16,374 MB) gave it away. The Node layer now merges missing roles from persisted settings
 (index.ts selectModel) and the UI always sends every role; when poking the ENGINE directly,
 always send the full selection.
+
+**App defaults for a role nobody picked (2026-11-06, ear-tested).** `mm3EffectiveSelection`
+(index.ts) resolves each role as the persisted pick if its file is on disk, else the first
+installed quant on `mm3DefaultQuantLadder`: LM `q8_0`; depth `NVFP4` then `q8_0` when
+`/mm3/props` `dit_runtime.sm >= 120`, else `q8_0`; DiT, cond and vocoder empty (engine
+auto). `reconcileSelection` pushes that on every capability poll without persisting it, and
+the training preview pin uses the same resolution. The recommended Q8_0 pack carries
+`mm3-depth-NVFP4` so a new Blackwell install gets the default.
 
 **CLOSED NEGATIVE (2026-08-21): batching the flow DiT's cond+uncond CFG passes.** Full batch-2
 graph built and A/B'd (bcdcab0): 81 ms/step vs 66 two-pass at L=689 — **22 % SLOWER**, corr

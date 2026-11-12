@@ -759,10 +759,28 @@ link_ggml_backends(heartmula-probe)
 add_executable(heartcodec-probe tools/heartcodec-probe.cpp)
 target_link_libraries(heartcodec-probe PRIVATE yyjson)
 link_ggml_backends(heartcodec-probe)
+# MM3 refiner parity entry points; implementations follow the frozen torch fixtures.
+add_executable(mm3-refiner-mert-probe tools/mm3-refiner-mert-probe.cpp)
+target_link_libraries(mm3-refiner-mert-probe PRIVATE yyjson)
+link_ggml_backends(mm3-refiner-mert-probe)
+add_executable(mm3-refiner-clap-probe tools/mm3-refiner-clap-probe.cpp)
+target_link_libraries(mm3-refiner-clap-probe PRIVATE yyjson)
+link_ggml_backends(mm3-refiner-clap-probe)
+add_executable(mm3-refiner-dit-probe tools/mm3-refiner-dit-probe.cpp)
+target_link_libraries(mm3-refiner-dit-probe PRIVATE yyjson)
+link_ggml_backends(mm3-refiner-dit-probe)
+# MM3 refiner end to end (ModelStore, the four modules, windowing, loudness): fixture parity and behaviour checks.
+add_executable(mm3-refiner-probe tools/mm3-refiner-probe.cpp)
+target_link_libraries(mm3-refiner-probe PRIVATE acestep-core)
+link_ggml_backends(mm3-refiner-probe)
 # HeartMuLa text to music through heartmula/pipeline.h; the smoke test's HeartMuLa case.
 add_executable(heartmula-generate tools/heartmula-generate.cpp)
 target_link_libraries(heartmula-generate PRIVATE yyjson)
 link_ggml_backends(heartmula-generate)
+# MuLaCover Stage 3a receipts: Qwen style vector parity, cover-module load and refusals.
+add_executable(mulacover-check tools/mulacover-check.cpp)
+target_link_libraries(mulacover-check PRIVATE yyjson)
+link_ggml_backends(mulacover-check)
 # HeartMuLa imatrix collection and held-out quant scoring (tools/heartmula-quant-ladder.mjs).
 add_executable(heartmula-quant tools/heartmula-quant.cpp)
 target_link_libraries(heartmula-quant PRIVATE yyjson)

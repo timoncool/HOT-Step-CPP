@@ -84,6 +84,27 @@ static bool pm_file_exists(const std::string & path) {
     return hs_file_exists(path);
 }
 
+// dataset.json stores absolute audio paths, so moving or renaming the dataset
+// folder strands every one of them. Look beside dataset.json first, for the
+// longest tail of the stored path that exists (sub/x.flac before x.flac). A
+// pushed manifest keeps the controller's absolute paths, and on a worker those
+// may resolve to a network mount, so a local copy must win over the stored
+// path. Falls back to the stored path when nothing matches.
+static std::string pm_resolve_audio(const std::string & audio, const std::string & ds_path) {
+    if (audio.empty()) {
+        return audio;
+    }
+    const size_t      ds  = ds_path.find_last_of("/\\");
+    const std::string dir = ds == std::string::npos ? std::string() : ds_path.substr(0, ds + 1);
+    for (size_t p = audio.find_first_of("/\\"); p != std::string::npos; p = audio.find_first_of("/\\", p + 1)) {
+        const std::string cand = dir + audio.substr(p + 1);
+        if (pm_file_exists(cand)) {
+            return cand;
+        }
+    }
+    return audio;
+}
+
 // stat() a file -> byte size + mtime in epoch ms. Returns false when absent.
 static bool pm_stat_file(const std::string & path, long long * bytes, long long * mtime_ms) {
     HS_STAT_T st;

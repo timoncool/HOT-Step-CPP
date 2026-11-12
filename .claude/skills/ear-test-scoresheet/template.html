@@ -26,6 +26,8 @@
   --accent:#58A9C6;--accent-ink:#0E1512;--good:#5BC08A;--warn:#E0AE4C;--bad:#E57A68;
   --good-bg:#1D3326;--warn-bg:#352C17;--bad-bg:#3A221E;}
 *{box-sizing:border-box}
+/* Each score click rebuilds the rows; Chrome's scroll anchoring then lost its anchor and jumped the page. */
+html{overflow-anchor:none}
 body{background:var(--ground);color:var(--ink);font-family:var(--body);font-size:14px;line-height:1.45;margin:0}
 .wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:24px 64px}
 header h1{font-family:var(--display);font-weight:700;font-size:34px;letter-spacing:.01em;margin:0;text-wrap:balance}
@@ -149,6 +151,9 @@ const isRef=t=>!!t.reference;
 const avg=(s,keys)=>{const v=keys.map(k=>s?.[k]).filter(Number.isFinite);return v.length?v.reduce((a,b)=>a+b,0)/v.length:null;};
 let noteTimer=null;
 function render(){
+  // Building the rows moves every audio player out of the page for a moment; at the
+  // bottom of the page that shrink clamps the scroll, so put it back afterwards.
+  const keepY=scrollY;
   const rounds=[...new Set(TRACKS.map(t=>t.round))].sort((a,b)=>a-b);
   if(round===null||!rounds.includes(round))round=rounds[rounds.length-1]??null;
   const groups=[...new Set(TRACKS.filter(t=>t.round===round).map(t=>t.group))];
@@ -170,6 +175,7 @@ function render(){
     el("div",{class:"pick"},el("label",{for:sel.id},CONFIG.pickLabel||"Last good rung"),sel,pnote,el("span",{class:"count"},`${scored}/${list.length} scored`)),
     chart(list),
     el("div",{class:"rows"},...list.map(row)));
+  if(scrollY!==keepY)scrollTo(0,keepY);
   // Put the cursor back if a redraw (a render landing) happened mid-note.
   if(focusId){const n=document.getElementById(focusId);if(n&&n.tagName==="TEXTAREA"){n.focus();if(Number.isFinite(caret))n.setSelectionRange(caret,caret);}}
 }

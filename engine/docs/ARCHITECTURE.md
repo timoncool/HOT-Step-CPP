@@ -396,10 +396,13 @@ are reported, not ignored.
 | `steps` | checkpoint (30) | Flow steps, 1 to 1000 |
 | `cfg_flow` | checkpoint (1.7) | Flow CFG, above 0 up to 100 |
 | `flow_uncond_interval` | 1 | 1 to 16. Above 1, the unconditional branch runs only every Nth step |
+| `flow_hop_frames` | checkpoint (100) | Flow window hop in frames, 100 to 160 against the 200-frame window. Longer hops overlap less, so there are fewer windows and less flow work; the carry and seam crop scale with the overlap. Absent is the exact reference |
 | `get_wav_bits` | 16 | 16, 24 or 32 |
 | `get_lrc` | false | Lyric timestamps from the LM's alignment heads |
 | `get_ar_codes` | false | Keep the planner codes on the job (`GET /mm3/job?id=&ar=1` or `GET /mm3/take?...&ar=1`) |
 | `dit_backend` | `"ggml"` | `ggml` or `tensorrt` |
+| `dit_precision` | `"bf16"` | `bf16` or `fp8`. With `tensorrt`, `fp8` uses the experimental FP8 MLP engine (own base engine and refit cache); ignored by `ggml` |
+| `dit_fp8_calib` | `<models>/mm3/mm3-dit-trt.fp8.json` | FP8 activation calibration JSON. The server sends the one it ships, `server/src/data/mm3-dit-trt.fp8.json` |
 | `depth_fused` | true | Fused depth-decoder graph with GPU sampling |
 | `infer_method`, `scheduler`, `guidance_mode`, `plugin_params` | `""`, `""`, `""`, `{}` | Lua plugins for the flow stage. Empty keeps the native Euler path and plain CFG. `guidance_mode: "apg"` uses native APG |
 | `flow_shift` | 1.0 | Above 0 up to 20. Only used with a scheduler plugin |
@@ -410,12 +413,21 @@ are reported, not ignored.
 | `require_eos`, `stop_after_first_eos`, `eos_rounds`, `min_frames` | false, false, 4, 0 | Natural-ending controls. `eos_rounds` is 1 to 16; `min_frames` drops plans shorter than that |
 | `reuse_ar` | false | Reuse the previous planner output when every planner input matches |
 | `forced_frame_hiddens_file`, `save_frame_hiddens`, `frame_hiddens_save_path` | | Load or save the planner output as a `.mm3hiddens` file |
-| `forced_semantic`, `forced_acoustic` | | Replay captured codes. Both or neither; `forced_acoustic` has 7 entries per semantic entry |
+| `forced_semantic`, `forced_acoustic` | | Replay captured codes; `forced_acoustic` has 7 entries per semantic entry. `forced_semantic` alone pins content and samples the acoustic codes from the caption. A `-1` entry is a free frame |
+| `lm_force_bias` | absent | Semantic-only soft forcing, 0 to 1000: adds this to the forced code's guided logit and samples instead of pinning. Absent = hard pin. With a bias or a `-1` frame, `forced_acoustic` is refused |
+| `lm_guide_file`, `lm_guide_scale`, `lm_guide_k`, `lm_guide_outside`, `lm_guide_gate_file`, `lm_guide_trace_file` | absent, 0.5, 0, 0 | Source guide: a Y2GD file from `ace-train mm3-codes`/`mm3-launder --guide-k N` (top N encoder codes and log-softmax per frame). Each draw mixes `(1 - scale) * p_LM + scale * p_encoder` over the candidates (`yue2_guide_apply`). `lm_guide_k` 0 uses every candidate in the file; `lm_guide_outside` at -100 or below allows candidates only. The gate file is raw f32, one scale multiplier per frame. The trace file receives per-frame JSON (rank of the drawn code, overlap, LM mass on the candidates, gap, surprise). Length = guide frames, EOS masked. Exclusive with `forced_semantic` and `forced_frame_hiddens_file`. Scale 1 with k 1 reproduces the hard pin exactly |
+| `lm_depth_greedy`, `lm_state_fix` | false, 0 | Probes on guided frames, read only with `lm_guide_file`. `lm_depth_greedy` takes argmax acoustic codes. `lm_state_fix` moves the conditional hidden row until the drawn code is in its top 10: 1 = depth decoder input, 2 = emitted stream 0, 3 = both. The LM's KV cache never sees the moved row, but under 1 or 3 the acoustic codes it produces are fed back |
+| `lm_guide_seconds` | absent | With `lm_guide_file`: keep only the first N seconds of the guide (Cover Studio trim) |
+| `lm_blend_file`, `lm_blend_amount` | absent, 0 | State blend. A `.mm3hiddens` block (for a cover, its launder's, from `mm3-launder --keep-hiddens`). Each emitted frame's hiddens, all 8 streams, move `amount` (0 to 1) of the way toward the same frame of the block before the flow sees them; frames past its end are left alone. The LM never sees the blend. Refused with `forced_frame_hiddens_file` |
+| `lm_guide_product` | absent | Probe, read only with `lm_guide_file`. 0 to 4: replaces the probability mix with a product rule on the candidates only, `a * ln p_encoder + ln p_LM`, the LM side from its logits before the conditional top-k. Scale and outside are unused. At scale 0 with outside hard, a frame whose candidates all fell outside the LM's top-k re-admits them at those same logits instead of ending the song |
+| `a2a_source`, `a2a_strength`, `a2a_hold`, `a2a_source_seconds` | absent, 0, 0, absent | Audio to audio (Route B). The WAV or MP3 at the absolute path `a2a_source` is DAV-encoded once at job start, and each flow window starts at `t0 = a2a_strength` from the noised source, skipping the steps before it (SDEdit). 0 = off, 1 = the source back. `a2a_hold` (0 to 1) re-imposes the source at the top of that fraction of the remaining steps. `a2a_source_seconds` trims the source. Without forced codes or a saved plan the render length is capped to the source. Not in the AR cache key |
 | `stream` | false | Emit audio per window for `GET /mm3/stream` |
 | `lm_adapter` | `""` | Path to a PEFT LM adapter |
 | `lm_adapter_mode` | `"runtime"` | `runtime` or `merge` |
 | `lm_adapter_merge_gpu` | true | Merge mode: merge on the GPU |
 | `lm_adapter_scale`, `lm_adapter_scale_attn`, `lm_adapter_scale_mlp`, `lm_adapter_scale_early`, `lm_adapter_scale_mid`, `lm_adapter_scale_late` | 1.0 each | Adapter scales, -4 to 4: overall, by module group, and by depth third |
+| `lm_adapter_fade_in`, `lm_adapter_fade_out`, `lm_adapter_fade_len`, `lm_adapter_fade_floor`, `lm_adapter_fade_step` | 0, 0, 0, 0, 10 | Adapter strength along the song, in seconds: the base alone for the first `fade_in`, full strength for the body, then from `fade_out` a ramp to `fade_floor` (0 to 1, a multiplier on `lm_adapter_scale`) over `fade_len` (0 = a hard handoff), in `fade_step` steps (1 to 60). Times 0 to 360. Runtime mode only; ignored with a log line in merge mode. In the AR cache key when set. `/mm3/lm-plan` takes the same keys, plus `lrc: true` for each take's LRC |
+| `lm_adapter_plan` | 1.0 | Plan dial, 0 to 1: how much the adapter plans the song. Below 1 each take gets a base CFG pair (adapter delta masked off), the semantic draw samples `base + plan * (adapter - base)` guided logits, and the depth decoder reads the adapter rows, so 0 = the base plans and the adapter sings. Doubles the LM rows and KV, so `takes` is clamped to 2 (with a CFG pair) while it applies. Runtime mode only; ignored with a log line in merge mode or for an adapter with an artist token or KV prefix. In the AR cache key below 1. `/mm3/lm-plan` takes it too |
 | `lm_soft_off` | false | Run the adapter's weight delta without its artist token or KV prefix |
 | `adapter_runtime_dora` | false | The same key ACE reads, here for the LM adapter: true recomputes a DoRA adapter's column norms at the dialled scale instead of its base scale |
 
@@ -506,6 +518,37 @@ reads `nar` from the handoff. The lane is skipped, and the render runs inline, w
 `YUE2_NO_OVERLAP` is set, under ConvRot, with a Lua NAR solver or scheduler, or with less
 than `YUE2_OVERLAP_MIN_FREE_GB` (default 4) of free VRAM. Warm, unload and select-model wait
 for a render in flight before touching weights.
+
+### MM3 latent refiner request (`POST /mm3/refine`)
+
+Audio in, audio out: the terminusresearch latent refiner as a post-process on any
+finished render. Parameters come in the query string and the body is the audio (WAV
+or MP3, mono or stereo, any rate). The job runs on the shared FIFO worker.
+
+| Query | Default | Meaning |
+|---|---|---|
+| `steps` | 32 | Bridge steps, a whole number 1 to 64 |
+| `window` | 30 | Window length in seconds. 0 is direct mode: the whole clip as one sequence. Whatever the mode, the sequence the DiT attends over (the clip, or the window when it is shorter than the clip) is limited to 5168 frames (60 s), answered with 413 |
+| `overlap` | 2 | Overlap between windows in seconds, 0 or more and shorter than the window. Window and overlap round to the 512-sample DAV hop, as in the package |
+| `mix` | 1 | 0 to 1, audio domain, after the loudness match. 0 returns the input unchanged without loading a model (and without queueing) |
+
+There is no seed: the bridge is deterministic. Answers: `200 {"id"}`; `400` for an
+empty or undecodable body, a malformed or out-of-range parameter, or audio shorter than
+0.5 s; `413` for direct mode past the frame limit; `501` when a pack file is missing
+(the message names the pattern). Models are read from `<models>/mm3/`:
+`mm3-refiner-refiner-*.gguf`, `mm3-refiner-mert-*.gguf`, `mm3-refiner-clap-*.gguf` (the CLAP
+style vector, one per window), `mm3-enc-*.gguf` and `mm3-voc-*.gguf` (f32 or f16 first, else the
+first by name).
+
+Progress is `GET /job?id=`. `phase` is `queued`, `loading_refiner`, `refine_condition`
+(`phase_step`/`phase_total` count windows; reported once each for the DAV encode pass, MERT
+and CLAP), `refine_bridge` (DiT forwards done over windows x steps), `vae_decode`,
+`encoding_output`, then `done`, `failed` or `cancelled`. A failed job adds `"error"`.
+`POST /job?id=&cancel=1` is honoured between bridge steps and between phases.
+`GET /job?id=&result=1` returns `audio/wav`, float32 stereo at the input rate and with the
+input's frame count (a mono input comes back as identical channels). The result is the
+refined audio with the input's integrated loudness (BS.1770) restored and clipped to
+plus or minus 1, then mixed. Design, residency and checks: [docs/dev/engine.md](../../docs/dev/engine.md#mm3-latent-refiner-audio-in-audio-out).
 
 ### Stable Audio 3 request (`POST /sa3-synth`)
 
@@ -962,6 +1005,8 @@ GET  /mm3/job?id=                MM3 progress: stage, window, seed, timings.
 GET  /mm3/take?id=&take=N        Audio for one take of an ensemble render.
                                  &lrc=1 returns its LRC, &ar=1 its planner codes.
 GET  /mm3/stream?id=             Live audio chunks of a running job (one reader).
+POST /mm3/refine                 MM3 latent refiner job on the shared queue (audio in,
+                                 audio out); progress and result through /job.
 POST /mm3/tokenize-check         Prompt token count (5000-token limit).
 POST /mm3/imatrix                Activation statistics for quantize --imatrix.
 POST /mm3/voc-decode, /mm3/dit-forward, /mm3/flow-sample, /mm3/depth-frame,

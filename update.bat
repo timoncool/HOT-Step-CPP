@@ -1,9 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
+REM Stock Windows ships PowerShell 5.1 only; use pwsh (7+) when it is installed.
+REM Resolved before any step that can replace this script, and on every re-entry.
+set "HOTSTEP_PS=powershell.exe -NoProfile -ExecutionPolicy Bypass"
+where pwsh >nul 2>&1 && set "HOTSTEP_PS=pwsh -NoProfile"
 REM Serialize engine snapshots with rebuilds and updates in this checkout.
 if "%HOTSTEP_UPDATE_FROM_TEMP%"=="1" goto :engine_lock_held
 if /i not "%HOTSTEP_ENGINE_LOCK_ROOT%\"=="%~dp0" (
-    pwsh -NoProfile -File "%~dp0tools\prod\engine-lock.ps1" -Script "%~f0" %*
+    %HOTSTEP_PS% -File "%~dp0tools\prod\engine-lock.ps1" -Script "%~f0" %*
     goto :engine_lock_result
 )
 goto :engine_lock_held
@@ -108,6 +112,9 @@ REM Save current HEAD (and the ggml submodule pointer) for later
 for /f "tokens=*" %%h in ('git rev-parse HEAD 2^>nul') do set "OLD_HEAD=%%h"
 for /f "tokens=*" %%h in ('git rev-parse HEAD:engine/ggml 2^>nul') do set "OLD_GGML=%%h"
 
+REM npm install can rewrite these generated lockfiles across npm versions.
+git checkout -- server/package-lock.json ui/package-lock.json
+
 REM Check for uncommitted changes to TRACKED files only.
 REM
 REM   --ignore-submodules=dirty: engine/ggml is checked on its own just below.
@@ -186,7 +193,7 @@ if not defined HOTSTEP_SHUTDOWN_PORT (
     echo WARNING: could not resolve this checkout's server port; using !HOTSTEP_SHUTDOWN_PORT!.
 )
 REM A trailing directory separator excludes sibling checkouts with a shared prefix.
-pwsh -NoProfile -File "%HOTSTEP_REPO_DIR%tools\prod\stop-checkout.ps1" -Root "%HOTSTEP_REPO_DIR%." -Port "%HOTSTEP_SHUTDOWN_PORT%"
+%HOTSTEP_PS% -File "%HOTSTEP_REPO_DIR%tools\prod\stop-checkout.ps1" -Root "%HOTSTEP_REPO_DIR%." -Port "%HOTSTEP_SHUTDOWN_PORT%"
 if errorlevel 1 goto :fail
 
 REM ── Phase 2: Code sync ─────────────────────────────────────────────

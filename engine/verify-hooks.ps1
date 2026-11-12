@@ -82,6 +82,12 @@ $familyHooks = @(
         LostMsg = "MID-FILE include (after the job system: Job/job_create/work_push), not next to mm3-server.h at the top - re-add it AFTER job_status_str(), which is where Job, job_create, job_set_phase, work_push and g_store are defined. Lose the include and POST /mm3/synth vanishes, leaving only the deprecated /mm3/synth-e2e bring-up path that does GPU work on an httplib thread. Without the call, POST /mm3/synth and GET /mm3/job are not routed."
     }
     @{
+        Family  = "MiniMax-Music3 latent refiner"
+        Include = '#include\s+"minimax/mm3-refiner-job\.h"'
+        Call    = 'mm3_refiner_register_routes\s*\('
+        LostMsg = "MID-FILE include like mm3-job.h (it needs Job/job_create/job_set_phase/work_push/g_store), re-add it right after minimax/mm3-job.h. Without the include or the call, POST /mm3/refine is not routed and the optional refiner post-process stage 404s."
+    }
+    @{
         Family  = "YuE2"
         Include = '#include\s+"yue2/yue2-server\.h"'
         Call    = 'yue2_register_routes\s*\('
@@ -259,6 +265,13 @@ Test-GgmlHook "BF16_ROUND unary op on CUDA (Hook 16)" @("$ggml/include/ggml.h", 
 #   BF16 tensor-core GEMMs cast F32 adapter factors to BF16 at every site.
 Test-GgmlHook "ggml.c BF16 MUL_MAT gradient (Hook 18)" @("$ggml/src/ggml.c") @('HOT-Step patch: bf16-mul-mat-grad') `
     "YuE2 joint training aborts in ggml_build_backward_expand unless YUE2_AITK_PRECISION=strict-f32."
+
+# Hook 19: GGML_HINT_STRICT_F32 keeps a MUL_MAT off TF32 on CUDA. The MM3 refiner's
+#   MERT conditioner sets it on every GEMM; SILENT if lost: its 13 states miss the
+#   parity gate under ggml-cuda's default TF32 (tools/mm3-refiner/check-mert.ps1 -Mode tf32).
+Test-GgmlHook "ggml-cuda strict-F32 MUL_MAT hint (Hook 19)" @("$ggml/include/ggml.h", "$cuda/ggml-cuda.cu") `
+    @('GGML_HINT_STRICT_F32\s*=', 'HOT-Step patch: strict-f32-hint') `
+    "The MM3 refiner will not compile, or SILENT: its MERT conditioning drifts under TF32."
 
 # Hook 17: engine/ggml is clean and at the commit this repo pins. The fork is
 #   the only place ggml changes live now; local edits in engine/ggml are lost

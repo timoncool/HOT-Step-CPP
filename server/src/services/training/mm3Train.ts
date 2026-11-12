@@ -11,7 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { config } from '../../config.js';
+import { config, getFFmpegPath } from '../../config.js';
 import { datasetDir } from './paths.js';
 import type { Mm3PreviewOptions } from './types.js';
 
@@ -108,6 +108,28 @@ export function missingMm3TrainModels(need: 'codes' | 'train' | 'launder',
        [m.depth, 'mm3-depth-f16.gguf']]
     : [[m.lm, path.basename(m.lm)], [m.depth, 'mm3-depth-f16.gguf']];
   return wanted.filter(([p]) => !p || !fs.existsSync(p)).map(([, label]) => label);
+}
+
+/** How many manifest rows have a `<stem>.mm3.txt` beside their audio. Mirrors
+ *  the trainer's own rule (mm3-lm-train-run.h): stem = filename minus its last
+ *  extension, caption = `<captionsDir>/<stem>.mm3.txt`. Never throws. */
+export function countMm3Captions(manifest: string, captionsDir: string): { total: number; captioned: number } {
+  let rows: unknown[] = [];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(manifest, 'utf-8'));
+    rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.samples) ? parsed.samples : [];
+  } catch {
+    return { total: 0, captioned: 0 };
+  }
+  let total = 0, captioned = 0;
+  for (const raw of rows) {
+    const filename = (raw as { filename?: unknown })?.filename;
+    if (typeof filename !== 'string' || !filename) continue;
+    total++;
+    const stem = filename.replace(/\.[^.]*$/, '');
+    if (fs.existsSync(path.join(captionsDir, `${stem}.mm3.txt`))) captioned++;
+  }
+  return { total, captioned };
 }
 
 // ── Base catalogue ──────────────────────────────────────────────────────────
@@ -234,6 +256,9 @@ export const MM3_VRAM_MODEL = {
   /** Typical MM3 prompt. Added to maxFrames to get the sequence length. */
   promptTokens: 1142,
   constMb: 441,
+  /** Fast/Fastest precision on a non-BF16 base: the one-layer BF16 weight
+   *  stage the trainer fills each layer (measured +368-378 MB on q8_0). */
+  bf16StageMb: 378,
   /** Frozen KV prefix (engine train/lm-kvprefix.h). NOT fitted — this one is
    *  arithmetic: 36 layers x K and V x n_kv_heads*head_dim (1024) x 4 bytes is
    *  exactly 0.28125 MB per stored column, and the store spans the prefill
@@ -362,7 +387,11 @@ export function availableMm3Bases(rank: number = MM3_LM_DEFAULTS.rank,
         lossDelta: facts.lossDelta,
         quality:   facts.quality,
         extraMb,
-        peakMb:    estimateMm3PeakMb(bytes, rank, maxFrames, extraMb),
+        // At the recipe's own optimizer and attention. Exact attention's
+        // quadratic term put q8_0 at ~65 GB for a whole song, so on a 32 GB
+        // card nothing "fitted" and the recommender fell to rank 16.
+        peakMb:    estimateMm3PeakMb(bytes, rank, maxFrames, extraMb, MM3_LM_DEFAULTS.optimizer, 0,
+                                     MM3_LM_DEFAULTS.attnBackend),
       };
     })
     .filter(b => b.bytes > 0)
@@ -429,6 +458,31 @@ function rankLadder(): number[] {
   return capped.length ? capped : [MM3_LM_DEFAULTS.rank];
 }
 
+/** MM3's LM: 36 layers of 4096. What --ckpt-offload moves off the card is
+ *  all but two of its [H, S] f32 checkpoints (engine train/lm-ckpt.h). */
+const MM3_LM_LAYERS = 36;
+const MM3_LM_HIDDEN = 4096;
+
+export interface Mm3OffloadPlan { offload: boolean; peakMb: number; budgetMb: number; offloadedMb: number }
+
+/** Whether a run needs --ckpt-offload to stay on the card, from the same model
+ *  as the VRAM estimate. `frames` is the longest window the run trains (the
+ *  engine sizes its buffers to the longest track it keeps). The budget leaves
+ *  the recommender's headroom. Unknown card (0) or base: no offload. */
+export function mm3CkptOffloadPlan(o: {
+  basePrecision: string; rank: number; frames: number; optimizer: 'muon' | 'adamw' | 'prodigy';
+  attn: 'exact' | 'flash'; prefixFrames: number; trainPrecision: string;
+}, gpuTotalMb: number, bases: Array<Pick<Mm3BaseInfo, 'id' | 'bytes' | 'extraMb'>> = availableMm3Bases()): Mm3OffloadPlan {
+  const S = MM3_VRAM_MODEL.promptTokens + Math.max(0, o.frames);
+  const offloadedMb = Math.round((MM3_LM_LAYERS - 2) * MM3_LM_HIDDEN * S * 4 / 1048576);
+  const base = bases.find(b => b.id === o.basePrecision);
+  if (!base || !(gpuTotalMb > 0)) return { offload: false, peakMb: 0, budgetMb: 0, offloadedMb };
+  const stageMb = o.trainPrecision !== 'full' && o.basePrecision !== 'bf16' ? MM3_VRAM_MODEL.bf16StageMb : 0;
+  const peakMb = estimateMm3PeakMb(base.bytes, o.rank, o.frames, base.extraMb, o.optimizer, o.prefixFrames, o.attn) + stageMb;
+  const budgetMb = gpuTotalMb - Math.min(1536, Math.round(gpuTotalMb * 0.08));
+  return { offload: peakMb > budgetMb, peakMb, budgetMb, offloadedMb };
+}
+
 export function recommendMm3Config(gpuTotalMb: number,
                                    maxFrames: number = MM3_LM_DEFAULTS.maxFrames,
                                    headroomMb?: number): Mm3Recommendation {
@@ -453,8 +507,12 @@ export function recommendMm3Config(gpuTotalMb: number,
     if (base.quality === 'poor') {
       continue;
     }
+    // The default precision's BF16 weight stage, as the UI estimate adds it.
+    const stageMb = MM3_LM_DEFAULTS.trainPrecision !== 'full' && base.id !== 'bf16'
+      ? MM3_VRAM_MODEL.bf16StageMb : 0;
     for (const rank of rankLadder()) {
-      const peak = estimateMm3PeakMb(base.bytes, rank, maxFrames, base.extraMb);
+      const peak = estimateMm3PeakMb(base.bytes, rank, maxFrames, base.extraMb, MM3_LM_DEFAULTS.optimizer, 0,
+                                     MM3_LM_DEFAULTS.attnBackend) + stageMb;
       if (peak + headroom <= gpuTotalMb) {
         return { base: base.id, rank, overBudget: false };
       }
@@ -527,7 +585,7 @@ export const MM3_LM_DEFAULTS = {
   // copy, are on MM3LmTrainArgs in engine/src/train/mm3-lm-train-run.h.
   rank: 128,
   alpha: 128,
-  lr: 8e-5,     // the default (Balanced) recipe; Fast's 1.6e-4 is experimental — see MM3_LM_PRESETS
+  lr: 8e-5,     // every preset's LR; 2x broke vocals (2026-09-07)
   /** 1200, down from 2500, because a step is no longer the same size. At the
    *  128-frame crop a step supervised 5 seconds; at 4272 it supervises 171, so
    *  2500 steps went from 320k supervised frames to 10.7M — 312 epochs over 8
@@ -553,7 +611,11 @@ export const MM3_LM_DEFAULTS = {
    *  250 on 2026-08-26 to give a target-loss run room to reach one; a 250-step
    *  cap would have ended almost every run before the target could bind, which
    *  is the same as not having a target. */
-  steps: 500,   // the default (Balanced) recipe; Fast's 300 is experimental — see MM3_LM_PRESETS
+  /** 300 since 2026-11-07 (Rob): the Fast preset. In the HOTSTEP-1033 blind
+   *  matrix (one album, 14 arms at 300 steps) the recipe's three arms scored
+   *  4.22-4.72 of 5 against 3.1-3.9 for every other method and setting, and
+   *  its step-300 checkpoint beat step 100. 600 and 900 are not heard. */
+  steps: 300,
   /** ── Stopping strategy ──────────────────────────────────────────────────
    *
    *  'steps', 500, since 2026-09-06 (Rob): the default method is HOT-PiZZA
@@ -934,9 +996,9 @@ export const MM3_LM_DEFAULTS = {
   // are also real. Both are FD-gated on the MM3 trainer and both export as
   // ORDINARY PEFT LoRAs — PiSSA at rank 2r, HRA at rank r — so unlike HiRA and
   // LoHa they need nothing from the runtime or merge loaders and render as they
-  // trained. --pissa is refused together with --resume, which is why the arg
-  // builder below drops it when resumeFrom is set rather than letting the run
-  // exit 2. A trainable --prefix-n landed on that parser on 2026-09-05 and is
+  // trained. --pissa resumes (resume format v5 checks the rebuilt init), and
+  // the arg builder below keeps it on the resume leg. A trainable --prefix-n
+  // landed on that parser on 2026-09-05 and is
   // FD-gated (train/lm-prefix.h; still a different thing from --prefix-frames,
   // which is the FROZEN history prefix). It is checkpointed-path only, and the
   // engine refuses it together with --prefix-frames, --attn flash, or
@@ -964,6 +1026,14 @@ export const MM3_LM_DEFAULTS = {
    *  (self-test, FD, step-1 loss within tf32 rounding), tied exact blind
    *  (68 vs 72 of 90) and takes 14% off the step, 1 GB off the peak. */
   attnBackend: 'flash' as 'exact' | 'flash',
+  /** Training precision (2026-11-06). 'full' = FP32 arithmetic, no flag.
+   *  'fast' = --weights bf16 (BF16 base GEMMs, ~1.8x per step on a 5090).
+   *  'fastest' = also --attn flash-bf16 when attention is flash (~2.6x). Fast
+   *  and Fastest add the one-layer BF16 weight stage on a non-BF16 base
+   *  (MM3_VRAM_MODEL.bf16StageMb). Fastest is the default since matched
+   *  adapters were ear-tested against Full with no audible loss. See
+   *  mm3PrecisionFlags. */
+  trainPrecision: 'fastest' as Mm3TrainPrecision,
   /** LoRA-family parameterizations, mutually exclusive with each other and
    *  with LoKr (adapterType). Same semantics as train-dit's dora/hira/loha/
    *  pissa/hra — see DitMethod in TrainDitForm.tsx. */
@@ -1032,11 +1102,13 @@ export const MM3_LM_DEFAULTS = {
  *             history behind the highest scores recorded here (72 and 70.5
  *             of 90); the gain over Balanced sat inside the listening noise.
  *
- *  MM3_LM_DEFAULTS carries the Balanced values, so an empty request and the
+ *  (The three descriptions above predate the whole-song presets below.)
+ *  MM3_LM_DEFAULTS carries the Fast values since 2026-11-07, so an empty request and the
  *  form's initial state are the same recipe. The route applies a named
  *  preset UNDER the request's own fields (applyMm3Preset). */
 export type Mm3PresetName = 'fast' | 'balanced' | 'thorough';
-export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'balanced';
+// Fast since 2026-11-07: the depth the HOTSTEP-1033 matrix heard and scored best.
+export const MM3_LM_DEFAULT_PRESET: Mm3PresetName = 'fast';
 export const MM3_LM_PRESETS: Record<Mm3PresetName, {
   steps: number; lr: number; maxFrames: number; prefixFrames: number; prefixChunk: number;
 }> = {
@@ -1056,7 +1128,7 @@ export function isMm3PresetName(v: unknown): v is Mm3PresetName {
   return v === 'fast' || v === 'balanced' || v === 'thorough';
 }
 /** Defaults with a named preset laid over them; an unknown or absent name
- *  returns the defaults untouched (which are the Balanced preset). */
+ *  returns the defaults untouched (which are the Fast preset). */
 type Mm3PresetFields = (typeof MM3_LM_PRESETS)[Mm3PresetName];
 /** The defaults with the preset-governed fields widened to plain numbers. */
 export type Mm3EffectiveDefaults = Omit<typeof MM3_LM_DEFAULTS, keyof Mm3PresetFields> & Mm3PresetFields;
@@ -1085,6 +1157,38 @@ export interface Mm3CodesArgs {
    *  (deftones A/B, 2026-08-31). Off = plain mm3-codes, byte-identical to the
    *  pipeline before this option existed. */
   launder?: boolean;
+  launderSteps?: number;
+  launderSeed?: number;
+  /** Also write <id>.guide: the encoder's top N codes per frame (cover modes). */
+  guideK?: number;
+  /** Launder only: also write the renderer condition as <dir>/<id>.mm3hiddens. */
+  keepHiddens?: string;
+  /** Re-encode from scratch: the cache (and the prior capture beside it) is cleared before the job. */
+  force?: boolean;
+  /** Only tracks whose name contains this text (case-insensitive). */
+  only?: string;
+  /** Cap on how many tracks this run encodes; 0 or absent = all. */
+  limit?: number;
+}
+
+/** Clear the cache when forced and return the manifest the job should read. `mm3-codes` takes neither
+ *  a filter nor a limit, so a filtered run reads a subset manifest written beside the full one, which
+ *  stays untouched. Throws when the filter matches nothing. */
+export function prepareMm3CodesInput(a: Mm3CodesArgs): string {
+  if (a.force) fs.rmSync(a.outDir, { recursive: true, force: true });
+  const only = a.only?.trim().toLowerCase() ?? '';
+  const limit = a.limit && a.limit > 0 ? Math.floor(a.limit) : 0;
+  if (!only && !limit) return a.datasetJson;
+  const manifest = JSON.parse(fs.readFileSync(a.datasetJson, 'utf-8'));
+  let samples: any[] = Array.isArray(manifest.samples) ? manifest.samples : [];
+  if (only) {
+    samples = samples.filter(s => String(s.filename || path.basename(String(s.audio_path || ''))).toLowerCase().includes(only));
+  }
+  if (limit) samples = samples.slice(0, limit);
+  if (!samples.length) throw new Error(`No tracks match the name filter "${a.only}".`);
+  const subset = path.join(path.dirname(a.datasetJson), 'dataset.mm3-codes-subset.json');
+  fs.writeFileSync(subset, JSON.stringify({ ...manifest, samples }));
+  return subset;
 }
 
 export function buildMm3CodesArgs(a: Mm3CodesArgs): string[] {
@@ -1098,6 +1202,8 @@ export function buildMm3CodesArgs(a: Mm3CodesArgs): string[] {
         '--rec7', m.rec7,
         '--models', mm3ModelDir(),
         '--out', a.outDir,
+        '--steps', String(a.launderSteps ?? 30),
+        '--seed', String(a.launderSeed ?? 42),
       ]
     : [
         'mm3-codes', '--jsonl',
@@ -1111,6 +1217,12 @@ export function buildMm3CodesArgs(a: Mm3CodesArgs): string[] {
   const cap = a.launder ? 359 : Infinity;
   const md = a.maxDuration && a.maxDuration > 0 ? Math.min(Math.round(a.maxDuration), cap) : (a.launder ? 359 : 0);
   if (md > 0) args.push('--max-duration', String(md));
+  // Without it the engine runs whatever "ffmpeg" is on PATH, and a PC with no
+  // system ffmpeg fails every track ("ffmpeg exit 1").
+  const ffmpeg = getFFmpegPath();
+  if (ffmpeg) args.push('--ffmpeg', ffmpeg);
+  if (a.guideK && a.guideK > 0) args.push('--guide-k', String(Math.round(a.guideK)));
+  if (a.launder && a.keepHiddens) args.push('--keep-hiddens', a.keepHiddens);
   return args;
 }
 
@@ -1177,6 +1289,9 @@ export interface ResolvedMm3TrainLmOptions {
   lokrAlpha: number;
   /** Attention backend. See MM3_LM_DEFAULTS.attnBackend. */
   attnBackend: 'exact' | 'flash';
+  /** See MM3_LM_DEFAULTS.trainPrecision. Absent (a manifest from before it
+   *  existed) = 'full'. */
+  trainPrecision?: Mm3TrainPrecision;
   /** LoRA-family parameterizations. All five are LoKr-incompatible and
    *  mutually exclusive with each other (dora > rslora > hira > loha > pissa
    *  > hra precedence in buildMm3TrainLmArgs, textually identical to
@@ -1191,6 +1306,9 @@ export interface ResolvedMm3TrainLmOptions {
   /** See MM3_LM_DEFAULTS.pissaCache / pissaFrozenF16. */
   pissaCache: boolean;
   pissaFrozenF16: boolean;
+  /** --ckpt-offload on: activation checkpoints in host RAM. Set by the route
+   *  from mm3CkptOffloadPlan when the run would not fit the card. */
+  ckptOffload?: boolean;
   hra: boolean;
   loraPlusRatio: number;
   /** Soft prompt. '' = no token. See MM3_LM_DEFAULTS.artistToken. */
@@ -1246,14 +1364,35 @@ export interface ResolvedMm3TrainLmOptions {
   resumeStep?: number;
 }
 
+export type Mm3TrainPrecision = 'full' | 'fast' | 'fastest';
+export function isMm3TrainPrecision(v: unknown): v is Mm3TrainPrecision {
+  return v === 'full' || v === 'fast' || v === 'fastest';
+}
+
+/** The --weights value and the --attn value (null = do not emit) for a
+ *  precision choice. A BF16 base always trains Lever A: it is the same size as
+ *  f16 and worse for inference, so it has no other reason to be picked.
+ *  'fastest' only upgrades flash to flash-bf16; when attention resolved to
+ *  exact (switched off, or a build with no fused kernel) it trains as 'fast'
+ *  rather than turning flash on behind the user's back.
+ *  'fast' and 'fastest' also pass --tf32 on: their big GEMMs already round to
+ *  BF16 (8-bit mantissa), so TF32's 11 bits on the leftover F32 GEMMs costs
+ *  nothing they have not accepted. 1.09x on a 4090, +1.4 % on a 5090. The flag
+ *  only skips NVIDIA_TF32_OVERRIDE=0; cuBLAS ignores TF32 math below sm_80 and
+ *  other backends never read it. 'full' keeps strict FP32. */
+export function mm3PrecisionFlags(precision: Mm3TrainPrecision | undefined, basePrecision: Mm3BasePrecision,
+                                  attnBackend: 'exact' | 'flash'): { weights: string; attn: string | null; tf32: boolean } {
+  const p = precision ?? 'full';
+  return {
+    weights: basePrecision === 'bf16' || p !== 'full' ? 'bf16' : 'f32-window',
+    attn: attnBackend === 'exact' ? null : p === 'fastest' ? 'flash-bf16' : attnBackend,
+    tf32: p !== 'full',
+  };
+}
+
 export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   const m = resolveMm3TrainModels(o.basePrecision);
-  // DERIVED, not a separate knob. Lever A needs a BF16-native base and a BF16
-  // base has no other reason to be selected — it is the same size as f16 and
-  // worse for inference — so the two are one decision. Offering them separately
-  // would only create two ways to ask for a run the engine then falls back out
-  // of, with a warning the user has to notice.
-  const weights = o.basePrecision === 'bf16' ? 'bf16' : 'f32-window';
+  const { weights, attn, tf32 } = mm3PrecisionFlags(o.trainPrecision, o.basePrecision, o.attnBackend ?? 'exact');
   const args = [
     'mm3-lm-train', '--jsonl',
     '--lm', m.lm,
@@ -1312,7 +1451,7 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     // booleans never resolves to a different method on a different trainer:
     // dora, then rslora (independent of dora — a rank-scaling modifier, not a
     // competing method), then hira (excludes dora), loha (excludes dora/hira),
-    // pissa (excludes dora/hira/loha, and not resumable), hra (excludes
+    // pissa (excludes dora/hira/loha), hra (excludes
     // dora/hira/loha/pissa/rslora).
     if (o.dora) args.push('--dora');
     if (o.rslora) args.push('--rslora');
@@ -1322,9 +1461,8 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
     // delta IS (y = Wx + s*(BA - B0A0)x), and the A/B tensor set is identical
     // with and without it — so dropping the flag to make `--pissa --resume`
     // legal produced a run that looked like a resume and trained against a
-    // different function from step 1. The engine refuses the pair outright
-    // (ace-train.cpp) and the resume route refuses it before spawning; leaving
-    // it on here means the illegal state fails loudly instead of quietly.
+    // different function from step 1. With the flag kept, the engine rebuilds
+    // the frozen pair and checks it against the init hash in the resume state.
     if (o.pissa && !o.dora && !o.hira && !o.loha) {
       args.push(o.hotPizza ? '--hot-pizza' : '--pissa');
       if (o.pissaCache) args.push('--pissa-cache-dir', path.join(config.aceServer.adapters, 'mm3-lm-adapters', '_pissa-init-cache'));
@@ -1345,13 +1483,15 @@ export function buildMm3TrainLmArgs(o: ResolvedMm3TrainLmOptions): string[] {
   // caller still asks for. The route resolves the flash+frozen-prefix
   // collision (engine exit) before this ever runs — see attnBackendResolved
   // in routes/training.ts.
-  if (o.attnBackend && o.attnBackend !== 'exact') args.push('--attn', o.attnBackend);
+  if (attn) args.push('--attn', attn);
+  if (tf32) args.push('--tf32', 'on');
   // Whole-song recipe (2026-09-11): tracks that do not fit the window are left
   // out rather than trained in pieces. Emitted only for 'exclude' so an older
   // engine never sees the flag for the 'crop' behaviour it already has.
   // 'excise' keeps the flag too: the retarget pass shortens what it can, and whatever it refused must still be
   // left out rather than silently falling back to crops.
   if ((o.longTracks ?? 'exclude') !== 'crop') args.push('--drop-over-frames', String(o.maxFrames));
+  if (o.ckptOffload) args.push('--ckpt-offload', 'on');
   // Soft prompt. Uses the SAME flag names the parser already accepts
   // (--artist-token/-k/-lr) — this is not a new engine surface, just a
   // previously-unwired one.

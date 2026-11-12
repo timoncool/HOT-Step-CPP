@@ -57,6 +57,14 @@ import { useBackendStore } from '../../stores/backendStore';
 import { fetchYue2CaptionSource, resolveYue2Caption, yue2PickAtEnqueue, type Yue2SourceTrack } from '../../utils/yue2CaptionSource';
 import { yue2CoverApi, type Yue2CoverDatasetMetadata, type Yue2CoverJob, type Yue2CoverReadiness,
   type Yue2ScoreSection } from '../../services/yue2CoverApi';
+import type { CoverLeadSheetSource, CoverLeadSheetResult } from '../../../../server/src/contracts/studioWorkflows';
+import { LeadSheetSourcePicker } from './LeadSheetSourcePicker';
+import { readLeadSheetSource, selectedLeadSheetSource, leadSheetReadinessPath, leadSheetScoreUpdate } from './leadSheetSource';
+import { documentOptions } from '../../queries/cover-lyrics/workflows';
+import { HeartmulaCoverPanel } from './HeartmulaCoverPanel';
+import { Mm3CoverPanel, type Mm3SourceFacts } from './Mm3CoverPanel';
+import { restoreMm3Cover, mm3CoverInput, mm3CoverReady, type Mm3CoverSettings } from './mm3CoverState';
+import { EMPTY_HEARTMULA_TAGS, type HeartmulaCoverTags } from './heartmulaCoverState';
 import { Yue2CoverPanel, COVER_AR_DEFAULT, clampCoverAr, COVER_GUIDE_DEFAULT, coverGuideBlock, type CoverGuideState } from './Yue2CoverPanel';
 import { resolveYue2Render, type Yue2RenderMode } from './yue2RenderMode';
 import { Yue2CoverScore } from './Yue2CoverScore';
@@ -144,6 +152,18 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const { capabilities } = useCapabilities();
   const audioTransformMode = capabilities?.features.cover === true && capabilities.features.coverAudioTransform === true;
   const yue2Mode = useBackendStore(s => s.activeBackendId === 'yue2');
+  const heartmulaMode = useBackendStore(s => s.activeBackendId === 'heartmula');
+  const leadSheetMode = yue2Mode || heartmulaMode;
+  // MM3 covers replay the source's encoded codes (a plank): no score, no ACE settings.
+  const mm3Mode = useBackendStore(s => s.activeBackendId === 'minimax-m3') && capabilities?.features.coverCodeForcing === true;
+  const audioOnly = audioTransformMode || mm3Mode;
+  const [mm3Cover, setMm3Cover] = useState<Mm3CoverSettings>(() => restoreMm3Cover(restore('mm3Cover', {})));
+  useEffect(() => { persist('mm3Cover', mm3Cover); }, [mm3Cover]);
+  const [heartmulaTags, setHeartmulaTags] = useState(() => restore<HeartmulaCoverTags>('heartmulaTags', EMPTY_HEARTMULA_TAGS));
+  const [heartmulaSeed, setHeartmulaSeed] = useState(() => restore('heartmulaSeed', -1));
+  const [heartmulaErrorOf, setHeartmulaErrorOf] = useState<{ sourceKey: string; message: string } | null>(null);
+  useEffect(() => { persist('heartmulaTags', heartmulaTags); }, [heartmulaTags]);
+  useEffect(() => { persist('heartmulaSeed', heartmulaSeed); }, [heartmulaSeed]);
   const sa3AdaptersQuery = useQuery({ ...stableStepAdaptersOptions(), enabled: audioTransformMode });
   const [sa3Transform, setSa3Transform] = useState(() => restore('sa3Transform', 0.3));
   const [sa3Seed, setSa3Seed] = useState(() => restore('sa3Seed', -1));
@@ -184,7 +204,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [lyrics, setLyrics] = useState(() => restore<string>('lyrics', ''));
   const [lyricsSource, setLyricsSource] = useState<'dataset-sidecar' | null>(() => restore('lyricsSource', null));
   const [datasetAnalysis, setDatasetAnalysis] = useState(() => restore('datasetAnalysis', false));
-  const [sheetScoreSource, setSheetScoreSource] = useState<'dataset' | null>(null);
+  const [sheetScoreSource, setSheetScoreSource] = useState<string | null>(() => restore('sheetScoreSource', null));
+  const [chordQuality, setChordQuality] = useState<CoverLeadSheetResult['chordQuality'] | null>(() => restore('chordQuality', null));
+  const [leadSheetSource, setLeadSheetSource] = useState<CoverLeadSheetSource | undefined>(() => readLeadSheetSource(restore('leadSheetSource', null)));
+  const [sourceChanging, setSourceChanging] = useState(false);
+  const sourceChangeRef = useRef(false);
+  const sourceHydratedRef = useRef('');
   const sourceLookupRef = useRef(0);
   const lyricEditRef = useRef(0);
   const instrumentalEditRef = useRef(0);
@@ -275,8 +300,16 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [coverLyricSchedule, setCoverLyricSchedule] = useState<'off' | 'bias' | 'mask'>(() => restore('coverLyricSchedule', 'off'));
   const [captionMode, setCaptionMode] = useState(() => restore('captionMode', 'custom'));
   const [captionTracks, setCaptionTracks] = useState<Yue2SourceTrack[]>([]);
-  const readinessQuery = useQuery({ ...snapshotOptions<Yue2CoverReadiness>('cover', '/yue2-cover/readiness'), enabled: yue2Mode && !!token });
+  const readinessQuery = useQuery({ ...snapshotOptions<Yue2CoverReadiness>('cover', leadSheetReadinessPath(leadSheetSource)), enabled: leadSheetMode && !!token });
   const readiness = readinessQuery.data ?? null;
+  const selectedSource = selectedLeadSheetSource(leadSheetSource, readiness?.source);
+  const coverDocumentQuery = useQuery({ ...documentOptions(coverDraftId), enabled: leadSheetMode && !!token && !!coverDraftId });
+  useEffect(() => {
+    const document = coverDocumentQuery.data?.document;
+    if (document?.id !== coverDraftId || sourceHydratedRef.current === coverDraftId) return;
+    sourceHydratedRef.current = coverDraftId;
+    setLeadSheetSource(readLeadSheetSource(document.data.leadSheetSource));
+  }, [coverDocumentQuery.data, coverDraftId]);
   const [sheetJob, setSheetJob] = useState<Yue2CoverJob | null>(null);
   const [sheetJobId, setSheetJobId] = useState('');
   const sheetJobRef = useRef('');
@@ -323,8 +356,10 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     sepJobId, sepStems, stemControls, showMixer, isSeparating, sepProgress, sepMessage,
     setShowMixer, setStemControls, startSeparation: startStemSeparation, clearStems,
   } = useCoverStemsStore();
-  const sourceKey = JSON.stringify([sourceMode, sourceAudioUrl, sourceSongId, sourceAssetId, advancedMode && sepJobId,
-    advancedMode && sepStems?.length, advancedMode && stemControls]);
+  const sourceKey = JSON.stringify([sourceMode, sourceAudioUrl, sourceSongId, sourceAssetId, !heartmulaMode && advancedMode && sepJobId,
+    !heartmulaMode && advancedMode && sepStems?.length, !heartmulaMode && advancedMode && stemControls]);
+  const heartmulaError = heartmulaErrorOf?.sourceKey === sourceKey ? heartmulaErrorOf.message : '';
+  const setHeartmulaError = (message: string) => setHeartmulaErrorOf(message ? { sourceKey, message } : null);
   const sourceKeyRef = useRef(sourceKey);
   const sourceResetKeyRef = useRef(sourceKey);
   const skipSourceResetRef = useRef(false);
@@ -373,6 +408,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     sheetRequestRef.current += 1;
     setApprovedSheet(null); setSheetAbc(''); setScoreSections([]);
     setSheetAudioUrl(''); setSheetError(''); setSheetJob(null); setSheetPreparing(false);
+    setSheetScoreSource(null); setChordQuality(null);
     if (sheetJobRef.current && token) void yue2CoverApi.cancel(sheetJobRef.current).catch(() => {});
     sheetJobRef.current = ''; setSheetJobId('');
   }, [sourceKey, token]);
@@ -412,7 +448,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   }, [sheetJobId, sheetSnapshot.data]);
 
   useEffect(() => {
-    if (!yue2Mode || !token || !sheetAbc.trim()) return;
+    if (!leadSheetMode || !token || !sheetAbc.trim()) return;
     let live = true;
     const timer = setTimeout(() => {
       // The sections only: the lyrics are paired with them by Prepare's own check.
@@ -421,7 +457,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       }).catch(() => {});
     }, 250);
     return () => { live = false; clearTimeout(timer); };
-  }, [yue2Mode, token, sheetAbc]);
+  }, [leadSheetMode, token, sheetAbc]);
 
 
   // ── Persist ──
@@ -430,6 +466,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => { persist('sourceAssetId', sourceAssetId); }, [sourceAssetId]);
   useEffect(() => { persist('coverDraftId', coverDraftId); }, [coverDraftId]);
   useEffect(() => { persist('coverDraftRevision', coverDraftRevision); }, [coverDraftRevision]);
+  useEffect(() => { persist('leadSheetSource', leadSheetSource ?? null); }, [leadSheetSource]);
+  useEffect(() => { persist('sheetScoreSource', sheetScoreSource); }, [sheetScoreSource]);
+  useEffect(() => { persist('chordQuality', chordQuality); }, [chordQuality]);
   useEffect(() => { persist('sourceSongId', sourceSongId); }, [sourceSongId]);
   useEffect(() => { persist('metadata', metadata); }, [metadata]);
   useEffect(() => { persist('analysis', analysis); }, [analysis]);
@@ -484,7 +523,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => { persist('approvedSheet', approvedSheet); }, [approvedSheet]);
   // The editing fields, mirrored into this browser's revisioned server draft.
   // coverDraftId/Revision stay local: they point at the workflow's cover-draft.
-  const draft = useStudioDraftMirror('cover', token, { 'cover-studio-sa3Transform': sa3Transform, 'cover-studio-sa3Seed': sa3Seed, 'cover-studio-sa3Adapter': sa3Adapter, 'cover-studio-sourceFileName': sourceFileName, 'cover-studio-sourceAudioUrl': sourceAudioUrl, 'cover-studio-sourceAssetId': sourceAssetId, 'cover-studio-sourceSongId': sourceSongId, 'cover-studio-metadata': metadata, 'cover-studio-analysis': analysis, 'cover-studio-songArtist': songArtist, 'cover-studio-songTitle': songTitle, 'cover-studio-lyrics': lyrics, 'cover-studio-lyricsSource': lyricsSource, 'cover-studio-datasetAnalysis': datasetAnalysis, 'cover-studio-selectedArtistId': selectedArtistId, 'cover-studio-selectedPreset': selectedPreset, 'cover-studio-artistCaption': artistCaption, 'cover-studio-audioCoverStrength': audioCoverStrength, 'cover-studio-coverNoiseStrength': coverNoiseStrength, 'cover-studio-coverNoiseMethod': coverNoiseMethod, 'cover-studio-tempoScale': tempoScale, 'cover-studio-pitchShift': pitchShift, 'cover-studio-bpmCorrection': bpmCorrection, 'cover-studio-bpmOverride': bpmOverride, 'cover-studio-keyOverride': keyOverride, 'cover-studio-noFsq': noFsq, 'cover-studio-coverInstrumental': instrumental, 'cover-studio-sourceLatentUrl': sourceLatentUrl, 'cover-studio-coverVocalLanguage': vocalLanguage, 'cover-studio-coverTimbreOverride': timbreOverridePath, 'cover-studio-sepLevel': sepLevel,
+  const draft = useStudioDraftMirror('cover', token, { 'cover-studio-mm3Cover': mm3Cover, 'cover-studio-leadSheetSource': leadSheetSource, 'cover-studio-sheetScoreSource': sheetScoreSource, 'cover-studio-chordQuality': chordQuality, 'cover-studio-heartmulaTags': heartmulaTags, 'cover-studio-heartmulaSeed': heartmulaSeed, 'cover-studio-sa3Transform': sa3Transform, 'cover-studio-sa3Seed': sa3Seed, 'cover-studio-sa3Adapter': sa3Adapter, 'cover-studio-sourceFileName': sourceFileName, 'cover-studio-sourceAudioUrl': sourceAudioUrl, 'cover-studio-sourceAssetId': sourceAssetId, 'cover-studio-sourceSongId': sourceSongId, 'cover-studio-metadata': metadata, 'cover-studio-analysis': analysis, 'cover-studio-songArtist': songArtist, 'cover-studio-songTitle': songTitle, 'cover-studio-lyrics': lyrics, 'cover-studio-lyricsSource': lyricsSource, 'cover-studio-datasetAnalysis': datasetAnalysis, 'cover-studio-selectedArtistId': selectedArtistId, 'cover-studio-selectedPreset': selectedPreset, 'cover-studio-artistCaption': artistCaption, 'cover-studio-audioCoverStrength': audioCoverStrength, 'cover-studio-coverNoiseStrength': coverNoiseStrength, 'cover-studio-coverNoiseMethod': coverNoiseMethod, 'cover-studio-tempoScale': tempoScale, 'cover-studio-pitchShift': pitchShift, 'cover-studio-bpmCorrection': bpmCorrection, 'cover-studio-bpmOverride': bpmOverride, 'cover-studio-keyOverride': keyOverride, 'cover-studio-noFsq': noFsq, 'cover-studio-coverInstrumental': instrumental, 'cover-studio-sourceLatentUrl': sourceLatentUrl, 'cover-studio-coverVocalLanguage': vocalLanguage, 'cover-studio-coverTimbreOverride': timbreOverridePath, 'cover-studio-sepLevel': sepLevel,
     'cover-studio-sourceMode': sourceMode, 'cover-studio-advancedMode': advancedMode, 'cover-studio-pairMode': renderMode, 'cover-studio-yue2Ar': yue2Ar, 'cover-studio-yue2Nar': yue2Nar, 'cover-studio-coverVoices': coverVoices, 'cover-studio-keepChords': keepChords, 'cover-studio-instrumentalMode': instrumentalMode, 'cover-studio-coverTempoMode': coverTempoMode, 'cover-studio-coverBpm': coverBpm, 'cover-studio-coverKeyShift': coverKeyShift, 'cover-studio-coverCfgScale': coverCfgScale, 'cover-studio-coverGuide': coverGuide, 'cover-studio-coverLyricSchedule': coverLyricSchedule, 'cover-studio-captionMode': captionMode, 'cover-studio-sheetAbc': sheetAbc, 'cover-studio-scoreSections': scoreSections, ...prep.draftFields, 'cover-studio-scoreTempoScale': scoreTempoScale, 'cover-studio-sheetAudioUrl': sheetAudioUrl, 'cover-studio-approvedSheet': approvedSheet, 'cover-studio-selectedYue2ArtistId': selectedYue2ArtistId, 'cover-studio-selectedYue2LyricsSetId': selectedYue2LyricsSetId, 'cover-studio-coveringBand': coveringBand, 'cover-studio-buildMode': buildMode, 'cover-studio-buildSessionId': buildSessionId, 'cover-studio-buildLyricsDraft': buildLyricsDraft, ...(draftName ? { 'cover-studio-draftName': draftName } : {}) },
     { ...(sourceAssetId ? { sourceAssetId } : {}), ...(sourceSongId ? { sourceSongId } : {}) });
   // Loading a draft sets the same state the controls edit. Its uploaded source
@@ -492,6 +531,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // beyond opening the source); nothing is generated.
   const applyDraft = (body: { fields: Record<string, unknown> }) => {
     const f = body.fields;
+    setCoverDraftId(''); setCoverDraftRevision(0);
+    const restoredSource = readLeadSheetSource(f['cover-studio-leadSheetSource']);
+    setLeadSheetSource(restoredSource);
+    setSheetScoreSource((f['cover-studio-sheetScoreSource'] as string) ?? null);
+    setChordQuality((f['cover-studio-chordQuality'] as CoverLeadSheetResult['chordQuality']) ?? null);
     setSa3Transform(typeof f['cover-studio-sa3Transform'] === 'number' ? Math.max(0.1, Math.min(0.9, f['cover-studio-sa3Transform'])) : 0.3);
     setSa3Seed(typeof f['cover-studio-sa3Seed'] === 'number' ? f['cover-studio-sa3Seed'] : -1);
     setSa3Adapter(typeof f['cover-studio-sa3Adapter'] === 'string' ? f['cover-studio-sa3Adapter'] : '');
@@ -501,14 +545,18 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       f['cover-studio-sourceAudioUrl'] ?? sourceAudioUrl,
       f['cover-studio-sourceSongId'] ?? sourceSongId,
       f['cover-studio-sourceAssetId'] ?? sourceAssetId,
-      (f['cover-studio-advancedMode'] ?? advancedMode) && sepJobId,
-      (f['cover-studio-advancedMode'] ?? advancedMode) && sepStems?.length,
-      (f['cover-studio-advancedMode'] ?? advancedMode) && stemControls,
+      !heartmulaMode && (f['cover-studio-advancedMode'] ?? advancedMode) && sepJobId,
+      !heartmulaMode && (f['cover-studio-advancedMode'] ?? advancedMode) && sepStems?.length,
+      !heartmulaMode && (f['cover-studio-advancedMode'] ?? advancedMode) && stemControls,
     ]);
     skipSourceResetRef.current = nextSourceKey !== sourceKey;
     setSourceMode(Object.hasOwn(f, 'cover-studio-sourceMode') ? f['cover-studio-sourceMode'] as 'audio' | 'musicxml' : 'audio');
     sourceLookupRef.current++;
     captionRequestRef.current++;
+    setHeartmulaTags((f['cover-studio-heartmulaTags'] as HeartmulaCoverTags) ?? EMPTY_HEARTMULA_TAGS);
+    setHeartmulaSeed((f['cover-studio-heartmulaSeed'] as number) ?? -1);
+    if (Object.hasOwn(f, 'cover-studio-mm3Cover')) setMm3Cover(restoreMm3Cover(f['cover-studio-mm3Cover']));
+    setHeartmulaError('');
     setCoverDraftId(''); setCoverDraftRevision(0);
     if (Object.hasOwn(f, 'cover-studio-sourceFileName')) setSourceFileName(f['cover-studio-sourceFileName'] as never);
     if (Object.hasOwn(f, 'cover-studio-sourceAudioUrl')) setSourceAudioUrl(f['cover-studio-sourceAudioUrl'] as never);
@@ -577,8 +625,10 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     setBuildLyricsDraft((f['cover-studio-buildLyricsDraft'] ?? null) as never);
     const assetId = f['cover-studio-sourceAssetId'];
     if (typeof assetId === 'string' && assetId) {
+      // This browser snapshot opens a fresh workflow draft, so its score needs approval again.
+      setApprovedSheet(null);
       const meta = f['cover-studio-metadata'] as AudioMetadata | null, found = f['cover-studio-analysis'] as AudioAnalysis | null;
-      void openUploadedAsset(assetId, sourceLookupRef.current, meta && found ? { metadata: meta, analysis: found } : undefined)
+      void openUploadedAsset(assetId, sourceLookupRef.current, meta && found ? { metadata: meta, analysis: found } : undefined, restoredSource)
         // Transport failures already toast via the global handler.
         .catch(err => { if (!(err instanceof ApiError)) showToast(String((err as Error).message)); });
     }
@@ -588,7 +638,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
 
   const applyDatasetMetadata = (data: Yue2CoverDatasetMetadata, lyricEdit: number, instrumentalEdit: number): boolean => {
     if (!data.matched) return false;
-    if (data.abc) { setSheetAbc(data.abc); setScoreSections(data.sections || []); setSheetScoreSource('dataset'); }
+    if (data.abc) { setSheetAbc(data.abc); setScoreSections(data.sections || []); setSheetScoreSource('dataset'); setChordQuality('provided'); }
     if (!data.metadataAvailable || data.bpm == null || !data.key) return false;
     if (lyricEditRef.current === lyricEdit) {
       setLyrics(data.lyrics || '');
@@ -606,6 +656,42 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (!token) return null;
     try { return await yue2CoverApi.sourceMetadata(input); }
     catch { return null; }
+  };
+
+  const prepareMm3Source = async (signal: AbortSignal): Promise<Mm3SourceFacts> => {
+    const lookup = sourceLookupRef.current;
+    const data = await yue2CoverApi.sourceMetadata(sourceSongId ? { songId: sourceSongId } : { sourceAudioUrl });
+    signal.throwIfAborted();
+    let facts = data.metadataAvailable && data.bpm && data.key
+      ? { bpm: data.bpm, key: data.key, scale: data.key.split(' ')[1] } : analysis;
+    if (!facts) {
+      const found = await apiClient.post<{ bpm: number; key: string; scale?: string }>('/analyze', { audioUrl: sourceAudioUrl });
+      signal.throwIfAborted();
+      facts = { bpm: found.bpm, key: `${found.key} ${found.scale || 'major'}`, scale: found.scale };
+    }
+    if (lookup !== sourceLookupRef.current) throw new DOMException('Source changed', 'AbortError');
+    // Library sends and older drafts need the same asset-backed render document as uploads.
+    if (!coverDraftId || !coverDraftRevision) {
+      let assetId = sourceAssetId;
+      if (!assetId) {
+        const audio = await apiClient.get<Blob>(sourceAudioUrl, { baseURL: '', responseType: 'blob', signal });
+        const uploaded = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file: audio,
+          name: sourceAudioUrl.split('/').pop() || 'cover-source.wav' }] });
+        signal.throwIfAborted();
+        if (lookup !== sourceLookupRef.current) throw new DOMException('Source changed', 'AbortError');
+        assetId = uploaded.asset_id || '';
+        setSourceAssetId(assetId);
+      }
+      if (!assetId) throw new Error(t('cover.mm3.assetMissing', 'Source upload did not return an asset. Retry.'));
+      await openUploadedAsset(assetId, lookup, metadata ? { metadata, analysis: facts } : undefined);
+      signal.throwIfAborted();
+    }
+    setAnalysis(facts);
+    setDatasetAnalysis(!!data.metadataAvailable);
+    setLyrics(data.lyrics || '');
+    return { ...facts, lyrics: data.lyrics || '', mm3Caption: data.mm3Caption || '',
+      instrumental: data.isInstrumental === true,
+      origin: data.metadataAvailable ? 'dataset' : 'analysis' };
   };
 
   // ── "Send to Cover Studio" — load a library track as the cover source (#61) ──
@@ -639,7 +725,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     setSongTitle(s.title || '');
     if (s.artistName) setSongArtist(s.artistName);
     setLyrics(s.lyrics || gpData.lyrics || '');
-    setArtistCaption(s.style || s.caption || gpData.caption || '');
+    setArtistCaption(mm3Mode ? '' : s.style || s.caption || gpData.caption || '');
 
     // Instrumental / vocal intent
     const lyr = (s.lyrics || gpData.lyrics || '').trim().toLowerCase();
@@ -682,12 +768,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   useEffect(() => {
     if (restoredPresetLoaded.current || !setsQuery.data || !presetsQuery.data) return;
     restoredPresetLoaded.current = true;
-    if (!yue2Mode && !audioTransformMode && selectedArtistId && !selectedPreset) {
+    if (!leadSheetMode && !audioTransformMode && selectedArtistId && !selectedPreset) {
       const ids = new Set(setsQuery.data.filter(ls => ls.artist_id === selectedArtistId).map(ls => ls.id));
       const preset = presetsQuery.data.presets.find(p => ids.has(p.lyrics_set_id) && p.adapter_path);
       if (preset) setSelectedPreset(preset);
     }
-  }, [yue2Mode, audioTransformMode, setsQuery.data, presetsQuery.data, selectedArtistId]);
+  }, [leadSheetMode, audioTransformMode, setsQuery.data, presetsQuery.data, selectedArtistId]);
 
   useEffect(() => {
     if (!yue2Mode || renderMode !== 'artist' || selectedYue2ArtistId == null || !setsQuery.data || !presetsQuery.data) return;
@@ -701,18 +787,50 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (chosen && chosen.lsId !== selectedYue2LyricsSetId) setSelectedYue2LyricsSetId(chosen.lsId);
   }, [yue2Mode, renderMode, selectedYue2ArtistId, setsQuery.data, presetsQuery.data, selectedYue2LyricsSetId]);
 
+  const changeLeadSheetSource = async (choice: CoverLeadSheetSource) => {
+    if (sourceChangeRef.current || sheetPreparing || choice === selectedSource) return;
+    if (!coverDraftId || !coverDraftRevision) { setLeadSheetSource(choice); return; }
+    sourceChangeRef.current = true; setSourceChanging(true);
+    const lookup = sourceLookupRef.current;
+    const request = ++sheetRequestRef.current;
+    setSheetError('');
+    try {
+      const { job } = await coverWorkflowApi.source(coverDraftId, coverDraftRevision, choice);
+      const done = await waitForCoverJob(job.id, () => sourceLookupRef.current !== lookup || sheetRequestRef.current !== request);
+      if (sourceLookupRef.current !== lookup || sheetRequestRef.current !== request) return;
+      const result = done.result as CoverDraftResult;
+      sourceHydratedRef.current = result.documentId;
+      setCoverDraftRevision(result.revision); setLeadSheetSource(result.leadSheetSource ?? choice);
+      const score = leadSheetScoreUpdate(result);
+      setApprovedSheet(score.approved); setSheetAbc(score.abc); setScoreSections([]);
+      setSheetScoreSource(score.scoreSource); setChordQuality(score.chordQuality);
+      setSheetAudioUrl('');
+    } catch (err) { if (sourceLookupRef.current === lookup) setSheetError((err as Error).message); }
+    finally { sourceChangeRef.current = false; setSourceChanging(false); }
+  };
+
   const openUploadedAsset = async (assetId: string, lookup: number, cached?: {
     metadata: AudioMetadata; analysis: AudioAnalysis;
-  }): Promise<CoverDraftResult | null> => {
+  }, choice?: CoverLeadSheetSource, existing?: { documentId: string; revision: number }): Promise<CoverDraftResult | null> => {
     if (!token || !assetId) return null;
-    const { job } = await coverWorkflowApi.open(assetId, cached);
+    if (existing && !choice) {
+      const { document } = await workflowApi.getDocument(existing.documentId);
+      choice = readLeadSheetSource(document.data.leadSheetSource)
+        ?? (await yue2CoverApi.readiness()).source;
+      if (!choice) throw new Error('The lead-sheet source is still loading');
+    }
+    const { job } = existing && choice
+      ? await coverWorkflowApi.source(existing.documentId, existing.revision, choice, assetId)
+      : await coverWorkflowApi.open(assetId, cached, choice);
     coverWorkflowJobRef.current = job.id;
     try {
       const done = await waitForCoverJob(job.id, () => sourceLookupRef.current !== lookup);
       if (sourceLookupRef.current !== lookup) return null;
       const result = done.result as CoverDraftResult;
+      sourceHydratedRef.current = result.documentId;
       setCoverDraftId(result.documentId);
       setCoverDraftRevision(result.revision);
+      setLeadSheetSource(result.leadSheetSource);
       return result;
     } finally {
       if (coverWorkflowJobRef.current === job.id) coverWorkflowJobRef.current = '';
@@ -720,8 +838,13 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
 
   const handleFileSelected = async (file: File) => {
-    setSourceMode('audio');
     if (!token) { showToast(t('cover.signInFirst')); return; }
+    if (sourceChangeRef.current || sheetPreparing) return;
+    const existing = coverDraftId && coverDraftRevision
+      ? { documentId: coverDraftId, revision: coverDraftRevision } : undefined;
+    const choice = existing ? selectedSource : leadSheetSource;
+    sourceChangeRef.current = true; setSourceChanging(true);
+    setSourceMode('audio');
     const lookup = ++sourceLookupRef.current;
     if (coverWorkflowJobRef.current) void workflowApi.cancel(coverWorkflowJobRef.current).catch(() => {});
     captionRequestRef.current++;
@@ -758,7 +881,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           metadata: { artist: cached.artist || '', title: cached.title || '',
             album: cached.album || '', duration: cached.duration ?? null },
           analysis: { bpm: cached.bpm, key: cached.key, scale: cached.scale },
-        } : undefined);
+        } : undefined, choice, existing);
         if (useDetectedDetails && opened?.analysis) setAnalysis(opened.analysis);
         const dataset = await lookupDatasetMetadata({ sourceAudioUrl: d.audio_url });
         if (sourceLookupRef.current === lookup && dataset) applyDatasetMetadata(dataset, lyricEdit, instrumentalEdit);
@@ -766,7 +889,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         // Transport failures already toast via the global handler; surface only
         // domain errors (a failed cover-draft job throws a plain Error).
         if (!(err instanceof ApiError)) showToast(err instanceof Error ? err.message : String(err));
-      } finally { if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
+      } finally { sourceChangeRef.current = false; setSourceChanging(false); if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
       return;
     }
 
@@ -782,7 +905,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       setSourceAssetId(upData.asset_id || '');
       setIsAnalyzing(true);
 
-      const opened = await openUploadedAsset(upData.asset_id || '', lookup);
+      const opened = await openUploadedAsset(upData.asset_id || '', lookup, undefined, choice, existing);
       if (sourceLookupRef.current !== lookup) return;
       if (opened?.metadata) {
         setMetadata(opened.metadata);
@@ -818,7 +941,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       // Transport failures already toast via the global handler; surface only
       // domain errors (a failed cover-draft job throws a plain Error).
       if (!(err instanceof ApiError)) showToast(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    } finally { if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
+    } finally { sourceChangeRef.current = false; setSourceChanging(false); if (sourceLookupRef.current === lookup) { setIsAnalyzing(false); } }
   };
 
   // ── Lyrics search ──
@@ -889,7 +1012,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       const results = lyrics_sets.map(ls => ({ lsId: ls.id, album: ls.album || String(ls.id), preset: bySet.get(ls.id) ?? null }));
       if (!current()) return;
       // Find caption — waterfall: generations → profiles → LLM
-      if (token && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+      if (token && sourceAssetId && coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
         setBgCaptionPending(true);
         const pending = resolveCaptionOnNode(artist.id, false);
         const request = captionRequestRef.current;
@@ -970,7 +1093,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
   const captionMut = useMutation({
     mutationFn: async ({ artistId, provider, model }: { artistId: number; provider: string; model: string }) => {
-      if (token && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+      if (token && sourceAssetId && coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
         return (await resolveCaptionOnNode(artistId, true)) || '';
       }
       const res = await lireekApi.generateCaption(artistId, { provider, model: model || undefined, force: true });
@@ -992,20 +1115,20 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     captionMut.mutate({ artistId: selectedArtistId, provider, model });
   };
 
-  const prepareYue2Source = async (): Promise<{ sourceAudioUrl?: string; songId?: string; audioUrl: string }> => {
-    if (advancedMode && sepStems?.length && sepJobId) {
+  const prepareYue2Source = async (): Promise<{ sourceAudioUrl?: string; songId?: string; audioUrl: string; assetId?: string }> => {
+    if (!heartmulaMode && advancedMode && sepStems?.length && sepJobId) {
       const controls = stemControls.map(c => ({ index: c.index, volume: c.muted ? 0 : c.volume, muted: c.muted }));
       const blob = await recombineStems(sepJobId, controls);
       const uploaded = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file: blob, name: 'recombined-stems.wav' }] });
       if (!uploaded.audio_url) throw new Error('Recombined source has no audio URL');
-      return { sourceAudioUrl: uploaded.audio_url, audioUrl: uploaded.audio_url };
+      return { sourceAudioUrl: uploaded.audio_url, audioUrl: uploaded.audio_url, assetId: uploaded.asset_id };
     }
     if (sourceSongId) return { songId: sourceSongId, audioUrl: sourceAudioUrl };
     return { sourceAudioUrl, audioUrl: sourceAudioUrl };
   };
 
   const handleTranscribe = async () => {
-    if (!token || !sourceAudioUrl) return;
+    if (!token || !sourceAudioUrl || sourceChangeRef.current) return;
     if (sourceAssetId && (!coverDraftId || !coverDraftRevision)) {
       setSheetError('Source is still being prepared'); return;
     }
@@ -1014,7 +1137,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     let workflowId = '';
     setSheetError(''); setSheetPreparing(true);
     try {
-      if (sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+      if (coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
         const { job } = await coverWorkflowApi.transcribe(coverDraftId, coverDraftRevision, !!sheetAbc);
         workflowId = job.id;
         coverWorkflowJobRef.current = job.id;
@@ -1023,24 +1146,46 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
         const result = done.result as CoverDraftResult;
         setCoverDraftRevision(result.revision);
-        acceptTranscript(result.abc || '', []);
-        setSheetScoreSource(result.scoreSource === 'dataset' ? 'dataset' : null);
+        const score = leadSheetScoreUpdate(result);
+        setApprovedSheet(score.approved);
+        acceptTranscript(score.abc, []);
+        setSheetScoreSource(score.scoreSource); setChordQuality(score.chordQuality);
         setSheetAudioUrl(sourceAudioUrl);
         return;
       }
       const source = await prepareYue2Source();
       if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
-      const result = await yue2CoverApi.start({ ...source, sourceLabel: sourceFileName.slice(0, 120), force: !!sheetAbc });
-      if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) {
-        if (result.jobId) await yue2CoverApi.cancel(result.jobId);
-        return;
+      // Library and stem-mix sources need an asset before the same stored-source workflow can run.
+      let assetId = source.assetId;
+      if (!assetId) {
+        const audio = await apiClient.get<Blob>(source.audioUrl, { baseURL: '', responseType: 'blob' });
+        if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
+        const uploaded = await uploadMut.mutateAsync({ path: '/upload/audio', files: [{ field: 'audio', file: audio,
+          name: source.audioUrl.split('/').pop() || 'cover-source.wav' }] });
+        assetId = uploaded.asset_id;
       }
+      if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
+      if (!assetId) throw new Error('Source upload did not return an asset');
+      const opened = await coverWorkflowApi.open(assetId, undefined, selectedSource);
+      workflowId = opened.job.id;
+      coverWorkflowJobRef.current = workflowId;
+      const initial = await waitForCoverJob(workflowId, () => sourceKeyRef.current !== key || sheetRequestRef.current !== request);
+      if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
+      const draft = initial.result as CoverDraftResult;
+      sourceHydratedRef.current = draft.documentId;
+      setCoverDraftId(draft.documentId); setCoverDraftRevision(draft.revision);
+      setLeadSheetSource(draft.leadSheetSource);
+      const { job } = await coverWorkflowApi.transcribe(draft.documentId, draft.revision, !!sheetAbc);
+      workflowId = job.id; coverWorkflowJobRef.current = workflowId;
+      const done = await waitForCoverJob(workflowId, () => sourceKeyRef.current !== key || sheetRequestRef.current !== request);
+      if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
+      const result = done.result as CoverDraftResult;
+      setCoverDraftRevision(result.revision);
+      const score = leadSheetScoreUpdate(result);
+      setApprovedSheet(score.approved); acceptTranscript(score.abc, []);
+      setSheetScoreSource(score.scoreSource); setChordQuality(score.chordQuality);
+      setLeadSheetSource(draft.leadSheetSource);
       setSheetAudioUrl(source.audioUrl);
-      if (result.jobId) { sheetJobRef.current = result.jobId; setSheetJobId(result.jobId); }
-      else if (result.abc) {
-        acceptTranscript(result.abc, result.sections || []);
-        setSheetScoreSource(result.scoreSource === 'dataset' ? 'dataset' : null);
-      }
     } catch (err: any) { if (sourceKeyRef.current === key && sheetRequestRef.current === request) setSheetError(err.message); }
     finally {
       if (workflowId && coverWorkflowJobRef.current === workflowId) coverWorkflowJobRef.current = '';
@@ -1055,7 +1200,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const autoTranscribedRef = useRef(sourceKey);
   useEffect(() => {
     if (autoTranscribedRef.current === sourceKey) return;
-    if (!yue2Mode || !token || sourceMode !== 'audio' || !sourceAudioUrl || isUploading || isAnalyzing) return;
+    if (!leadSheetMode || !token || sourceMode !== 'audio' || !sourceAudioUrl || isUploading || isAnalyzing || sourceChanging) return;
     if (sheetAbc.trim() || sheetPreparing || sheetJobId || !readiness?.ready) return;
     if (sourceAssetId && (!coverDraftId || !coverDraftRevision)) return;
     autoTranscribedRef.current = sourceKey;
@@ -1089,7 +1234,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     const request = ++sheetRequestRef.current;
     setSheetError(''); setSheetPreparing(true);
     try {
-      if (sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+      if (coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
         const result = await coverWorkflowApi.approveScore(coverDraftId, coverDraftRevision, sheetAbc);
         if (sourceKeyRef.current !== key || sheetRequestRef.current !== request) return;
         setCoverDraftRevision(result.document.revision);
@@ -1172,7 +1317,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const scaledScoreBpm = Math.round(scoreBpm * scoreTempoFactor);
   const scaleScoreTempo = (by: number) => setScoreTempoScale({ abc: sheetAbc, factor: scoreTempoFactor * by });
   const scoreKey = coverScoreKeyLabel(sheetAbc).replace(/(major|minor|dorian|phrygian|lydian|mixolydian|locrian)$/, m => m[0].toUpperCase() + m.slice(1));
-  const scoreDetailsDiffer = yue2Mode && datasetAnalysis && !!analysis && scoreBpm > 0 && !!scoreKey &&
+  const scoreDetailsDiffer = leadSheetMode && datasetAnalysis && !!analysis && scoreBpm > 0 && !!scoreKey &&
     (Math.round(analysis.bpm) !== scoreBpm || analysis.key.toLowerCase() !== scoreKey.toLowerCase());
   // Both legs are silent — the sheet's "Save to dataset:" line is the sole
   // notifier, so onError shows every failure. The source key travels as a
@@ -1182,7 +1327,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const scoreDetailsMut = useMutation({
     mutationFn: async (key: string) => {
       let bpm = scaledScoreBpm, musicalKey = scoreKey;
-      if (sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+      if (sourceAssetId && coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
         const saved = await coverWorkflowApi.saveScoreDetails(coverDraftId,
           coverDraftRevision, sheetAbc, scoreTempoFactor);
         bpm = saved.bpm; musicalKey = saved.key;
@@ -1207,16 +1352,16 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
 
   // ── Generation ──
-  // A YuE2 render sends the Prepare document's confirmed pair: the score and the
+  // A lead-sheet render sends the Prepare document's confirmed pair: the score and the
   // lyrics tagged in its order. Instrumental mode comes from the document too
   // (every section marked Instrumental); the server refuses a mismatch.
-  const preparedResult = yue2Mode ? exportPrepare(prep.doc) : null;
+  const preparedResult = leadSheetMode ? exportPrepare(prep.doc) : null;
   const confirmedPair = preparedResult && !('error' in preparedResult) ? preparedResult : null;
   const prepareBlock = preparedResult && 'error' in preparedResult ? preparedResult.error : '';
-  const renderInstrumental = yue2Mode ? !!confirmedPair?.instrumental : instrumental;
-  const renderLyrics = yue2Mode ? confirmedPair?.lyrics ?? '' : lyrics;
+  const renderInstrumental = leadSheetMode ? !!confirmedPair?.instrumental : instrumental;
+  const renderLyrics = leadSheetMode ? confirmedPair?.lyrics ?? '' : lyrics;
   // The dataset sidecar's lyrics are marked as such only while the pair still sends them as they are.
-  const renderLyricsSource = !yue2Mode || (confirmedPair && confirmedPair.lyrics === normalizeAbc(lyrics)) ? lyricsSource : null;
+  const renderLyricsSource = !leadSheetMode || (confirmedPair && confirmedPair.lyrics === normalizeAbc(lyrics)) ? lyricsSource : null;
   const resolvedCaption = artistCaption.trim();
   const selectCaptionSource = (mode: string) => {
     setCaptionMode(mode);
@@ -1257,16 +1402,20 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     const engineParams = { ...gp.getGlobalParams() as Record<string, unknown>,
       ...(renderInstrumental ? { yue2InstrumentalMode: instrumentalMode } : {}) };
     const backend = useBackendStore.getState().activeBackendId;
+    const renderSourceKey = sourceKey;
+    setHeartmulaError('');
     const input = {
       documentId: coverDraftId, revision: coverDraftRevision,
       expectedBackend: backend, engineParams,
       ...(audioTransformMode ? { strength: sa3Transform, seed: sa3Seed,
         ...(sa3Adapter ? { adapter: `${sa3Adapter}:1` } : {}) } : {}),
+      ...(heartmulaMode ? { heartmulaTags: { ...heartmulaTags }, seed: heartmulaSeed } : {}),
+      ...(mm3Mode ? { seed: mm3Cover.seed, mm3Cover: mm3CoverInput(mm3Cover) } : {}),
       title: songTitle, artistName: songArtist,
-      targetArtistName: audioTransformMode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '',
+      targetArtistName: audioTransformMode || heartmulaMode || mm3Mode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '',
       lyrics: audioTransformMode ? '' : renderLyrics, caption: artistCaption,
-      instrumental: audioTransformMode || renderInstrumental, lyricsSource: audioTransformMode ? null : renderLyricsSource, scoreSource: audioTransformMode ? null : sheetScoreSource, analysis,
-      ...(yue2Mode ? { prepare: prep.doc } : {}),
+      instrumental: audioTransformMode || (mm3Mode ? !lyrics.trim() : renderInstrumental), lyricsSource: audioTransformMode ? null : renderLyricsSource, scoreSource: audioTransformMode ? null : sheetScoreSource, analysis,
+      ...(leadSheetMode ? { prepare: prep.doc } : {}),
       settings: { coResident: settings.coResident, cacheLmCodes: settings.cacheLmCodes,
         parallelWhisper: settings.parallelWhisper, parallelQualityEval: settings.parallelQualityEval,
         parallelCoverArt: settings.parallelCoverArt },
@@ -1288,7 +1437,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     };
     const qId = addManualQueueItem({ title: songArtist
       ? `${songTitle || 'Cover'} (${songArtist} Cover)` : (songTitle || 'Cover'),
-      artistName: audioTransformMode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '', caption: artistCaption });
+      artistName: audioTransformMode || heartmulaMode ? '' : yue2Mode ? targetYue2Artist : artists.find(a => a.id === selectedArtistId)?.name || '', caption: artistCaption });
     updateManualQueueItem(qId, { stage: 'Preparing…' });
     setIsGenerating(true);
     void (async () => {
@@ -1317,6 +1466,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       showToast(t('cover.coverGenerated'));
     } catch (err: any) {
       failManualQueueItem(qId, err.message || 'Generation failed');
+      if (backend === 'heartmula' && useBackendStore.getState().activeBackendId === backend && sourceKeyRef.current === renderSourceKey) setHeartmulaError(err.message || 'Generation failed');
     } finally {
       if (coverRenderJobRef.current === workflowId) {
         setIsGenerating(false); setActiveJobId(null); setQueueItemId(null);
@@ -1446,6 +1596,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     masteringEnabled: engineParams.masteringEnabled, masteringReference: engineParams.masteringReference,
     lufsEnabled: engineParams.lufsEnabled, lufsTarget: engineParams.lufsTarget,
     lufsCeilingDb: engineParams.lufsCeilingDb,
+    mm3RefinerEnabled: engineParams.mm3RefinerEnabled, mm3RefinerSteps: engineParams.mm3RefinerSteps,
+    mm3RefinerWindowSeconds: engineParams.mm3RefinerWindowSeconds,
+    mm3RefinerOverlapSeconds: engineParams.mm3RefinerOverlapSeconds, mm3RefinerMix: engineParams.mm3RefinerMix,
     stableStepOn: engineParams.stableStepOn, stableStepStrength: engineParams.stableStepStrength,
     stableStepBackend: engineParams.stableStepBackend, stableStepAdapters: engineParams.stableStepAdapters,
     stableStepSeed: engineParams.stableStepSeed,
@@ -1475,7 +1628,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     yue2LyricSchedule: coverLyricSchedule, customMode: true, taskType: 'text2music',
     title, artist: targetYue2Artist, artistName: targetYue2Artist || songArtist, sourceArtist: songArtist, caption: artistCaption, style: artistCaption, lyrics: renderInstrumental ? '' : renderLyrics,
     ...(renderLyricsSource ? { lyricsSource: renderLyricsSource } : {}),
-    ...(sheetScoreSource ? { scoreSource: 'dataset-sidecar' } : {}),
+    ...(sheetScoreSource === 'dataset' ? { scoreSource: 'dataset-sidecar' } : {}),
     instrumental: renderInstrumental, source: 'cover-studio',
     ...(sourceMode === 'audio' ? { sourceAudioUrl: approvedSheet.audioUrl } : {}),
     yue2Cover: sourceMode === 'audio'
@@ -1489,6 +1642,24 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
 
   const handleGenerate = () => {
+    if (heartmulaMode) {
+      setHeartmulaError('');
+      if (!token || !coverDraftId || !coverDraftRevision || !sourceAssetId || sourceMode !== 'audio') {
+        setHeartmulaError(t('cover.heartmula.uploadRequired', 'Upload a source recording before submitting a HeartMuLa cover.')); return;
+      }
+      if (!confirmedPair || !approvedSheet || approvedSheet.key !== sourceKey) {
+        setHeartmulaError(prepareBlock || t('cover.heartmula.approveRequired', 'Confirm the score and lyrics, then approve the score in Prepare.')); return;
+      }
+      if (Object.values(heartmulaTags).some(value => value.length > 512 || /[[\];\r\n]/.test(value))) {
+        setHeartmulaError(t('cover.heartmula.invalidTags', 'Use up to 512 characters per tag field, without brackets, semicolons or line breaks.')); return;
+      }
+      submitCoverWorkflow(); return;
+    }
+    if (mm3Mode) {
+      if (!token || !sourceAudioUrl || !coverDraftId || !coverDraftRevision || !mm3CoverReady(mm3Cover, sourceAudioUrl)) return;
+      submitCoverWorkflow();
+      return;
+    }
     if (audioTransformMode) {
       if (!token || !sourceAudioUrl || !coverDraftId || !coverDraftRevision || !artistCaption.trim()) return;
       submitCoverWorkflow();
@@ -1503,7 +1674,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (yue2Mode && renderMode !== 'base' && (!activeYue2Ar || !activeYue2Nar)) {
       showToast('Choose both YuE2 adapter halves'); return;
     }
-    if (sourceMode === 'audio' && sourceAssetId && coverDraftId && coverDraftRevision && !advancedMode) {
+    if (sourceMode === 'audio' && sourceAssetId && coverDraftId && coverDraftRevision && (!advancedMode || heartmulaMode)) {
       if (yue2Mode && (!approvedSheet || approvedSheet.key !== sourceKey)) {
         showToast('Approve the confirmed score first'); return;
       }
@@ -1742,6 +1913,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (captionJobRef.current && token) void workflowApi.cancel(captionJobRef.current).catch(() => {});
     if (coverWorkflowJobRef.current && token) void workflowApi.cancel(coverWorkflowJobRef.current).catch(() => {});
     setSourceAssetId(''); setCoverDraftId(''); setCoverDraftRevision(0);
+    setLeadSheetSource(undefined); setChordQuality(null);
     setSourceFileName(''); setSourceAudioUrl(''); setSourceSongId('');
     setMetadata(null); setAnalysis(null);
     setSongArtist(''); setSongTitle(''); setLyrics('');
@@ -1771,11 +1943,16 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   };
 
   // Always allow queuing another cover — covers stack and run one at a time (#62).
-  const canGenerate = audioTransformMode
+  const canGenerate = !sourceChanging && (heartmulaMode
+    ? !!token && sourceMode === 'audio' && !!sourceAssetId && !!coverDraftId && !!coverDraftRevision
+      && !!confirmedPair && !!approvedSheet && approvedSheet.key === sourceKey
+    : mm3Mode
+    ? !!sourceAudioUrl && !!coverDraftId && !!coverDraftRevision && mm3CoverReady(mm3Cover, sourceAudioUrl)
+    : audioTransformMode
     ? !!sourceAudioUrl && !!coverDraftId && !!coverDraftRevision && !!artistCaption.trim()
     : (!yue2Mode || sourceMode === 'audio' ? !!sourceAudioUrl && (!sourceAssetId || (!!coverDraftId && !!coverDraftRevision)) : true)
     && (yue2Mode ? !!confirmedPair : (!!lyrics.trim() || instrumental))
-    && (!yue2Mode || (!!approvedSheet && approvedSheet.key === sourceKey && (renderMode === 'base' || (!!activeYue2Ar && !!activeYue2Nar))));
+    && (!yue2Mode || (!!approvedSheet && approvedSheet.key === sourceKey && (renderMode === 'base' || (!!activeYue2Ar && !!activeYue2Nar)))));
 
   // ── SuperSep handlers ──
   // Split + poll now runs inside coverStemsStore.startSeparation, so it keeps
@@ -1796,7 +1973,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   // Drafts sit under Generate in whichever settings column is showing.
   const draftsFold = (
     <Fold title="Drafts" storageKey="cover-studio-fold-drafts">
-      <StudioDraftPicker control={draft} textKey="cover-studio-songTitle" apply={applyDraft} namedSave={yue2Mode} inline />
+      <StudioDraftPicker control={draft} textKey="cover-studio-songTitle" apply={applyDraft} namedSave={leadSheetMode} inline />
     </Fold>
   );
 
@@ -1871,7 +2048,10 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       <div className={`flex-1 flex overflow-x-auto overflow-y-hidden ${yue2Mode && buildMode ? 'hidden' : ''}`}>
         {/* Left: source choice */}
         <div className="min-w-[240px] flex-shrink-0 flex flex-col min-h-0" style={{ width: sourceWidth }}>
-        {yue2Mode && <div className="border-r border-zinc-200 dark:border-white/5 p-4 space-y-3 overflow-y-auto">
+        {leadSheetMode && <div className="border-r border-zinc-200 dark:border-white/5 p-4 space-y-3 overflow-y-auto">
+          <LeadSheetSourcePicker value={selectedSource} disabled={sourceChanging || sheetPreparing || isUploading || isAnalyzing || bgCaptionPending || captionMut.isPending || (!!coverDraftId && coverDocumentQuery.isPending)}
+            onChange={value => void changeLeadSheetSource(value)} />
+          {readinessQuery.isError && <QueryError error={readinessQuery.error} onRetry={() => void readinessQuery.refetch()} />}
           <div className="flex gap-2" role="group" aria-label={t('cover.sourceMode.label')}>
             <button type="button" onClick={() => selectSourceMode('audio')} aria-pressed={sourceMode === 'audio'}
               className={`rounded-lg px-3 py-1.5 text-xs ${sourceMode === 'audio' ? 'bg-cyan-500/20 text-cyan-700 dark:text-cyan-300' : 'text-zinc-600 dark:text-zinc-400'}`}>
@@ -1895,8 +2075,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             </div>
           </MusicXmlImport>}
         </div>}
-        {(!yue2Mode || sourceMode === 'audio') && <>
-        {!audioTransformMode && <div className="px-4 pt-4 space-y-2">
+        {(!leadSheetMode || sourceMode === 'audio') && <>
+        {!audioOnly && <div className="px-4 pt-4 space-y-2">
           <Toggle size="sm" accent="cyan" checked={useDetectedDetails}
             disabled={isUploading || isAnalyzing}
             onChange={enabled => {
@@ -1906,11 +2086,11 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             label={t('cover.useDetectedDetails', 'Use detected BPM/key')}
             info={t('cover.useDetectedDetailsInfo', 'On: loading audio uses detected, cached or dataset BPM and key. Off: ignore those results; loading new audio resets BPM and key to the defaults. Source analysis may still run. This does not edit the ABC score. Default manual values are 120 BPM and C major.')} />
           <ParamLabel label={t('cover.sourceKeyBehavior', 'Source key behavior')}
-            info={yue2Mode
+            info={heartmulaMode ? t('cover.heartmula.sourceKeyInfo', 'The source key is metadata. HeartMuLa uses the notes and tempo in the approved ABC score. Edit the score in Prepare to change them.') : leadSheetMode
               ? t('cover.sourceKeyBehaviorYue2', 'The source Key field is metadata. It does not transpose the ABC notes or pitch-shift the recording. YuE2 composes from the reviewed ABC score; use Pitch Shift in the cover settings to transpose that score for generation.')
               : t('cover.sourceKeyBehaviorAce', 'The source Key field corrects the key sent to generation as conditioning. Changing it does not apply a DSP pitch shift to the recording. Use Pitch Shift in the cover settings to change the audio pitch.')}
             className="text-xs text-zinc-600 dark:text-zinc-400" />
-          {yue2Mode && analysis && <div className="flex items-center gap-2">
+          {leadSheetMode && analysis && <div className="flex items-center gap-2">
             <ParamLabel label={t('cover.tempoFix')} info={t('cover.sourceTempoFixInfo', 'Halve or double the current source BPM, including a manual override. This corrects source metadata; it does not change the ABC score tempo.')} className="text-xs text-zinc-600 dark:text-zinc-400" />
             {([0.5, 2] as const).map(factor => <button key={factor} type="button"
               onClick={() => setBpmOverride(Math.max(20, Math.min(300, Math.round((bpmOverride ?? analysis.bpm) * factor))))}
@@ -1920,8 +2100,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
           </div>}
         </div>}
         <SourcePanel
-          yue2Mode={yue2Mode}
-          audioTransformMode={audioTransformMode}
+          yue2Mode={leadSheetMode}
+          audioTransformMode={audioOnly}
           sourceFileName={sourceFileName} metadata={metadata} analysis={analysis}
           fromDataset={datasetAnalysis}
           scoreDetails={scoreDetailsDiffer ? { bpm: scaledScoreBpm, key: scoreKey, saving: scoreDetailsSaving,
@@ -1962,9 +2142,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
         /></>}
         </div>
 
-        {!audioTransformMode && <CoverResizeHandle label="Resize source column" direction="horizontal" onMouseDown={e => startResize(e, sourceWidth, setSourceWidth, 240, 900)} />}
+        {!audioOnly && <CoverResizeHandle label="Resize source column" direction="horizontal" onMouseDown={e => startResize(e, sourceWidth, setSourceWidth, 240, 900)} />}
         {/* Center: Lyrics and score */}
-        {!audioTransformMode && <><div className="min-w-[320px] flex-shrink-0 flex flex-col overflow-hidden border-r border-zinc-200 dark:border-white/5" style={{ width: scoreWidth }}>
+        {!audioOnly && <><div className="min-w-[320px] flex-shrink-0 flex flex-col overflow-hidden border-r border-zinc-200 dark:border-white/5" style={{ width: scoreWidth }}>
           <div className="flex-shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-white/5">
             <div className="flex items-center justify-between gap-2">
               {/* Artist + Title inputs */}
@@ -1981,12 +2161,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
               </button>
             </div>
           </div>
-          {!yue2Mode && <div className="flex-1 min-h-0 p-4 flex flex-col gap-1">
+          {!leadSheetMode && <div className="flex-1 min-h-0 p-4 flex flex-col gap-1">
             {lyricsSource && <span className="text-[10px] text-cyan-600 dark:text-cyan-300">Lyrics from dataset · editable</span>}
             <LyricsSectionHighlight value={lyrics} onChange={value => { lyricEditRef.current++; setLyrics(value); setLyricsSource(null); }}
               placeholder={t('cover.lyricsPlaceholder')} highlight={null} />
           </div>}
-          {yue2Mode && <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+          {leadSheetMode && <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
             {lyricsSource && <span className="text-[10px] text-cyan-600 dark:text-cyan-300">Lyrics from dataset · editable</span>}
             <div className="flex flex-wrap items-center gap-1" role="group" aria-label={t('cover.prepare.steps')}>
               {([['structure', t('cover.prepare.step.structure'), true],
@@ -2077,8 +2257,8 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             message={`Replace the dataset song’s tempo and key with the score’s (${scaledScoreBpm} BPM, ${scoreKey})? The current .txt is kept as a backup.`}
             confirmLabel="Save" onCancel={() => setScoreDetailsConfirm(false)}
             onConfirm={() => { setScoreDetailsConfirm(false); void saveScoreDetails(); }} />
-          {yue2Mode && <CoverResizeHandle label="Resize lyrics and lead sheet" direction="vertical" onMouseDown={startScoreResize} />}
-          {yue2Mode && <Yue2CoverScore
+          {leadSheetMode && <CoverResizeHandle label="Resize lyrics and lead sheet" direction="vertical" onMouseDown={startScoreResize} />}
+          {leadSheetMode && <Yue2CoverScore
             height={scoreHeight}
             wide={scoreWidth > 400}
             sourceReady={(sourceMode === 'musicxml' ? !!sheetAbc.trim() : !!sourceAudioUrl) && !isUploading}
@@ -2090,7 +2270,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
             onMoveSection={(index, bar) => { prep.applyStructuralOp({ kind: 'move', index, bar }); }}
             highlightBars={prep.step === 'structure' ? scoreHighlight : null}
             play={scorePlay} onPlaying={onScorePlaying}
-            scoreSource={sheetScoreSource} onSection={index => setActiveSectionOf({ abc: sheetAbc, index })}
+            scoreSource={sheetScoreSource} chordQuality={chordQuality} onSection={index => setActiveSectionOf({ abc: sheetAbc, index })}
             onTranscribe={handleTranscribe} onCancel={handleCancelSheet}
           />}
 
@@ -2103,7 +2283,17 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
 
         <CoverResizeHandle label="Resize lyrics and score column" direction="horizontal" onMouseDown={e => startResize(e, scoreWidth, setScoreWidth, 320, 1200)} /></>}
         {/* Right: Artist + Settings */}
-        {audioTransformMode ? renderAudioTransformPanel() : yue2Mode ? <div className="min-w-[300px] flex-1 flex flex-col min-h-0" style={{ flexBasis: settingsWidth }}>
+        {audioTransformMode ? renderAudioTransformPanel() : mm3Mode ? <Mm3CoverPanel
+          settings={mm3Cover} onSettings={setMm3Cover} sourceAudioUrl={sourceAudioUrl || ''} sourceName={sourceFileName || ''}
+          caption={artistCaption} onCaption={setArtistCaption} lyrics={lyrics} onLyrics={setLyrics}
+          sourceReady={!sourceChanging && !isAnalyzing} prepareSource={prepareMm3Source}
+          duration={metadata?.duration || 0} artists={artists} albums={allSets} presets={allPresets}
+          canGenerate={canGenerate} generating={isGenerating} onGenerate={handleGenerate} onCancel={handleCancel}
+          footer={draftsFold} /> : heartmulaMode ? <HeartmulaCoverPanel
+          tags={heartmulaTags} onTags={setHeartmulaTags} seed={heartmulaSeed} onSeed={setHeartmulaSeed}
+          canGenerate={canGenerate} generating={isGenerating} error={heartmulaError || (sourceMode !== 'audio' || !sourceAssetId
+            ? t('cover.heartmula.uploadRequired', 'Upload a source recording before submitting a HeartMuLa cover.') : '')}
+          onGenerate={handleGenerate} onCancel={handleCancel} footer={draftsFold} /> : yue2Mode ? <div className="min-w-[300px] flex-1 flex flex-col min-h-0" style={{ flexBasis: settingsWidth }}>
           {renderMode === 'base' && (pickerAr || pickerNar) && <p className="px-4 pt-3 text-xs text-amber-600 dark:text-amber-400">
             {t('cover.yue2BaseIgnoresLora')}</p>}
           <Yue2CoverPanel
