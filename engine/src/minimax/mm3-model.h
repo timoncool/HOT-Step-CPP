@@ -120,6 +120,9 @@ struct MM3LmConfig {
 // identically, for every logit. The unconditional row is then computed, read
 // back, and algebraically cancelled: pure waste. Both stages therefore build
 // single-row graphs at 1.0 and the full pair at anything else.
+// Single-row vs a 2-row run at 1.0 is the same forward within kernel
+// numerics, not bit for bit: the batch-2 prefill moves the hidden ~0.35 %,
+// top-k sampling amplifies it, so a seed gives a different take (HOTSTEP-1222).
 //
 // Keyed on the arithmetic, never on a model name, so it is correct for any
 // checkpoint that ships this scale — and bit-identical to the old code path at
@@ -130,6 +133,22 @@ struct MM3LmConfig {
 // The scale to guide with, with the pre-KV-metadata fallback applied once.
 static inline float mm3_ar_cfg_scale(const MM3LmConfig & c) {
     return c.ar_cfg_scale > 0.0f ? c.ar_cfg_scale : 1.5f;
+}
+
+// EXPERIMENT: MM3_DEPTH_CFG=<scale> guides the depth decoder at its own scale,
+// leaving the semantic draw at mm3.ar.cfg_scale. For a guidance-distilled
+// composer (scale 1.0) whose depth decoder is still the stock CFG-1.5 one.
+// Needs the unconditional LM row, so mm3_cfg_rows returns 2 while it is set.
+static inline float mm3_depth_cfg_override() {
+    static const float v = [] {
+        const char * e = std::getenv("MM3_DEPTH_CFG");
+        return e && e[0] ? (float) atof(e) : 0.0f;
+    }();
+    return v;
+}
+
+static inline float mm3_depth_cfg_scale(const MM3LmConfig & c) {
+    return mm3_depth_cfg_override() > 0.0f ? mm3_depth_cfg_override() : mm3_ar_cfg_scale(c);
 }
 
 static inline int mm3_cfg_rows(const MM3LmConfig & c) {
@@ -149,6 +168,9 @@ static inline int mm3_cfg_rows(const MM3LmConfig & c) {
     }();
     if (forced) {
         return forced;
+    }
+    if (mm3_depth_cfg_override() > 0.0f) {
+        return MM3_LM_CFG_ROWS;
     }
     return std::fabs(mm3_ar_cfg_scale(c) - 1.0f) <= 1e-6f ? 1 : MM3_LM_CFG_ROWS;
 }
@@ -181,15 +203,26 @@ static inline int mm3_cfg_rows(const MM3LmConfig & c) {
 // K <= 8 on a guidance-distilled checkpoint that runs single-row.
 #define MM3_MAX_BATCH_ROWS 8
 
+// The LM alone may go past it: the plan dial's base rows double every take's
+// LM rows. Above 8 rows ggml takes MMQ, which measured faster here than
+// splitting into 8-row MMVQ matmuls (MM3_LM_ROW_SPLIT=1, mm3-lm-graph.h): 31.5
+// vs 38.2 ms per AR iteration at 16 rows on a 5090. The depth decoder and the
+// flow stage only ever see the adapter rows, within MM3_MAX_BATCH_ROWS.
+#define MM3_MAX_LM_ROWS 16
+
 // Largest K the row budget allows for this checkpoint. 4 normally, 8 at CFG 1.0.
-// `plan_rows`: the plan dial's base rows double every take's rows, so the
-// budget halves (2 takes with a CFG pair). Measured on a 5090, 300 s cap:
-// 3 takes with base rows want a 14.3 GB KV cache, filled the card and ran
-// ~10x slower (spilling to system RAM); within the budget the dial never
-// needs more VRAM than 4 takes do without it, and stays on MMVQ.
+// `plan_rows`: the plan dial's base rows double every take's LM rows, so 4
+// takes with a CFG pair need 16. VRAM is the real limit there, not the kernel:
+// on a 5090, 300 s cap, 3 takes with base rows want a 14.3 GB f16 KV cache,
+// filled the card and ran ~10x slower (spilling to system RAM). The request's
+// lm_kv_q8 halves that cache; the server sends it for more than 2 takes.
 static inline int mm3_max_takes(const MM3LmConfig & c, bool plan_rows = false) {
-    const int r = mm3_cfg_rows(c) * (plan_rows ? 2 : 1);
-    return r > 0 && r <= MM3_MAX_BATCH_ROWS ? MM3_MAX_BATCH_ROWS / r : 1;
+    const int p = mm3_cfg_rows(c);
+    if (p <= 0 || p > MM3_MAX_BATCH_ROWS) {
+        return 1;
+    }
+    const int k = MM3_MAX_BATCH_ROWS / p;
+    return plan_rows ? std::min(k, MM3_MAX_LM_ROWS / (2 * p)) : k;
 }
 
 // Clamp a requested take count into what the kernels can actually serve.

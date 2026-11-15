@@ -54,6 +54,7 @@ import {
 } from './hiddens.js';
 import { MM3_LM_ADAPTER_DEFAULT_SCALES, resolveMm3LmAdapterPath } from './lmAdapter.js';
 import { applyMm3Trigger, readMm3AdapterTrigger } from './trigger.js';
+import { classifyHeader } from '../../training/lyricTags.js';
 import { runPostProcessingChain } from '../../generation/postProcessing.js';
 import type { PostProcessParams } from '../../generation/postProcessing.js';
 import {
@@ -97,23 +98,6 @@ const MM3_MAX_DURATION_SEC = 300;
 const MM3_ENDING_TAKES  = 3;
 const MM3_ENDING_ROUNDS = 4;
 
-// ── Adapter tail fade (mm3AdapterTailFade) ───────────────────────────────────
-//
-// An LM adapter suppresses the base model's ending, so the fade hands the tail
-// back: full strength until the lyrics should be sung, then a 60 s ramp to the
-// base. The start is the base model's own pace (it sang a 336-word sheet by
-// ~183 s, 1.85 words/s) plus 30 s. Starting while lyrics remain does not work:
-// the base inherits half a song and runs to the cap (HOTSTEP-1068: 9/12 natural
-// endings with this rule against 2/12 without; 0-2/12 fading at 150 s).
-// Clamped so the base always gets a minute before the 300 s cap.
-const MM3_BASE_WORDS_PER_SEC = 1.85;
-const MM3_TAIL_FADE_LEN_SEC = 60;
-export function mm3TailFadeStartSec(lyrics: string): number | null {
-  const words = mm3SungWords(lyrics);
-  if (words === 0) return null;
-  return Math.round(Math.min(MM3_MAX_DURATION_SEC - MM3_TAIL_FADE_LEN_SEC, Math.max(60, words / MM3_BASE_WORDS_PER_SEC + 30)));
-}
-
 // ── Minimum length (mm3MinLength) ────────────────────────────────────────────
 //
 // A plan that reaches EOS after two seconds has ended, correctly, on a song the
@@ -147,6 +131,25 @@ function mm3SungWords(lyrics: string): number {
     .split(/\s+/)
     .filter(w => /[\p{L}\p{N}]/u.test(w))
     .length;
+}
+
+/**
+ * "[Chorus - High Energy]" -> "[Chorus]". MM3 sings a descriptor inside a
+ * section tag as a lyric line ("High Energy!"), so it steers nothing. Only a
+ * tag whose head (before " - ", ":", "(", "," or "|") is a section is cut, and
+ * the head is kept verbatim ("[Verse 1: soft]" -> "[Verse 1]"). The descriptor
+ * still reaches the music through the caption: Lyric Studio's Arrangement
+ * timeline is built from the full tags (lireek/prompts.ts extractSectionTags).
+ */
+export function mm3StripTagDescriptors(lyrics: string): { lyrics: string; stripped: string[] } {
+  const stripped: string[] = [];
+  const out = lyrics.replace(/\[([^\]\n]+)\]/g, (tag, body: string) => {
+    const head = body.split(/\s+[-–—]\s+|\s*[:(,|]/)[0].trim();
+    if (head === body.trim() || !head || !classifyHeader(head)) return tag;
+    stripped.push(tag);
+    return `[${head}]`;
+  });
+  return { lyrics: out, stripped };
 }
 
 /** Shortest plausible length for these lyrics, in seconds. */
@@ -423,7 +426,11 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
   // Instrumental: MM3's contract is blank lyrics → the engine substitutes its
   // own instrumental token. Do NOT send ACE's '[Instrumental]' sentinel; that
   // would be tokenized as literal lyric text.
-  const lyrics: string = params.instrumental ? '' : (params.lyrics || '');
+  const tagged = mm3StripTagDescriptors(params.instrumental ? '' : String(params.lyrics || ''));
+  const lyrics = tagged.lyrics;
+  if (tagged.stripped.length) {
+    notes.push(`section-tag descriptors removed from the lyrics (MM3 sings them): ${tagged.stripped.join(', ')}`);
+  }
 
   // ── Duration: ALWAYS auto on this backend ──────────────────────────────────
   //
@@ -543,7 +550,22 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
   // Variations and natural endings want the same batched AR pass, so they share
   // it rather than fighting: asking for more variations than the ending check
   // needs simply raises the candidate count.
-  const takes = requireEnding ? Math.max(MM3_ENDING_TAKES, askedTakes) : askedTakes;
+  //
+  // The plan dial below 1 doubles the planner's rows. Compact Planner Cache
+  // (mm3KvQ8, default on) uses q8_0 for every such render to leave VRAM headroom.
+  // One or two requested songs still use at most two candidates, even at q8;
+  // more variations can use the 16-row LM budget only while compact is on.
+  const planRaw = Number(params.mm3LmAdapterScalePlan);
+  const planRows = !!lmAdapterPath && fs.existsSync(lmAdapterPath)
+    && Number.isFinite(planRaw) && planRaw >= 0 && planRaw < 1;
+  const kvQ8 = planRows && params.mm3KvQ8 !== false;
+  const wantTakes = requireEnding ? Math.max(MM3_ENDING_TAKES, askedTakes) : askedTakes;
+  const takes = planRows && (askedTakes <= 2 || !kvQ8) ? Math.min(2, wantTakes) : wantTakes;
+  if (planRows && wantTakes > takes) {
+    notes.push(`LM adapter plan dial below 1: ${takes} takes per planning round`
+      + (askedTakes > 2 ? ' (Compact Planner Cache is off)' : ''));
+  }
+  if (kvQ8) notes.push(`planner KV cache at q8_0 for ${takes} takes with the plan dial's base rows`);
   if (requireEnding) {
     notes.push(
       `natural ending required: ${takes} candidate plans per round, up to ${MM3_ENDING_ROUNDS} rounds. `
@@ -551,7 +573,12 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
       + `stage. `
       + (askedTakes === 1
         ? 'The batch stops at the first natural ending and renders that one song. '
-        : `This produces 1..${takes} songs, depending on which candidates ended. `)
+        : 'The first round that has an ending wins: the candidates that ended in it are rendered and the rest '
+          + 'are dropped, not re-planned. '
+          + (lmAdapterPath && fs.existsSync(lmAdapterPath) && params.mm3BaseHandoff !== false
+            ? 'With Base Model Ending, a round where none ended rescues its capped candidates in order until '
+              + 'the first one ends, and renders that one. '
+            : ''))
       + `Turn "Require Natural Ending" off to render whatever the planner produced.`,
     );
   }
@@ -652,6 +679,7 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
       // batched AR pass. Omitted at 1 so an ordinary render's wire request is
       // byte-for-byte what it always was.
       ...(takes > 1 ? { takes } : {}),
+      ...(kvQ8 ? { lm_kv_q8: true } : {}),
       // Natural endings. Omitted entirely when off, so turning the toggle off
       // gives back exactly the request this backend sent before the feature
       // existed.
@@ -659,6 +687,12 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
         require_eos: true,
         eos_rounds: MM3_ENDING_ROUNDS,
         ...(askedTakes === 1 ? { stop_after_first_eos: true } : {}),
+        // Base handoff: the engine rescues capped adapter takes of a round where
+        // none ended, until the first rescue ends (base renders are untouched).
+        // Omitted when off or without an
+        // adapter, so those requests are what they were.
+        ...(params.mm3BaseHandoff !== false && lmAdapterPath && fs.existsSync(lmAdapterPath)
+          ? { eos_handoff: true } : {}),
       } : {}),
       // Minimum length. Omitted at 0 so turning the toggle off gives back
       // exactly the request this backend sent before the check existed. With
@@ -803,36 +837,10 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
         // Application mode: "runtime" (default; low-rank deltas in-graph, live
         // dials, ~+28%/step at r256) or "merge" (folded into the resident
         // weights once — zero per-step cost; scale changes re-merge).
-        // Strength along the song (engine MM3LmAdapterSchedule): the base for
-        // the first N s, full strength for the body, then a ramp back to the
-        // base (or a floor) for the ending. Off unless a fade is set. It needs
-        // the deltas in the graph, so it wins over merge mode.
-        const fadeNum = (key: string, max: number): number | undefined => {
-          const v = Number((params as Record<string, unknown>)[key]);
-          return Number.isFinite(v) && v >= 0 && v <= max ? v : undefined;
-        };
-        const fade = {
-          lm_adapter_fade_in: fadeNum('mm3LmAdapterFadeIn', 360),
-          lm_adapter_fade_out: fadeNum('mm3LmAdapterFadeOut', 360),
-          lm_adapter_fade_len: fadeNum('mm3LmAdapterFadeLen', 360),
-          lm_adapter_fade_floor: fadeNum('mm3LmAdapterFadeFloor', 1),
-        };
-        // The Generation toggle derives the fade from the lyrics; explicit fade
-        // params (scripts, A/B arms) win over it.
-        if (params.mm3AdapterTailFade === true && fade.lm_adapter_fade_out === undefined) {
-          const start = mm3TailFadeStartSec(lyrics);
-          if (start === null) {
-            notes.push('Adapter tail fade skipped: no sung lyrics to time it from');
-          } else {
-            fade.lm_adapter_fade_out = start;
-            fade.lm_adapter_fade_len ??= MM3_TAIL_FADE_LEN_SEC;
-            notes.push(`Adapter tail fade: full strength to ${start}s, then down to the base model by ${start + MM3_TAIL_FADE_LEN_SEC}s`);
-          }
-        }
-        const fadeOn = (fade.lm_adapter_fade_in ?? 0) > 0 || (fade.lm_adapter_fade_out ?? 0) > 0;
-        if (fadeOn && params.mm3LmAdapterMode === 'merge') {
-          notes.push('LM adapter fade set: rendering in runtime mode, since a merged adapter cannot change strength mid-song');
-        }
+        // The engine's lm_adapter_fade_* fields stay a diagnostic with no user
+        // path: the Adapter Tail Fade ran the base on the adapter's cache and
+        // turned capped takes to static (HOTSTEP-1179). Saved presets that
+        // still carry mm3AdapterTailFade or mm3LmAdapterFade* are ignored.
         // Plan dial (engine lm_adapter_plan): below 1 the engine adds base rows
         // with the adapter delta masked off, which a merged LM has no base
         // weights for. Sent only when it does something.
@@ -841,10 +849,10 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
         if (plan !== undefined && params.mm3LmAdapterMode === 'merge') {
           notes.push('LM adapter plan dial below 1: rendering in runtime mode, since a merged adapter has no base weights to plan with');
         }
-        // The base rows double the planner's batch, so the engine plans at most
-        // 2 takes (engine mm3_max_takes); a 3- or 4-candidate ask gets 2.
-        if (plan !== undefined) notes.push(`LM adapter plan dial: ${plan} (at most 2 takes per planning round)`);
-        const mode = params.mm3LmAdapterMode === 'merge' && !fadeOn && plan === undefined ? 'merge' : 'runtime';
+        // The base rows double the planner's batch; the take count is settled
+        // with the q8 cache above (planRows).
+        if (plan !== undefined) notes.push(`LM adapter plan dial: ${plan}`);
+        const mode = params.mm3LmAdapterMode === 'merge' && plan === undefined ? 'merge' : 'runtime';
         notes.push(`LM adapter: ${path.basename(resolved)} (${mode})`);
         const mergeGpu = params.mm3LmMergeGpu !== false;
         if (mode === 'merge') notes.push(`LM adapter merging: ${mergeGpu ? 'GPU preferred' : 'CPU-assisted'}`);
@@ -858,7 +866,6 @@ export function mapMinimaxParams(params: any): MinimaxParamMapping {
           lm_adapter_scale_early: dial('mm3LmAdapterScaleEarly', d.scaleEarly),
           lm_adapter_scale_mid: dial('mm3LmAdapterScaleMid', d.scaleMid),
           lm_adapter_scale_late: dial('mm3LmAdapterScaleLate', d.scaleLate),
-          ...(fadeOn ? fade : {}),
           ...(plan !== undefined ? { lm_adapter_plan: plan } : {}),
         };
       })() : {}),
@@ -1008,6 +1015,13 @@ export function minimaxStageText(d: Mm3JobDetail, elapsedSec: number): { stage: 
         progress: 10 + Math.round(frac(d.step, d.n_steps) * 25),
       };
     }
+    case 'handoff':
+      // Base Model Ending: the base plays out capped take `window` of `n_windows`.
+      // Not a new planning round, so it does not reuse the 'ar' wording.
+      return {
+        stage: `MiniMax-Music3: base model ending take ${d.window + 1} of ${d.n_windows} (frame ${d.step}/${d.n_steps})`,
+        progress: 35,
+      };
     case 'cond':
       return { stage: `MiniMax-Music3: conditioning (window ${d.window + 1}/${d.n_windows})`, progress: 36 + Math.round(frac(d.window + 1, d.n_windows) * 4) };
     case 'flow': {
@@ -1261,7 +1275,15 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
     }, DETAIL_POLL_MS);
     detailTimer.unref?.();
 
-    await deps.pollUntilDone(sub.job_id, job, deps.signal, timeoutMinutes);
+    try {
+      await deps.pollUntilDone(sub.job_id, job, deps.signal, timeoutMinutes);
+    } catch (err) {
+      if (!deps.signal.aborted) {
+        const detail = await mm3JobDetail(sub.job_id).catch(() => undefined);
+        if (detail?.status === 'failed' && detail.error) throw new Error(detail.error);
+      }
+      throw err;
+    }
     clearInterval(detailTimer);
     detailTimer = undefined;
     timing.push({ name: 'MM3 Generate', ms: Math.round(performance.now() - submitStart) });
@@ -1412,7 +1434,8 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
         .filter(s => s.length > 0);
       job.mm3Takes = nTakes;
       if (seeds.length) job.mm3TakeSeeds = seeds;
-      job.mm3Ending = { planned, rendered: nTakes, dropped, rounds };
+      const rescued = takeDetail.flatMap((d, i) => (d?.rescued === true ? [i] : []));
+      job.mm3Ending = { planned, rendered: nTakes, dropped, rounds, ...(rescued.length ? { rescued } : {}) };
       const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
       log('INFO',
         `[MM3] Candidates: ${planned} ${plural(planned, 'plan', 'plans')} in `
@@ -1421,6 +1444,20 @@ export async function runMinimaxGeneration(job: GenerationJob, deps: MinimaxGene
         + `${tooShort} too short, `
         + `${Math.max(0, dropped - capped - tooShort)} other candidates not selected`
         + (seeds.length ? ` (seeds ${seeds.join(', ')})` : ''));
+      // The first round with an ending wins, so a render can come back with
+      // fewer songs than were planned per round.
+      const wanted = req.stop_after_first_eos ? 1 : Number(req.takes ?? 1);
+      if (req.require_eos && !finalDetail?.eos_fallback && nTakes < wanted) {
+        log('INFO', `[MM3] ${wanted - nTakes} of ${wanted} ${plural(wanted, 'song', 'songs')} dropped for want of an `
+          + `ending: rendering the ${nTakes} that ended in round ${rounds}, the first round with an ending`);
+      }
+      if (rescued.length) {
+        log('INFO', `[MM3] Base handoff: ${rescued.length} capped ${plural(rescued.length, 'take', 'takes')} ended by `
+          + 'the base model ('
+          + rescued.map(i => `take ${i + 1}: switched at ${Number(takeDetail[i].handoff_cue_s).toFixed(1)}s, `
+            + `ended ${Number(takeDetail[i].handoff_eos_s).toFixed(1)}s later`).join('; ')
+          + ')');
+      }
       if (finalDetail?.eos_fallback) {
         // Every plan hit the cap. The engine rendered the longest one instead
         // of failing, so the user gets audio — but it does not end, and the two

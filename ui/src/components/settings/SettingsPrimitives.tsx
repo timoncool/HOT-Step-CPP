@@ -32,7 +32,7 @@ export const SettingRow: React.FC<{
   defaultValue?: boolean;
   disabled?: boolean;
 }> = ({ id, label, description, checked, onChange, badges, defaultValue, disabled }) => (
-  <div className="setting-row">
+  <div className="setting-row setting-row--compact">
     <div className="setting-info">
       <div className="setting-label">
         <ParamLabel
@@ -64,7 +64,7 @@ export const SelectRow: React.FC<{
   defaultValue?: string | number;
   disabled?: boolean;
 }> = ({ id, label, description, value, options, onChange, defaultValue, disabled }) => (
-  <div className="setting-row">
+  <div className="setting-row setting-row--compact">
     <div className="setting-info">
       <ParamLabel
         label={label}
@@ -78,7 +78,7 @@ export const SelectRow: React.FC<{
       value={value}
       onChange={(v) => onChange(String(v))}
       options={options}
-      className="min-w-[100px]"
+      className="setting-select"
       disabled={disabled}
     />
   </div>
@@ -107,8 +107,9 @@ export const EnvTextRow: React.FC<{
   onChange: (key: string, value: string) => void;
   type?: 'text' | 'number';
   placeholder?: string;
-}> = ({ envKey, label, description, value, onChange, type = 'text', placeholder }) => (
-  <div className="setting-row">
+  fullWidth?: boolean;
+}> = ({ envKey, label, description, value, onChange, type = 'text', placeholder, fullWidth = false }) => (
+  <div className={`setting-row${fullWidth ? ' setting-row--wide' : ' setting-row--compact'}`}>
     <div className="setting-info">
       <div className="setting-label">
         <ParamLabel label={label} info={description} className="" />
@@ -139,7 +140,7 @@ export const EnvPasswordRow: React.FC<{
 }> = ({ envKey, label, description, value, onChange, placeholder }) => {
   const [visible, setVisible] = useState(false);
   return (
-    <div className="setting-row">
+    <div className="setting-row setting-row--compact">
       <div className="setting-info">
         <ParamLabel label={label} info={description} className="setting-label" />
       </div>
@@ -220,6 +221,6 @@ export const EnvSubsection: React.FC<{
       />
       <span className="env-subsection-title">{title}</span>
     </div>
-    {isOpen && children}
+    {isOpen && <div className="settings-grid">{children}</div>}
   </div>
 );

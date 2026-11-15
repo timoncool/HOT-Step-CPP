@@ -201,11 +201,11 @@ export function useYue2Build(token: string | null, sessionId: string, setSession
 
   // One mutation per command; they share commit/fail because every one returns the session's new snapshot.
   const generateMut = useMutation({
-    mutationFn: async (v: { params: Record<string, unknown>; to: number; count: number; caption: string; lyrics: Record<string, string> }) => {
+    mutationFn: async (v: { params: Record<string, unknown>; to: number; count: number; caption: string; lyrics: Record<string, string>; newChords: boolean }) => {
       let started = live;
       if (!started) { started = await yue2CoverApi.buildStart(v.params, draft.text ?? undefined); setSessionId(started.id); }
       if (Object.keys(v.lyrics).length) started = await yue2CoverApi.buildOccurrenceLyrics(started.id, started.revision, v.lyrics);
-      return yue2CoverApi.buildGenerate(started.id, started.revision, v.to, v.count, v.caption || undefined);
+      return yue2CoverApi.buildGenerate(started.id, started.revision, v.to, v.count, v.caption || undefined, v.newChords);
     },
     onSuccess: commit, onError: fail,
   });
@@ -276,8 +276,8 @@ export function useYue2Build(token: string | null, sessionId: string, setSession
     session: live, loading: lyricsTarget(sessionId, live) === 'loading', error: error || snapshot.error?.message || '', busy,
     /** Generates takes, starting the session from `params` if there is none. A non-empty
      *  `caption` is these takes' own; `lyrics` (occurrence id to lines) is applied first. */
-    generate: (params: Record<string, unknown>, to: number, count: number, caption: string, lyrics: Record<string, string> = {}) =>
-      generateMut.mutateAsync({ params, to, count, caption, lyrics }).catch(() => null),
+    generate: (params: Record<string, unknown>, to: number, count: number, caption: string, lyrics: Record<string, string> = {}, newChords = false) =>
+      generateMut.mutateAsync({ params, to, count, caption, lyrics, newChords }).catch(() => null),
     /** Gives unbuilt occurrences their own lines, or (null) the build's again. */
     occurrenceLyrics: (edits: Record<string, string | null>) => { void occurrenceLyricsMut.mutateAsync({ edits }).catch(() => null); },
     /** Applies new cover settings to the session (before its first keep). */
@@ -346,7 +346,8 @@ function TakeWave({ peaks, from, to, playhead, crop, canIn, colour, onSeek }: {
 }
 
 /** "vocal melody only, free tempo, source key, condition strength 1, AR strength 0.6" */
-export function settingsSummary(s: BuildSettings, keyLabel: string): string {
+export function settingsSummary(s: BuildSettings, keyLabel: string, cover = true): string {
+  if (!cover) return `condition strength ${s.cfgScale}, AR strength ${s.arStrength}`;
   const tempo = typeof s.tempo === 'number' ? `${s.tempo} BPM` : s.tempo === 'free' ? 'free tempo' : 'source tempo';
   const key = s.keyShift === 0 ? 'source key' : `${s.keyShift > 0 ? '+' : ''}${s.keyShift} st${keyLabel ? ` (${transposeKey(keyLabel, s.keyShift)})` : ''}`;
   return [s.voices === 'vocal' ? 'vocal melody only' : 'vocal + instrumental line', tempo, key,
@@ -357,8 +358,8 @@ export function settingsSummary(s: BuildSettings, keyLabel: string): string {
  *  Prepare page's and change at once. A build has its own: edits wait for
  *  Apply, which rebuilds the build's request before its first keep and starts
  *  a fresh build after it. */
-function SettingsRow({ value, onApply, build, kept, disabled, keyLabel, sourceBpm }: {
-  value: BuildSettings; onApply: (settings: BuildSettings) => void; build: boolean; kept: boolean; disabled: boolean; keyLabel: string; sourceBpm: number;
+function SettingsRow({ value, onApply, build, kept, disabled, keyLabel, sourceBpm, cover }: {
+  value: BuildSettings; onApply: (settings: BuildSettings) => void; build: boolean; kept: boolean; disabled: boolean; keyLabel: string; sourceBpm: number; cover: boolean;
 }) {
   const saved = JSON.stringify(value);
   const [draft, setDraft] = useState(value);
@@ -373,7 +374,7 @@ function SettingsRow({ value, onApply, build, kept, disabled, keyLabel, sourceBp
   if (kept && !open) return (
     <div className="flex flex-wrap items-center gap-2 border-b border-zinc-200 dark:border-white/10 px-4 py-2 text-xs text-zinc-500">
       <Lock className="w-3 h-3" />
-      <span className="min-w-0 flex-1">Settings locked: the kept sections were built with {settingsSummary(value, keyLabel)}. Changing them starts a fresh build.</span>
+      <span className="min-w-0 flex-1">Settings locked: the kept sections were built with {settingsSummary(value, keyLabel, cover)}. Changing them starts a fresh build.</span>
       <button type="button" onClick={() => setOpen(true)} disabled={disabled}
         className="flex items-center gap-1 text-cyan-700 dark:text-cyan-300 disabled:opacity-40">Change<ChevronDown className="w-3 h-3" /></button>
     </div>
@@ -381,24 +382,24 @@ function SettingsRow({ value, onApply, build, kept, disabled, keyLabel, sourceBp
   return (
     <fieldset disabled={disabled} className="border-b border-zinc-200 dark:border-white/10 px-4 py-2 space-y-2">
       <div className="flex flex-wrap items-start gap-x-5 gap-y-3 [&>*]:min-w-[150px] [&>*]:flex-1" aria-label="Build settings">
-        <div className="space-y-2">
+        {cover && <div className="space-y-2">
           <ParamLabel label="Voices" info="Vocal melody alone gives the new style room to choose its instruments. Both keeps the transcribed instrumental line too." />
           <StyledSelect accent="pink" value={shown.voices} disabled={disabled} onChange={v => set({ voices: v as BuildSettings['voices'] })}
             options={[{ value: 'vocal', label: 'Vocal melody only' }, { value: 'both', label: 'Vocal + instrumental line' }]} />
-        </div>
-        <div className="space-y-2">
+        </div>}
+        {cover && <div className="space-y-2">
           <ParamLabel label="Tempo" info="Free removes the score tempo; Source retains it; Set writes a target BPM using the score's beat unit." />
           <StyledSelect accent="pink" value={tempoMode} disabled={disabled}
             onChange={v => set({ tempo: v === 'set' ? (typeof shown.tempo === 'number' ? shown.tempo : Math.max(20, Math.min(300, sourceBpm))) : v as 'free' | 'source' })}
             options={[{ value: 'free', label: 'Free (style decides)' }, { value: 'source', label: 'Source tempo' }, { value: 'set', label: 'Set BPM' }]} />
-        </div>
-        {typeof shown.tempo === 'number' && <EditableSlider label="Target BPM" value={shown.tempo} min={20} max={300} step={1} disabled={disabled}
+        </div>}
+        {cover && typeof shown.tempo === 'number' && <EditableSlider label="Target BPM" value={shown.tempo} min={20} max={300} step={1} disabled={disabled}
           onChange={v => set({ tempo: v })} helpText={`Source: ${sourceBpm} BPM`} />}
-        <EditableSlider label="Pitch Shift" value={shown.keyShift} min={-12} max={12} step={1} defaultValue={0} disabled={disabled || !keyLabel}
+        {cover && <EditableSlider label="Pitch Shift" value={shown.keyShift} min={-12} max={12} step={1} defaultValue={0} disabled={disabled || !keyLabel}
           onChange={v => set({ keyShift: v })}
           formatDisplay={v => v === 0 ? 'Source key' : `${v > 0 ? '+' : ''}${v} st → ${transposeKey(keyLabel, v)}`}
           helpText={keyLabel ? `Source: ${keyLabel}.` : 'No supported score key found.'}
-          tooltip="Moves the score up or down by whole semitones, within twelve." />
+          tooltip="Moves the score up or down by whole semitones, within twelve." />}
         <EditableSlider label="Condition strength" value={shown.cfgScale} min={0.1} max={2} step={0.05} defaultValue={1} disabled={disabled}
           onChange={v => set({ cfgScale: v })} tooltip="Tightens style, lyrics and score together." />
         <CoverArStrength value={shown.arStrength} onChange={v => set({ arStrength: v })} disabled={disabled} />
@@ -440,6 +441,10 @@ interface PageProps {
   keyLabel: string;
   sourceBpm: number;
   title: string;
+  /** False for a build that is not a cover (Custom-Gen's): the voices, tempo and key shift controls do not show. Default true. */
+  coverSettings?: boolean;
+  /** The back button's label. Default "Prepare". */
+  backLabel?: string;
   /** The score in source order, and the source recording ('' when there is none or a cut means the
    *  score no longer follows it), for the source bar's playback popup. */
   scoreAbc: string;
@@ -451,7 +456,7 @@ interface PageProps {
   /** The build's caption, which the caption field starts from for each section. */
   caption: string;
   /** `caption`, when non-empty, is these takes' own; `lyrics` (occurrence id to lines) is applied first. True once queued. */
-  onGenerate: (to: number, count: number, caption: string, lyrics: Record<string, string>) => Promise<boolean>;
+  onGenerate: (to: number, count: number, caption: string, lyrics: Record<string, string>, newChords: boolean) => Promise<boolean>;
   /** Gives unbuilt occurrences their own lines, or (null) the build's again. */
   onOccurrenceLyrics: (edits: Record<string, string | null>) => void;
   /** Sets what the unbuilt part of the output is: section ids (s0...) or upcoming occurrence ids (o3...). */
@@ -484,6 +489,8 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
   const generation = useRef(0);
   const [target, setTarget] = useState<string | null>(null);
   const [count, setCount] = useState(4);
+  // New chords per take is the default for a build that is not a cover; a cover follows its score.
+  const [newChords, setNewChords] = useState(p.coverSettings === false);
   const [menu, setMenu] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   // Crops set on takes not yet kept (applied by Keep), and the take whose crop is being edited.
@@ -633,7 +640,7 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
   const current = Object.fromEntries(shown.map(x => [x.item.id, x.lines]));
   const generate = async () => {
     if (range === null) return;
-    if (await p.onGenerate(range, count, submittedCaption(caption, p.caption), pendingLyrics(drafts, current))) setDrafts({});
+    if (await p.onGenerate(range, count, submittedCaption(caption, p.caption), pendingLyrics(drafts, current), newChords)) setDrafts({});
   };
   const bars = (i: number) => s?.arrangement.sections[i]?.bars ?? (p.sections[i + 1]?.startBar ?? p.totalBars + 1) - p.sections[i].startBar;
   const itemBars = (i: PlanItem) => i.improv ?? bars(i.section);
@@ -670,7 +677,7 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
       {/* Top bar: what is being built and how. */}
       <div className="flex flex-wrap items-center gap-3 border-b border-zinc-200 dark:border-white/10 px-4 py-2">
         <button type="button" onClick={p.onBack} className="flex items-center gap-1 text-xs text-zinc-600 dark:text-zinc-300 hover:text-cyan-600">
-          <ArrowLeft className="w-3.5 h-3.5" />Prepare</button>
+          <ArrowLeft className="w-3.5 h-3.5" />{p.backLabel ?? 'Prepare'}</button>
         <p className="min-w-0 flex-1 truncate text-sm font-semibold text-zinc-900 dark:text-white">{p.title}</p>
         <div className="relative">
           <button type="button" onClick={() => setMenu(m => !m)} disabled={!s} aria-label="Build actions"
@@ -691,7 +698,7 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
       </div>
 
       <SettingsRow value={p.settings} onApply={p.onSettings} build={!!s} kept={!!s?.kept.length} disabled={!editable}
-        keyLabel={p.keyLabel} sourceBpm={p.sourceBpm} />
+        keyLabel={p.keyLabel} sourceBpm={p.sourceBpm} cover={p.coverSettings !== false} />
 
       {/* Source bar: the score as it is. Song bar: what the output will be, kept occurrences first. */}
       <div className="border-b border-zinc-200 dark:border-white/10 px-4 py-3 space-y-2">
@@ -901,6 +908,7 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
                   <button type="button" onClick={() => remove(take.id)} disabled={p.busy} aria-label={`Delete take ${i + 1}`}
                     className="rounded p-1 text-zinc-400 hover:text-red-500 disabled:opacity-40"><Trash2 className="w-4 h-4" /></button>
                 </div>
+                {take.planNote && <p className="text-xs text-amber-600">{take.planNote}</p>}
                 <TakeWave peaks={take.peaks ?? []} from={full.from} to={full.to} playhead={playheadOf(take.id)} crop={set}
                   canIn={cropLimits(take).inMax > 0} colour={colour}
                   onSeek={at => seek(take.id, take.audioUrl, full.from, full.to, at, offset)} />
@@ -922,6 +930,12 @@ export const Yue2BuildPage: React.FC<PageProps> = p => {
             {s?.error && <p role="alert" className="text-xs text-red-500">Last take failed: {s.error}</p>}
           </div>
           {!done && <div className="space-y-1">
+            <div role="radiogroup" aria-label="Chords for these takes" className="flex gap-2 text-xs"
+              title="Takes of a section you have not built yet can each write their own chords, planned after what you kept, or follow the score as it stands. A repeat of a section you kept follows the kept one either way.">
+              {([[true, 'New chords per take'], [false, 'Follow the score']] as const).map(([on, text]) =>
+                <button type="button" key={text} role="radio" aria-checked={newChords === on} onClick={() => setNewChords(on)}
+                  className={`rounded-lg border px-2 py-1 ${newChords === on ? 'border-cyan-500 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300' : 'border-zinc-300 dark:border-white/10'}`}>{text}</button>)}
+            </div>
             <div className="flex items-center gap-2">
               <div className="w-20 flex-shrink-0" title="Takes per run">
                 <StyledSelect accent="pink" value={count} onChange={v => setCount(Number(v))}

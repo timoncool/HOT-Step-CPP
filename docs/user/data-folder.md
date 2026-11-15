@@ -21,14 +21,18 @@ Engine binaries, the bundled Node runtime, UI, shipped plugins, noise samples an
 
 ## Upgrade to a new version
 
+In **Settings > Updates**, Windows portable installs started by a compatible updater launcher offer **Download update**. Downloading verifies and stages the release without changing the running app. You can cancel it. When ready, finish running jobs, click **Restart and install** and confirm. The screen waits for the launcher to restart HOT-Step, shows the outcome and offers **Reload** for the new UI. If the new version fails and rolls back, the old version runs with its restored data. If recovery is required, follow the HOT-Step launcher window. After five minutes without a result, the screen points to that window and keeps checking.
+
+Older releases, Linux and macOS require the manual upgrade below. The Updates panel explains why and links to the release. Source checkouts must close HOT-Step and run `update.bat` in the install folder. Portable installs follow releases only.
+
 1. Stop HOT-Step and back up your data folder, including `settings/.env`.
 2. Extract the complete new archive into a separate folder.
 3. Start `HOT-Step.bat` on Windows or `./HOT-Step.sh` on Linux and macOS.
 4. Check **Settings > Storage & Data > Data folder**. The saved location should be unchanged.
 
-Releases before v1.4.1 kept their data inside the app folder. With no saved location, starting the new launcher inside such an install carries that install's data into the sibling folder. Conflicting populated destinations stop startup instead of merging libraries.
+Releases before v1.4.1 kept their data inside the app folder. With no saved location, a new version extracted over such an install carries that install's data into the sibling `HOT-Step-Data` folder the first time `HOT-Step.bat` or `HOT-Step.sh` starts it. If that move stops, the next start resumes it. Conflicting populated destinations stop startup instead of merging libraries.
 
-A fresh extraction elsewhere cannot find an arbitrary older app folder. Use **Import previous install** in Settings and provide the older app folder. Import needs an empty current library and never merges libraries. It moves the older install's library, models, adapters, logs and Whisper into the data folder, and copies its own Lua plugins and downloaded runtime libraries. The older app folder stays in place without that data, and its `.env` is renamed `.env.migrated`. Its settings become `settings/.env`; a `settings/.env` the data folder already had is kept as `settings/.env.before-import-<id>`.
+A fresh extraction elsewhere cannot find an arbitrary older app folder. Run **Import previous install** in Settings first, before you create any songs or settings in the new library, and provide the older app folder. Import needs an empty current library and never merges libraries. It moves the older install's library, models, adapters, logs and Whisper into the data folder, and copies its own Lua plugins and downloaded runtime libraries. The older app folder stays in place without that data, and its `.env` is renamed `.env.migrated`. Its settings become `settings/.env`; a `settings/.env` the data folder already had is kept as `settings/.env.before-import-<id>`.
 
 ## Choose or move a folder
 
@@ -39,7 +43,7 @@ Open the **Data folder** panel on the **Storage & Data** tab of Settings, choose
 - **Create empty data folder** starts an empty library in an empty destination while retaining your current folder.
 - **Import previous install** moves an older install's data into the current empty library, as described above. Enter the older app folder, not its data subfolder.
 
-The data folder cannot be inside the app folder, and Settings refuses a folder that another install recorded in your profile already uses, such as the release app or a development checkout.
+The data folder cannot be inside the app folder. On Windows installs with an updater launcher, this means the whole extracted folder containing `HOT-Step.bat`, including locations outside its `app/` subfolder. Settings also refuses a folder that another install recorded in your profile already uses, such as the release app or a development checkout.
 
 Click **Preview change** to see the folders, size and space required. Finish queued and active work and downloads, then click **Confirm and restart**. Transfers run before the library opens; the launch console shows progress. Same-volume moves rename folders. Across volumes, HOT-Step copies and checks file sizes before removing verified source folders. External path overrides remain outside the transfer.
 

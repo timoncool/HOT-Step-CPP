@@ -15,6 +15,87 @@ request capture, and the engine capability manifest are in
 The C++ engine has its own HTTP API on port 8085, used only by the Node server. Its request
 format is documented in [engine/docs/ARCHITECTURE.md](../../engine/docs/ARCHITECTURE.md).
 
+Update preparation is available only to Windows x64 portable installs with a valid
+release identity, an exact supported variant, and `updaterProtocol >= 1`. A source
+checkout uses `update.bat`. The stable launcher supplies `HOT_STEP_INSTALL_ROOT`;
+staging lives in its `updater` folder, outside the active payload and data root.
+Existing protocol-0 packages remain notice-only.
+
+`GET /api/health` reports `engine.ready`, `engine.failed`, `engine.noModels`
+and the server's reason in `engine.bootStatus`. The tab shows that reason when
+`failed` is true and suppresses the first-run Model Manager prompt. Failure
+takes priority over `noModels`. While the engine starts, both flags are false
+and neither banner appears. An empty models folder still shows the download
+banner and opens the Model Manager after eight seconds. Health polling continues
+after readiness so later failures and model-scan results reach the tab.
+
+`POST /api/updates/check` discovers a candidate for the latest stable release when
+preparation is eligible. `GET /api/updates/status` never fetches from GitHub; its
+`prepare` object reports `offered`, a plain `reason`, `candidate`, `phase`,
+`downloadedBytes`, `totalBytes`, `error`, and `preparedId`. The candidate contains
+`id`, `tag`, `sha`, `variant`, `assetName`, and `bytes`. Its opaque ID expires after
+an hour or a server restart.
+
+`POST /api/updates/prepare` accepts only `{ "candidateId": "<server-issued ID>" }`
+and returns 202 with the preparation status. Poll the status endpoint until
+`ready`, `failed`, or `cancelled`. A second prepare returns 409. To cancel, post
+the same body to `/api/updates/prepare/cancel`. Both mutations reject cross-origin
+requests. Downloads restart from zero after failure or cancellation.
+
+The service rechecks release metadata, requires the exact asset and its SHA-256
+sidecar, and verifies both API digests. It streams into private staging, validates
+archive paths and sizes, and checks the extracted runtime and embedded build
+identity. It accepts stored/deflate ZIPs up to 2 GiB compressed, 8 GiB expanded,
+and 20,000 entries; ZIP64 and unsupported extensions require manual installation.
+Preflight reserves the maximum expanded size plus 256 MiB of headroom. A successful
+prepare leaves `<updater>/<preparedId>/payload` and `ready.json` for the launcher.
+`getPrepared()` on the exported `updateDownloads` service returns the internal
+receipt and paths. Preparation never changes the active payload or data root.
+The archive must be the versioned layout (stable launcher root plus exactly one
+`app/<id>/`, see [Windows updater layout](releasing.md#windows-updater-layout-protocol-1)).
+On the next prepare, a lock with a provably dead owner is reclaimed once.
+Malformed lock records are reclaimed after a 30-second initialization grace;
+live owners and uncertain process probes keep their locks. While holding the
+lock, the service removes incomplete `prepare-xxxxxx` directories left by a
+crashed prepare. It preserves links, unrelated directories, and every directory
+with a `ready.json` receipt. An existing ready receipt blocks a second prepare.
+After a server restart the service takes back a valid receipt for a newer release
+(status `ready`, same `preparedId` and candidate ID) when the staged files still
+match the names and sizes in `ready.json`, and deletes one that is stale or no
+longer checks out; hashes are checked again before apply. The launcher deletes staging it has installed from.
+
+`POST /api/updates/apply` accepts only `{ "candidateId": "<staged candidate ID>" }`
+and rejects cross-origin requests. It needs `install.supported` from the status
+endpoint: updater protocol 1 or higher, started by the stable launcher, Windows.
+It checks every staged file against the SHA-256 recorded while extracting the
+verified archive (same names, sizes and hashes), refuses a payload whose files
+differ from its `payload-manifest.json`, then opens the maintenance transaction:
+preflight (a scheduled data-folder move, data overlapping the app, the data folder
+or a path setting anywhere inside the install folder, older `app/<id>` included),
+lease, gate closed, in-flight requests drained, busy check. Answers:
+
+- 202 `{ phase: "stopping", from, to }`: the launcher took the update. The server
+  stops about 300 ms later. Poll `GET /api/health` until it answers, then read
+  `install.lastResult` from the status endpoint.
+- 409 `{ error, blockers }`: work is running or queued. The gate reopened and
+  nothing was cancelled. A 409 without `blockers` means unsupported, not staged,
+  a different candidate, already installing, or the launcher refused.
+- 400 `{ error, errors }`: preflight failed, with one entry per problem.
+
+The status endpoint's `install` object reports `supported`, `reason`, `phase`
+(`idle` or `stopping`) and `lastResult`, the launcher's record of the last update:
+`{ outcome, from, to, at, message }`, where `outcome` is `installed`,
+`rolled-back` (the new version failed before commit and the old one runs on its
+restored data), `recovery-required` (nothing was started; the launcher window says
+what to fix) or `failed` (stopped before anything changed). `from` and `to` are
+payload names (`<tag>-<sha12>-<variant>`).
+
+`/api/maintenance` is mounted in `server/src/index.ts`, so it is missing from the
+generated table below. `GET /api/maintenance/status` is the launcher's health
+attestation (`closed`, `leaseId`, `build`, `db`, `ui`, `engine`) and
+`POST /api/maintenance/release` opens the gate. While a lease is held both need the
+`x-hotstep-maintenance-token` header; otherwise they are open and report an open gate.
+
 MM3 cover encoding uses `POST /api/mm3/cover/encode` with `sourceAudioUrl`, optional
 `sourceName`, and `launder: true` for the Cover Studio path. API callers can omit
 `launder` for plain encoding. Laundering accepts `launderSteps` (integer 1..1000,
@@ -176,7 +257,7 @@ For development testing, set `HOTSTEP_YUE2_COVER_FORCE_FALLBACK=1` while running
 
 Total: <!-- generated:start route-count -->
 <!-- generated by tools/docs/build-docs.mjs, do not edit by hand -->
-493 routes
+491 routes
 <!-- generated:end route-count -->
 
 <!-- generated:start routes -->
@@ -208,6 +289,7 @@ Total: <!-- generated:start route-count -->
 | `POST` | `/api/songs/export-zip` | `server/src/routes/songs.ts` |
 | `POST` | `/api/songs/nuke-generations` | `server/src/routes/songs.ts` |
 | `POST` | `/api/songs/:id/crop` | `server/src/routes/songs.ts` |
+| `POST` | `/api/songs/:id/fade` | `server/src/routes/songs.ts` |
 | `POST` | `/api/songs/lyrics/offset` | `server/src/routes/songs.ts` |
 | `POST` | `/api/songs/lyrics/split` | `server/src/routes/songs.ts` |
 | `POST` | `/api/songs/lyrics/timings` | `server/src/routes/songs.ts` |
@@ -253,20 +335,6 @@ Total: <!-- generated:start route-count -->
 | `GET` | `/api/health/presence` | `server/src/routes/health.ts` |
 | `GET` | `/api/health` | `server/src/routes/health.ts` |
 
-### `/api/updates`
-
-| Method | Path | Defined in |
-|---|---|---|
-| `GET` | `/api/updates/status` | `server/src/routes/updates.ts` |
-| `POST` | `/api/updates/check` | `server/src/routes/updates.ts` |
-
-### `/api/shutdown`
-
-| Method | Path | Defined in |
-|---|---|---|
-| `POST` | `/api/shutdown` | `server/src/routes/shutdown.ts` |
-| `POST` | `/api/shutdown/restart` | `server/src/routes/shutdown.ts` |
-
 ### `/api/mastering`
 
 | Method | Path | Defined in |
@@ -280,6 +348,7 @@ Total: <!-- generated:start route-count -->
 
 | Method | Path | Defined in |
 |---|---|---|
+| `POST` | `/api/download/reveal` | `server/src/routes/download.ts` |
 | `GET` | `/api/download/:id/lrc` | `server/src/routes/download.ts` |
 | `POST` | `/api/download/:id/lrc/save` | `server/src/routes/download.ts` |
 | `GET` | `/api/download/:id` | `server/src/routes/download.ts` |

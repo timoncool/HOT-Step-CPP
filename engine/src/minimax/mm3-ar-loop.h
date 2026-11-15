@@ -151,20 +151,32 @@ struct MM3ArResult {
     int64_t n_codebooks  = 0;  // 8 = 1 semantic + 7 acoustic
     int64_t sem_vocab    = 0;  // SV
     bool    eos_hit      = false;
-    // EOS trace (MM3ArOptions::eos_trace), one entry per iteration, take 0 only:
+    // EOS trace (MM3ArOptions::eos_trace), one entry per iteration, every take:
     //   eos_p_cond   softmax of the raw CONDITIONAL candidate row at EOS
+    //   eos_p_uncond the same on the raw UNCONDITIONAL row (what CFG subtracts)
     //   eos_p_final  what the sampler would draw: CFG-guided, masked by the
     //                conditional top-k, then top-k'd again (mm3_sample_top_k)
     //   eos_rank     EOS's rank in the conditional row (0 = argmax)
     //   eos_topk_ok  1 when EOS survived the conditional top-k mask
+    //   emit_lp      log-softmax of the raw conditional row at the code this
+    //                iteration emitted (the forced code under replay, EOS on
+    //                the iteration that ended the take)
+    //   emit_rank    that code's rank in the raw conditional row
     // Exists to answer "does the adapter still predict an ending at the true
     // end of a real track" under forced replay, without touching sampling.
-    std::vector<float>   eos_p_cond, eos_p_final;
-    std::vector<int32_t> eos_rank, eos_topk_ok;
+    std::vector<float>   eos_p_cond, eos_p_uncond, eos_p_final, emit_lp;
+    std::vector<int32_t> eos_rank, eos_topk_ok, emit_rank;
+    //   watch_p      raw conditional softmax summed over MM3ArOptions::eos_watch
+    //                (empty when no codes are watched)
+    std::vector<float>   watch_p;
     // LRC text derived from the LM's own decode attention (mm3-align.h). Empty
     // when alignment was off, the track was instrumental, or alignment failed —
     // never a reason to fail the run.
     std::string lrc;
+    // Base handoff cue (MM3ArOptions::handoff_cue): the frame a capped take is
+    // cut at before the base plays it out, and that point in seconds. -1 = none.
+    int64_t     handoff_cut = -1;
+    double      handoff_cue = 0.0;
 
     std::vector<int32_t> semantic_all;    // [I]        includes the un-emitted iteration 0
     std::vector<int32_t> acoustic_all;    // [I, NC]
@@ -262,6 +274,9 @@ struct MM3ArOptions {
     // Record per-iteration EOS statistics into MM3ArResult (see there). Costs
     // two O(NCAND) passes per step on the host; off by default.
     bool    eos_trace       = false;
+    // Semantic codes whose raw conditional probability eos_trace sums into
+    // watch_p each iteration (a model's wind-down set). Needs eos_trace.
+    std::vector<int32_t> eos_watch;
     // Forced replay normally stops at the end of the forced frames. With this
     // on it hands over to free sampling there and runs to EOS or max_frames:
     // the model continues someone else's plan (lever 4b, 2026-09-08: the base
@@ -275,6 +290,10 @@ struct MM3ArOptions {
     // together or not at all.
     bool                  want_lrc = false;
     bool                  lrc_eos_only = false;
+    // Base handoff: while fewer takes ended than are wanted, align the capped
+    // ones too and set MM3ArResult::handoff_cut (mm3_align_handoff_cue). Needs
+    // want_lrc and tok.
+    bool                  handoff_cue = false;
     bool                  stop_after_first_eos = false;
     const MM3Tokenizer *  tok      = nullptr;
 
@@ -321,9 +340,17 @@ struct MM3ArOptions {
     const MM3LmAdapter * lm_adapter = nullptr;
     MM3LmAdapterScales   lm_adapter_scales = {};
     // Strength along the song (MM3LmAdapterSchedule), a multiplier on
-    // lm_adapter_scales.global. Needs a runtime adapter: merge mode has baked
-    // the delta into the weights, so there is nothing to turn down.
+    // lm_adapter_scales.global. Needs a runtime adapter or lm_adapter_merged.
     MM3LmAdapterSchedule lm_adapter_sched = {};
+    // Merge mode with a schedule: the adapter already folded into the resident
+    // weights at lm_adapter_scales. Wherever the schedule is below 1 the graph
+    // carries it again at (mult - 1) times its scale, which takes the merged
+    // delta back down: W + s*BA + (mult - 1)*s*BA = W + mult*s*BA, up to the
+    // merge's one requantization. At 1 the graph is the plain merged one, so
+    // the body runs at merge speed and only the faded stretch pays the
+    // runtime ops. Plain LoRA only (mm3_lm_merge_fade_ok); never set together
+    // with lm_adapter.
+    const MM3LmAdapter * lm_adapter_merged = nullptr;
     // Plan dial, 0..1: how much the adapter plans the song. Below 1 every take
     // gets a base pair (same prompt, delta masked off), guidance runs per
     // model, the semantic draw samples base + plan * (adapter - base), and the
@@ -331,6 +358,9 @@ struct MM3ArOptions {
     // adapter rows, so the adapter sings whatever is planned. 1 (or no runtime
     // adapter) = no base rows: today's graph and today's RNG draws.
     float                lm_adapter_plan  = 1.0f;
+    // Store the LM KV cache as Q8_0 (request lm_kv_q8, mm3_lm_kv_type): half the
+    // VRAM for ~7% per step, which is what fits 3-4 takes under the plan dial.
+    bool                 lm_kv_q8         = false;
 
     // The adapter whose SOFT-PROMPT halves (artist token, trained KV prefix)
     // apply. Usually the same object as lm_adapter, and deliberately a separate
@@ -614,6 +644,35 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
             return false;
         }
     }
+    // Context guard (HOTSTEP-1119). The LM declares qwen3.context_length (10240)
+    // but the request limits allow a 5000-token prompt plus 9000 frames. Past it
+    // the plan degrades. Measured on a 3090, q8_0, two seeds: a 4224-token prompt
+    // planned to 9000 frames kept normal code diversity to about position 11700,
+    // then fell (semantic entropy per 20 s 7.3 -> 3.7 bits with one code on half
+    // the frames at seed 5; 7.7 -> 6.0 at seed 6). A 1097-token prompt, which
+    // never passes 10240, held 7.4 to 8.0 bits to the end at both seeds. So a
+    // free plan is capped to the declared context, not to where the fall began.
+    // Forced codes are the caller's (a plank, training codes) and replay as
+    // given, with a warning.
+    const int64_t ctx_len = (int64_t) c.context_length;
+    if (ctx_len > 0 && n_prompt + max_frames > ctx_len) {
+        if (forced && !opt.forced_continue) {
+            fprintf(stderr,
+                    "[MM3-AR] WARNING: %lld prompt tokens + %lld forced frames pass the LM's %lld-position context; "
+                    "the hiddens past it are out of range for the model\n",
+                    (long long) n_prompt, (long long) max_frames, (long long) ctx_len);
+        } else if (ctx_len - n_prompt < 1) {
+            if (err) {
+                *err = "the prompt fills the LM's " + std::to_string((long long) ctx_len) + "-position context";
+            }
+            return false;
+        } else {
+            fprintf(stderr, "[MM3-AR] frames capped %lld -> %lld: %lld prompt tokens + frames must fit the LM's "
+                            "%lld-position context\n",
+                    (long long) max_frames, (long long) (ctx_len - n_prompt), (long long) n_prompt, (long long) ctx_len);
+            max_frames = ctx_len - n_prompt;
+        }
+    }
     const bool guided = opt.guide != nullptr;
     if (guided) {
         if (forced) {
@@ -726,7 +785,7 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     // Both graph sets bake rows() into their shapes, so K has to be settled
     // before either is prepared. Kept in lockstep on purpose: the depth decoder
     // reads the LM's hidden rows straight out of the same buffer.
-    mm3_lm_set_takes(&g_mm3_lm, K, plan_mix);
+    mm3_lm_set_takes(&g_mm3_lm, K, plan_mix, opt.lm_kv_q8);
     if (plan_mix) {
         fprintf(stderr, "[MM3-AR] plan dial %.2f: base rows active (%d take%s, %zu adapter + %zu base LM rows)\n",
                 (double) plan, K, K == 1 ? "" : "s", KP, KP);
@@ -815,9 +874,9 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     // Cut to the batch ceiling rather than to what this run uses: the readback
     // helpers size their transfers from the graph, so a ceiling-sized buffer
     // can never be the thing that overruns.
-    // The plan dial's base rows fit too: mm3_max_takes halves K for them.
-    std::vector<float> hidden((size_t) (H * MM3_MAX_BATCH_ROWS));
-    std::vector<float> logits((size_t) (hn * MM3_MAX_BATCH_ROWS));
+    // The plan dial's base rows double the LM rows: MM3_MAX_LM_ROWS covers them.
+    std::vector<float> hidden((size_t) (H * MM3_MAX_LM_ROWS));
+    std::vector<float> logits((size_t) (hn * MM3_MAX_LM_ROWS));
     std::vector<float> feedback((size_t) H);
 
     // Row of take t: conditional, and unconditional. At P == 1 (a
@@ -847,8 +906,8 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
     // multiplier per iteration is exact for every take. Iteration `it` is
     // song time it / 25 s; the decode at the end of iteration it makes the
     // logits iteration it + 1 samples from, so that is the time it is set for.
-    const bool sched_on = opt.lm_adapter && opt.lm_adapter_sched.active();
-    if (opt.lm_adapter_sched.active() && !opt.lm_adapter) {
+    const bool sched_on = (opt.lm_adapter || opt.lm_adapter_merged) && opt.lm_adapter_sched.active();
+    if (opt.lm_adapter_sched.active() && !sched_on) {
         fprintf(stderr, "[MM3-AR] adapter schedule ignored: no runtime LM adapter (none loaded, or merge mode)\n");
     }
     float      sched_cur   = -1.0f;
@@ -859,6 +918,15 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         }
         sched_cur             = mult;
         MM3LmAdapterScales sc = opt.lm_adapter_scales;
+        if (opt.lm_adapter_merged) {
+            // Merged: full strength is the weights as they are; below it the
+            // graph takes the missing share of the delta back out.
+            sc.global *= mult - 1.0f;
+            mm3_lm_set_adapter(&g_mm3_lm, mult < 1.0f ? opt.lm_adapter_merged : nullptr, sc);
+            fprintf(stderr, "[MM3-AR] adapter schedule: x%.2f from %.1f s (merged, correction x%.2f)\n", mult,
+                    (double) it / 25.0, mult - 1.0f);
+            return;
+        }
         sc.global *= mult;
         // Zero is the base itself: no delta in the graph, and no delta cost.
         mm3_lm_set_adapter(&g_mm3_lm, mult > 0.0f ? opt.lm_adapter : nullptr, sc);
@@ -894,6 +962,104 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         outs[t].prefill_sum = ps;
     }
 
+    // ── Fully forced codes: one teacher-forced pass instead of the frame loop ──
+    //
+    // With both code streams pinned nothing is sampled, so the per-frame decode
+    // and depth steps only re-derive hiddens that are a function of the codes.
+    // mm3_lm_replay_frames recomputes the LM half as a chunked prefill and
+    // mm3_depth_replay_run the seven depth hiddens as one S=8 forward per frame,
+    // batched (minimaxmusic.cpp 8ab559f). Same frames, same codes, hiddens equal
+    // to rounding. Everything the replay does not model takes the loop: soft or
+    // partial forcing, forced_continue, an adapter schedule, the plan dial's base
+    // rows, parity dumps, EOS traces, live LRC, the state blend, and an armed
+    // imatrix collection (its hook sits on the decode and depth schedulers).
+    // MM3_FORCED_REPLAY=0 forces the loop, for A/B runs.
+    static const bool replay_env = [] {
+        const char * e = std::getenv("MM3_FORCED_REPLAY");
+        return !(e && e[0] == '0');
+    }();
+    const bool replay_fast = replay_env && forced_ac_given && !opt.forced_continue && !soft_force && !sched_on &&
+                             !plan_mix && opt.dump_iters == 0 && !opt.eos_trace && !opt.blend && !lrc_on &&
+                             !align_dump && opt.collect_hiddens && K == 1 && !g_mm3_imatrix.armed;
+    if (replay_fast) {
+        const int64_t F  = max_frames;
+        // The loop's depth step range-checks each forced code before it is
+        // gathered; the replay gathers them all at once, so check them here.
+        // Iterations 0..F-1 feed the LM, 1..F the depth decoder.
+        const int64_t AVmin = std::min<int64_t>(AV, (int64_t) m.synth_cfg.depth.audio_vocab_size);
+        for (int64_t i = 0; i < (F + 1) * NC; i++) {
+            const int32_t fc = opt.forced_acoustic[i];
+            if (fc < 0 || (int64_t) fc >= AVmin) {
+                if (err) {
+                    *err = "forced acoustic code " + std::to_string(fc) + " at iteration " +
+                           std::to_string((long long) (i / NC)) + ", codebook " + std::to_string((long long) (i % NC + 1)) +
+                           " is outside [0, " + std::to_string((long long) AVmin) + ")";
+                }
+                return false;
+            }
+        }
+        const auto    t0 = std::chrono::steady_clock::now();
+        // lmh[f] is the LM hidden emitted with frame f: the output after feeding
+        // iteration f's codes. Iteration F's codes are never fed back (note 2).
+        std::vector<float> lmh((size_t) (F * H));
+        if (!mm3_lm_replay_frames(m, &g_mm3_lm, opt.forced_semantic, opt.forced_acoustic, F, lmh.data(), err)) {
+            return false;
+        }
+        out->lm_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        out->semantic_all.assign(opt.forced_semantic, opt.forced_semantic + F + 1);
+        out->acoustic_all.assign(opt.forced_acoustic, opt.forced_acoustic + (F + 1) * NC);
+        out->n_iterations = F + 1;
+
+        MM3DepthReplay dr;
+        if (!mm3_depth_prepare(m, &g_mm3_depth, err) || !mm3_depth_replay_build(m, &g_mm3_depth, &dr, err)) {
+            mm3_depth_replay_free(&dr);
+            return false;
+        }
+        std::vector<float> dh((size_t) (MM3_DEPTH_REPLAY_BATCH * NC * H));
+        // Whole, before the first append: the streaming hook reads this block
+        // while it grows (see the reserve before the frame loop).
+        out->frame_hiddens.reserve((size_t) (F * (NC + 1) * H));
+        bool               ok = true;
+        for (int64_t f0 = 0; ok && f0 < F; f0 += MM3_DEPTH_REPLAY_BATCH) {
+            const int64_t nf = std::min<int64_t>(MM3_DEPTH_REPLAY_BATCH, F - f0);
+            // Frame f is iteration f + 1: the depth decoder reads that
+            // iteration's LM hidden and codes.
+            const auto t1 = std::chrono::steady_clock::now();
+            ok = mm3_depth_replay_run(m, &dr, lmh.data() + f0 * H, opt.forced_semantic + f0 + 1,
+                                      opt.forced_acoustic + (f0 + 1) * NC, nf, dh.data(), err);
+            // Graph time only: the hooks below can dispatch flow windows.
+            out->depth_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+            for (int64_t f = 0; ok && f < nf; f++) {
+                const float * hl = lmh.data() + (f0 + f) * H;
+                const float * hd = dh.data() + f * NC * H;
+                out->frame_hiddens.insert(out->frame_hiddens.end(), hl, hl + H);
+                out->frame_hiddens.insert(out->frame_hiddens.end(), hd, hd + NC * H);
+                out->n_frames++;
+                if (opt.on_frame) {
+                    opt.on_frame(out->n_frames, max_frames);
+                }
+                // Same hook order as the loop: progress, then window dispatch.
+                if (opt.on_takes_frame_ready) {
+                    ok = opt.on_takes_frame_ready(&out->n_frames, 1, err);
+                } else if (opt.on_frame_ready) {
+                    ok = opt.on_frame_ready(out->n_frames, err);
+                }
+            }
+            if (ok && opt.should_cancel && opt.should_cancel()) {
+                if (err) {
+                    *err = MM3_ERR_CANCELLED;
+                }
+                ok = false;
+            }
+        }
+        mm3_depth_replay_free(&dr);
+        if (!ok) {
+            return false;
+        }
+        fprintf(stderr, "[MM3-AR] Forced replay: %lld frames in one pass - LM %.0f ms, depth %.0f ms "
+                        "(MM3_FORCED_REPLAY=0 runs the frame loop)\n",
+                (long long) F, out->lm_ms, out->depth_ms);
+    }
 
     // Candidate layout: index 0 is EOS, indices 1..SV are semantic codes 0..SV-1.
     // Everything else in the 200000-entry vocabulary is masked and never gathered.
@@ -934,7 +1100,7 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         }
     }
 
-    for (int64_t it = 0; it <= max_frames; it++) {
+    for (int64_t it = 0; !replay_fast && it <= max_frames; it++) {
         if (forced && it >= opt.forced_len && !opt.forced_continue) {
             break;
         }
@@ -1023,13 +1189,16 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
             // ── CFG, then the first top-k filter (ranked by the CONDITIONAL row) ──
             for (int64_t i = 0; i < NCAND; i++) {
                 const float u           = cand_unc[(size_t) i];
-                cand_guided[(size_t) i] = u + (cand_cond[(size_t) i] - u) * CFG;
+                // Exact at 1.0: u + (c - u) can round off c by an ulp when a 2-row
+                // pair is forced (MM3_AR_CFG_ROWS=2 / MM3_DEPTH_CFG) on a CFG-1.0 LM.
+                cand_guided[(size_t) i] = CFG == 1.0f ? cand_cond[(size_t) i] : u + (cand_cond[(size_t) i] - u) * CFG;
             }
             // Read before the conditional top-k below can mask it out.
             const float fs_guided = soft_it && fs_it >= 0 ? cand_guided[(size_t) (1 + fs_it)] : 0.0f;
             if (guide_it) {
                 gd_pre = cand_guided;  // per take: the fallback below reads it too
             }
+            double tr_cmax = 0.0, tr_lse = 0.0;  // eos_trace: raw conditional log-normaliser
             {
                 int64_t k = TOPK < NCAND ? (int64_t) TOPK : NCAND;
                 if (k < 1) {
@@ -1049,29 +1218,39 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                         cand_guided[(size_t) i] = -INFINITY;
                     }
                 }
-                if (opt.eos_trace && t == 0) {
+                if (opt.eos_trace) {
                     // Raw conditional softmax at EOS, and EOS's rank in that row.
-                    double  cmax = -INFINITY;
+                    double  cmax = -INFINITY, umax = -INFINITY;
                     int64_t rank = 0;
                     for (int64_t i = 0; i < NCAND; i++) {
                         const double x = (double) cand_cond[(size_t) i];
                         if (x > cmax) {
                             cmax = x;
                         }
+                        umax = std::max(umax, (double) cand_unc[(size_t) i]);
                         if (i > 0 && x > (double) cand_cond[0]) {
                             rank++;
                         }
                     }
-                    double csum = 0.0;
+                    double csum = 0.0, usum = 0.0;
                     for (int64_t i = 0; i < NCAND; i++) {
                         const double x = (double) cand_cond[(size_t) i];
                         if (std::isfinite(x)) {
                             csum += std::exp(x - cmax);
                         }
+                        const double y = (double) cand_unc[(size_t) i];
+                        if (std::isfinite(y)) {
+                            usum += std::exp(y - umax);
+                        }
                     }
                     const float p_cond = std::isfinite((double) cand_cond[0]) && csum > 0.0
                                              ? (float) (std::exp((double) cand_cond[0] - cmax) / csum)
                                              : 0.0f;
+                    const float p_unc = std::isfinite((double) cand_unc[0]) && usum > 0.0
+                                            ? (float) (std::exp((double) cand_unc[0] - umax) / usum)
+                                            : 0.0f;
+                    tr_cmax = cmax;
+                    tr_lse  = csum > 0.0 ? std::log(csum) : 0.0;
                     // What the draw would see: the second top-k over the guided row
                     // (mm3_sample_top_k), softmax over its survivors.
                     float p_final = 0.0f;
@@ -1106,10 +1285,11 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                             p_final = (float) (std::exp((double) g0 - gmax) / gsum);
                         }
                     }
-                    outs[0].eos_p_cond.push_back(p_cond);
-                    outs[0].eos_p_final.push_back(p_final);
-                    outs[0].eos_rank.push_back((int32_t) rank);
-                    outs[0].eos_topk_ok.push_back(std::isfinite(cand_guided[0]) ? 1 : 0);
+                    outs[t].eos_p_cond.push_back(p_cond);
+                    outs[t].eos_p_uncond.push_back(p_unc);
+                    outs[t].eos_p_final.push_back(p_final);
+                    outs[t].eos_rank.push_back((int32_t) rank);
+                    outs[t].eos_topk_ok.push_back(std::isfinite(cand_guided[0]) ? 1 : 0);
                 }
             }
 
@@ -1234,9 +1414,31 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                                       (int64_t) outs[t].semantic_all.size(), opt.knobs);
             }
 
+            // eos_trace: how the raw conditional row scored what was emitted.
+            const auto trace_emit = [&](int64_t ci) {
+                if (!opt.eos_trace) {
+                    return;
+                }
+                const double x    = (double) cand_cond[(size_t) ci];
+                int32_t      rank = 0;
+                for (int64_t i = 0; i < NCAND; i++) {
+                    rank += (double) cand_cond[(size_t) i] > x ? 1 : 0;
+                }
+                outs[t].emit_lp.push_back(std::isfinite(x) ? (float) (x - tr_cmax - tr_lse) : -1e30f);
+                outs[t].emit_rank.push_back(rank);
+                if (!opt.eos_watch.empty()) {
+                    double pw = 0.0;
+                    for (int32_t c : opt.eos_watch) {
+                        const double y = (double) cand_cond[(size_t) (1 + c)];  // range-checked at entry
+                        pw += std::isfinite(y) ? std::exp(y - tr_cmax - tr_lse) : 0.0;
+                    }
+                    outs[t].watch_p.push_back((float) pw);
+                }
+            };
             // ── sample (or replay) ──
             if (forced_it && !soft_it) {
                 sem_code[(size_t) t] = fs_it;  // range-checked at entry
+                trace_emit(1 + fs_it);
             } else {
                 const int64_t idx = guide_pick >= 0 ? guide_pick
                                     : opt.knobs.any_active()
@@ -1244,6 +1446,7 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                                                              rngs[(size_t) t], &samp_scratch)
                                         : mm3_sample_top_k(cand_guided.data(), NCAND, TOPK, rngs[(size_t) t],
                                                            &samp_scratch);
+                trace_emit(idx);
                 if (idx == 0) {
                     // EOS. This take is finished; the others carry on. Its rows
                     // keep being computed (the batch shape is fixed for the run)
@@ -1688,13 +1891,20 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
         // The replay runs the whole plan under ONE adapter setting. A schedule
         // left the graph at its tail strength; align under the body's instead,
         // which is where the lyrics are. The tail's timestamps are approximate.
+        // Merged (lm_adapter null): the body is the merged weights alone.
         if (sched_on) {
             mm3_lm_set_adapter(&g_mm3_lm, opt.lm_adapter, opt.lm_adapter_scales);
         }
+        int n_ended = 0;
+        for (int t = 0; t < K; t++) {
+            n_ended += outs[t].eos_hit ? 1 : 0;
+        }
+        const bool want_cue = opt.handoff_cue && n_ended < (opt.stop_after_first_eos ? 1 : K);
         for (int t = 0; t < K; t++) {
             MM3ArResult * o = &outs[t];
+            const bool    cue = want_cue && !o->eos_hit && o->n_frames >= max_frames;
             // Selection is already known, before any alignment work.
-            if ((opt.lrc_eos_only && !o->eos_hit) || (first_eos_take >= 0 && t != first_eos_take)) {
+            if (!cue && ((opt.lrc_eos_only && !o->eos_hit) || (first_eos_take >= 0 && t != first_eos_take))) {
                 continue;
             }
             if (o->n_frames <= 1) {
@@ -1714,7 +1924,14 @@ static bool mm3_ar_plan_takes(const MM3Model & m, const int32_t * cond_ids, cons
                                   n_steps, lyr0, lyr1, &flat, &rerr)) {
                 const float dur = m.lm_cfg.frame_rate > 0 ? (float) o->n_frames / (float) m.lm_cfg.frame_rate : 0.0f;
                 const std::vector<int> ids(cond_ids + lyr0, cond_ids + lyr1);
-                o->lrc              = mm3_align_build_lrc(flat, ids, opt.tok->bpe, (int) n_steps, dur);
+                if (cue && n_steps == o->n_frames) {
+                    o->handoff_cut = mm3_align_handoff_cue(flat, ids, opt.tok->bpe, (int) n_steps, max_frames,
+                                                           &o->lrc, &o->handoff_cue);
+                    fprintf(stderr, "[MM3-AR] handoff cue, take %d: %.2f s (frame %lld; -1 = no line held)\n", t,
+                            o->handoff_cue, (long long) o->handoff_cut);
+                } else {
+                    o->lrc = mm3_align_build_lrc(flat, ids, opt.tok->bpe, (int) n_steps, dur);
+                }
                 const double lrc_ms =
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_lrc).count();
                 fprintf(stderr, "[MM3-LRC] %s via replay%s (%lld frames, %.1f s, %.0f ms)\n",

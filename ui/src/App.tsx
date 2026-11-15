@@ -9,6 +9,8 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { viewFromUrl, urlForView } from './app/viewRoutes';
 import { RestartingOverlay, ServerOfflineOverlay } from './app/ServerOverlays';
+import { UpdateReconnectOverlay, UpdateRestartContext } from './components/settings/UpdateReconnectOverlay';
+import type { UpdateRestartAttempt } from './services/updatesApi';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from './context/AuthContext';
 import { GlobalParamsProvider, useGlobalParams } from './context/GlobalParamsContext';
@@ -23,6 +25,7 @@ import { SONG_VIEWS, invalidateSongs, patchLibrary, patchSong, removeSongs, song
 import { waitForQuery } from './queries/wait';
 import { Sidebar } from './components/sidebar/Sidebar';
 import { CreatePanel } from './components/create/CreatePanel';
+import { CreateBuildTab, CreateTabs } from './components/create/CreateBuildTab';
 import { SongList } from './components/library/SongList';
 import { StreamWaveform } from './components/player/StreamWaveform';
 import { mm3StreamEnsureTakes, useMm3StreamAudio } from './stores/mm3StreamStore';
@@ -40,14 +43,16 @@ import { getElement as getPlayerElement, subscribeFrame } from './audio/engine';
 import { SectionMarkers } from './components/player/SectionMarkers';
 import { LyricTimelineMarks } from './components/player/LyricTimelineMarks';
 import { LyricsBar } from './components/player/LyricsBar';
-import { TrimControls } from './components/player/TrimControls';
+import { CropFadeControls } from './components/player/CropFadeControls';
 import { SpectrumAnalyzer } from './components/player/SpectrumAnalyzer';
 import { StreamSpectrum } from './components/player/StreamSpectrum';
 import { RightSidebar } from './components/details/RightSidebar';
+import { SongDetailsSlideOver } from './components/details/SongDetailsSlideOver';
 import { MetadataEditorModal } from './components/details/MetadataEditorModal';
 import { CoverArtPromptModal } from './components/library/CoverArtPromptModal';
 import { ImportTracksModal } from './components/library/ImportTracksModal';
-import { Toast, type ToastType } from './components/shared/Toast';
+import { notify, type ToastType } from './components/shared/Toast';
+import { toast } from 'react-toastify';
 import { HotkeyHelpModal } from './components/shared/HotkeyHelpModal';
 import { CommandPalette, OPEN_PALETTE_EVENT } from './components/shared/CommandPalette';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
@@ -67,6 +72,7 @@ import { TrainingStudio } from './components/training-studio/TrainingStudio';
 import { CompareStudio } from './components/compare-studio/CompareStudio';
 import { setPendingCompareSongs } from './services/compareApi';
 import { GlobalParamBar } from './components/global-bar/GlobalParamBar';
+import { MobilePlaylistOverlay } from './components/playlist/MobilePlaylistOverlay';
 import { InstaGenPanel } from './components/insta-gen/InstaGenPanel';
 import {
   usePlaybackSelector,
@@ -81,9 +87,8 @@ import {
   cycleRepeat as pbCycleRepeat,
   setSpectrumEnabled as pbSetSpectrumEnabled,
   setPlaybackVariant as pbSetPlaybackVariant,
-  setTrimMode as pbSetTrimMode,
-  handleTrimClick as pbHandleTrimClick,
-  reloadCurrentTrack as pbReloadCurrentTrack,
+  setEditMode as pbSetEditMode,
+  setEndCrop as pbSetEndCrop,
   toggleAB as pbToggleAB,
   exitABMode as pbExitABMode,
   stop as pbStop,
@@ -93,12 +98,13 @@ import {
 } from './stores/playbackStore';
 import type { Song, GenerationParams } from './types';
 import type { CreateIntent } from '../../server/src/contracts/resolution';
-import { addToPlaylist } from './components/lyric-studio/playlistStore';
+import { addToPlaylist, usePlaylist, DELETE_CONFIRM_KEY, type PlaylistItem } from './components/lyric-studio/playlistStore';
 import { DisguiseModeProvider } from './hooks/useDisguiseMode';
 import { ABCompareModal } from './components/shared/ABCompareModal';
 import { useABCompareSelector, playAB, openModal as openABModal, clear as clearAB } from './stores/abCompareStore';
 import { useDiscoMode, toggleDiscoMode, setDiscoPlaying, setDiscoDataUrl, syncStems, updateMainTime } from './stores/discoStore';
 import { DiscoPulseWrapper } from './components/shared/DiscoPulseWrapper';
+import { Toggle } from './components/shared/Toggle';
 
 import { HiHatParticles } from './components/shared/HiHatParticles';
 import { subscribeEventSource } from './services/sharedEventSource';
@@ -181,13 +187,20 @@ const AppContent: React.FC = () => {
   const songsQuery = useQuery({ ...songsOptions(), enabled: !!token });
   const songs = songsQuery.data?.songs ?? NO_SONGS;
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [mobilePlaylistOpen, setMobilePlaylistOpen] = useState(false);
+  const [pendingDeleteItem, setPendingDeleteItem] = useState<PlaylistItem | null>(null);
+  const [deleteConfirmDismissed, setDeleteConfirmDismissed] = useState(false);
   const [selectedSong, setSelectedSong] = useState<Song | null>(null);
+  const { remove: removeFromPlaylist } = usePlaylist();
 
   // Resizable panel widths (persisted)
   const [createPanelWidth, setCreatePanelWidth] = usePersistedState('ace-createPanelWidth', 490);
   const [rightSidebarWidth, setRightSidebarWidth] = usePersistedState('ace-rightSidebarWidth', 360);
   const [activitySidebarWidth, setActivitySidebarWidth] = usePersistedState('hs-activitySidebarWidth', 420);
-  const [showRightSidebar, setShowRightSidebar] = useState(true);
+  // Song Details opens only from a track's i button (or a notification);
+  // once open it follows whichever track is clicked or played.
+  const [showRightSidebar, setShowRightSidebar] = useState(false);
+  const showDetails = useCallback((song: Song) => { setSelectedSong(song); setShowRightSidebar(true); }, []);
 
   // Assistant panel state (persisted)
   const [showAssistant, setShowAssistant] = usePersistedState('hs-showAssistant', false);
@@ -221,10 +234,8 @@ const AppContent: React.FC = () => {
   const spectrumEnabled = usePlaybackSelector(s => s.spectrumEnabled);
   const shuffle = usePlaybackSelector(s => s.shuffle);
   const repeat = usePlaybackSelector(s => s.repeat);
-  const trimMode = usePlaybackSelector(s => s.trimMode);
-  const trimInPoint = usePlaybackSelector(s => s.trimInPoint);
-  const trimOutPoint = usePlaybackSelector(s => s.trimOutPoint);
-  const trimClickCount = usePlaybackSelector(s => s.trimClickCount);
+  const editMode = usePlaybackSelector(s => s.editMode);
+  const endEdit = usePlaybackSelector(s => s.endEdit);
   const abMode = usePlaybackSelector(s => s.abMode);
   const abActiveLabel = usePlaybackSelector(s => s.playMastered && s.abMode ? 'B' as const : 'A' as const);
   const discoMode = useDiscoMode();
@@ -315,11 +326,6 @@ const AppContent: React.FC = () => {
     syncStems('seek', time);
   }, []);
 
-  // Toast state
-  const [toast, setToast] = useState<{ message: string; type: ToastType; isVisible: boolean }>({
-    message: '', type: 'success', isVisible: false,
-  });
-
   // Confirm dialog state
   const [confirmDialog, setConfirmDialog] = useState<{
     title: string; message: string; confirmLabel?: string; danger?: boolean; onConfirm: () => void;
@@ -328,6 +334,7 @@ const AppContent: React.FC = () => {
   const [isShutdown, setIsShutdown] = useState(false);
   const [isRestarting, setIsRestarting] = useState(false);
   const [isOffline, setIsOffline] = useState(false);
+  const [updateAttempt, setUpdateAttempt] = useState<UpdateRestartAttempt | null>(null);
 
   // Presence beacon: the launcher asks /api/health whether any tab is already
   // open before opening a new one. The server counts each tab's /api/logs
@@ -396,17 +403,27 @@ const AppContent: React.FC = () => {
   // Direct download helper (reads settings from localStorage)
   const handleDownload = useCallback((song: Song) => downloadTrack(song), []);
 
-  const showToast = (message: string, type: ToastType = 'success') => {
-    setToast({ message, type, isVisible: true });
-  };
+  // App toasts share the react-toastify stack (top right, auto-dismiss) with the rest of the app.
+  const showToast = (message: string, type: ToastType = 'success') => notify(message, type);
 
   // downloadTrack.ts saves into the DOWNLOAD_DIR folder when one is set; say where it went.
   useEffect(() => {
     const onSaved = (e: Event) => {
       const { path, error } = (e as CustomEvent<{ path?: string; error?: string }>).detail;
-      setToast(error
-        ? { message: t('download.saveFailed', 'Download failed: {{error}}', { error }), type: 'error', isVisible: true }
-        : { message: t('download.savedTo', 'Saved to {{path}}', { path }), type: 'success', isVisible: true });
+      if (error) { toast.error(t('download.saveFailed', 'Download failed: {{error}}', { error })); return; }
+      toast.success(
+        <div className="flex flex-col gap-1">
+          <span className="break-all">{t('download.savedTo', 'Saved to {{path}}', { path })}</span>
+          <button
+            className="self-start text-sm font-medium text-pink-500 hover:text-pink-400 underline"
+            onClick={() => { void fetch('/api/download/reveal', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }),
+            }); }}
+          >
+            {t('download.openFolder', 'Open folder')}
+          </button>
+        </div>,
+      );
     };
     window.addEventListener('hotstep:download-saved', onSaved);
     return () => window.removeEventListener('hotstep:download-saved', onSaved);
@@ -470,7 +487,6 @@ const AppContent: React.FC = () => {
       return;
     }
     setSelectedSong(song);
-    setShowRightSidebar(true);
     playFromList(songToTrack(song), songs.map(songToTrack), 'library');
   }, [currentTrack?.id, songs]);
 
@@ -588,6 +604,25 @@ const AppContent: React.FC = () => {
   // Global params from context
   const globalParams = useGlobalParams();
 
+  // Content params (from CreatePanel) merged with the global engine params and the settings a render carries.
+  // The Build by section tab starts its session from the same params.
+  const createParamsRef = useRef<(() => Partial<GenerationParams>) | null>(null);
+  const enrichCreateParams = useCallback((contentParams: Partial<GenerationParams>) => ({
+    ...globalParams.getGlobalParams(),
+    ...contentParams,
+    source: 'create',
+    coResident: settings.coResident,
+    cacheLmCodes: settings.cacheLmCodes,
+    parallelWhisper: settings.parallelWhisper,
+    parallelQualityEval: settings.parallelQualityEval,
+    parallelCoverArt: settings.parallelCoverArt,
+  }), [globalParams, settings]);
+  const savedBuildSessions = useMemo(() => new Set(songs.flatMap(s => {
+    const id = ((s.generationParams ?? (s as any).generation_params) as any)?.yue2Build?.session;
+    return typeof id === 'string' ? [id] : [];
+  })), [songs]);
+  const [createTab, setCreateTab] = usePersistedState<'oneshot' | 'build'>('hs-createTab', 'oneshot');
+
   // Handle generation — merges content params (from CreatePanel) with global engine params (from context)
   const handleGenerate = useCallback((contentParams: Partial<GenerationParams>, contentIntent?: CreateIntent) => {
     if (!token) return;
@@ -595,16 +630,7 @@ const AppContent: React.FC = () => {
     void requestNotifyPermissionFromGesture();
     // Merge: global engine params + content-specific params + settings
     const engineParams = globalParams.getGlobalParams();
-    const enrichedParams = {
-      ...engineParams,
-      ...contentParams,
-      source: 'create',
-      coResident: settings.coResident,
-      cacheLmCodes: settings.cacheLmCodes,
-      parallelWhisper: settings.parallelWhisper,
-      parallelQualityEval: settings.parallelQualityEval,
-      parallelCoverArt: settings.parallelCoverArt,
-    };
+    const enrichedParams = enrichCreateParams(contentParams);
 
     enqueueSimpleGen(
       enrichedParams,
@@ -615,7 +641,7 @@ const AppContent: React.FC = () => {
         parallelWhisper: settings.parallelWhisper, parallelQualityEval: settings.parallelQualityEval,
         parallelCoverArt: settings.parallelCoverArt } } : undefined,
     );
-  }, [token, settings, globalParams, handleSongCreated]);
+  }, [token, settings, globalParams, enrichCreateParams, handleSongCreated]);
 
   // Handle delete
   const handleDelete = useCallback(async (song: Song) => {
@@ -625,6 +651,55 @@ const AppContent: React.FC = () => {
     if (selectedSong?.id === song.id) setSelectedSong(null);
     showToast(`Deleted "${song.title}"`, 'success');
   }, [token, selectedSong, queryClient]);
+
+  // ── Mobile playlist swipe handlers ──────────────────────────────
+  const handleDeleteFromPlaylist = useCallback(async (item: PlaylistItem) => {
+    if (!token) return;
+    try {
+      // Pause first if this is the currently playing track — prevents the
+      // playback engine from racing with the deletion and skipping tracks.
+      if (currentTrack?.id === item.id && isPlaying) {
+        pbTogglePlay(); // pause
+        await new Promise(r => setTimeout(r, 100)); // let the pause settle
+      }
+      await songApi.delete(item.id);
+      removeFromPlaylist(item.id);
+      if (currentTrack?.id === item.id) pbNext();
+      void removeSongs(queryClient, [item.id]);
+      showToast(`Deleted "${item.title}"`, 'success');
+    } catch (err: any) {
+      showToast(`Delete failed: ${err.message}`, 'error');
+    }
+  }, [token, currentTrack?.id, isPlaying, queryClient, removeFromPlaylist]);
+
+  const handleSwipeLeft = useCallback((item: PlaylistItem) => {
+    if (localStorage.getItem(DELETE_CONFIRM_KEY) === 'true') {
+      void handleDeleteFromPlaylist(item);
+    } else {
+      setPendingDeleteItem(item);
+      setDeleteConfirmDismissed(false);
+    }
+  }, [handleDeleteFromPlaylist]);
+
+  const handleSwipeRight = useCallback((item: PlaylistItem) => {
+    removeFromPlaylist(item.id);
+  }, [removeFromPlaylist]);
+
+  const handleDeleteConfirm = useCallback(() => {
+    if (!pendingDeleteItem) return;
+    if (deleteConfirmDismissed) {
+      localStorage.setItem(DELETE_CONFIRM_KEY, 'true');
+    } else {
+      localStorage.removeItem(DELETE_CONFIRM_KEY);
+    }
+    const item = pendingDeleteItem;
+    setPendingDeleteItem(null);
+    void handleDeleteFromPlaylist(item);
+  }, [pendingDeleteItem, deleteConfirmDismissed, handleDeleteFromPlaylist]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setPendingDeleteItem(null);
+  }, []);
 
   // Global desktop hotkeys (see utils/hotkeys.ts); "?" opens the cheat sheet.
   const [showHotkeyHelp, setShowHotkeyHelp] = useState(false);
@@ -736,6 +811,18 @@ const AppContent: React.FC = () => {
     return () => window.removeEventListener('song-postprocess-reverted', handler);
   }, [queryClient]);
 
+  // A rename from the shared song menu (SongActionsMenu) — already saved.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { songId, title } = (e as CustomEvent).detail || {};
+      if (!songId || !title) return;
+      void patchSong(queryClient, songId, { title });
+      setSelectedSong(prev => (prev?.id === songId ? { ...prev, title } as Song : prev));
+    };
+    window.addEventListener('song-renamed', handler);
+    return () => window.removeEventListener('song-renamed', handler);
+  }, [queryClient]);
+
   // Listen for song-created events (fired by audioGenQueueStore on completion)
   // This covers Lyric Studio, Cover Studio, and resumed queue items.
   useEffect(() => {
@@ -787,6 +874,13 @@ const AppContent: React.FC = () => {
     );
   }
 
+  // Update recovery owns its health polling and waits for a matching receipt.
+  // Never mount the ordinary liveness screens, which reload on health alone.
+  if (updateAttempt) {
+    return <div className="fixed inset-0 bg-white dark:bg-black">
+      <UpdateReconnectOverlay attempt={updateAttempt} />
+    </div>;
+  }
   if (isRestarting) {
     return <RestartingOverlay />;
   }
@@ -794,22 +888,52 @@ const AppContent: React.FC = () => {
     return <ServerOfflineOverlay />;
   }
   // Main content renderer
+  // The Song Details column, shared by Create, Generations and Library.
+  // It slides in from the right and the centre column reflows as it does.
+  const renderSongDetails = (hideNarrow: boolean) => (
+    <SongDetailsSlideOver
+      open={showRightSidebar && !!selectedSong}
+      width={rightSidebarWidth}
+      onResize={setRightSidebarWidth}
+      hideNarrow={hideNarrow}
+    >
+      {selectedSong && (
+        <DiscoPulseWrapper hue={DISCO.rightSidebar}
+          className="h-full bg-zinc-50 dark:bg-suno z-10 border-l border-zinc-200 dark:border-white/5"
+        >
+          <RightSidebar
+            song={selectedSong}
+            onClose={() => setShowRightSidebar(false)}
+            onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
+            onDelete={handleDelete}
+            onPlay={playSong}
+            isPlaying={isPlaying && currentTrack?.id === selectedSong?.id}
+            onDownload={handleDownload}
+            onRename={handleRename}
+          />
+        </DiscoPulseWrapper>
+      )}
+    </SongDetailsSlideOver>
+  );
+
   const renderContent = () => {
     if (activeView === 'settings') {
       return (
         <DiscoPulseWrapper hue={DISCO.activity} className="flex-1 overflow-y-auto">
-          <SettingsPanel
-            settings={settings}
-            onSettingsChange={setSettings}
-            onNukeComplete={() => {
-              patchLibrary(queryClient, () => []);
-              void invalidateSongs(queryClient);
-              setSelectedSong(null);
-              // The queue is a persisted singleton store outside the song
-              // cache, so it survives the nuke unless explicitly cleared.
-              clearFinishedFromAudioQueue();
-            }}
-          />
+          <UpdateRestartContext.Provider value={{ attempt: updateAttempt, setAttempt: setUpdateAttempt }}>
+            <SettingsPanel
+              settings={settings}
+              onSettingsChange={setSettings}
+              onNukeComplete={() => {
+                patchLibrary(queryClient, () => []);
+                void invalidateSongs(queryClient);
+                setSelectedSong(null);
+                // The queue is a persisted singleton store outside the song
+                // cache, so it survives the nuke unless explicitly cleared.
+                clearFinishedFromAudioQueue();
+              }}
+            />
+          </UpdateRestartContext.Provider>
         </DiscoPulseWrapper>
       );
     }
@@ -943,7 +1067,8 @@ const AppContent: React.FC = () => {
               onPlay={playSong}
               onDelete={handleDelete}
               onBulkDelete={handleBulkDelete}
-              onSelect={(s) => { setSelectedSong(s); setShowRightSidebar(true); }}
+              onSelect={setSelectedSong}
+              onShowDetails={showDetails}
               onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
               onDownload={handleDownload}
               onRename={handleRename}
@@ -969,50 +1094,7 @@ const AppContent: React.FC = () => {
 
 
           {/* Right Sidebar — Song detail (same as Create) */}
-          {showRightSidebar && selectedSong && (
-            <>
-              {/* Right resize handle */}
-              <div
-                className="flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-pink-500/20 active:bg-pink-500/30 transition-colors"
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  const startX = e.clientX;
-                  const startW = rightSidebarWidth;
-                  const onMove = (ev: MouseEvent) => {
-                    const newW = Math.min(600, Math.max(280, startW + startX - ev.clientX));
-                    setRightSidebarWidth(newW);
-                  };
-                  const onUp = () => {
-                    document.removeEventListener('mousemove', onMove);
-                    document.removeEventListener('mouseup', onUp);
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                  };
-                  document.body.style.cursor = 'col-resize';
-                  document.body.style.userSelect = 'none';
-                  document.addEventListener('mousemove', onMove);
-                  document.addEventListener('mouseup', onUp);
-                }}
-              >
-                <div className="w-0.5 h-8 rounded-full bg-zinc-600 group-hover:bg-pink-400 transition-colors" />
-              </div>
-              <DiscoPulseWrapper hue={DISCO.rightSidebar}
-                className="flex-shrink-0 h-full bg-zinc-50 dark:bg-suno z-10 border-l border-zinc-200 dark:border-white/5 max-xl:max-w-[26vw]"
-                style={{ width: rightSidebarWidth }}
-              >
-                <RightSidebar
-                  song={selectedSong}
-                  onClose={() => setShowRightSidebar(false)}
-                  onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
-                  onDelete={handleDelete}
-                  onPlay={playSong}
-                  isPlaying={isPlaying && currentTrack?.id === selectedSong?.id}
-                  onDownload={handleDownload}
-                  onRename={handleRename}
-                />
-              </DiscoPulseWrapper>
-            </>
-          )}
+          {renderSongDetails(false)}
         </div>
       );
     }
@@ -1046,7 +1128,8 @@ const AppContent: React.FC = () => {
                   showToast(t('library.exportZipFailed', 'Zip export failed: {{error}}', { error: (e as Error).message }), 'error');
                 }
               }}
-              onSelect={(s) => { setSelectedSong(s); setShowRightSidebar(true); }}
+              onSelect={setSelectedSong}
+              onShowDetails={showDetails}
               onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
               onDownload={handleDownload}
               onRename={handleRename}
@@ -1069,63 +1152,29 @@ const AppContent: React.FC = () => {
           </DiscoPulseWrapper>
 
           {/* Right Sidebar — Song detail */}
-          {showRightSidebar && selectedSong && (
-            <>
-              {/* Resize handle */}
-              <div
-                className="flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-pink-500/20 active:bg-pink-500/30 transition-colors"
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  const startX = e.clientX;
-                  const startW = rightSidebarWidth;
-                  const onMove = (ev: MouseEvent) => {
-                    const newW = Math.min(600, Math.max(280, startW + startX - ev.clientX));
-                    setRightSidebarWidth(newW);
-                  };
-                  const onUp = () => {
-                    document.removeEventListener('mousemove', onMove);
-                    document.removeEventListener('mouseup', onUp);
-                    document.body.style.cursor = '';
-                    document.body.style.userSelect = '';
-                  };
-                  document.body.style.cursor = 'col-resize';
-                  document.body.style.userSelect = 'none';
-                  document.addEventListener('mousemove', onMove);
-                  document.addEventListener('mouseup', onUp);
-                }}
-              >
-                <div className="w-0.5 h-8 rounded-full bg-zinc-600 group-hover:bg-pink-400 transition-colors" />
-              </div>
-              <DiscoPulseWrapper hue={DISCO.rightSidebar}
-                className="flex-shrink-0 h-full bg-zinc-50 dark:bg-suno z-10 border-l border-zinc-200 dark:border-white/5 max-xl:max-w-[26vw]"
-                style={{ width: rightSidebarWidth }}
-              >
-                <RightSidebar
-                  song={selectedSong}
-                  onClose={() => setShowRightSidebar(false)}
-                  onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
-                  onDelete={handleDelete}
-                  onPlay={playSong}
-                  isPlaying={isPlaying && currentTrack?.id === selectedSong?.id}
-                  onDownload={handleDownload}
-                  onRename={handleRename}
-                />
-              </DiscoPulseWrapper>
-            </>
-          )}
+          {renderSongDetails(false)}
         </div>
       );
     }
 
-    // Default: create view
+    // Default: create view, a studio with two tabs: One-shot (the page below) and Build by section.
+    // The one-shot page stays mounted under the Build tab, since it holds the form the build starts from.
     // Layout: side-by-side on wide landscape, stacked vertically on narrow (<1024px)
     // and on portrait screens >= 1024px (e.g. 1080x1920 at 100%).
     return (
-      <div className="flex flex-1 min-w-0 min-h-0
+      <div className="flex flex-1 min-w-0 min-h-0 flex-col">
+      <CreateTabs tab={createTab} onTab={setCreateTab} />
+      {createTab === 'build' && <CreateBuildTab token={token} getParams={() => {
+        const content = createParamsRef.current?.();
+        return content ? enrichCreateParams(content) as Record<string, unknown> : null;
+      }} onSave={(params) => { if (token) void enqueueSimpleGen(enrichCreateParams(params as Partial<GenerationParams>), token, handleSongCreated); }}
+        savedSessions={savedBuildSessions}
+        onOneShot={() => setCreateTab('oneshot')} />}
+      <div className={`flex flex-1 min-w-0 min-h-0
         min-[1024px]:flex-row max-[1023px]:flex-col
         min-[1024px]:overflow-clip max-[1023px]:overflow-visible
         portrait-wide:flex-col
-        portrait-wide:overflow-visible">
+        portrait-wide:overflow-visible ${createTab === 'build' ? 'hidden' : ''}`}>
         {/* Create Panel — resizable on wide landscape, full-width on narrow/portrait.
             Tailwind's ! prefix generates !important which overrides inline style. */}
         <DiscoPulseWrapper
@@ -1140,6 +1189,7 @@ const AppContent: React.FC = () => {
             onGenerate={handleGenerate}
             activeJobCount={activeJobCount}
             reuseData={reuseData}
+            paramsRef={createParamsRef}
           />
         </DiscoPulseWrapper>
 
@@ -1185,7 +1235,8 @@ const AppContent: React.FC = () => {
             onPlay={playSong}
             onDelete={handleDelete}
             onBulkDelete={handleBulkDelete}
-            onSelect={(s) => { setSelectedSong(s); setShowRightSidebar(true); }}
+            onSelect={setSelectedSong}
+            onShowDetails={showDetails}
             onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
             onDownload={handleDownload}
             onRename={handleRename}
@@ -1211,52 +1262,8 @@ const AppContent: React.FC = () => {
 
 
         {/* Right Sidebar — resizable; hidden on narrow / portrait stacked layout */}
-        {showRightSidebar && selectedSong && (
-          <>
-            {/* Right resize handle */}
-            <div
-              className="flex-shrink-0 w-1.5 h-full cursor-col-resize group z-20 flex items-center hover:bg-pink-500/20 active:bg-pink-500/30 transition-colors
-                max-[1023px]:hidden portrait-wide:hidden"
-              onMouseDown={(e) => {
-                e.preventDefault();
-                const startX = e.clientX;
-                const startW = rightSidebarWidth;
-                const onMove = (ev: MouseEvent) => {
-                  const newW = Math.min(600, Math.max(280, startW + startX - ev.clientX));
-                  setRightSidebarWidth(newW);
-                };
-                const onUp = () => {
-                  document.removeEventListener('mousemove', onMove);
-                  document.removeEventListener('mouseup', onUp);
-                  document.body.style.cursor = '';
-                  document.body.style.userSelect = '';
-                };
-                document.body.style.cursor = 'col-resize';
-                document.body.style.userSelect = 'none';
-                document.addEventListener('mousemove', onMove);
-                document.addEventListener('mouseup', onUp);
-              }}
-            >
-              <div className="w-0.5 h-8 rounded-full bg-zinc-600 group-hover:bg-pink-400 transition-colors" />
-            </div>
-            <DiscoPulseWrapper hue={DISCO.rightSidebar}
-              className="flex-shrink-0 h-full bg-zinc-50 dark:bg-suno z-10 border-l border-zinc-200 dark:border-white/5
-                max-xl:max-w-[26vw] max-[1023px]:hidden portrait-wide:hidden"
-              style={{ width: rightSidebarWidth }}
-            >
-              <RightSidebar
-                song={selectedSong}
-                onClose={() => setShowRightSidebar(false)}
-                onReuse={handleReuse} onSendToCover={handleSendToCover} onEditMetadata={handleEditMetadata}
-                onDelete={handleDelete}
-                onPlay={playSong}
-                isPlaying={isPlaying && currentTrack?.id === selectedSong?.id}
-                onDownload={handleDownload}
-                onRename={handleRename}
-              />
-            </DiscoPulseWrapper>
-          </>
-        )}
+        {renderSongDetails(true)}
+      </div>
       </div>
     );
   };
@@ -1268,7 +1275,10 @@ const AppContent: React.FC = () => {
           GlobalParamBar so both desktop and mobile bars share the same
           backdrop and z-level. */}
       <JobProgressWatcher />
-      <GlobalParamBar onOpenMobileNav={() => setMobileNavOpen(true)} />
+      <GlobalParamBar
+        onOpenMobileNav={() => { setMobileNavOpen(true); setMobilePlaylistOpen(false); }}
+        onOpenMobilePlaylist={() => { setMobilePlaylistOpen(true); setMobileNavOpen(false); }}
+      />
 
       {/* Asks before running a generation queue restored from a previous
           session, rather than starting it unattended (issue #100). Renders
@@ -1317,6 +1327,13 @@ const AppContent: React.FC = () => {
         />
         </DiscoPulseWrapper>
 
+        <MobilePlaylistOverlay
+          isOpen={mobilePlaylistOpen}
+          onClose={() => setMobilePlaylistOpen(false)}
+          onSwipeLeft={handleSwipeLeft}
+          onSwipeRight={handleSwipeRight}
+        />
+
         {/* Left stack — everything the activity column does NOT cover. The
             player lives in here rather than spanning the window, so the
             column runs the full height and the transport stops at its edge. */}
@@ -1335,8 +1352,8 @@ const AppContent: React.FC = () => {
             <div
               style={{
                 display: 'grid',
-                gridTemplateRows: (playerActive || trimMode) ? '1fr' : '0fr',
-                opacity: (playerActive || trimMode) ? 1 : 0,
+                gridTemplateRows: (playerActive || editMode) ? '1fr' : '0fr',
+                opacity: (playerActive || editMode) ? 1 : 0,
                 transition: 'grid-template-rows 0.4s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease',
               }}
             >
@@ -1352,15 +1369,10 @@ const AppContent: React.FC = () => {
                 isPlaying={isPlaying}
               />
               <StreamSpectrum visible={spectrumEnabled && playerActive && isStreamTrack} />
-              {trimMode && (
-                <TrimControls
-                  trimInPoint={trimInPoint}
-                  trimOutPoint={trimOutPoint}
-                  trimClickCount={trimClickCount}
+              {editMode && (
+                <CropFadeControls
                   songId={currentTrack?.id ?? null}
                   audioUrl={currentTrack?.audioUrl ?? null}
-                  onReload={pbReloadCurrentTrack}
-                  onCancel={() => pbSetTrimMode(false)}
                 />
               )}
               {/* One waveform. The live-render canvas replaces it rather than
@@ -1372,14 +1384,13 @@ const AppContent: React.FC = () => {
                 ) : (
                   <Waveform
                     height={56}
-                    trimIn={trimMode ? trimInPoint : null}
-                    trimOut={trimMode ? trimOutPoint : null}
-                    onClickTime={trimMode ? pbHandleTrimClick : undefined}
+                    edit={editMode ? endEdit : null}
+                    onDragTime={editMode ? pbSetEndCrop : undefined}
                   />
                 )}
                 {/* Where each syllable starts, over the bars. Clicks pass
                     through, so the waveform still owns seeking. */}
-                {!isStreamTrack && !trimMode && (
+                {!isStreamTrack && !editMode && (
                   <LyricTimelineMarks
                     audioUrl={currentTrack?.audioUrl ?? undefined}
                     duration={duration}
@@ -1433,8 +1444,8 @@ const AppContent: React.FC = () => {
               onDownloadVariant={(v) => currentSong && downloadTrackVersion(currentSong as Song, v)}
               spectrumEnabled={spectrumEnabled}
               onToggleSpectrum={() => pbSetSpectrumEnabled(!spectrumEnabled)}
-              trimMode={trimMode}
-              onToggleTrimMode={() => pbSetTrimMode(!trimMode)}
+              editMode={editMode}
+              onToggleEditMode={() => pbSetEditMode(!editMode)}
               abMode={abMode}
               abActiveLabel={abActiveLabel}
               onToggleAB={pbToggleAB}
@@ -1481,6 +1492,8 @@ const AppContent: React.FC = () => {
             showToast={showToast}
             compact={activitySidebarWidth < 380}
             showTerminal
+            onPlaylistSwipeLeft={handleSwipeLeft}
+            onPlaylistSwipeRight={handleSwipeRight}
           />
         </DiscoPulseWrapper>
 
@@ -1541,12 +1554,6 @@ const AppContent: React.FC = () => {
           }}
         />
       )}
-      <Toast
-        message={toast.message}
-        type={toast.type}
-        isVisible={toast.isVisible}
-        onClose={() => setToast(prev => ({ ...prev, isVisible: false }))}
-      />
       <ConfirmDialog
         isOpen={confirmDialog !== null}
         title={confirmDialog?.title ?? ''}
@@ -1556,6 +1563,44 @@ const AppContent: React.FC = () => {
         onConfirm={() => confirmDialog?.onConfirm()}
         onCancel={() => setConfirmDialog(null)}
       />
+
+      {/* Mobile playlist delete confirm dialog — custom inline with "Don't ask again" */}
+      {pendingDeleteItem && (
+        <div className="fixed inset-0 z-[150] flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/30 dark:bg-black/60 backdrop-blur-sm drawer-backdrop-in"
+            onClick={handleDeleteCancel}
+          />
+          <div className="relative bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-white/10 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl drawer-slide-in-right">
+            <h3 className="text-lg font-bold text-zinc-900 dark:text-white mb-2">Delete song?</h3>
+            <p className="text-sm text-zinc-700 dark:text-zinc-300 mb-4">
+              Delete "{pendingDeleteItem.title}"{pendingDeleteItem.artistName ? ` by ${pendingDeleteItem.artistName}` : ''}? This cannot be undone.
+            </p>
+            <Toggle
+              size="sm"
+              className="mb-6"
+              checked={deleteConfirmDismissed}
+              onChange={setDeleteConfirmDismissed}
+              label="Don't ask again"
+              info="From now on a left swipe on the phone playlist deletes the song without asking, in this browser only. Clearing the site's data in the browser brings the prompt back."
+            />
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={handleDeleteCancel}
+                className="px-4 py-2 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 font-semibold hover:bg-zinc-300 dark:hover:bg-zinc-700 transition-colors"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                onClick={handleDeleteConfirm}
+                className="px-4 py-2 rounded-lg font-semibold transition-colors bg-red-600 text-white hover:bg-red-500"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <ABCompareModal />
 

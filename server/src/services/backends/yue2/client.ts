@@ -136,6 +136,7 @@ export interface Yue2Props {
     vae_standard?: Yue2PropsFile;
     vae_legacy?: Yue2PropsFile;
     vae_dec2x?: Yue2PropsFile;
+    vae_rs_x3?: Yue2PropsFile;
   };
   variants?: {
     lm?: Yue2LmVariants;
@@ -148,6 +149,8 @@ export interface Yue2Props {
   max_synth_batch?: number;
   /** Songs per plan_only request ("songs" entries); absent on engines older than 2026-09-28. */
   max_plan_batch?: number;
+  /** plan_only + plan_continue + abc plans one section on from a kept score; absent on older engines. */
+  plan_continue?: boolean;
   nar_resident?: boolean;
   /** The checkpoint's sampler defaults per stage (GGUF yue2.sampling.*). */
   sampling?: { plan?: Yue2StageDefaults; semantic?: Yue2StageDefaults };
@@ -200,7 +203,7 @@ export interface Yue2AdapterRef {
  *  mm3SelectModel's shape at YuE2's much smaller (two-part) scale. */
 export interface Yue2Selection {
   lm?: string;
-  vae_variant?: 'standard' | 'legacy' | 'dec2x';
+  vae_variant?: Yue2VaeVariant;
   /** A NAR LoRA to merge into the LM at load, as an ABSOLUTE path.
    *
    *  The engine opens the path AS GIVEN — yue2-adapter.h resolves it against
@@ -244,7 +247,7 @@ export interface Yue2SelectModelResult {
 
 export interface Yue2WarmRequest {
   lm?: string;
-  vae_variant?: 'standard' | 'legacy' | 'dec2x';
+  vae_variant?: Yue2VaeVariant;
 }
 
 export interface Yue2UnloadResult {
@@ -273,8 +276,16 @@ export interface Yue2SynthRequest {
    *  by the UI in v1; carried here for completeness/API callers. */
   abc?: string;
   /** Stop after the plan stage and return only the ABC score — the score
-   *  preview flow. Needs cot melody/full and no `abc`. */
+   *  preview flow. Needs cot melody/full and no `abc` (unless plan_continue). */
   plan_only?: boolean;
+  /** With plan_only: `abc` (or every `songs` entry's) is a kept score ending
+   *  in the label line of the next section plus its newline. The planner
+   *  writes that one section and stops before the next `%` line; the result
+   *  abc is the prefix byte-for-byte plus the section, and
+   *  stage_end_reasons.plan is section_end, eos or limit_hit.
+   *  plan_max_tokens then caps generated tokens only. Engines that support
+   *  it report props.plan_continue. */
+  plan_continue?: boolean;
   /** Stop after the semantic stage: the result body is the raw codec id
    *  stream as a JSON array. No NAR, no VAE. A planner probe for training. */
   semantic_only?: boolean;
@@ -300,7 +311,7 @@ export interface Yue2SynthRequest {
   infer_method?: 'md_wasserstein_yue2' | 'md_ancestral_yue2' | 'md_latent_eq_yue2' | 'md_tlie_yue2';
   scheduler?: 'md_ht_scheduler V3' | 'md_plan_aware_yue2' | 'md_plan_loose_yue2' | 'md_plan_overdrive_yue2';
   plugin_params?: Record<string, string | number | boolean>;
-  vae_variant?: 'standard' | 'legacy' | 'dec2x';
+  vae_variant?: Yue2VaeVariant;
   /** Validator-only per the plan; never sent by this backend's own mapping. */
   noise_source?: 'native' | 'fixture';
   /** Preview-only semantic frame ceiling; 0 leaves normal generation limits. */
@@ -416,7 +427,7 @@ export interface Yue2SynthResponse {
 }
 
 /** Named per-stage end reason, per §7's Job result contract. */
-export type Yue2StageEndReason = 'eos' | 'limit_hit' | 'preview_limit' | 'skipped';
+export type Yue2StageEndReason = 'eos' | 'limit_hit' | 'preview_limit' | 'skipped' | 'section_end';
 export type Yue2JobEndReason = 'completed' | 'cancelled' | 'engine_failed' | 'limit_hit' | 'preview_limit' | 'failed';
 
 /** The additive extras this client reads OPTIMISTICALLY off the shared GET
@@ -502,6 +513,16 @@ export function yue2AssetReason(props: Yue2Props | null, file: Yue2PropsFile | u
   return undefined;
 }
 
+/** The engine's VAE variants (YUE2_VAE_VARIANT_NAME in engine/src/yue2/yue2-model.h).
+ *  rs-x3 is Ruach Studio's YuE2-VAE-RS x3 decoder. */
+export const YUE2_VAE_VARIANTS = ['standard', 'legacy', 'dec2x', 'rs-x3'] as const;
+export type Yue2VaeVariant = typeof YUE2_VAE_VARIANTS[number];
+export const isYue2VaeVariant = (v: unknown): v is Yue2VaeVariant =>
+  (YUE2_VAE_VARIANTS as readonly unknown[]).includes(v);
+/** The /yue2/props file entry for a variant (`vae_rs_x3` for rs-x3). */
+export const yue2VaeFile = (props: Yue2Props | null | undefined, v: Yue2VaeVariant): Yue2PropsFile | undefined =>
+  props?.files?.[`vae_${v.replace(/-/g, '_')}` as keyof NonNullable<Yue2Props['files']>];
+
 export type Yue2AssetPick = Pick<Yue2SynthRequest, 'lm_type' | 'plan_only' | 'semantic_only'> & { vae_variant?: string };
 
 /** Validate the captured pick, before planning can spend any GPU time. */
@@ -525,10 +546,10 @@ export function yue2ValidateAssets(props: Yue2Props | null, pick: Yue2AssetPick)
   }
   if (!pick.plan_only && !pick.semantic_only) {
     const vae = pick.vae_variant || 'standard';
-    if (vae !== 'standard' && vae !== 'legacy' && vae !== 'dec2x') {
-      throw new Error(`Cannot start generation: unknown YuE2 VAE variant (${vae}). Choose standard, legacy or dec2x.`);
+    if (!isYue2VaeVariant(vae)) {
+      throw new Error(`Cannot start generation: unknown YuE2 VAE variant (${vae}). Choose ${YUE2_VAE_VARIANTS.join(', ')}.`);
     }
-    requireAsset(`VAE (${vae})`, props?.files?.[`vae_${vae}`]);
+    requireAsset(`VAE (${vae})`, yue2VaeFile(props, vae));
   }
 }
 

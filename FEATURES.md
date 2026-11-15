@@ -49,6 +49,8 @@ Pick the backend from the Generation engine box at the top of the sidebar; it ap
 
 ### YuE2
 
+- [Continue from a recording (experimental)](docs/user/studios/create.md): upload audio, select up to 30 seconds and compose a new song from that prefix, with an optional empty style. Works on simple material and HOT-Step renders; real vocal recordings are unreliable, with smeared starts and looping.
+
 | Feature | What it does |
 |---|---|
 | Native port | AR composer and NAR renderer halves plus a VAE decoder, in C++/GGML, producing 48 kHz stereo. |
@@ -91,11 +93,15 @@ The global bar holds every setting that applies to a render, whichever studio st
 | Plugin pickers | Solver, schedule and guidance mode come from Lua plugins, each with its own settings panel. |
 | Built-in schedules | Beta (Custom), Power and Composite (2-Stage), plus an Auto shift derived from duration and step count. |
 | Performance trades | CFG Cutoff, LM CFG Cutoff and Step Cache for speed at some cost in adherence. |
-| Timbre reference | A reference track fed to the DiT to guide tone and texture. |
+| Timbre reference | A reference track fed to the DiT to guide tone and texture, with a strength dial from none to full. |
 | DCW correction | Wavelet-domain correction during sampling, low band, high band, both, or latent space. |
 | Auto-trim | Renders past the requested length, cuts at a natural ending, and fades out only if none is found. |
 | Latent post-processing | Latent shift, latent rescale and custom timestep lists. |
 | Denoiser and LSS | An in-engine spectral gate after decode and a latent spectral suppressor before it. |
+| ADG guidance | ACE base-model angle guidance, with a clipped clean-latent rotation. See [Generation](docs/user/generation.md#ace-step-variations-and-guidance-intervals). |
+| CFG intervals | Apply ACE guidance only inside inclusive diffusion timestep bounds, for GGML and TensorRT. |
+| Retake variations | Mix a second seeded noise draw with variance from 0 to 1; saves the actual retake seed per song. |
+| Repeated PEFT wrappers | ACE DiT adapter keys with repeated PEFT prefixes map to the intended base weights. |
 | Seed Manager | Save, star, search and reload seeds; the seed actually used is stored with each song. |
 | Seed breeding | Blend the initial noise of two seeds (`seedB`, `seedBlend`) to get children between two keeper takes. API only for now. |
 | Seed morph | Time-varying seed blend (`seedBlendEnd`): the noise morphs from `seedBlend` at the start to `seedBlendEnd` at the end, slerped per latent frame. API only for now. |
@@ -192,12 +198,12 @@ Every render and import lands here. Details: [Library](docs/user/studios/library
 | Global player | Transport, repeat modes, spectrum analyzer, disco mode and volume, visible in every view. |
 | Rate and pitch preview | Playback speed from 0.5x to 2x, and a 48k/44.1k toggle that hears a render clocked at 44.1 kHz. |
 | Variant switch | No Adapter, Unmastered and Mastered versions, each with its own download. |
-| Waveform tools | Trim and crop in and out points, section markers, and a synced LRC lyrics bar that highlights each Whisper word with a tick per syllable on the waveform. An Edit button on the open strip opens a lyric editor modal: transport, speed, volume, the waveform, a 30 to 600 px/s zoom, one row per line with a draggable chip per word, word nudge, loop and split, whole-track nudge, undo and redo, optional autosave, and revision-checked saves that rebuild the `.lrc`. Unsaved edits can be discarded on close. |
-| Playlist queue | One browser-local play queue with reorder, Play All and Download All. Ordered playlist snapshots save with server revisions. A browser playlist can be imported explicitly; a failed save keeps the local edit visible for reapplication. |
+| Waveform tools | One crop and fade mode: pick Intro or Outro, drag the cut on the waveform, set that end's fade length and curve, hear it previewed, then Done writes both ends at once, section markers, and a synced LRC lyrics bar that highlights each Whisper word with a tick per syllable on the waveform. An Edit button on the open strip opens a lyric editor modal: transport, speed, volume, the waveform, a 30 to 600 px/s zoom, one row per line with a draggable chip per word, word nudge, loop and split, whole-track nudge, undo and redo, optional autosave, and revision-checked saves that rebuild the `.lrc`. Unsaved edits can be discarded on close. |
+| Playlist queue | One browser-local play queue with reorder, Play All and Download All. On phones it opens full screen with swipe to remove or delete. Ordered playlist snapshots save with server revisions. A browser playlist can be imported explicitly; a failed save keeps the local edit visible for reapplication. |
 
 ## Lyric Studio
 
-AI-assisted lyric writing from a learned style profile, plus per-album render presets. Details: [Lyric Studio](docs/user/studios/lyric-studio.md)
+AI-assisted lyric writing from a learned style profile, plus caption-based sound profiles and instrumental generation, per-album render presets and adapters. Details: [Lyric Studio](docs/user/studios/lyric-studio.md)
 
 | Feature | What it does |
 |---|---|
@@ -258,7 +264,7 @@ Details: [Cover Studio](docs/user/studios/cover-studio.md)
 | Instrumental melody mode (YuE2) | With Instrumental on, choose Vocal wins (the melody moves to Ins and cuts overlapping Ins notes) or Resting Ins bars only (the melody moves only into bars where Ins is silent, as in the YuE2 instrumental ComfyUI node). Vocal is muted either way. |
 | Follow source (YuE2) | Optionally let the recording steer the composer through the real-audio tokenizer's codes, with an adherence dial, candidate count, hard restriction, an adherence curve over the song and a periodic wobble. Off while the pitch is shifted or a BPM is set. [Details](docs/user/studios/cover-studio.md) |
 | Adapter pair (YuE2) | Render with the base model or an explicit AR/NAR pair captured when you queue the cover. Custom starts from the model picker's pair, and Base notes when it ignores a picked adapter. |
-| HeartMuLa lead-sheet cover | Approved Prepare ABC, explicit topic/genre/instrument/mood tags, section-marked lyrics and seed; 240-second ceiling. MuLaCover weights and outputs are CC BY-NC 4.0. Engine support and downloads pending. |
+| HeartMuLa lead-sheet cover | Approved Prepare ABC, explicit topic/genre/instrument/mood tags, section-marked lyrics and seed; up to 300 seconds. Needs the MuLaCover model pack, whose weights and outputs are CC BY-NC 4.0; download MuLaCover cover model from the HeartMuLa tab in Model Manager, including the HeartMuLa codec and tokenizer. Needs the Qwen3 Embedding BF16 text encoder. |
 | Serial cover queue | Queue more covers while one renders. |
 
 ## Repaint Studio

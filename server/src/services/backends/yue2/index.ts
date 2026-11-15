@@ -33,9 +33,11 @@ import { coverScoreChoices, transformCoverScore, type CoverScoreChoices } from '
 import { EMPTY_COVER_SCORE_ERROR, hasSoundingScore, hasSoundingVocalBar } from './scoreHealth.js';
 import { yue2CoverGuide, type Yue2CoverGuide } from './sourceGuide.js';
 import { runYue2Generation } from './generate.js';
+import { yue2Continuation } from './continuation.js';
 import {
   yue2Props, yue2PropsCached, yue2SelectModel, yue2Unload, TIMEOUT_DRAIN,
   yue2AssetReason, yue2ValidateAssets, yue2Preflight,
+  YUE2_VAE_VARIANTS, isYue2VaeVariant, yue2VaeFile,
 } from './client.js';
 import type { Yue2AdapterRef, Yue2AdapterScales, Yue2Props, Yue2Selection } from './client.js';
 import type {
@@ -409,6 +411,8 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
     || !(typeof submission.lyrics === 'string' && submission.lyrics);
   const soundingFor = (abc: string) => instrumentalRender ? hasSoundingScore(abc) : hasSoundingVocalBar(abc, true);
   const cover = yue2CoverFromSubmission(submission);
+  const continuation = yue2Continuation(submission.yue2Continuation);
+  if (continuation && (cover || submission.yue2Build)) throw new Error('Continuation cannot be combined with a cover or a build session.');
   if (cover?.sourceKind === 'musicxml' && submission.sourceAudioUrl) {
     throw new Error('MusicXML covers cannot also supply source audio.');
   }
@@ -434,6 +438,7 @@ function resolveRequest(submission: Readonly<Record<string, unknown>>): Resolved
   for (const key of Object.keys(submission)) {
     if (key.startsWith('yue2')) options[key] = submission[key];
   }
+  if (continuation) options.yue2Continuation = continuation;
   if (cover && coverAbc) {
     const choices = coverScoreChoices(cover);
     const score = transformCoverScore(coverAbc, choices);
@@ -1397,8 +1402,8 @@ async function models(): Promise<BackendModels> {
 
   const meta: NonNullable<BackendModels['meta']> = {};
   meta.vae = {};
-  for (const variant of ['standard', 'legacy', 'dec2x'] as const) {
-    const file = props?.files?.[`vae_${variant}`];
+  for (const variant of YUE2_VAE_VARIANTS) {
+    const file = yue2VaeFile(props, variant);
     meta.vae[variant] = { label: file?.name, bytes: file?.bytes, disabledReason: yue2AssetReason(props, file) };
   }
   if (v?.lm?.available?.length) {
@@ -1413,8 +1418,9 @@ async function models(): Promise<BackendModels> {
   return {
     buckets: {
       lm: (v?.lm?.available ?? []).map(f => f.type),
-      // Keep a saved dec2x visible even if its file was removed, with a reason.
-      vae: ['standard', 'legacy', ...(props?.files?.vae_dec2x?.found || persisted.vae_variant === 'dec2x' ? ['dec2x'] : [])],
+      // dec2x is a local fine-tune with no download: list it only when installed or
+      // saved (then with a reason). The rest are always listed, greyed when missing.
+      vae: YUE2_VAE_VARIANTS.filter(v => v !== 'dec2x' || props?.files?.vae_dec2x?.found || persisted.vae_variant === 'dec2x'),
     },
     adapters: [],
     lmAdapters: adapters.paths,
@@ -1772,7 +1778,7 @@ async function reconcileSelection(props: Yue2Props | null, stale: boolean): Prom
   if (!lmDrifted && !adapterDrifted) return;
 
   const sel: Yue2Selection = { lm: targetLm };
-  if (want.vae_variant === 'standard' || want.vae_variant === 'legacy' || want.vae_variant === 'dec2x') {
+  if (isYue2VaeVariant(want.vae_variant)) {
     sel.vae_variant = want.vae_variant;
   }
   // Only speak about the adapter when there is something to say: replaying the

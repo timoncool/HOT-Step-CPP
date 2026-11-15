@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { jobCover, mapYue2Params, planYue2Jobs, yue2PlanMode, type Yue2PreparedJob } from './generate.js';
+import { releaseYue2RenderLane, jobCover, mapYue2Params, planYue2Jobs, yue2PlanMode, yue2TrackReplayParams, type Yue2PreparedJob } from './generate.js';
 import { yue2Seed, yue2SeedPlus } from './client.js';
 import type { GenerationJob } from '../../generation/jobTypes.js';
 import type { Yue2PersistedSelection } from './index.js';
+
 
 // #S3: a cover job's source identity and approved ABC are captured into the
 // envelope at submit (index.ts's resolveRequest) and read ONLY from there —
@@ -97,6 +98,79 @@ const pick: Yue2PersistedSelection = {
 };
 const abc = ['X:1', 'M:4/4', 'L:1/4', 'Q:1/4=60', 'K:C', '% verse', 'V: Vocal', 'C4|', ''].join('\n');
 const lyrics = '[Verse]\nfirst line';
+
+test('empty style and lyrics remain empty on the wire', () => {
+  const { req } = mapYue2Params({ caption: '', lyrics: '', yue2CaptionBpmKey: false }, pick);
+  assert.equal(req.style, '');
+  assert.equal(req.lyrics, undefined);
+});
+
+test('batch member metadata replays its own score and exact semantic and noise seeds', () => {
+  const firstAbc = 'X:1\nK:C\nC4|';
+  const secondAbc = 'X:2\nK:C\nD4|';
+  const { req } = mapYue2Params({ caption: 'folk', seed: 7, yue2Abc: firstAbc }, pick);
+  const saved = yue2TrackReplayParams({ ...req, lm_batch_size: 3, synth_batch_size: 2,
+    songs: [{ style: 'folk', abc: firstAbc, seed: 7 }] }, {
+    song: 1, variation: 1, seed: '18446744073709551610', noise_seed: '18446744073709551611', abc: secondAbc,
+  });
+  assert.equal(saved.yue2Abc, secondAbc);
+  assert.equal(saved.yue2ScoreOrigin, 'supplied');
+  assert.equal(saved.yue2Request.abc, secondAbc);
+  assert.equal(saved.yue2Request.songs, undefined);
+  assert.equal(saved.yue2Request.lm_batch_size, undefined);
+  assert.equal(saved.yue2Request.synth_batch_size, undefined);
+  const replay = mapYue2Params({ caption: 'folk', ...saved, randomSeed: false, batchSize: 1,
+    yue2BatchSize: 1, yue2Variations: 1 }, pick).req;
+  assert.equal(replay.abc, secondAbc);
+  assert.equal(replay.seed, '18446744073709551610');
+  assert.equal(replay.noise_seed, '18446744073709551611');
+  assert.equal(replay.lm_batch_size, undefined);
+  assert.equal(replay.synth_batch_size, undefined);
+});
+
+test('single-track metadata retains supplied scores and falls back to the final score on older engines', () => {
+  const { req } = mapYue2Params({ caption: 'folk', lyrics, seed: 0, yue2Abc: abc }, pick);
+  const td = { song: 0, variation: 0, seed: 0, noise_seed: 0 };
+  assert.equal(yue2TrackReplayParams(req, td).yue2Abc, req.abc);
+  const saved = yue2TrackReplayParams({ ...req, abc: undefined }, td, abc);
+  assert.equal(saved.yue2Abc, abc);
+  assert.equal(saved.seed, 0);
+  assert.equal(saved.yue2NoiseSeed, 0);
+});
+
+test('score origin records the engine input path even though both paths save the rendered score', () => {
+  const { req } = mapYue2Params({ caption: 'folk', lyrics, seed: 7 }, pick);
+  const td = { song: 0, variation: 0, seed: 7, noise_seed: 7, abc };
+  const engine = yue2TrackReplayParams(req, td, undefined, false);
+  assert.equal(engine.yue2ScoreOrigin, 'engine');
+  assert.equal(engine.yue2Abc, abc);
+  for (const provenance of [{ abcSupplied: true }, { abcPlanned: true }]) {
+    const saved = yue2TrackReplayParams({ ...req, abc }, td, undefined,
+      !!provenance.abcSupplied || !!provenance.abcPlanned);
+    assert.equal(saved.yue2ScoreOrigin, 'supplied');
+    assert.equal(saved.yue2Abc, abc);
+  }
+});
+
+test('supplied vocal scores retain every byte, including the last newline; blank scores stay absent', () => {
+  for (const score of [abc, `\n${abc}\n`, abc.trim()]) {
+    const mapped = mapYue2Params({ caption: 'folk', lyrics, yue2Abc: score }, pick);
+    assert.equal(mapped.req.abc, score);
+    assert.equal(mapped.abcSupplied, true);
+  }
+  assert.equal(mapYue2Params({ caption: 'folk', lyrics, yue2Abc: ' \n\t' }, pick).req.abc, undefined);
+});
+
+test('instrumental score replay is byte-idempotent through the mapper in both modes', () => {
+  const score = 'X:1\nM:4/4\nL:1/4\nK:C\nV: Vocal\n"C"C2D2|\nV: Ins\nG4|\n';
+  for (const yue2InstrumentalMode of ['overlap', 'resting']) {
+    const params = { caption: 'folk', instrumental: true, yue2InstrumentalMode, yue2Abc: score };
+    const first = mapYue2Params(params, pick).req.abc;
+    assert.ok(first);
+    assert.notEqual(first, score, 'the first pass transforms sung notes');
+    assert.equal(mapYue2Params({ ...params, yue2Abc: first }, pick).req.abc, first);
+  }
+});
 
 test('score provenance survives app planning, engine fallback and instrumental planning', () => {
   for (const instrumental of [false, true]) {
@@ -195,10 +269,10 @@ test('a supplied score is moved for an instrumental whatever re-planning is, and
   for (const yue2AutoReplan of [true, false]) {
     for (const cot of ['full', 'melody']) {
       const inst = mapYue2Params({ caption: 'piano', instrumental: true, yue2Abc: native, yue2Cot: cot, yue2AutoReplan }, pick).req;
-      assert.match(inst.abc!, /\nV: Vocal\n"C"z16"G"z16\|\nV: Ins\nc16d16\|$/, `instrumental, autoReplan ${yue2AutoReplan}, cot ${cot}`);
+      assert.match(inst.abc!, /\nV: Vocal\n"C"z16"G"z16\|\nV: Ins\nc16d16\|\n$/, `instrumental, autoReplan ${yue2AutoReplan}, cot ${cot}`);
       assert.equal(yue2PlanMode({ instrumental: true, yue2AutoReplan }, inst), null);
       const vocal = mapYue2Params({ caption: 'folk', lyrics, yue2Abc: native, yue2Cot: cot, yue2AutoReplan }, pick).req;
-      assert.equal(vocal.abc, native.trim(), `vocal, autoReplan ${yue2AutoReplan}, cot ${cot}`);
+      assert.equal(vocal.abc, native, `vocal, autoReplan ${yue2AutoReplan}, cot ${cot}`);
     }
   }
 });
@@ -322,4 +396,69 @@ test('yue2CaptionBpmKey: on and absent keep the tail, off leaves it out', async 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('inline YuE2 renders hold the lane until completion; eligible renders hand it over', async t => {
+  const { config } = await import('../../../config.js');
+  const lane = await import('../../generation/gpuLane.js');
+  const saved = config.aceServer.keepLoaded;
+  t.after(() => { config.aceServer.keepLoaded = saved; });
+  for (const keepLoaded of [false, true]) {
+    for (const params of [{}, { yue2NarSolver: 'midpoint', yue2NarScheduler: 'uniform' },
+      { yue2NarSolver: 'tlie', yue2NarScheduler: 'plan_overdrive' },
+      { yue2NarSolver: 'wasserstein' }, { yue2NarSolver: 'ancestral' },
+      { yue2NarSolver: 'latent_eq' }, { yue2NarSolver: 'tlie' }, { yue2NarScheduler: 'ht_v3' },
+      { yue2NarScheduler: 'plan_aware' }, { yue2NarScheduler: 'plan_loose' }, { yue2NarScheduler: 'plan_overdrive' }]) {
+      for (const phase of ['queued', 'plan', 'semantic', 'nar', 'vae_decode', 'done']) {
+        config.aceServer.keepLoaded = keepLoaded;
+        const { req } = mapYue2Params({ caption: 'folk', ...params }, pick);
+        const expected = keepLoaded && !req.infer_method && !req.scheduler
+          && (phase === 'nar' || phase === 'vae_decode');
+        let finish!: () => void;
+        const rendering = new Promise<void>(resolve => { finish = resolve; });
+        let lease!: Parameters<typeof lane.releaseGpuLane>[0];
+        const first = lane.runOnWorkerLane(async held => { lease = held; await rendering; }, { family: 'yue2' });
+        let secondStarted = false;
+        const second = lane.runOnWorkerLane(async () => { secondStarted = true; }, { family: 'yue2' });
+        await Promise.resolve();
+        let releases = 0;
+        const released = releaseYue2RenderLane(req, phase, {
+          releaseLane: () => { releases++; return lane.releaseGpuLane(lease); },
+          nextLaneFamily: lane.gpuLaneNextFamily,
+        });
+        await Promise.resolve();
+        try {
+          const label = JSON.stringify({ keepLoaded, params, phase });
+          assert.equal(released, expected, label);
+          assert.equal(releases, Number(expected), label);
+          assert.equal(secondStarted, expected, label);
+        } finally {
+          finish();
+          await Promise.all([first, second]);
+        }
+        assert.equal(secondStarted, true, 'the next job starts after completion');
+      }
+    }
+  }
+});
+
+test('YuE2 handoff waits for other families and tolerates absent callbacks', async () => {
+  const { config } = await import('../../../config.js');
+  const saved = config.aceServer.keepLoaded;
+  config.aceServer.keepLoaded = true;
+  try {
+    const { req } = mapYue2Params({ caption: 'folk' }, pick);
+    let releases = 0;
+    for (const family of [undefined, 'ace', 'minimax-m3']) {
+      assert.equal(releaseYue2RenderLane(req, 'nar', {
+        releaseLane: () => { releases++; return true; }, nextLaneFamily: () => family,
+      }), false);
+    }
+    assert.equal(releases, 0);
+    assert.equal(releaseYue2RenderLane(req, 'nar', { nextLaneFamily: () => 'yue2' }), false);
+    assert.equal(releaseYue2RenderLane(req, 'nar', { releaseLane: () => true }), false);
+    assert.equal(releaseYue2RenderLane(req, 'nar', {
+      releaseLane: () => false, nextLaneFamily: () => 'yue2',
+    }), false);
+  } finally { config.aceServer.keepLoaded = saved; }
 });

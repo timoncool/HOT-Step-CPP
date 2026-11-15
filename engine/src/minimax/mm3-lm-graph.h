@@ -174,7 +174,10 @@
 // it adds ~2,000 nodes and lands around 3,700 — inside 4096, but with under 10%
 // headroom, which is not a margin worth defending. The cost of a bigger cap is
 // one pointer per slot in the node array.
-#define MM3_LM_MAX_NODES 8192
+// Doubled again for the opt-in row split (mm3_lm_mm): past 8 rows every
+// projection is two matmuls, two adapter applies and a concat, which takes a
+// LoKr graph past 8192.
+#define MM3_LM_MAX_NODES 16384
 // Attention-window quantum (design note C).
 #define MM3_LM_KV_BUCKET 256
 
@@ -184,9 +187,11 @@
 // still grows with song length. The write side is ggml_set_rows (F32 -> Q8_0 on
 // CUDA), the read side is flash attention (Q8_0 K/V are first-class there);
 // the manual F32 path widens the cache first (mm3_lm_attn_f32). Read once per
-// process: MM3_LM_KV_TYPE=f16|q8_0.
-static inline ggml_type mm3_lm_kv_type() {
-    static const ggml_type t = [] {
+// process: MM3_LM_KV_TYPE=f16|q8_0, which overrides the request. Otherwise the
+// request's lm_kv_q8 picks it (`q8`); it costs ~7% per step at 300 s and halves
+// the VRAM, which is what lets the plan dial's base rows run 3 or 4 takes.
+static inline ggml_type mm3_lm_kv_type(bool q8 = false) {
+    static const int env = [] {
         const char * e = std::getenv("MM3_LM_KV_TYPE");
         if (e && e[0]) {
             std::string s(e);
@@ -194,16 +199,28 @@ static inline ggml_type mm3_lm_kv_type() {
                 ch = (char) tolower((unsigned char) ch);
             }
             if (s == "q8_0" || s == "q8") {
-                return GGML_TYPE_Q8_0;
+                return (int) GGML_TYPE_Q8_0;
             }
             if (s == "f16") {
-                return GGML_TYPE_F16;
+                return (int) GGML_TYPE_F16;
             }
-            fprintf(stderr, "[MM3-LM] MM3_LM_KV_TYPE=%s not recognised (f16|q8_0); using f16\n", e);
+            fprintf(stderr, "[MM3-LM] MM3_LM_KV_TYPE=%s not recognised (f16|q8_0); ignoring it\n", e);
         }
-        return GGML_TYPE_F16;
+        return -1;
     }();
-    return t;
+    return env >= 0 ? (ggml_type) env : q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+}
+
+// MM3_LM_ROW_SPLIT=1: run a folded batch past MM3_MAX_BATCH_ROWS as 8-row
+// matmuls, each on ggml's matrix-vector kernel, instead of one matmul (MMQ on
+// CUDA). Off by default: measured on a 5090, q8_0 LM, plan 0.25, 4 takes (16
+// rows), steps 500-5000, MMQ ran 31.5 ms per AR iteration and the split 38.2.
+static inline bool mm3_lm_row_split() {
+    static const bool on = [] {
+        const char * e = std::getenv("MM3_LM_ROW_SPLIT");
+        return e && e[0] == '1';
+    }();
+    return on;
 }
 // MM3_MAX_BATCH_ROWS (mm3-model.h) is the MAXIMUM — the size every host-side
 // staging buffer is cut to, so a caller's [8, H] hidden / [8, V] logit buffers
@@ -259,6 +276,10 @@ struct MM3LmSlot {
     int64_t n_kv_pad      = 0;
     size_t  compute_bytes = 0;
     int     n_nodes       = 0;
+    // Replay slot only: true = every block, the decode's attention kind, and
+    // out_hidden = the post-norm hidden of every position (mm3_lm_replay_frames).
+    // false = the LRC alignment pass.
+    bool    full          = false;
 };
 
 struct MM3LmGraph {
@@ -343,6 +364,9 @@ struct MM3LmGraph {
     // loop mixes the two models' logits and the depth decoder keeps reading
     // the adapter rows, which come first. Off = today's graph exactly.
     bool                       base_rows = false;
+    // Request lm_kv_q8: store the KV cache as Q8_0 (mm3_lm_kv_type). Baked
+    // into the KV buffer, so mm3_lm_set_takes owns it like rows().
+    bool                       kv_q8     = false;
     // The per-row 1/0 on the adapter delta, F32 [1, 1, B]: 1 on the adapter
     // rows, 0 on the base rows. Its values only depend on rows(), so it lives
     // in the KV buffer and is written once there, never uploaded per step.
@@ -630,6 +654,23 @@ static ggml_tensor * mm3_lm_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
                                const MM3LmAdapterScales & sc, int layer, int module, bool want_fold,
                                ggml_tensor * dmask = nullptr) {
     const bool fold = want_fold && x->ne[1] == 1 && x->ne[2] > 1 && x->ne[3] == 1 && ggml_is_contiguous(x);
+    // Past the matrix-vector ceiling (plan dial base rows, MM3_MAX_LM_ROWS),
+    // opt-in (mm3_lm_row_split): one matmul per 8-row chunk, so every chunk
+    // keeps MMVQ's shared weight read; the weights are read once per chunk. The
+    // chunks are contiguous views ([H, 1, B] with ne1 == 1), so each folds again.
+    if (fold && x->ne[2] > MM3_MAX_BATCH_ROWS && mm3_lm_row_split()) {
+        ggml_tensor * out = nullptr;
+        for (int64_t c0 = 0; c0 < x->ne[2]; c0 += MM3_MAX_BATCH_ROWS) {
+            const int64_t nb = std::min<int64_t>(MM3_MAX_BATCH_ROWS, x->ne[2] - c0);
+            ggml_tensor * xc = ggml_view_3d(ctx, x, x->ne[0], 1, nb, x->nb[1], x->nb[2], (size_t) c0 * x->nb[2]);
+            ggml_tensor * mc = dmask ? ggml_view_3d(ctx, dmask, 1, 1, nb, dmask->nb[1], dmask->nb[2],
+                                                    (size_t) c0 * dmask->nb[2])
+                                     : nullptr;
+            ggml_tensor * yc = mm3_lm_mm(ctx, w, xc, ad, sc, layer, module, want_fold, mc);
+            out              = out ? ggml_concat(ctx, out, yc, 2) : yc;
+        }
+        return out;
+    }
     if (fold) {
         x = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[2]);  // [H, 1, B] -> [H, B]
     }
@@ -659,6 +700,12 @@ static ggml_tensor * mm3_lm_mm(ggml_context * ctx, ggml_tensor * w, ggml_tensor 
             // disagreed about the same adapter at the same dials.
             if (s != 0.0f) {
                 ggml_tensor * ax = ggml_mul_mat(ctx, p.a, x);
+                // F32 precision on the A side: rank rows and a long K. On CUDA it
+                // also routes the decode batch (2 to 8 rows) to the vector kernel,
+                // one block per rank row with an F32 sum, instead of the tensor-core
+                // kernel that tiles 32 rows per block and so ran a rank-256 A on 8
+                // blocks (HOT-ggml few-rows-mmvf; -1.5 ms/step at 2 takes, 5090).
+                ggml_mul_mat_set_prec(ax, GGML_PREC_F32);
                 if (mk && !p.has_dora()) {
                     ax     = ggml_mul(ctx, ax, mk);
                     masked = true;
@@ -762,7 +809,7 @@ static ggml_tensor * mm3_lm_block(ggml_context * ctx, ggml_cgraph * gf, const MM
     ggml_tensor * attn;
     if (use_flash) {
         attn = ggml_flash_attn_ext(ctx, q4, k_win, v_win, mask, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        ggml_prec_set_acc(attn, GGML_PREC_F32);
     } else {
         attn = mm3_lm_attn_f32(ctx, q4, k_win, v_win, mask, scale, out_scores);
     }
@@ -995,7 +1042,7 @@ static int64_t mm3_lm_bucket(int64_t n) {
 // bad call site can never silently push ggml off the matrix-vector path.
 // `base_rows` adds the plan dial's base copy of every pair (MM3LmGraph); it
 // changes rows() the same way, so it tears down the same things.
-static void mm3_lm_set_takes(MM3LmGraph * g, int takes, bool base_rows = false) {
+static void mm3_lm_set_takes(MM3LmGraph * g, int takes, bool base_rows = false, bool kv_q8 = false) {
     if (takes < 1) {
         takes = 1;
     }
@@ -1013,13 +1060,14 @@ static void mm3_lm_set_takes(MM3LmGraph * g, int takes, bool base_rows = false) 
         return e[0] == '0' ? 0 : 1;
     }();
     const bool fold = forced >= 0 ? forced == 1 : true;
-    if (g->n_takes == takes && g->fold_rows == fold && g->base_rows == base_rows) {
+    if (g->n_takes == takes && g->fold_rows == fold && g->base_rows == base_rows && g->kv_q8 == kv_q8) {
         return;
     }
     mm3_lm_free(g);
     g->n_takes   = takes;
     g->fold_rows = fold;
     g->base_rows = base_rows;
+    g->kv_q8     = kv_q8;
 }
 
 // Grows only; a shrink would throw away a valid allocation for nothing.
@@ -1136,7 +1184,7 @@ static bool mm3_lm_prepare(const MM3Model & m, MM3LmGraph * g, int64_t n_ctx_nee
     }
     g->kv_k.assign((size_t) L, nullptr);
     g->kv_v.assign((size_t) L, nullptr);
-    const ggml_type kv_type = mm3_lm_kv_type();
+    const ggml_type kv_type = mm3_lm_kv_type(g->kv_q8);
     for (int i = 0; i < L; i++) {
         char nm[64];
         g->kv_k[(size_t) i] = ggml_new_tensor_4d(g->kv_ctx, kv_type, D, want, Nkv, g->rows());
@@ -1616,13 +1664,13 @@ static bool mm3_lm_decode(const MM3Model & m, MM3LmGraph * g, const int32_t * se
 #define MM3_LRC_REPLAY_CHUNK 256
 
 static bool mm3_lm_build_replay_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSlot * s, int64_t T, int64_t n_kv_pad,
-                                     std::string * err) {
+                                     std::string * err, bool full = false) {
     const MM3LmConfig & c    = m.lm_cfg;
     const int64_t       H    = (int64_t) c.embedding_length;
     const int64_t       D    = (int64_t) c.key_length;
     const int64_t       Nkv  = (int64_t) c.head_count_kv;
     const int64_t       NC   = (int64_t) c.num_codebooks - 1;
-    const int           Lmax = mm3_align_max_layer();
+    const int           Lmax = full ? (int) m.lm.blk.size() - 1 : mm3_align_max_layer();
 
     const size_t ctx_bytes =
         ggml_tensor_overhead() * (MM3_LM_MAX_NODES + 256) + ggml_graph_overhead_custom(MM3_LM_MAX_NODES, false);
@@ -1690,15 +1738,21 @@ static bool mm3_lm_build_replay_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSl
         ggml_tensor * vc0 = ggml_view_4d(ctx, g->kv_v[(size_t) i], D, g->n_ctx, Nkv, 1, g->kv_v[(size_t) i]->nb[1],
                                          g->kv_v[(size_t) i]->nb[2], g->kv_v[(size_t) i]->nb[3], 0);
         ggml_tensor * sc   = nullptr;
-        const bool    want = mm3_align_layer_needed(i);
+        const bool    want = !full && mm3_align_layer_needed(i);
         h = mm3_lm_block(ctx, gf, c, m.lm.blk[(size_t) i], h, s->in_pos, s->in_mask, s->in_rows, kc0, vc0, n_kv_pad,
-                         /*use_flash*/ false, want ? &sc : nullptr, g->adapter, &g->adapter_scales, i);
+                         /*use_flash*/ full && g->use_flash_attn, want ? &sc : nullptr, g->adapter, &g->adapter_scales,
+                         i);
         if (want && sc) {
             ggml_set_name(sc, ("mm3_lm_replay_attn_" + std::to_string(i)).c_str());
             ggml_set_output(sc);
             ggml_build_forward_expand(gf, sc);
             s->attn_scores[(size_t) i] = sc;
         }
+    }
+    if (full) {
+        s->out_hidden = mm3_lm_rms(ctx, h, m.lm.output_norm, c.rms_eps);  // [H, T, 1]
+        ggml_set_output(s->out_hidden);
+        ggml_build_forward_expand(gf, s->out_hidden);
     }
     s->graph = gf;
 
@@ -1717,6 +1771,7 @@ static bool mm3_lm_build_replay_slot(const MM3Model & m, MM3LmGraph * g, MM3LmSl
     s->gctx          = ctx;
     s->T             = T;
     s->n_kv_pad      = n_kv_pad;
+    s->full          = full;
     s->n_nodes       = ggml_graph_n_nodes(s->graph);
     s->compute_bytes = ggml_backend_sched_get_buffer_size(s->sched, g->backend);
     return true;
@@ -1769,7 +1824,7 @@ static bool mm3_lm_lrc_replay(const MM3Model & m, MM3LmGraph * g, const int32_t 
     int                  n_chunks = 0;
     while (g->kv_pos < total) {
         const int64_t T = std::min<int64_t>(MM3_LRC_REPLAY_CHUNK, total - g->kv_pos);
-        if (!g->replay.graph || g->replay.T != T || g->replay.n_kv_pad != n_kv_pad) {
+        if (!g->replay.graph || g->replay.T != T || g->replay.n_kv_pad != n_kv_pad || g->replay.full) {
             mm3_lm_free_slot(&g->replay);
             if (!g->replay.sched) {
                 g->replay.sched = backend_sched_new(g->bp, MM3_LM_MAX_NODES * 2);
@@ -1837,5 +1892,78 @@ static bool mm3_lm_lrc_replay(const MM3Model & m, MM3LmGraph * g, const int32_t 
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr, "[MM3-LRC] Replay: %lld positions (%lld frames) in %d chunks, blocks 0..%d, %.0f ms\n",
             (long long) total, (long long) n_steps, n_chunks, mm3_align_max_layer(), ms);
+    return true;
+}
+
+// ── Forced-code replay: the frame hiddens in one teacher-forced pass ────────
+//
+// When every code is forced, the AR loop's decode steps are a teacher-forced
+// sequence: the hidden that frame j's flow conditioning reads is the post-norm
+// output at position (prompt end + j), fed with iteration j's codes. Causality
+// makes a chunked prefill over those positions compute the same thing, so this
+// runs ceil(n / chunk) graphs instead of n. Conditional row only (row 0 of the
+// cache): the uncond row never reaches a hidden. Call right after
+// mm3_lm_prefill, which leaves kv_pos at the prompt end and has already seeded
+// any trained prefix and artist token. The arithmetic matches the decode graph
+// (same feedback embedding order, same attention kind); the matmuls batch
+// differently, so agreement is to rounding, not to the bit.
+//
+//   sem / ac   iterations 0..n-1: raw semantic codes [n], acoustic [n, NC]
+//   out        [n, H], row j = the hidden emitted with frame j
+static bool mm3_lm_replay_frames(const MM3Model & m, MM3LmGraph * g, const int32_t * sem, const int32_t * ac,
+                                 int64_t n, float * out, std::string * err) {
+    const MM3LmConfig & c   = m.lm_cfg;
+    const int64_t       H   = (int64_t) c.embedding_length;
+    const int64_t       NC  = (int64_t) c.num_codebooks - 1;
+    const int64_t       AV  = (int64_t) c.acoustic_vocab_size;
+    const int64_t       OFF = (int64_t) c.semantic_vocab_offset;
+    const int64_t       end = g->kv_pos + n;
+    if (n <= 0 || end > g->n_ctx) {
+        if (err) {
+            *err = "forced replay of " + std::to_string((long long) n) + " frames does not fit the KV cache";
+        }
+        return false;
+    }
+    const int64_t        n_kv_pad = std::min<int64_t>(mm3_lm_bucket(end), g->n_ctx);
+    std::vector<int32_t> ids, acr;
+    std::vector<float>   gate, scl;
+    for (int64_t j0 = 0; j0 < n;) {
+        const int64_t T = std::min<int64_t>(MM3_LRC_REPLAY_CHUNK, n - j0);
+        if (!g->replay.graph || g->replay.T != T || g->replay.n_kv_pad != n_kv_pad || !g->replay.full) {
+            mm3_lm_free_slot(&g->replay);
+            if (!g->replay.sched) {
+                g->replay.sched = backend_sched_new(g->bp, MM3_LM_MAX_NODES * 2);
+            }
+            if (!mm3_lm_build_replay_slot(m, g, &g->replay, T, n_kv_pad, err, /*full*/ true)) {
+                return false;
+            }
+        }
+        MM3LmSlot & s = g->replay;
+        ids.assign((size_t) T, 0);
+        acr.assign((size_t) (T * NC), 0);
+        gate.assign((size_t) T, 1.0f);
+        scl.assign((size_t) T, c.ar_embedding_scale);
+        for (int64_t i = 0; i < T; i++) {
+            const int64_t j = j0 + i;
+            ids[(size_t) i] = (int32_t) (OFF + sem[j]);
+            for (int64_t k = 0; k < NC; k++) {
+                acr[(size_t) (i * NC + k)] = ac[j * NC + k] + (int32_t) (k * AV);
+            }
+        }
+        ggml_backend_tensor_set(s.in_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(s.in_ac, acr.data(), 0, acr.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(s.in_gate, gate.data(), 0, gate.size() * sizeof(float));
+        ggml_backend_tensor_set(s.in_scale, scl.data(), 0, scl.size() * sizeof(float));
+        mm3_lm_upload_step(g, &s, T, n_kv_pad);
+        if (ggml_backend_sched_graph_compute(s.sched, s.graph) != GGML_STATUS_SUCCESS) {
+            if (err) {
+                *err = "MM3 LM forced replay graph compute failed";
+            }
+            return false;
+        }
+        ggml_backend_tensor_get(s.out_hidden, out + j0 * H, 0, (size_t) (T * H) * sizeof(float));
+        g->kv_pos += T;
+        j0 += T;
+    }
     return true;
 }

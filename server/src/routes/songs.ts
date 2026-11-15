@@ -7,11 +7,13 @@ import fs from 'fs';
 import path from 'path';
 import multer from 'multer';
 import { getDb } from '../db/database.js';
+import { registerBusyCheck } from '../dataroot/pointer.js';
 import { config } from '../config.js';
 import { getUserId } from './auth.js';
 import { deleteAudioGenerationsByJobIds } from '../db/lireekDb.js';
 import { cleanupDeletedSongs } from '../services/compare/store.js';
-import { cropWavFile, cropLrcFile, cropLyricsJsonFile } from '../services/audioCrop.js';
+import { cropWavFile, cropLrcFile, cropLyricsJsonFile, fadeWavFile } from '../services/audioCrop.js';
+import { FADE_CURVES } from '../contracts/fade.js';
 import { analyzeAndSaveDiscoData } from '../services/disco-analyzer.js';
 import {
   startRePostProcess, checkPpEligibility, requestedPpStages, revertPostProcessing,
@@ -652,6 +654,40 @@ router.post('/:id/crop', (req, res) => {
   }
 });
 
+// POST /api/songs/:id/fade — fade the start or end of the audio (destructive).
+// Body: { kind: 'in' | 'out', lengthSec, curve, audioUrl? }. Same song lookup
+// as crop; the length stays the same, so sidecars and duration are untouched.
+router.post('/:id/fade', (req, res) => {
+  const userId = getUserId(req);
+  if (!userId) { res.status(401).json({ error: 'Unauthorized' }); return; }
+
+  const { kind, lengthSec, curve, audioUrl } = req.body ?? {};
+  if ((kind !== 'in' && kind !== 'out') || !FADE_CURVES.includes(curve)
+      || typeof lengthSec !== 'number' || !Number.isFinite(lengthSec) || lengthSec <= 0) {
+    res.status(400).json({ error: `kind ('in'|'out'), lengthSec (> 0) and curve (${FADE_CURVES.join('|')}) are required` });
+    return;
+  }
+
+  let song = getDb().prepare('SELECT * FROM songs WHERE id = ?').get(req.params.id) as any;
+  if (!song && audioUrl) song = getDb().prepare('SELECT * FROM songs WHERE audio_url = ?').get(audioUrl) as any;
+  if (!song) { res.status(404).json({ error: 'Song not found' }); return; }
+
+  const audioPath = path.join(config.data.audioDir, path.basename(song.audio_url));
+  if (!fs.existsSync(audioPath)) { res.status(404).json({ error: 'Audio file not found' }); return; }
+
+  try {
+    const applied = fadeWavFile(audioPath, kind, lengthSec, curve);
+    if (song.mastered_audio_url) {
+      const masteredPath = path.join(config.data.audioDir, path.basename(song.mastered_audio_url));
+      if (fs.existsSync(masteredPath)) fadeWavFile(masteredPath, kind, lengthSec, curve);
+    }
+    console.log(`[Songs] Fade ${kind} ${applied.toFixed(2)}s (${curve}) on ${song.id}`);
+    res.json({ faded: true, lengthSec: applied });
+  } catch (err: any) {
+    console.error(`[Songs] Fade failed:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // POST /api/songs/lyrics/offset — move a track's lyric timing by hand.
 //
@@ -1007,6 +1043,11 @@ router.delete('/:id/postprocess', (req, res) => {
 
 // Track in-flight extractions to prevent duplicate SuperSep jobs
 const extractionsInFlight = new Set<string>();
+// Extraction answers before it finishes and retranscribe runs for minutes; both write the library.
+registerBusyCheck('songs', () => [
+  ...(extractionsInFlight.size ? [`${extractionsInFlight.size} drum stem extraction(s) running`] : []),
+  ...(activeRetranscribes.size ? [`${activeRetranscribes.size} retranscription(s) running`] : []),
+]);
 
 // POST /api/songs/:id/extract-kick — extract kick drum stem for beat visualization
 router.post('/:id/extract-kick', async (req, res) => {

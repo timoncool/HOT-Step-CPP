@@ -335,6 +335,48 @@ test('cross-volume: copies, verifies sizes, keeps the source on failure, cleans 
   assert.equal(readPointer(f.ptrFile)!.root, newRoot);
 });
 
+test('cross-volume cleanup removes non-ASCII source entries', () => {
+  const f = fixture();
+  const oldRoot = path.join(f.base, 'old-root');
+  const newRoot = path.join(f.base, 'new-root');
+  const rel = path.join('library', 'Folder \u2014 Caf\u00e9', 'track.txt');
+  write(path.join(oldRoot, rel), 'keep');
+  const { op } = planOperation('move', newRoot, { appRoot: f.app, currentRoot: oldRoot, currentDb: null });
+  const ptr = { version: 1 as const, root: oldRoot, pending: op };
+  const real = hooks.sameVolume;
+  hooks.sameVolume = () => false;
+  try { runPending(f.ptrFile, ptr, f.app, quiet); }
+  finally { hooks.sameVolume = real; }
+  assert.equal(fs.existsSync(path.join(oldRoot, rel)), false);
+  assert.equal(fs.readFileSync(path.join(newRoot, rel), 'utf8'), 'keep');
+  assert.equal(readPointer(f.ptrFile)!.pending, null);
+});
+
+test('a cleanup failure warns without failing a verified move', t => {
+  const f = fixture();
+  const oldRoot = path.join(f.base, 'old-root');
+  const newRoot = path.join(f.base, 'new-root');
+  const source = path.join(oldRoot, 'library', 'locked.txt');
+  write(source, 'keep');
+  const { op } = planOperation('move', newRoot, { appRoot: f.app, currentRoot: oldRoot, currentDb: null });
+  const ptr = { version: 1 as const, root: oldRoot, pending: op };
+  const real = hooks.sameVolume;
+  const rm = fs.rmSync;
+  const failure = t.mock.method(fs, 'rmSync', (...args: Parameters<typeof fs.rmSync>) => {
+    if (isInside(oldRoot, String(args[0]))) throw new Error('access denied');
+    return rm(...args);
+  });
+  const logs: string[] = [];
+  hooks.sameVolume = () => false;
+  try { runPending(f.ptrFile, ptr, f.app, line => logs.push(line)); }
+  finally { hooks.sameVolume = real; failure.mock.restore(); }
+  assert.equal(readPointer(f.ptrFile)!.root, newRoot);
+  assert.equal(readPointer(f.ptrFile)!.pending, null);
+  assert.equal(fs.readFileSync(path.join(newRoot, 'library', 'locked.txt'), 'utf8'), 'keep');
+  assert.ok(fs.existsSync(source));
+  assert.ok(logs.some(line => line.includes('WARNING') && line.includes(oldRoot) && line.includes('access denied')));
+});
+
 test('DB rewrite: a unique-key collision rolls back everything', () => {
   const f = fixture();
   const from = path.join(f.base, 'old');
@@ -420,7 +462,7 @@ function loadConfig(env: NodeJS.ProcessEnv): any {
   const script = `const m = await import(${JSON.stringify(new URL('../config.ts', import.meta.url).href)});
 console.log('@@' + JSON.stringify({ data: m.config.data.dir, training: m.config.training.dir, models: m.config.aceServer.models,
   adapters: m.config.aceServer.adapters, env: m.ENV_FILE_PATH, logs: m.LOGS_DIR, marker: m.RESTART_MARKER_PATH,
-  trt: m.config.aceServer.trtLibs, portable: m.PORTABLE_MODE, root: m.PROJECT_ROOT }));`;
+  trt: m.config.aceServer.trtLibs, portable: m.PORTABLE_MODE, root: m.PROJECT_ROOT, exe: m.config.aceServer.exe }));`;
   const clean = { ...process.env };
   for (const k of ['HOT_STEP_ROOT', 'HOT_STEP_DATA_ROOT', 'HOT_STEP_PROFILE_DIR', 'DATA_DIR', 'ACESTEPCPP_MODELS', 'ACESTEPCPP_ADAPTERS', 'TRAINING_DIR', 'TENSORRT_LIBS']) delete clean[k];
   const out = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
@@ -900,7 +942,7 @@ for (const mode of ['release', 'dev'] as const) {
       }
       const before = snapshot(f.base);
       const report = locateData({ env, checkoutRoot: f.app });
-      const expectedRoot = mode === 'release' && state === 'override' ? override
+      const expectedRoot = state === 'override' ? override
         : state === 'valid' ? saved : mode === 'release' ? f.sibling : null;
       assert.equal(report.root, expectedRoot);
       assert.deepEqual(snapshot(f.base), before, 'locator never writes, even when fallback does not exist');
@@ -1052,4 +1094,222 @@ test('profile folder per platform, including macOS and Windows paths with spaces
   assert.equal(profileDir({}, 'win32', path.join('C:', 'Users', 'Jo Bloggs')), path.join('C:', 'Users', 'Jo Bloggs', 'AppData', 'Local', 'HOT-Step'));
   // The fixture override beats every platform default.
   assert.equal(profileDir({ HOT_STEP_PROFILE_DIR: path.resolve('p q') }, 'darwin', mac), path.resolve('p q'));
+});
+
+// ── Versioned layout: the stable launcher sets HOT_STEP_ROOT to app/<id> and HOT_STEP_INSTALL_ROOT to the unzipped folder ──
+
+/** What a protocol-1 package puts in `install` (unzipped over an old one, or into an empty folder). */
+function versioned(f: ReturnType<typeof fixture>, install = f.app) {
+  const payload = path.join(install, 'app', 'v3.0.0-0123456789ab-cpu');
+  for (const n of BUNDLED_DATA_NAMES) write(path.join(payload, 'server', 'data', n), 'bundled');
+  write(path.join(payload, 'engine', 'ace-server.exe'), 'new');
+  write(path.join(payload, '.env.example'), 'DATA_DIR=./server/data\nPP_STEM_CACHE_GB=4\n');
+  for (const n of ['HOT-Step.bat', 'launcher.mjs', 'README.txt', path.join('runtime', 'node.exe'), path.join('updater', 'last-result.json')]) write(path.join(install, n));
+  write(path.join(install, 'current.json'), JSON.stringify({ format: 1, payload: path.basename(payload) }));
+  return { install, payload, env: { HOT_STEP_ROOT: payload, HOT_STEP_INSTALL_ROOT: install, HOT_STEP_PROFILE_DIR: f.prof } as NodeJS.ProcessEnv };
+}
+
+function settingsPlans(env: NodeJS.ProcessEnv, targets: string[], kind = 'move'): any {
+  const script = `const m = await import(${JSON.stringify(new URL('./pointer.ts', import.meta.url).href)});
+const targets = ${JSON.stringify(targets)};
+const previews = targets.map(t => m.previewOperation(${JSON.stringify(kind)}, t, null));
+const refusals = targets.map((t, i) => {
+  if (previews[i].ok) return null;
+  try { m.scheduleOperation(${JSON.stringify(kind)}, t, null); return 'accepted'; }
+  catch (e) { return { status: e.status, message: e.message }; }
+});
+console.log('@@' + JSON.stringify({ previews, refusals, preflight: m.updatePreflight() }));`;
+  const clean = { ...process.env };
+  for (const k of ['HOT_STEP_ROOT', 'HOT_STEP_INSTALL_ROOT', 'HOT_STEP_DATA_ROOT', 'HOT_STEP_PROFILE_DIR', ...Object.keys(clean).filter(k => /^(DATA_DIR|ACESTEPCPP_|TRAINING_DIR|TENSORRT_LIBS)/.test(k))]) delete clean[k];
+  const out = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    env: { ...clean, ...env }, cwd: SERVER_DIR, encoding: 'utf-8', timeout: 60_000,
+  });
+  return JSON.parse(out.split('\n').find(l => l.startsWith('@@'))!.slice(2));
+}
+
+test('Settings Move refuses destinations anywhere inside a versioned install', () => {
+  const f = fixture();
+  const v = versioned(f);
+  initLayout(dataLayout(f.sibling));
+  writePointer(f.ptrFile, { version: 1, root: f.sibling, pending: null });
+  const alias = path.join(f.base, 'install-link');
+  fs.symlinkSync(v.install, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const targets = [v.install, path.join(v.install, 'my-data'), path.join(v.payload, 'my-data'), path.join(alias, 'my-data'), path.join(f.base, 'outside')];
+  const r = settingsPlans(v.env, targets);
+  for (let i = 0; i < targets.length - 1; i++) {
+    assert.equal(r.previews[i].ok, false, targets[i]);
+    assert.ok(r.previews[i].errors.includes(`the data folder cannot be inside the app folder (${v.install})`));
+    assert.equal(r.refusals[i].status, 400);
+  }
+  assert.equal(r.previews.at(-1).ok, true);
+  assert.equal(readPointer(f.ptrFile)!.pending, null);
+});
+
+test('Settings Move keeps the flat release and checkout destination boundaries', () => {
+  for (const dev of [false, true]) {
+    const f = fixture();
+    initLayout(dataLayout(f.sibling));
+    const app = dev ? path.dirname(SERVER_DIR) : f.app;
+    const ptrFile = dev ? devPointerFile(f.prof, app) : f.ptrFile;
+    writePointer(ptrFile, { version: 1, root: f.sibling, pending: null, ...(dev ? { checkout: app } : {}) });
+    const env = dev ? { HOT_STEP_PROFILE_DIR: f.prof } : f.env;
+    const r = settingsPlans(env, [path.join(app, 'my-data'), path.join(f.base, 'outside')]);
+    assert.equal(r.previews[0].ok, false);
+    assert.ok(r.previews[0].errors.includes(`the data folder cannot be inside the app folder (${app})`));
+    assert.equal(r.refusals[0].status, 400);
+    assert.equal(r.previews[1].ok, true);
+  }
+});
+
+test('versioned Settings still imports from the install folder with a saved location', () => {
+  const f = fixture();
+  oldInAppData(f);
+  const v = versioned(f);
+  initLayout(dataLayout(f.sibling));
+  writePointer(f.ptrFile, { version: 1, root: f.sibling, pending: null });
+  assert.equal(settingsPlans(v.env, [v.install], 'import').previews[0].ok, true);
+});
+
+test('versioned update preflight allows an existing data folder inside the install', () => {
+  const f = fixture();
+  const v = versioned(f);
+  const root = path.join(v.install, 'my-data');
+  initLayout(dataLayout(root));
+  writePointer(f.ptrFile, { version: 1, root, pending: null });
+  assert.deepEqual(settingsPlans(v.env, []).preflight, []);
+});
+
+/** f.app as a release from before data folders: library in server/data, models and settings in the app folder. */
+function oldInAppData(f: ReturnType<typeof fixture>) {
+  const sd = path.join(f.app, 'server', 'data');
+  makeDb(path.join(sd, 'hotstep.db'), [{ params: { p: path.join(sd, 'audio', 'a.wav') } }]);
+  write(path.join(sd, 'audio', 'a.wav'), 'wav');
+  write(path.join(f.app, 'models', 'm.gguf'), 'gguf');
+  write(path.join(f.app, 'engine', 'ace-server.exe'), 'old flat engine');
+  write(path.join(f.app, '.env'), ['DATA_DIR=./server/data', 'PP_STEM_CACHE_GB=7', 'ACESTEPCPP_EXE=./engine/ace-server.exe'].join('\n'));
+  return sd;
+}
+
+test('versioned package unzipped over an old install: its in-app data moves beside the install, and the new engine runs', async () => {
+  const f = fixture();
+  const sd = oldInAppData(f);
+  const v = versioned(f);
+  const r = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  assert.equal(r.runtime.dataRoot, f.sibling);
+  assert.equal(r.runtime.appRoot, v.payload);
+  assert.deepEqual(readPointer(f.ptrFile), { version: 1, root: f.sibling, pending: null });
+  const l = dataLayout(f.sibling);
+  assert.equal(fs.readFileSync(path.join(l.library, 'audio', 'a.wav'), 'utf-8'), 'wav');
+  assert.ok(fs.existsSync(path.join(l.models, 'm.gguf')));
+  assert.deepEqual(fs.readdirSync(sd).sort(), [...BUNDLED_DATA_NAMES].sort());
+  const env = fs.readFileSync(l.envPath, 'utf-8');
+  assert.match(env, /^PP_STEM_CACHE_GB=7$/m);
+  assert.doesNotMatch(env, /ACESTEPCPP_EXE|DATA_DIR/);
+  assert.ok(fs.existsSync(path.join(f.app, '.env.migrated')) && !fs.existsSync(path.join(f.app, '.env')));
+  assert.ok(!fs.existsSync(path.join(f.app, 'app', 'HOT-Step-Data')));
+  const conn = new Database(path.join(l.library, 'hotstep.db'), { readonly: true });
+  assert.equal(JSON.parse((conn.prepare('SELECT generation_params FROM songs').get() as any).generation_params).p, path.join(l.library, 'audio', 'a.wav'));
+  conn.close();
+  // The flat engine still in the install folder is not the one config starts.
+  const c = loadConfig(v.env);
+  assert.equal(c.root, v.payload);
+  assert.equal(c.exe, path.join(v.payload, 'engine', 'ace-server.exe'));
+  assert.equal(c.data, l.library);
+});
+
+test('versioned package in a new folder: its own root is not old data, and the first start only records the default', async () => {
+  const f = fixture();
+  const v = versioned(f, path.join(f.base, 'HOT-Step'));
+  const before = snapshot(v.install);
+  const r = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  assert.equal(r.runtime.dataRoot, f.sibling);
+  assert.deepEqual(readPointer(f.ptrFile), { version: 1, root: f.sibling, pending: null });
+  assert.deepEqual(snapshot(v.install), before);
+  assert.deepEqual(fs.readdirSync(dataLayout(f.sibling).library), []);
+});
+
+test('versioned layout with a saved pointer: old data in the install folder stays put, and Import can still take it', async () => {
+  const f = fixture();
+  const sd = oldInAppData(f);
+  const elsewhere = path.join(f.base, 'Data Drive', 'HOT-Step-Data');
+  initLayout(dataLayout(elsewhere));
+  writePointer(f.ptrFile, { version: 1, root: elsewhere, pending: null });
+  const v = versioned(f);
+  const r = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  assert.equal(r.runtime.dataRoot, elsewhere);
+  assert.ok(fs.existsSync(path.join(sd, 'hotstep.db')) && fs.existsSync(path.join(f.app, '.env')));
+  assert.ok(!fs.existsSync(f.sibling));
+  // Settings plans against the payload, so the install folder counts as an old install, not "this app folder".
+  const { errors } = planOperation('import', v.install, { appRoot: v.payload, currentRoot: elsewhere, currentDb: null });
+  assert.deepEqual(errors, []);
+});
+
+test('versioned layout: a populated default folder stops the migration, and one that stops half-way resumes on the next start', async () => {
+  const f = fixture();
+  oldInAppData(f);
+  const v = versioned(f);
+  write(path.join(f.sibling, 'library', 'hotstep.db'));
+  const refused = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.equal(refused.ok, false);
+  assert.match((refused as any).error, /already exists with other data/);
+  assert.ok(!fs.existsSync(f.ptrFile) && fs.existsSync(path.join(f.app, '.env')));
+  fs.rmSync(f.sibling, { recursive: true });
+
+  // A DB path that collides once rewritten stops the run after the files moved; fixing it lets the next start finish.
+  const lib = dataLayout(f.sibling).library;
+  const db = new Database(path.join(f.app, 'server', 'data', 'hotstep.db'));
+  const ins = db.prepare('INSERT INTO training_datasets (source_dir) VALUES (?)');
+  ins.run(path.join(f.app, 'server', 'data', 'x'));
+  ins.run(path.join(lib, 'x'));
+  db.close();
+  const first = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.equal(first.ok, false);
+  assert.match((first as any).error, /collides/);
+  const pending = readPointer(f.ptrFile)!.pending!;
+  assert.equal(pending.kind, 'migrate');
+  assert.equal(pending.source, f.app);
+  const conn = new Database(path.join(lib, 'hotstep.db'));
+  conn.prepare('DELETE FROM training_datasets WHERE source_dir = ?').run(path.join(lib, 'x'));
+  conn.close();
+  const second = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.ok(second.ok, !second.ok ? second.error : '');
+  assert.deepEqual(readPointer(f.ptrFile), { version: 1, root: f.sibling, pending: null });
+  assert.match(fs.readFileSync(dataLayout(f.sibling).envPath, 'utf-8'), /^PP_STEM_CACHE_GB=7$/m);
+});
+
+test('versioned layout: a saved data folder that went missing falls back beside the install, never inside app/', async () => {
+  const f = fixture();
+  writePointer(f.ptrFile, { version: 1, root: path.join(f.base, 'unplugged', 'HOT-Step-Data'), pending: null });
+  const v = versioned(f);
+  const r = await resolveRuntime({ env: v.env, log: quiet, skipEngineProbe: true });
+  assert.ok(r.ok, !r.ok ? r.error : '');
+  assert.equal(r.runtime.dataRoot, f.sibling);
+  assert.ok(!fs.existsSync(path.join(f.app, 'app', 'HOT-Step-Data')));
+});
+
+test('dev: HOT_STEP_DATA_ROOT beats a healthy dev pointer without rewriting it, must exist; unset, the pointer wins', async () => {
+  const f = fixture();
+  const co = path.join(f.base, 'co');
+  const saved = path.join(f.base, 'saved');
+  const override = path.join(f.base, 'with space', 'override');
+  initLayout(dataLayout(saved));
+  initLayout(dataLayout(override));
+  const ptrFile = devPointerFile(f.prof, co);
+  writePointer(ptrFile, { version: 1, root: saved, pending: null, checkout: co });
+  const before = fs.readFileSync(ptrFile, 'utf-8');
+  const env = { HOT_STEP_PROFILE_DIR: f.prof } as NodeJS.ProcessEnv;
+  const over = await resolveRuntime({ env: { ...env, HOT_STEP_DATA_ROOT: override }, log: quiet, checkoutRoot: co });
+  assert.ok(over.ok, !over.ok ? over.error : '');
+  assert.deepEqual([over.runtime.mode, over.runtime.dataRoot, over.runtime.override], ['dev', override, override]);
+  assert.equal(over.runtime.envPath, dataLayout(override).envPath);
+  assert.equal(fs.readFileSync(ptrFile, 'utf-8'), before);
+  assert.equal(locateData({ env: { ...env, HOT_STEP_DATA_ROOT: override }, checkoutRoot: co }).source, 'HOT_STEP_DATA_ROOT');
+  const missing = await resolveRuntime({ env: { ...env, HOT_STEP_DATA_ROOT: path.join(f.base, 'nope') }, log: quiet, checkoutRoot: co });
+  assert.ok(!missing.ok && /does not exist/.test(missing.error));
+  const plain = await resolveRuntime({ env, log: quiet, checkoutRoot: co });
+  assert.ok(plain.ok);
+  assert.deepEqual([plain.runtime.dataRoot, plain.runtime.override], [saved, null]);
 });

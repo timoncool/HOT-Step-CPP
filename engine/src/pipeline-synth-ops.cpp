@@ -5,7 +5,9 @@
 // pipeline-synth-impl.h for the struct layouts.
 
 #include "pipeline-synth-ops.h"
+#include "synth-finite.h"
 
+#include "retake-noise.h"
 #include "hot-step-sampler.h"
 #include "hot-step-sampler-trt.h"
 #include "adapter-trt.h"
@@ -17,6 +19,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +42,27 @@ static inline int hs_vae_chunk(const AceSynth * ctx) {
 }
 
 static const int FRAMES_PER_SECOND = 25;
+
+// data is frame-major; channels is 2 for stereo PCM and 64 for VAE latents.
+// Repeat short inputs to at least 30 s, then take the centre 10 s of each
+// third. Fixed centres avoid adding a second source of request randomness.
+static std::vector<float> timbre_window(const float * data, int frames, int channels, int rate) {
+    const int segment = 10 * rate;
+    const int target = 3 * segment;
+    const int repeated = frames < target ? ((target + frames - 1) / frames) * frames : frames;
+    const int third = repeated / 3;
+    std::vector<float> window((size_t) target * channels);
+    for (int part = 0; part < 3; ++part) {
+        const int length = part == 2 ? repeated - 2 * third : third;
+        const int start = part * third + (length - segment) / 2;
+        for (int t = 0; t < segment; ++t) {
+            memcpy(window.data() + (size_t) (part * segment + t) * channels,
+                   data + (size_t) ((start + t) % frames) * channels,
+                   channels * sizeof(float));
+        }
+    }
+    return window;
+}
 
 // ─── Determinism diagnostic ─────────────────────────────────────────────────
 static void diag_stats_f32(const char * label, const float * data, size_t n) {
@@ -411,7 +435,20 @@ void ops_encode_timbre(const AceSynth * ctx,
     // VAE encoder entirely, raw audio takes the encoder path. Latents win
     // when both are set. Without either input the timbre falls back to a
     // single silence frame, disabling timbre conditioning.
+    // Strength 0 is defined as no reference, so it takes that path exactly.
+    if (s.rr.timbre_reference_strength <= 0.0f && ((ref_latents && ref_T_latent > 0) || (ref_audio && ref_len > 0))) {
+        fprintf(stderr, "[Encode-Timbre] Strength 0: reference ignored\n");
+        ref_latents = nullptr;
+        ref_audio   = nullptr;
+    }
     if (ref_latents && ref_T_latent > 0) {
+        if (s.rr.timbre_reference_window) {
+            s.timbre_feats = timbre_window(ref_latents, ref_T_latent, 64, 25);
+            s.S_ref_timbre = 750;
+            fprintf(stderr, "[Encode-Timbre] Window: latents in %d frames (%.2fs) -> 750 frames (30s)\n",
+                    ref_T_latent, ref_T_latent / 25.0);
+            return;
+        }
         s.S_ref_timbre = ref_T_latent;
         s.timbre_feats.assign(ref_latents, ref_latents + (size_t) ref_T_latent * 64);
         fprintf(stderr, "[Encode-Timbre] Latents in: %d frames (%.1fs), VAE encode skipped\n", ref_T_latent,
@@ -419,6 +456,15 @@ void ops_encode_timbre(const AceSynth * ctx,
         return;
     }
     if (ref_audio && ref_len > 0) {
+        std::vector<float> window;
+        if (s.rr.timbre_reference_window) {
+            const int input_len = ref_len;
+            window = timbre_window(ref_audio, ref_len, 2, 48000);
+            ref_audio = window.data();
+            ref_len = 30 * 48000;
+            fprintf(stderr, "[Encode-Timbre] Window: audio in %d samples (%.2fs) -> 750 frames (30s)\n",
+                    input_len, input_len / 48000.0);
+        }
         s.timer.reset();
         VAEEncoder * ref_vae = store_require_vae_enc(ctx->store, ctx->vae_enc_key);
         if (!ref_vae) {
@@ -699,6 +745,36 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
 
         H_cond = ce->lyric_cfg.hidden_size;
 
+        // Timbre reference strength: token = none + k * (ref - none), where none
+        // is the token the encoder gives for the no-reference silence frame.
+        // The timbre token sits right after the lyric tokens in each encoding.
+        // Skipped at exactly 1.0 so the default stays bit-identical; with no
+        // reference the token already equals none and the blend is a no-op.
+        // ponytail: k is clamped to [0, 1]. Extrapolating the token past 1 gave a
+        // different render, not a stronger pull (and clipping on XL); a stronger
+        // pull needs guidance in the DiT loop, an extra pass per step.
+        const float        timbre_k = s.rr.timbre_reference_strength;
+        std::vector<float> timbre_none;
+        if (timbre_k != 1.0f && timbre_k > 0.0f) {  // 0 already took the no-reference path
+            std::vector<float> none_enc;
+            int                none_S = 0;
+            cond_ggml_forward(ce, main_fwd[0].text_hidden.data(), main_fwd[0].S_text, main_fwd[0].lyric_embed.data(),
+                              main_fwd[0].S_lyric, ctx->meta->silence_full.data(), 1, none_enc, &none_S);
+            timbre_none.assign(none_enc.begin() + (size_t) main_fwd[0].S_lyric * H_cond,
+                               none_enc.begin() + (size_t) (main_fwd[0].S_lyric + 1) * H_cond);
+            fprintf(stderr, "[Encode-Timbre] Strength %.3f: blending the timbre token against no reference\n",
+                    timbre_k);
+        }
+        auto blend_timbre = [&](std::vector<float> & enc, int S_lyric) {
+            if (timbre_none.empty()) {
+                return;
+            }
+            float * t = enc.data() + (size_t) S_lyric * H_cond;
+            for (int h = 0; h < H_cond; h++) {
+                t[h] = timbre_none[h] + timbre_k * (t[h] - timbre_none[h]);
+            }
+        };
+
         // null_condition_emb lives on the DiTMeta. Empty when the model has none.
         s.null_cond_vec.resize(H_cond);
         if (!ctx->meta->null_cond_cpu.empty()) {
@@ -718,6 +794,7 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
                               nullptr, 0,
                               s.timbre_feats.data(), s.S_ref_timbre, neg_enc, &neg_enc_S);
             if (neg_enc_S > 0 && !neg_enc.empty()) {
+                blend_timbre(neg_enc, 0);
                 s.neg_pooled.assign(H_cond, 0.0f);
                 for (int si = 0; si < neg_enc_S; si++)
                     for (int h = 0; h < H_cond; h++)
@@ -734,6 +811,7 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
             cond_ggml_forward(ce, main_fwd[b].text_hidden.data(), main_fwd[b].S_text, main_fwd[b].lyric_embed.data(),
                               main_fwd[b].S_lyric, s.timbre_feats.data(), s.S_ref_timbre, s.per_enc[b],
                               &s.per_enc_S[b]);
+            blend_timbre(s.per_enc[b], main_fwd[b].S_lyric);
             fprintf(stderr, "[Encode-Text Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n", b, main_fwd[b].S_text,
                     main_fwd[b].S_lyric, s.per_enc_S[b], s.timer.ms());
         }
@@ -744,6 +822,7 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
                 cond_ggml_forward(ce, nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text, nc_fwd[b].lyric_embed.data(),
                                   nc_fwd[b].S_lyric, s.timbre_feats.data(), s.S_ref_timbre, s.per_enc_nc[b],
                                   &s.per_enc_S_nc[b]);
+                blend_timbre(s.per_enc_nc[b], nc_fwd[b].S_lyric);
                 fprintf(stderr, "[Encode-Text Batch%d] non-cover: %d+%d tokens -> enc_S=%d\n", b, nc_fwd[b].S_text,
                         nc_fwd[b].S_lyric, s.per_enc_S_nc[b]);
             }
@@ -963,6 +1042,11 @@ void ops_init_noise(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
         float * dst = s.noise.data() + b * s.Oc * s.T;
         s.seeds[b]  = reqs[b].seed;
         philox_randn(reqs[b].seed, dst, s.Oc * s.T, /*bf16_round=*/true);
+        retake_noise(dst, s.Oc * s.T, reqs[b].retake_seed, reqs[b].retake_variance);
+        if (reqs[b].retake_variance > 0.0f) {
+            fprintf(stderr, "[Init-Noise Batch%d] Retake seed=%lld variance=%.3f\n", b,
+                    (long long) reqs[b].retake_seed, reqs[b].retake_variance);
+        }
         fprintf(stderr, "[Init-Noise Batch%d] Philox noise seed=%lld, [%d, %d] solver=%s\n", b,
                 (long long) reqs[b].seed, s.T, s.Oc, s.rr.solver.c_str());
 
@@ -1339,7 +1423,8 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
             /*real_S=*/nullptr, s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
             s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), /*use_sde=*/false, s.seeds.data(),
             ctx->params.use_batch_cfg,
-            !s.neg_pooled.empty() ? s.neg_pooled.data() : (s.null_cond_vec.empty() ? nullptr : s.null_cond_vec.data()) /* pooled negative, else pristine null (TRT CFG requires non-null) */);
+            !s.neg_pooled.empty() ? s.neg_pooled.data() : (s.null_cond_vec.empty() ? nullptr : s.null_cond_vec.data()) /* pooled negative, else pristine null (TRT CFG requires non-null) */,
+            s.rr.cfg_interval_start, s.rr.cfg_interval_end);
         if (dit_rc != 0) {
             return -1;
         }
@@ -1473,7 +1558,7 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
             /*repaint_injection_ratio=*/0.5f, /*repaint_crossfade_frames=*/0,
             /*neg_enc_data=*/s.neg_pooled.empty() ? nullptr : s.neg_pooled.data(),
             /*neg_enc_seq=*/s.neg_enc_seq.empty() ? nullptr : s.neg_enc_seq.data(),
-            /*neg_enc_seq_S=*/s.neg_enc_S);
+            /*neg_enc_seq_S=*/s.neg_enc_S, s.rr.cfg_interval_start, s.rr.cfg_interval_end);
         if (dit_rc != 0) {
             return -1;
         }
@@ -1489,6 +1574,8 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
 post_dit:
 #endif
 
+    if (!synth_finite(s.output.data(), s.output.size(), "DiT output")) return -1;
+
     // Latent post-processing before VAE decode: pred = pred * rescale + shift.
     // Skipped at defaults (1.0 / 0.0).
     if (s.rr.latent_rescale != 1.0f || s.rr.latent_shift != 0.0f) {
@@ -1499,6 +1586,8 @@ post_dit:
             s.output[i] = s.output[i] * s.rr.latent_rescale + s.rr.latent_shift;
         }
     }
+
+    if (!synth_finite(s.output.data(), s.output.size(), "DiT latent post-processing")) return -1;
 
     // ── Latent output RMS guard ─────────────────────────────────────────
     // Detect latent blowup (common with XL models at high noise + high CFG)
@@ -1641,6 +1730,8 @@ int ops_vae_decode(const AceSynth * ctx,
         }
         fprintf(stderr, "[VAE-Decode Batch%d] Decode: %.1f ms\n", b, s.timer.ms());
 
+        if (!synth_finite(audio.data(), (size_t) 2 * T_audio, "VAE decode")) return -1;
+
         if (b == 0) {
             debug_dump_2d(&s.dbg, "vae_audio", audio.data(), 2, T_audio);
         }
@@ -1756,10 +1847,15 @@ int ops_vae_decode_postprocess(const AceSynth * ctx,
         // This wraps vae_ggml_decode_tiled with the engine's VAE and chunk params
         // vae_ggml_decode_tiled packs ch1 at the returned count; the bridge
         // contract is capacity stride, so move ch1 out to max_T.
+        bool nonfinite_decode = false;
         PostprocessVaeDecodeFn decode_fn = [&](const float * latent, int T_lat, float * aud_out, int max_T) -> int {
             int n = vae_ggml_decode_tiled(vae, latent, T_lat, aud_out, max_T,
                                           hs_vae_chunk(ctx), ctx->params.vae_overlap,
                                           cancel, cancel_data);
+            if (n > 0 && !synth_finite(aud_out, (size_t) 2 * n, "VAE plugin tile decode")) {
+                nonfinite_decode = true;
+                return -1;
+            }
             if (n > 0 && n < max_T) {
                 memmove(aud_out + max_T, aud_out + n, (size_t) n * sizeof(float));
             }
@@ -1774,6 +1870,8 @@ int ops_vae_decode_postprocess(const AceSynth * ctx,
             *plugin, dit_out, T_latent, s.Oc, 2,
             audio.data(), T_audio_max, decode_fn,
             g_hotstep_params.plugin_params);
+
+        if (nonfinite_decode) return -1;
 
         if (T_audio < 0) {
             fprintf(stderr, "[Postprocess Batch%d] ERROR: plugin decode failed, falling back to built-in\n", b);
@@ -1792,6 +1890,8 @@ int ops_vae_decode_postprocess(const AceSynth * ctx,
             memmove(audio.data() + T_audio, audio.data() + T_audio_max, (size_t) T_audio * sizeof(float));
         }
         fprintf(stderr, "[Postprocess Batch%d] Decode: %.1f ms (T_audio=%d)\n", b, s.timer.ms(), T_audio);
+
+        if (!synth_finite(audio.data(), (size_t) 2 * T_audio, "VAE postprocess output")) return -1;
 
         int n_total    = 2 * T_audio;
         out[b].samples = (float *) malloc((size_t) n_total * sizeof(float));
@@ -1969,6 +2069,8 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
                 fprintf(stderr, "[PP-VAE Batch%d] WARNING: decode failed\n", b);
                 continue;
             }
+
+            if (!synth_finite(audio.data(), (size_t) 2 * T_audio, "PP-VAE decode")) return -1;
 
             // DEBUG: raw decode output stats (before gain)
             {

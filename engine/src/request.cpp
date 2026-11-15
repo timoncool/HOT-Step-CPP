@@ -6,6 +6,7 @@
 #include "yyjson.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -32,6 +33,10 @@ void request_init(AceRequest * r) {
     r->seed_b               = -1;
     r->seed_blend           = 0.0f;
     r->seed_blend_end       = -1.0f;
+    r->retake_seed = -1;
+    r->retake_variance = 0.0f;
+    r->cfg_interval_start = 0.0f;
+    r->cfg_interval_end = 1.0f;
     r->lm_temperature       = 0.85f;
     r->lm_cfg_scale         = 2.0f;
     r->lm_cfg_cutoff_ratio  = 1.0f;
@@ -58,6 +63,8 @@ void request_init(AceRequest * r) {
     r->dcw_high_scaler      = 0.0f;
     r->dcw_mode             = DCW_MODE_LOW;
     r->audio_cover_strength = 1.0f;
+    r->timbre_reference_window = false;
+    r->timbre_reference_strength = 1.0f;
     r->cover_noise_strength = 0.0f;
     r->cover_noise_method   = "";
     r->repainting_start     = 0.0f;
@@ -292,6 +299,19 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     if ((v = yyjson_obj_get(obj, "lm_dry_min_len")) && yyjson_is_num(v)) {
         r->lm_dry_min_len = (int) yyjson_get_num(v);
     }
+    if ((v = yyjson_obj_get(obj, "retake_seed")) && yyjson_is_num(v)) {
+        r->retake_seed = (int64_t) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "retake_variance")) && yyjson_is_num(v)) {
+        r->retake_variance = std::clamp((float) yyjson_get_num(v), 0.0f, 1.0f);
+    }
+    if ((v = yyjson_obj_get(obj, "cfg_interval_start")) && yyjson_is_num(v)) {
+        r->cfg_interval_start = std::clamp((float) yyjson_get_num(v), 0.0f, 1.0f);
+    }
+    if ((v = yyjson_obj_get(obj, "cfg_interval_end")) && yyjson_is_num(v)) {
+        r->cfg_interval_end = std::clamp((float) yyjson_get_num(v), 0.0f, 1.0f);
+    }
+    // An inverted interval is empty, matching the reference's two comparisons.
     if ((v = yyjson_obj_get(obj, "guidance_scale")) && yyjson_is_num(v)) {
         r->guidance_scale = (float) yyjson_get_num(v);
     }
@@ -309,6 +329,15 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "dcw_mode")) && yyjson_is_str(v)) {
         r->dcw_mode = yyjson_get_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "timbre_reference_window")) && yyjson_is_bool(v)) {
+        r->timbre_reference_window = yyjson_get_bool(v);
+    }
+    if ((v = yyjson_obj_get(obj, "timbre_reference_strength")) && yyjson_is_num(v)) {
+        const float ts = (float) yyjson_get_num(v);
+        if (std::isfinite(ts)) {
+            r->timbre_reference_strength = std::clamp(ts, 0.0f, 1.0f);
+        }
     }
     if ((v = yyjson_obj_get(obj, "audio_cover_strength")) && yyjson_is_num(v)) {
         r->audio_cover_strength = (float) yyjson_get_num(v);
@@ -588,6 +617,18 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     if (all || r->inference_steps != def.inference_steps) {
         yyjson_mut_obj_add_int(doc, root, "inference_steps", r->inference_steps);
     }
+    if (all || r->retake_seed != def.retake_seed) {
+        yyjson_mut_obj_add_sint(doc, root, "retake_seed", r->retake_seed);
+    }
+    if (all || r->retake_variance != def.retake_variance) {
+        yyjson_mut_obj_add_real(doc, root, "retake_variance", r->retake_variance);
+    }
+    if (all || r->cfg_interval_start != def.cfg_interval_start) {
+        yyjson_mut_obj_add_real(doc, root, "cfg_interval_start", r->cfg_interval_start);
+    }
+    if (all || r->cfg_interval_end != def.cfg_interval_end) {
+        yyjson_mut_obj_add_real(doc, root, "cfg_interval_end", r->cfg_interval_end);
+    }
     if (all || r->guidance_scale != def.guidance_scale) {
         yyjson_mut_obj_add_real(doc, root, "guidance_scale", r->guidance_scale);
     }
@@ -623,6 +664,12 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
 
     // cover/repaint
+    if (all || r->timbre_reference_window != def.timbre_reference_window) {
+        yyjson_mut_obj_add_bool(doc, root, "timbre_reference_window", r->timbre_reference_window);
+    }
+    if (all || r->timbre_reference_strength != def.timbre_reference_strength) {
+        yyjson_mut_obj_add_real(doc, root, "timbre_reference_strength", r->timbre_reference_strength);
+    }
     if (all || r->audio_cover_strength != def.audio_cover_strength) {
         yyjson_mut_obj_add_real(doc, root, "audio_cover_strength", r->audio_cover_strength);
     }
@@ -896,6 +943,10 @@ void request_dump(const AceRequest * r, FILE * f) {
 }
 
 void request_resolve_seed(AceRequest * r) {
+    if (r->retake_variance > 0.0f && r->retake_seed < 0) {
+        std::random_device rd;
+        r->retake_seed = (int64_t) rd();
+    }
     if (r->seed < 0) {
         std::random_device rd;
         r->seed = (int64_t) rd();

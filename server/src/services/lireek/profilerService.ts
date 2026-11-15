@@ -5,9 +5,19 @@ export interface SongLyrics {
   title: string;
   album?: string;
   lyrics: string;
+  instrumental?: boolean;
+  [key: string]: unknown;
+}
+
+export const NO_LYRICS_TO_PROFILE = 'no lyrics to profile: this album is instrumental';
+
+/** Only vocal lyrics contribute to lyric profiles, excerpts and statistics. */
+export function lyricSongs<T extends { lyrics?: string; instrumental?: boolean }>(songs: T[]): T[] {
+  return songs.filter(song => !song.instrumental && !!song.lyrics?.trim());
 }
 
 export interface LyricsProfile {
+  instrumental?: boolean;
   artist_id?: number;
   artist: string;
   album?: string;
@@ -710,6 +720,13 @@ export async function buildProfile(
   onPhase?: (phase: string) => void,
   onChunk?: ChunkCallback
 ): Promise<Partial<LyricsProfile>> {
+  if (songs.length && !lyricSongs(songs).length && songs.some(song => song.instrumental)) {
+    onPhase?.('Building sound profile from source captions…');
+    return { artist, album: album || undefined, instrumental: true,
+      audio_enrichment: computeAlbumEnrichment(songs) };
+  }
+  songs = lyricSongs(songs);
+  if (!songs.length) throw new Error(NO_LYRICS_TO_PROFILE);
   const effModel = modelName || llmService.getProvider(providerName).defaultModel;
 
   const struct = analyseStructure(songs);
@@ -813,6 +830,7 @@ export async function buildProfile(
  * lyrics set and patches the profile_data in place. This is fast — no LLM calls.
  */
 export function recalculateProfileStats(songs: SongLyrics[], profileData: any): any {
+  songs = lyricSongs(songs);
   const vocab = analyseVocabulary(songs);
   const meter = analyseMeter(songs);
   const rhyme = analyseRhymes(songs);

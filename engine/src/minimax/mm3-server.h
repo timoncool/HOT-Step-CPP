@@ -1065,9 +1065,13 @@ static bool mm3_json_bool(yyjson_val * root, const char * key, bool dflt) {
 //
 // BODY (JSON):
 //   prompt          the FULLY ASSEMBLED prompt template, e.g. the contents of
-//                   the fixture `tok_prompt_template.txt`. Caption/lyrics
-//                   assembly and the reference's text hygiene are a later
-//                   increment; this endpoint tokenises what it is given.
+//                   the fixture `tok_prompt_template.txt`; tokenised as given.
+//   caption, lyrics instead of `prompt`: assembled by mm3_assemble_prompt, the
+//                   trainer's and /mm3/synth's own assembly.
+//   eos_trace       true -> per-iteration EOS and emitted-code statistics for
+//                   every take (MM3ArResult), JSON body only.
+//   eos_watch       [codes] with eos_trace: per-iteration raw conditional
+//                   probability summed over these semantic codes (watch_p).
 //   ids_cond,       explicit token id rows, bypassing the tokenizer. When given
 //   ids_uncond      they win over `prompt`; `ids_uncond` alone may be omitted and
 //                   is then derived by the 3-token CFG mask rule.
@@ -1103,6 +1107,8 @@ static bool mm3_json_bool(yyjson_val * root, const char * key, bool dflt) {
 // the finite positions and assert the -inf masks match.
 //
 // 503 unless MM3 is warm (except tokenize_only).
+static std::string mm3_json_str(yyjson_val * root, const char * key);
+
 static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response & res) {
     std::lock_guard<std::mutex> lock(g_mm3_mutex);
 
@@ -1138,8 +1144,8 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     }
     if (!have_cond) {
         yyjson_val * pv = root ? yyjson_obj_get(root, "prompt") : nullptr;
-        if (!pv || !yyjson_is_str(pv)) {
-            mm3_json_error(res, 400, "need either \"prompt\" (the assembled template) or \"ids_cond\"");
+        if ((!pv || !yyjson_is_str(pv)) && mm3_json_str(root, "caption").empty()) {
+            mm3_json_error(res, 400, "need \"prompt\" (the assembled template), \"caption\" (+ \"lyrics\") or \"ids_cond\"");
             return;
         }
         std::string terr;
@@ -1147,7 +1153,14 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
             mm3_json_error(res, 503, terr);
             return;
         }
-        mm3_tokenizer_encode(g_mm3_tokenizer, std::string(yyjson_get_str(pv), yyjson_get_len(pv)), &ids_cond);
+        // `caption` (+ `lyrics`) instead of `prompt`: assembled exactly as the
+        // trainer and /mm3/synth assemble it, so a teacher-forced replay of a
+        // training track sees its training prompt.
+        const std::string cap = mm3_json_str(root, "caption");
+        const std::string text =
+            pv && yyjson_is_str(pv) ? std::string(yyjson_get_str(pv), yyjson_get_len(pv))
+                                    : mm3_assemble_prompt(cap, mm3_json_str(root, "lyrics"));
+        mm3_tokenizer_encode(g_mm3_tokenizer, text, &ids_cond);
         have_cond = true;
     }
     if (ids_cond.size() < 3) {
@@ -1201,6 +1214,10 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     // Ensemble takes: plan K independent songs from this prompt in one batched
     // pass (mm3-ar-loop.h). Clamped inside mm3_ar_plan_takes to the row budget.
     opt.n_takes         = (int) mm3_json_i64(root, "takes", 1);
+    {
+        yyjson_val * kq = yyjson_obj_get(root, "lm_kv_q8");
+        opt.lm_kv_q8    = kq && yyjson_is_bool(kq) && yyjson_get_bool(kq);
+    }
     // LRC per take ("lrc" in the JSON reply), to see where a plan sang its last line.
     if (mm3_json_bool(root, "lrc", false)) {
         std::string terr;
@@ -1210,6 +1227,8 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
         }
         opt.want_lrc = true;
         opt.tok      = &g_mm3_tokenizer;
+        // Base handoff cue on capped takes (mm3_align_handoff_cue), for tests.
+        opt.handoff_cue = mm3_json_bool(root, "handoff_cue", false);
     }
 
     // ── LM adapter, runtime deltas only ──
@@ -1305,6 +1324,19 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
         }
     }
 
+    {
+        bool has_w = false;
+        if (!mm3_json_int_array(root, "eos_watch", &opt.eos_watch, &has_w)) {
+            mm3_json_error(res, 400, "eos_watch must be an array of integers");
+            return;
+        }
+        for (int32_t c : opt.eos_watch) {
+            if (c < 0 || (int64_t) c >= (int64_t) g_mm3.lm_cfg.semantic_vocab_size) {
+                mm3_json_error(res, 400, "eos_watch code out of range");
+                return;
+            }
+        }
+    }
     std::vector<int32_t> f_sem, f_ac;
     bool                 has_sem = false, has_ac = false;
     if (!mm3_json_int_array(root, "forced_semantic", &f_sem, &has_sem) ||
@@ -1434,6 +1466,10 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     if (opt.want_lrc) {
         yyjson_mut_obj_add_strcpy(o, orot, "lrc", r.lrc.c_str());
     }
+    if (opt.handoff_cue) {
+        yyjson_mut_obj_add_int(o, orot, "handoff_cut", r.handoff_cut);
+        yyjson_mut_obj_add_real(o, orot, "handoff_cue", r.handoff_cue);
+    }
     yyjson_mut_obj_add_uint(o, orot, "prompt_tokens", ids_cond.size());
     yyjson_mut_obj_add_uint(o, orot, "hidden_dim", r.hidden_dim);
     yyjson_mut_obj_add_uint(o, orot, "num_codebooks", r.n_codebooks);
@@ -1445,25 +1481,47 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
     yyjson_mut_obj_add_real(o, orot, "iter0_max", r.iter0_max);
     yyjson_mut_obj_add_int(o, orot, "iter0_argmax", r.iter0_argmax);
 
-    // EOS trace (opt-in, take 0): parallel arrays indexed by iteration. See
+    // EOS trace (opt-in): parallel arrays indexed by iteration, one object per
+    // take (take 0 at the top level, every take under per_take). See
     // MM3ArResult for what each one measures.
-    if (opt.eos_trace) {
+    const auto add_trace = [&](yyjson_mut_val * dst, const MM3ArResult & tr) {
         yyjson_mut_val * et = yyjson_mut_obj(o);
         yyjson_mut_val * pc = yyjson_mut_arr(o);
+        yyjson_mut_val * pu = yyjson_mut_arr(o);
         yyjson_mut_val * pf = yyjson_mut_arr(o);
         yyjson_mut_val * rk = yyjson_mut_arr(o);
         yyjson_mut_val * ok = yyjson_mut_arr(o);
-        for (size_t i = 0; i < r.eos_p_cond.size(); i++) {
-            yyjson_mut_arr_add_real(o, pc, (double) r.eos_p_cond[i]);
-            yyjson_mut_arr_add_real(o, pf, (double) r.eos_p_final[i]);
-            yyjson_mut_arr_add_int(o, rk, r.eos_rank[i]);
-            yyjson_mut_arr_add_int(o, ok, r.eos_topk_ok[i]);
+        yyjson_mut_val * el = yyjson_mut_arr(o);
+        yyjson_mut_val * er = yyjson_mut_arr(o);
+        for (size_t i = 0; i < tr.eos_p_cond.size(); i++) {
+            yyjson_mut_arr_add_real(o, pc, (double) tr.eos_p_cond[i]);
+            yyjson_mut_arr_add_real(o, pu, (double) tr.eos_p_uncond[i]);
+            yyjson_mut_arr_add_real(o, pf, (double) tr.eos_p_final[i]);
+            yyjson_mut_arr_add_int(o, rk, tr.eos_rank[i]);
+            yyjson_mut_arr_add_int(o, ok, tr.eos_topk_ok[i]);
+        }
+        for (size_t i = 0; i < tr.emit_lp.size(); i++) {
+            yyjson_mut_arr_add_real(o, el, (double) tr.emit_lp[i]);
+            yyjson_mut_arr_add_int(o, er, tr.emit_rank[i]);
         }
         yyjson_mut_obj_add_val(o, et, "p_cond", pc);
+        yyjson_mut_obj_add_val(o, et, "p_uncond", pu);
         yyjson_mut_obj_add_val(o, et, "p_final", pf);
         yyjson_mut_obj_add_val(o, et, "rank", rk);
         yyjson_mut_obj_add_val(o, et, "topk_ok", ok);
-        yyjson_mut_obj_add_val(o, orot, "eos_trace", et);
+        yyjson_mut_obj_add_val(o, et, "emit_lp", el);
+        yyjson_mut_obj_add_val(o, et, "emit_rank", er);
+        if (!tr.watch_p.empty()) {
+            yyjson_mut_val * wp = yyjson_mut_arr(o);
+            for (float v : tr.watch_p) {
+                yyjson_mut_arr_add_real(o, wp, (double) v);
+            }
+            yyjson_mut_obj_add_val(o, et, "watch_p", wp);
+        }
+        yyjson_mut_obj_add_val(o, dst, "eos_trace", et);
+    };
+    if (opt.eos_trace) {
+        add_trace(orot, r);
     }
 
     // One entry per take: its seed, how far it got, and its own semantic code
@@ -1482,6 +1540,10 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
             if (opt.want_lrc) {
                 yyjson_mut_obj_add_strcpy(o, e, "lrc", rs[(size_t) t].lrc.c_str());
             }
+            if (opt.handoff_cue) {
+                yyjson_mut_obj_add_int(o, e, "handoff_cut", rs[(size_t) t].handoff_cut);
+                yyjson_mut_obj_add_real(o, e, "handoff_cue", rs[(size_t) t].handoff_cue);
+            }
             yyjson_mut_obj_add_real(o, e, "prefill_sum", rs[(size_t) t].prefill_sum);
             yyjson_mut_obj_add_real(o, e, "iter0_max", rs[(size_t) t].iter0_max);
             yyjson_mut_obj_add_int(o, e, "iter0_argmax", rs[(size_t) t].iter0_argmax);
@@ -1490,6 +1552,16 @@ static void mm3_handle_lm_plan(const httplib::Request & req, httplib::Response &
                 yyjson_mut_arr_add_int(o, sa, v);
             }
             yyjson_mut_obj_add_val(o, e, "semantic", sa);
+            if (opt.eos_trace) {
+                // A traced take can be replayed: its acoustic codes too, flat.
+                const MM3ArResult & rt = rs[(size_t) t];
+                yyjson_mut_val *    aa = yyjson_mut_arr(o);
+                for (int32_t v : rt.acoustic_all) {
+                    yyjson_mut_arr_add_int(o, aa, v);
+                }
+                yyjson_mut_obj_add_val(o, e, "acoustic", aa);
+                add_trace(e, rt);
+            }
             yyjson_mut_arr_add_val(tk, e);
         }
         yyjson_mut_obj_add_val(o, orot, "per_take", tk);

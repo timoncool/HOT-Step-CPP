@@ -12,6 +12,34 @@ time you open the app. A different browser, or one with its site data cleared, s
 the defaults listed below. To keep a set of settings you can return to, save a
 [profile](#profiles).
 
+## ACE-Step variations and guidance intervals
+
+Generation includes ADG, CFG interval start/end, and retake controls.
+ADG is Angle-based Dynamic Guidance from ACE-Step 1.5. It rotates the clean
+latent estimates using their conditional/unconditional angle, clipped at
+3.14/6 radians. Use a base model with Guidance Scale above 1. Turbo models do
+not have the unconditional embedding ADG needs. Other backend plugin bridges
+use ordinary CFG when this ACE-specific plugin is selected.
+
+CFG interval start and end are inclusive diffusion timestep bounds, defaulting
+to 0 and 1. Sampling runs from noisy 1 toward clean 0. Raising start stops
+guidance during the final steps; lowering end skips it during the early steps.
+Outside the interval the conditional prediction is used. Start above end makes
+the interval empty. These controls apply to every ACE guidance mode, including
+solver sub-evaluations. The existing step-based CFG Cutoff remains an additional
+limit. A restricted interval disables velocity caching so a cached guided
+prediction cannot leak across an interval boundary.
+
+Retake variance mixes the original seeded noise with a second draw using
+`cos(v*pi/2)*noise + sin(v*pi/2)*retake_noise`. Zero, the default, leaves the
+original take unchanged. One uses the retake seed's noise alone. Intermediate
+values preserve variance while varying the take. Keep the caption, lyrics,
+audio codes and primary seed fixed when comparing. Retake seed defaults to -1
+for a fresh draw; the resolved per-track seed is saved with the song so Apply
+Settings can reproduce it. Mixing happens before seed breeding and cover or
+repaint initialization. These controls work in both GGML and TensorRT ACE
+sampling; ADG and interval controls need Guidance Scale above 1.
+
 ## HeartMuLa controls
 
 Choose HeartMuLa in the engine picker. In Custom-Gen, Tags describes the genre,
@@ -90,7 +118,10 @@ engine falls back to BF16 and the generation log records the filename it loaded.
 | Text Encoder | Only shown when more than one text encoder is installed. |
 | Get More Models | Opens the Model Manager. |
 
-YuE2 keeps its standard and legacy VAE choices visible. Missing files or failed metadata
+YuE2 keeps its standard, legacy and rs-x3 VAE choices visible. rs-x3 is Ruach Studio's
+YuE2-VAE-RS x3 decoder: it removes Standard's 100 Hz ripple and the whistle at 6 and
+12 kHz, decodes the same songs, and needs about 0.8 GB more VRAM and a little more time
+(CC BY-NC 4.0, credit Ruach Studio). Missing files or failed metadata
 probes disable the affected choice and show the reason beneath it. Download the model
 in Model Manager or choose an installed VAE. Generation checks the captured model
 selection before planning starts, including files removed while a job was queued.
@@ -173,6 +204,12 @@ Uploads here and in Mastering share one list of reference tracks.
 With no timbre reference set, the mastering reference is used instead when Mastering is on
 and its "Also use as timbre reference" switch is on. A dedicated timbre reference always
 wins over the mastering one.
+
+Reference Strength appears once a reference is picked. It runs from 0 to 1, default 1. At 1
+the reference pulls as hard as it always has; at 0 the render is the same as having no
+reference; values between blend the two. The setting is saved with the song, so Reuse
+restores it, and songs made before it existed load at 1. Lyric Studio presets do not carry it
+yet.
 
 If a saved profile points at a reference file that has since been deleted, the generation
 is refused at submit with a message telling you to re-upload or clear it.
@@ -597,6 +634,20 @@ existing order and ownership rules while status views share current results.
 Leaving a status view stops that view's observation; use the job's explicit
 cancel control to stop server work. A completed server-queued render reaches
 the Library once, including when both the queue and its submitting view follow it.
+
+## Build by section (YuE2)
+
+Custom-Gen has two tabs when the engine is YuE2. **One-shot** is the usual page. **Build by section** builds the song one section at a time, the way Cover Studio's Build page does: pick the next sections, make several takes, keep one, move on. The tab is greyed out, with the reason in its tooltip, on other engines and when Chain of Thought is Off (the build follows a planned score).
+
+1. Fill in the style and lyrics on the One-shot tab, with a `[tag]` line for each section.
+2. Open Build by section and click **Plan the score**. The planner writes a score from your form. If its sections do not match your lyric tags, the tab says so; click **Re-plan with a new seed** until they pair. A lead sheet you pasted on the One-shot tab is used as it is.
+3. Click a section on the Source bar to add it to the song, then **Generate N takes**. Keep one take, then do the next section.
+   - **New chords per take** (the default here): each take of a section you have not built yet writes its own chords and melody for that section, planned after the sections you kept, so a chorus follows on from your verse. Keep writes the kept take's lines into the song, so a repeat (a second chorus) follows the kept one. A take that could not get a usable plan follows the score for that section and says so under its name; an older engine cannot plan this way, and says so too. A take costs a few seconds more for the planning.
+   - **Follow the score** (the default in Cover Studio): every take of a section follows the same score lines, so takes differ in performance, not in chords.
+4. **Condition strength** and **AR strength** can be changed until you keep the first take; Apply rebuilds the build and drops the takes made before it. After a keep they are locked, and changing them starts a fresh build.
+5. **Render Final Song** saves the kept sections as a song in the Library, with the usual post-processing.
+
+Voices, tempo and key shift are cover settings and do not appear here. The open build is remembered across reloads, and is forgotten once its song is saved.
 
 ## Related
 

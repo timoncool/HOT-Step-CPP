@@ -282,7 +282,7 @@ export const Mm3LmAdapterDropdown: React.FC = () => {
           <Slider
             label={t('globalBar.mm3LmPlan', 'Plan')}
             info={t('globalBar.mm3LmPlanInfo',
-              '1 = the adapter plans the song, 0 = the base model plans it and the adapter sings it, between = a mix. Below 1 the planner runs the base model beside the adapter on every step, so it renders in Runtime mode and planning is slower.')}
+              '1 = the adapter plans the song, 0 = the base model plans it and the adapter sings it, between = a mix. Below 1 the planner runs the base model beside the adapter on every step, so it renders in Runtime mode and planning is slower. Compact Planner Cache is on by default for every Plan render below 1 to reduce memory use. Turn it off for the f16 cache and a maximum of 2 variations. Changing the cache changes what a seed renders.')}
             infoMeta={t('globalBar.mm3LmPlanMeta', 'default 1.0 · range 0-1 · Runtime mode')}
             value={num(PARAM.plan, defaults.scalePlan ?? 1.0)}
             onChange={v => setBackendParam(PARAM.plan, v)}

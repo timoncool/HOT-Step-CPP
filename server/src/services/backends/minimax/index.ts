@@ -582,6 +582,20 @@ async function capabilities(): Promise<BackendCapabilities> {
         default: 1,
       },
       {
+        // Compact cache leaves headroom for every Plan render below 1.
+        key: 'mm3KvQ8',
+        type: 'toggle',
+        label: 'Compact Planner Cache',
+        hint: 'With the LM adapter\'s Plan dial below 1, stores the planner\'s memory at '
+            + '8 bits for every render to reduce VRAM use, including one or two songs. '
+            + 'One or two requested songs still use at most two candidates per round; '
+            + '3 or 4 variations can use up to four. Off uses the f16 cache and limits '
+            + 'Plan renders to 2 variations. Changing cache precision changes what a seed '
+            + 'renders. No effect when Plan is 1.',
+        default: true,
+        visible_when: { key: 'mm3LmAdapterScalePlan', less_than: 1 },
+      },
+      {
         // ── Natural endings ──
         //
         // A plan either reaches EOS or runs into the frame cap, and the second
@@ -598,7 +612,8 @@ async function capabilities(): Promise<BackendCapabilities> {
         label: 'Require Natural Ending',
         hint: 'Plans candidates together. For one requested song, stops the batch '
             + 'at the first natural ending and renders that song. Variations keep '
-            + 'all candidates that end. Re-plans with fresh seeds if none end before '
+            + 'the candidates that end in the first round with an ending, and drop '
+            + 'the rest rather than re-plan. Re-plans with fresh seeds if none end before '
             + 'the ceiling, then renders the longest plan anyway. Costs up to 12 '
             + 'planning passes when nothing ends, so turn it off if your adapter '
             + 'writes songs longer than the Duration you asked for.',
@@ -627,15 +642,20 @@ async function capabilities(): Promise<BackendCapabilities> {
         default: true,
       },
       {
-        key: 'mm3AdapterTailFade',
+        // Base handoff (engine eos_handoff, HOTSTEP-1194). Acts only with
+        // Require Natural Ending on and an LM adapter loaded.
+        key: 'mm3BaseHandoff',
         type: 'toggle',
-        label: 'Adapter Tail Fade',
-        hint: 'With an LM adapter loaded: keeps the adapter at full strength until '
-            + 'the lyrics should be sung, then steps it down to the base model over '
-            + '60 s so the song can end on its own. The start comes from the word '
-            + 'count. Renders the adapter in runtime mode (slower planning than merge). '
-            + 'No effect without an adapter or without lyrics.',
-        default: false,
+        label: 'Base Model Ending',
+        hint: 'With an LM adapter loaded and Require Natural Ending on: when a '
+            + 'take runs to the 5-minute cap, it is cut 25 s after its last '
+            + 'steadily placed lyric line and the base model plays the song out '
+            + 'from there and ends it. The take keeps the adapter\'s audio up to '
+            + 'the switch, with a 1 s crossfade. Each rescue adds about one more '
+            + 'plan and render of that take. Acts only on a round where no take '
+            + 'ended by itself, and stops at the first rescue that ends.',
+        default: true,
+        visible_when: { key: 'mm3LmAdapter', not_equals: '' },
       },
       {
         key: 'mm3LmTemperature',

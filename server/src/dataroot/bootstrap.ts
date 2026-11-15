@@ -2,14 +2,15 @@
 //
 // config.ts imports RUNTIME from here, so this module is evaluated before any
 // module that opens SQLite, log files or the engine. In a release it picks the
-// root (HOT_STEP_DATA_ROOT, profile pointer, this app's old layout, then
-// <parent of app>/HOT-Step-Data), runs a pending move/import/migration, and on
+// root (HOT_STEP_DATA_ROOT, profile pointer, this install's old layout, then
+// <parent of install>/HOT-Step-Data), runs a pending move/import/migration, and on
 // transfer or pointer failure serves one plain page and never lets the app start.
 // An unavailable saved root falls back without changing the pointer.
 // A dev checkout (no HOT_STEP_ROOT) keeps its checkout paths until Settings
 // writes its own dev pointer; from then on it works like a release, except
 // that nothing is migrated automatically and restart keeps the dev marker.
 
+import { removeSync } from '../services/fsRemove.js';
 import fs from 'fs';
 import http from 'http';
 import net from 'net';
@@ -21,8 +22,10 @@ import {
   readPointer, writePointer,
   type Pointer,
 } from './paths.js';
+import { defaultServerHost } from '../services/security/originPolicy.js';
 import { planOperation, runPending, sharedRoot } from './transfer.js';
 import { CHECKOUT_ROOT, accessibleRoot, pointerLocation, selectPointerRoot } from './locate.js';
+import { UPDATER_DIR_ENV, leaseForStartup } from '../services/updates/maintenance.js';
 
 export interface Runtime {
   mode: 'dev' | 'release';
@@ -61,7 +64,16 @@ function dev(checkout: string, prof: string, ptrFile: string, root: string | nul
   };
 }
 
-export type Resolution = { ok: true; runtime: Runtime } | { ok: false; error: string; pointerPath: string | null };
+/** `lease`: an update holds this install or data folder; the process exits
+ *  rather than serve the error page on a port the update will need. */
+export type Resolution = { ok: true; runtime: Runtime } | { ok: false; error: string; pointerPath: string | null; lease?: true };
+
+/** Another process's maintenance lease on the updater folder or `root`.
+ *  Checked before any SQLite or bootstrap work; a no-op with no lease on disk. */
+function leaseRefusal(env: NodeJS.ProcessEnv, root: string | null, pointerPath: string | null): Resolution | null {
+  try { leaseForStartup({ updaterDir: env[UPDATER_DIR_ENV] || null, dataRoot: root }, env); return null; }
+  catch (e: any) { return { ok: false, error: String(e?.message ?? e), pointerPath, lease: true }; }
+}
 
 function release(appRoot: string, root: string, prof: string, override: string | null): Runtime {
   const l = dataLayout(root);
@@ -86,10 +98,10 @@ function withLock<T>(prof: string, fn: () => T): T {
       let alive = false;
       try { if (pid) { process.kill(pid, 0); alive = true; } } catch (k: any) { alive = k.code === 'EPERM'; }
       if (alive) throw new Error(`another HOT-Step (PID ${pid}) is moving data`);
-      fs.rmSync(lock, { force: true });
+      removeSync(lock, { force: true });
     }
   }
-  try { return fn(); } finally { fs.rmSync(lock, { force: true }); }
+  try { return fn(); } finally { removeSync(lock, { force: true }); }
 }
 
 function portInUse(port: number, host = '127.0.0.1'): Promise<boolean> {
@@ -142,13 +154,26 @@ async function resolveDev(opts: ResolveOptions, env: NodeJS.ProcessEnv, log: (m:
   const { appRoot: checkout, profileDir: prof, pointerPath: ptrFile } = pointerLocation(env, opts.checkoutRoot ?? CHECKOUT_ROOT);
   const fail = (error: string): Resolution => ({ ok: false, error, pointerPath: ptrFile });
   try {
+    // HOT_STEP_DATA_ROOT follows the release rules: it must exist, beats the pointer,
+    // and the pointer is neither read nor rewritten.
+    if (env.HOT_STEP_DATA_ROOT) {
+      const root = path.resolve(env.HOT_STEP_DATA_ROOT);
+      if (!fs.existsSync(root)) return fail(`HOT_STEP_DATA_ROOT is ${root}, which does not exist.`);
+      const heldRoot = leaseRefusal(env, root, ptrFile);
+      if (heldRoot) return heldRoot;
+      initLayout(dataLayout(root));
+      log(`[Data] Using HOT_STEP_DATA_ROOT: ${root}`);
+      return { ok: true, runtime: { ...dev(checkout, prof, ptrFile, root), override: root } };
+    }
     let ptr: Pointer | null;
     try { ptr = readPointer(ptrFile); } catch (e: any) { return fail(`${e.message}. Fix or delete it, then restart.`); }
     if (!ptr || (!ptr.root && !ptr.pending)) return { ok: true, runtime: dev(checkout, prof, ptrFile, null) };
+    const held = leaseRefusal(env, ptr.root, ptrFile);
+    if (held) return held;
     const err = await runPendingAtBoot(ptrFile, ptr, checkout, prof, opts, log);
     if (err) return fail(err);
     if (!ptr.root) return { ok: true, runtime: dev(checkout, prof, ptrFile, null) }; // abandoned before any root
-    const selected = selectPointerRoot({ mode: 'dev', appRoot: checkout }, ptr.root);
+    const selected = selectPointerRoot({ mode: 'dev', installRoot: checkout }, ptr.root);
     if (selected.staleRoot) {
       log(`[Data] WARNING: Saved data folder ${ptr.root} is missing or cannot be accessed. Using this checkout's default folders in ${checkout}. Saved location unchanged; reconnect the drive and restart to use it again.`);
       return { ok: true, runtime: dev(checkout, prof, ptrFile, null) };
@@ -169,13 +194,17 @@ export async function resolveRuntime(opts: ResolveOptions = {}): Promise<Resolut
   const log = opts.log ?? (m => console.log(m));
   if (!env.HOT_STEP_ROOT) return resolveDev(opts, env, log);
 
-  const { appRoot, profileDir: prof, pointerPath: ptrFile } = pointerLocation(env);
+  const { appRoot, installRoot, profileDir: prof, pointerPath: ptrFile } = pointerLocation(env);
   const fail = (error: string): Resolution => ({ ok: false, error, pointerPath: ptrFile });
 
   try {
+    const held = leaseRefusal(env, null, ptrFile);
+    if (held) return held;
     if (env.HOT_STEP_DATA_ROOT) {
       const root = path.resolve(env.HOT_STEP_DATA_ROOT);
       if (!fs.existsSync(root)) return fail(`HOT_STEP_DATA_ROOT is ${root}, which does not exist.`);
+      const heldRoot = leaseRefusal(env, root, ptrFile);
+      if (heldRoot) return heldRoot;
       initLayout(dataLayout(root));
       log(`[Data] Using HOT_STEP_DATA_ROOT: ${root}`);
       return { ok: true, runtime: release(appRoot, root, prof, root) };
@@ -185,19 +214,21 @@ export async function resolveRuntime(opts: ResolveOptions = {}): Promise<Resolut
     try { ptr = readPointer(ptrFile); } catch (e: any) { return fail(`${e.message}. Fix or delete it, then restart.`); }
 
     if (!ptr) {
-      // First run of the new layout on this machine.
-      const sibling = path.join(path.dirname(appRoot), DEFAULT_DATA_FOLDER);
+      // First run of the new layout on this machine. Under the stable launcher
+      // the old version's data is in the install folder, not in app/<id>: a
+      // versioned package unzipped over an old one leaves it there.
+      const sibling = path.join(path.dirname(installRoot), DEFAULT_DATA_FOLDER);
       if (sharedRoot(prof, ptrFile, sibling)) {
         return fail(`${sibling} is a development checkout's data folder. Set HOT_STEP_DATA_ROOT, or move that checkout's data elsewhere, then restart.`);
       }
-      const legacy = inspectLegacy(appRoot);
+      const legacy = inspectLegacy(installRoot);
       const hasLegacy = legacyMappings(legacy, sibling).length > 0 || !!legacy.envFile;
       if (hasLegacy) {
         if (!isEmptyDir(sibling)) {
           return fail(`This app folder still holds data from an older version, and ${sibling} already exists with other data. `
             + `Move one of them aside, then restart.`);
         }
-        const { op, errors } = planOperation('migrate', sibling, { appRoot, currentRoot: null, currentDb: null });
+        const { op, errors } = planOperation('migrate', sibling, { appRoot: installRoot, currentRoot: null, currentDb: null });
         if (errors.length) return fail(`Could not plan moving this install's data to ${sibling}: ${errors.join('; ')}`);
         ptr = { version: 1, root: null, pending: op };
         writePointer(ptrFile, ptr);
@@ -212,12 +243,14 @@ export async function resolveRuntime(opts: ResolveOptions = {}): Promise<Resolut
       }
     }
 
+    const heldRoot = leaseRefusal(env, ptr.root, ptrFile);
+    if (heldRoot) return heldRoot;
     const err = await runPendingAtBoot(ptrFile, ptr, appRoot, prof, opts, log);
     if (err) return fail(err);
 
     let root = ptr.root;
     if (!root) return fail(`${ptrFile} names no data folder.`);
-    const selected = selectPointerRoot({ mode: 'release', appRoot }, root);
+    const selected = selectPointerRoot({ mode: 'release', installRoot }, root);
     const staleRoot = selected.staleRoot;
     if (staleRoot) {
       root = selected.root!;
@@ -243,7 +276,7 @@ function escapeHtml(s: string): string {
 /** The only thing a broken data location serves. Never returns. */
 async function serveErrorPage(error: string, pointerPath: string | null): Promise<never> {
   const port = parseInt(process.env.SERVER_PORT || '3001', 10);
-  const host = process.env.SERVER_HOST || '0.0.0.0';
+  const host = defaultServerHost(process.env.SERVER_HOST);
   console.error(`\n[Data] HOT-Step cannot start: ${error}\n`);
   const body = `<!doctype html><meta charset="utf-8"><title>HOT-Step: data folder problem</title>
 <body style="font-family:sans-serif;max-width:46em;margin:3em auto;line-height:1.5">
@@ -258,6 +291,10 @@ ${pointerPath ? `<p>The data location is recorded in <code>${escapeHtml(pointerP
 }
 
 const resolution = await resolveRuntime();
+if (!resolution.ok && resolution.lease) {
+  console.error(`\n[Data] HOT-Step cannot start: ${resolution.error}\n`);
+  process.exit(1);
+}
 if (!resolution.ok) await serveErrorPage(resolution.error, resolution.pointerPath);
 
 export const RUNTIME: Runtime = (resolution as { ok: true; runtime: Runtime }).runtime;

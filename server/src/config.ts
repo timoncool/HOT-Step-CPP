@@ -7,6 +7,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // Must stay the first local import: it picks (and if needed moves) the release
 // data folder before anything below reads a path.
 import { RUNTIME } from './dataroot/bootstrap.js';
+import { defaultServerHost } from './services/security/originPolicy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -66,6 +67,8 @@ const BUILD_VARIANTS: Record<string, string[]> = {
   'linux/x64': ['cuda13.1', 'cuda12.8', 'cuda12-volta', 'vulkan', 'rocm', 'cpu'],
   'macos/arm64': ['metal'],
 };
+/** Highest updater protocol this server speaks (release/build-info.mjs MAX_UPDATER_PROTOCOL). */
+export const MAX_UPDATER_PROTOCOL = 1;
 const FULL_SHA = /^[0-9a-f]{40}$/;
 /** A build-info.json that meets the whole contract, else null (unknown identity). */
 export function parseBuildInfo(text: string): BuildInfo | null {
@@ -78,9 +81,13 @@ export function parseBuildInfo(text: string): BuildInfo | null {
     && typeof i.engineSha === 'string' && FULL_SHA.test(i.engineSha)
     && i.channel === (i.tag ? 'release' : 'master')
     && BUILD_VARIANTS[`${i.os}/${i.arch}`]?.includes(i.variant) === true
-    && i.updaterProtocol === 0;
+    && (i.updaterProtocol === 0 || i.updaterProtocol === MAX_UPDATER_PROTOCOL);
   return ok ? i : null;
 }
+/** Protocol of the stable launcher that started this process (release/updater/launcher.mjs),
+ *  0 when it was not started by one. Apply needs it to equal build-info's updaterProtocol. */
+export const LAUNCHER_PROTOCOL = typeof process.send === 'function' && process.env.HOT_STEP_INSTALL_ROOT
+  ? Number.parseInt(process.env.HOT_STEP_LAUNCHER_PROTOCOL ?? '', 10) || 0 : 0;
 /** The package's exact identity; null (unknown) for older releases, git checkouts and invalid files. */
 export const BUILD_INFO: BuildInfo | null = (() => {
   let text: string;
@@ -113,7 +120,10 @@ dotenvConfig({ path: ENV_PATH });
 // all", and every child we spawn (ace-server, ace-train) inherits it and falls
 // back to CPU without saying why. The Settings GPU picker writes exactly that
 // line when the user selects Auto, so drop it here rather than propagate it.
-if (process.env.CUDA_VISIBLE_DEVICES !== undefined && process.env.CUDA_VISIBLE_DEVICES.trim() === '') {
+// "all" (keep every GPU visible) is a Settings value, not a CUDA one: CUDA reads
+// it as no GPUs, so it must not reach inherited child envs either.
+const GPU_SETTING_ALL = process.env.CUDA_VISIBLE_DEVICES?.trim().toLowerCase() === 'all' ? 'all' : undefined;
+if (process.env.CUDA_VISIBLE_DEVICES !== undefined && (process.env.CUDA_VISIBLE_DEVICES.trim() === '' || GPU_SETTING_ALL)) {
   delete process.env.CUDA_VISIBLE_DEVICES;
 }
 
@@ -225,7 +235,7 @@ export const config = {
     vaeChunk: parseInt(process.env.ACESTEPCPP_VAE_CHUNK || '1024', 10),
     vaeOverlap: parseInt(process.env.ACESTEPCPP_VAE_OVERLAP || '64', 10),
     /** GPU device selection — maps to CUDA_VISIBLE_DEVICES env var for the engine process */
-    cudaVisibleDevices: process.env.CUDA_VISIBLE_DEVICES || '',
+    cudaVisibleDevices: GPU_SETTING_ALL ?? (process.env.CUDA_VISIBLE_DEVICES || ''),
     /** Multi-GPU opt-in: comma-separated NVIDIA GPU UUIDs, one ace-server per
      *  card (services/engineWorkers.ts). Empty (the default) is the single
      *  engine above, launched exactly as before. Read once at boot. */
@@ -323,7 +333,8 @@ export const config = {
   // Node.js server
   server: {
     port: parseInt(process.env.SERVER_PORT || '3001', 10),
-    host: process.env.SERVER_HOST || '0.0.0.0',
+    // Loopback by default; set SERVER_HOST=0.0.0.0 (or a LAN/Tailscale IP) to expose it.
+    host: defaultServerHost(process.env.SERVER_HOST),
   },
 
   // Data paths

@@ -65,7 +65,8 @@ export const coverScoreSourceSchema = z.enum(['dataset', 'musicxml', 'sheetsage2
  * kind rather than copying those fields into a generic document update.
  * Readiness is GET /api/yue2/cover/readiness?source=<leadSheetSource>; the
  * existing {source, ready, model, refined, message} response is unchanged.
- * Native remains not installed until the native spawn wrapper is available.
+ * `yourmt3-chordnet` is ready only when ace-midi, its two locally converted GGUFs,
+ * the chord templates and the Beat This! model are present (no download entry).
  * Approved MusicXML/dataset scores can render without invoking readiness.
  * `dataset` stays the stored spelling; generation metadata uses dataset-sidecar. */
 export const coverSourceSchema = coverDraftRefSchema.extend({
@@ -128,8 +129,7 @@ export interface CoverTranscribeResult { documentId: string; revision: number; a
  *  request needs; the draft document supplies the resolved asset and, for
  *  YuE2 or HeartMuLa, the approved ABC score (409 if not approved).
  *  HeartMuLa requires heartmulaTags, ignores caption and YuE2 controls, and
- *  derives fresh rolls from that approved score. Its generation backend still
- *  returns "HeartMuLa covers are not available yet" until the engine is ready.
+ *  derives fresh rolls from that approved score.
  *  `prepare` (YuE2/HeartMuLa, optional) is contracts/yue2Prepare.ts's document:
  *  when sent, both its confirmations must be current and its structure must
  *  be the approved score, and the lyrics rendered are the ones it exports,

@@ -845,6 +845,8 @@ struct MM3GenRequest {
     MM3LmAdapterScales   lm_adapter_scales = {};
     MM3LmAdapterSchedule lm_adapter_sched  = {};
     float                lm_adapter_plan   = 1.0f;  // MM3ArOptions::lm_adapter_plan
+    bool                 lm_kv_q8          = false; // MM3ArOptions::lm_kv_q8
+    const MM3LmAdapter * lm_adapter_merged = nullptr;  // MM3ArOptions::lm_adapter_merged, borrowed
     // The adapter whose artist token / trained KV prefix apply. Same object as
     // lm_adapter in runtime mode; set in MERGE mode too, where lm_adapter is
     // null because the LoRA has been folded into the weights and a soft prompt
@@ -870,10 +872,13 @@ struct MM3GenRequest {
 
     /** Natural-ending candidates (2026-09-09). The takes are candidates: any
      *  take that reaches max_frames without EOS is DROPPED before stage 2 and
-     *  never rendered, and when no take of a round ended the planner runs
-     *  again with every seed moved on by the take count (round r plans
-     *  seed + r*K + t, flow noise included). After `eos_rounds` rounds with
-     *  no ending the call fails. Serial path only: an interleaved stream has
+     *  never rendered. The first round with an ending wins: every take of it
+     *  that ended is rendered (up to the count asked for) and no further
+     *  round is planned for the rest. Only a round where nothing ended (and
+     *  no rescue ended, see eos_handoff) is followed by another, with every
+     *  seed moved on by the take count (round r plans seed + r*K + t, flow
+     *  noise included). After `eos_rounds` rounds with no ending the longest
+     *  plan is kept (eos_fallback). Serial path only: an interleaved stream has
      *  already played what it planned, so there nothing is dropped or
      *  re-planned (logged once). Why this exists: a capped plan is only
      *  known to be capped at the last frame, so the cheapest reliable way to
@@ -890,6 +895,25 @@ struct MM3GenRequest {
      *  seeds. Works with require_eos off too, in which case "accepted" means
      *  long enough and nothing else. */
     int  min_frames  = 0;
+    /** Base handoff (2026-11-13). With require_eos and an LM adapter, when a
+     *  round ends no take by itself, its capped takes are rescued in take
+     *  order until the first rescue ends: each is cut at its lyric
+     *  cue (mm3_align_handoff_cue), the base model re-reads the prefix on a
+     *  cache it builds itself and samples on to EOS or the cap. A rescue that
+     *  ends is kept after the natural endings and rendered as a splice: the
+     *  take's own render up to the cue, the base plan's render after it, a 1 s
+     *  crossfade centred on the cue. Never the base on the cache the adapter
+     *  built: that collapsed capped plans into static. `handoff_seed` >= 0
+     *  replaces the continuation seed (tests). `handoff_swap` is set by the
+     *  job when the adapter is MERGED: (true) reloads the pristine base LM
+     *  before the first rescue, (false) merges the adapter again before any
+     *  later planning round. Subtracting the delta from merged weights is not
+     *  the base on a quantized LM, so it is never done. Null in runtime mode,
+     *  where the base weights are resident and the rescue simply runs without
+     *  the adapter. */
+    bool                                                eos_handoff  = false;
+    int64_t                                             handoff_seed = -1;
+    std::function<bool(bool to_base, std::string * err)> handoff_swap;
     /** Called once, right after planning, with the ORIGINAL take indices
      *  that ended (in order), so the job layer can compact its take list
      *  before the flow stage: streamed chunks and the finished songs then
@@ -966,6 +990,21 @@ struct MM3TakeRun {
     std::vector<int64_t> starts;
     int64_t              F  = 0;
     int64_t              NW = 0;
+    // Base handoff: windows from NW_stop on are not rendered (-1 = all), and
+    // emit = false keeps this take off the streaming sink.
+    int64_t              NW_stop = -1;
+    bool                 emit    = true;
+};
+
+// A rescued take (MM3GenRequest::eos_handoff): the capped plan, whose render
+// supplies the audio up to the cue, and the base plan that ended it.
+struct MM3Rescue {
+    MM3ArResult orig;
+    MM3ArResult plan;
+    uint64_t    seed = 0;   // the take's flow-noise seed, used by both renders
+    double      cue  = 0.0;
+    int         slot = -1;
+    int         round = 0;  // the planning round the capped take came from
 };
 
 struct MM3GenResult {
@@ -1000,6 +1039,18 @@ struct MM3GenResult {
      *  hit the frame cap (or the length floor) and is rendered anyway, because
      *  a capped song beats twenty minutes of planning and no audio at all. */
     bool        eos_fallback    = false;
+    /** Candidates over every round that hit the frame cap without EOS, and
+     *  that ended under the length floor. Same value on every take. */
+    int         cand_capped     = 0;
+    int         cand_short      = 0;
+    /** Base handoff (MM3GenRequest::eos_handoff): this take was rescued, cut at
+     *  `handoff_cue` s, and its base plan ended `handoff_eos` s after that.
+     *  `cand_rescued` counts the rescued takes rendered; same on every take. */
+    bool        rescued         = false;
+    double      handoff_cue     = 0.0;
+    double      handoff_eos     = 0.0;
+    uint64_t    handoff_seed    = 0;  // the base pass's seed; ar.seed stays the take's own
+    int         cand_rescued    = 0;
 
     double  ar_ms    = 0.0;
     double  cond_ms  = 0.0;
@@ -1156,6 +1207,8 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
     aopt.lm_adapter_scales = req.lm_adapter_scales;
     aopt.lm_adapter_sched  = req.lm_adapter_sched;
     aopt.lm_adapter_plan   = req.lm_adapter_plan;
+    aopt.lm_kv_q8          = req.lm_kv_q8;
+    aopt.lm_adapter_merged = req.lm_adapter_merged;
     aopt.lm_soft           = req.lm_soft;
     if (!req.forced_semantic.empty()) {
         // Empty forced_acoustic = semantic-only forcing (the depth decoder samples it).
@@ -1219,6 +1272,26 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
 
     aopt.want_lrc = req.want_lrc;
     aopt.tok      = tok;
+    // Base handoff, settled once. The cue comes from the lyric alignment, so it
+    // needs the tokenizer and turns the LRC replay on. A soft prompt stands it
+    // down for the same reason it stands the plan dial down.
+    const bool ho_ad   = req.lm_adapter || req.handoff_swap;
+    const bool ho_soft = req.lm_soft && (req.lm_soft->has_artist_token() || req.lm_soft->has_prefix());
+    bool       handoff = req.eos_handoff && req.require_eos && ho_ad && !ho_soft && !req.cached_hiddens;
+    bool       ho_base = false;  // merged mode: the pristine base is resident (handoff_swap(true) ran)
+    if (req.eos_handoff && req.require_eos && !handoff) {
+        fprintf(stderr, "[MM3-Pipe] base handoff off: %s\n",
+                !ho_ad    ? "no LM adapter in this render"
+                : ho_soft ? "the adapter carries a soft prompt"
+                          : "the plan came from the AR cache");
+    }
+    if (handoff && !tok) {
+        handoff = false;
+        fprintf(stderr, "[MM3-Pipe] base handoff off: no tokenizer to align the lyrics\n");
+    }
+    if (handoff) {
+        aopt.want_lrc = true;
+    }
 
 
     // ------------------------------------------------------------------------
@@ -1280,6 +1353,7 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
     // mid-call leaves the streaming path reading a hollowed-out vector — which
     // is exactly the crash this shape prevents.
     std::vector<MM3ArResult> ars((size_t) K);
+    std::vector<MM3Rescue>   resc;  // base handoff: rescued takes, in rescue order
 
     std::vector<MM3TakeRun> tk((size_t) K);
     for (int t = 0; t < K; t++) {
@@ -1464,7 +1538,9 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
                     dst[i] = mm3_clamp_sample(src[i]);
                 }
             }
-            req.on_chunk(t, k, st.stream_offset, len, stream_buf.data(), out->sample_rate);
+            if (st.emit) {
+                req.on_chunk(t, k, st.stream_offset, len, stream_buf.data(), out->sample_rate);
+            }
             st.stream_offset += len;
         }
 
@@ -1558,6 +1634,7 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         // own is enough to make the takes candidates.
         const int  min_frames = req.min_frames > 0 ? req.min_frames : 0;
         const bool cand       = (req.require_eos || min_frames > 0) && !interleave;
+        handoff               = handoff && cand;
         aopt.stop_after_first_eos = req.require_eos && cand && req.stop_after_first_eos;
         // Keyed to require_eos alone: the LRC behaviour belongs to the endings
         // feature, and a length floor must not quietly change it.
@@ -1589,20 +1666,42 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
             }
             return true;
         };
+        // `want` is the most a render keeps. With require_eos the first round
+        // that has an ending stops the planning (see the stop check below), so
+        // fewer may render. A bare length floor (endings off) still re-plans
+        // until `want` have passed: plans accepted in earlier rounds wait in
+        // the bank (they hold their frame hiddens, up to ~1 GB each at the
+        // cap) and take the first slots once planning stops. A one-song
+        // request (stop_after_first_eos) wants one.
+        const int                want = aopt.stop_after_first_eos ? 1 : K;
+        std::vector<MM3ArResult> bank_ar;
+        std::vector<uint64_t>    bank_seed;
+        std::vector<int>         bank_round;
+        int                      n_capped_all = 0, n_short_all = 0;
         int round = 0;
         for (;; round++) {
+            if (round > 0 && ho_base) {
+                // Merged mode: the rescue left the pristine base resident; this
+                // round plans with the adapter again.
+                if (!req.handoff_swap(false, err)) {
+                    return false;
+                }
+                ho_base = false;
+            }
             if (round > 0) {
                 aopt.seed += (uint64_t) K;
                 for (int t = 0; t < K; t++) {
                     ars[(size_t) t]      = MM3ArResult{};
                     tk[(size_t) t].seed += (uint64_t) K;   // the flow noise follows its plan
                 }
-                fprintf(stderr, "[MM3-Pipe] natural ending: no candidate ended in round %d; re-planning %d at seed %llu "
-                                "(round %d of %d)\n", round, K, (unsigned long long) aopt.seed, round + 1, rounds_max);
+                fprintf(stderr, "[MM3-Pipe] natural ending: %zu of %d wanted after round %d (%zu natural, %zu rescued); "
+                                "re-planning %d at seed %llu (round %d of %d)\n", bank_ar.size() + resc.size(), want,
+                        round, bank_ar.size(), resc.size(), K, (unsigned long long) aopt.seed, round + 1, rounds_max);
                 if (progress) {
                     progress(MM3GenProgress{ "ar", -1, 0, 0, aopt.max_frames });
                 }
             }
+            aopt.handoff_cue = handoff;
             if (!mm3_ar_plan_takes(m, ids_cond.data(), ids_uncond.data(), (int64_t) ids_cond.size(), aopt, ars.data(),
                                    err)) {
                 return false;
@@ -1613,19 +1712,106 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
             int n_keep  = 0;
             int n_short = 0;
             for (int t = 0; t < K; t++) {
+                const MM3ArResult & a = ars[(size_t) t];
                 if (accepted(t)) {
                     n_keep++;
-                } else if (min_frames > 0 && ars[(size_t) t].n_frames > 0 &&
-                           ars[(size_t) t].n_frames < min_frames &&
-                           (!req.require_eos || ars[(size_t) t].eos_hit)) {
+                } else if (min_frames > 0 && a.n_frames > 0 && a.n_frames < min_frames &&
+                           (!req.require_eos || a.eos_hit)) {
                     n_short++;
+                } else if (!a.eos_hit && a.n_frames >= req.max_frames) {
+                    n_capped_all++;
                 }
             }
-            if (n_keep > 0) {
+            n_short_all += n_short;
+            // Base handoff: any round where nothing ended by itself, capped takes
+            // in take order, until the first rescue ends. The base re-reads the
+            // prefix up to the cue on its own cache (runtime: no adapter; merged:
+            // the pristine base reloaded) and plays on from there.
+            for (int t = 0; aopt.handoff_cue && t < K && bank_ar.empty() && resc.empty() && n_keep == 0; t++) {
+                MM3ArResult & a = ars[(size_t) t];
+                if (a.eos_hit || a.handoff_cut <= 0) {
+                    continue;
+                }
+                if (bail()) {
+                    return false;
+                }
+                if (req.handoff_swap && !ho_base) {
+                    if (!req.handoff_swap(true, err)) {
+                        return false;
+                    }
+                    ho_base = true;
+                }
+                MM3ArOptions ho = aopt;
+                ho.n_takes      = 1;
+                ho.seed = req.handoff_seed >= 0 ? (uint64_t) req.handoff_seed : a.seed ^ 0x9E3779B97F4A7C15ull;
+                ho.forced_semantic           = a.semantic_all.data();
+                ho.forced_acoustic           = a.acoustic_all.data();
+                ho.forced_len                = a.handoff_cut + 1;
+                ho.force_bias                = -1.0f;
+                ho.forced_continue           = true;
+                ho.lm_adapter                = nullptr;
+                ho.lm_adapter_sched          = MM3LmAdapterSchedule{};
+                ho.lm_adapter_merged         = nullptr;
+                ho.lm_adapter_plan           = 1.0f;
+                ho.lm_soft                   = nullptr;
+                ho.stop_after_first_eos      = false;
+                ho.lrc_eos_only              = false;
+                ho.handoff_cue               = false;
+                ho.guide                     = nullptr;
+                ho.blend                     = nullptr;
+                ho.on_frame_ready            = nullptr;
+                ho.on_takes_frame_ready      = nullptr;
+                // Its own stage name: reported as "ar", each rescue restarted the
+                // planning bar from frame 0 and read as another failed round.
+                ho.on_frame = [&progress, t, K](int64_t f, int64_t total) {
+                    if (progress) {
+                        progress(MM3GenProgress{ "handoff", t, K, f, total });
+                    }
+                };
+                MM3ArResult r;
+                if (!mm3_ar_plan_takes(m, ids_cond.data(), ids_uncond.data(), (int64_t) ids_cond.size(), ho, &r,
+                                       err)) {
+                    return false;
+                }
+                const bool   ok  = r.eos_hit && (min_frames <= 0 || r.n_frames >= min_frames);
+                const double end = (double) r.n_frames / 25.0;
                 fprintf(stderr,
-                        "[MM3-Pipe] candidates: %d of %d kept in round %d; the rest are dropped (%d too short)\n",
-                        n_keep, K, round + 1, n_short);
+                        "[MM3-Pipe] base handoff: take %d (seed %llu) cut at %.2f s, base seed %llu: %s at %.1f s "
+                        "(%.1f s after the cue)\n",
+                        t, (unsigned long long) a.seed, a.handoff_cue, (unsigned long long) ho.seed,
+                        r.eos_hit ? (ok ? "EOS" : "EOS under the length floor") : "capped again", end,
+                        end - a.handoff_cue);
+                if (ok) {
+                    MM3Rescue rs;
+                    rs.cue   = a.handoff_cue;
+                    rs.seed  = tk[(size_t) t].seed;
+                    rs.round = round;
+                    rs.orig  = std::move(a);
+                    rs.plan  = std::move(r);
+                    resc.push_back(std::move(rs));
+                    n_capped_all--;
+                }
+            }
+            const int have = (int) (bank_ar.size() + resc.size()) + n_keep;
+            // Natural endings: the first round with an ending wins. Re-planning
+            // to fill the count cost 14 minutes in a live job and found
+            // nothing. A bare length floor still re-plans.
+            if (have >= want || (have > 0 && (req.require_eos || round + 1 >= rounds_max))) {
+                fprintf(stderr,
+                        "[MM3-Pipe] candidates: %d of %d kept in round %d (%zu from earlier rounds, %zu rescued, %d "
+                        "wanted); the rest are dropped (%d too short)\n",
+                        n_keep, K, round + 1, bank_ar.size(), resc.size(), want, n_short);
                 break;
+            }
+            if (have > 0) {
+                for (int t = 0; t < K; t++) {
+                    if (accepted(t)) {
+                        bank_ar.push_back(std::move(ars[(size_t) t]));
+                        bank_seed.push_back(tk[(size_t) t].seed);
+                        bank_round.push_back(round);
+                    }
+                }
+                continue;
             }
             if (round + 1 >= rounds_max) {
                 // Every round spent, nothing accepted. The planning is already
@@ -1651,6 +1837,15 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
                     }
                     return false;
                 }
+                {
+                    // It is rendered, so it is not counted as dropped.
+                    const MM3ArResult & a = ars[(size_t) fallback];
+                    if (!a.eos_hit && a.n_frames >= req.max_frames) {
+                        n_capped_all--;
+                    } else if (min_frames > 0 && a.n_frames < min_frames && (!req.require_eos || a.eos_hit)) {
+                        n_short_all--;
+                    }
+                }
                 if (min_frames > 0 && n_short > 0) {
                     fprintf(stderr,
                             "[MM3-Pipe] every candidate ended too early after %d round(s) of %d (%d plans, all "
@@ -1673,20 +1868,73 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
                 break;
             }
         }
-        int winner = -1;
-        if (aopt.stop_after_first_eos) {
-            for (int t = 0; t < K; t++) {
+        // Slot order: banked plans first, then this round's accepted ones, up
+        // to `want`; the remaining slots carry this round's rejects (dropped).
+        // The fallback plan counts as accepted, so it lands in slot 0.
+        std::vector<char> keep((size_t) K, 0);
+        std::vector<int>  slot_round((size_t) K, round);
+        std::vector<int>  slot_resc((size_t) K, -1);
+        if (cand) {
+            std::vector<MM3ArResult> nar;
+            std::vector<uint64_t>    nseed;
+            std::vector<char>        taken((size_t) K, 0);
+            for (size_t i = 0; i < bank_ar.size(); i++) {
+                nar.push_back(std::move(bank_ar[i]));
+                nseed.push_back(bank_seed[i]);
+                slot_round[nar.size() - 1] = bank_round[i];
+                keep[nar.size() - 1]       = 1;
+            }
+            for (int t = 0; t < K && (int) nar.size() < want; t++) {
                 if (accepted(t)) {
-                    winner = t;
-                    break;
+                    taken[(size_t) t] = 1;
+                    keep[nar.size()]  = 1;
+                    nar.push_back(std::move(ars[(size_t) t]));
+                    nseed.push_back(tk[(size_t) t].seed);
                 }
+            }
+            // Rescued takes sort after every natural ending.
+            for (size_t i = 0; i < resc.size() && (int) nar.size() < want; i++) {
+                resc[i].slot           = (int) nar.size();
+                slot_resc[nar.size()]  = (int) i;
+                slot_round[nar.size()] = resc[i].round;
+                keep[nar.size()]       = 1;
+                nar.push_back(std::move(resc[i].plan));
+                nseed.push_back(resc[i].seed);
+            }
+            for (int t = 0; t < K && (int) nar.size() < K; t++) {
+                if (!taken[(size_t) t]) {
+                    nar.push_back(std::move(ars[(size_t) t]));
+                    nseed.push_back(tk[(size_t) t].seed);
+                }
+            }
+            for (int t = 0; t < K; t++) {
+                ars[(size_t) t]     = std::move(nar[(size_t) t]);
+                tk[(size_t) t].seed = nseed[(size_t) t];
             }
         }
         for (int t = 0; t < K; t++) {
-            outs[t].dropped         = cand && (!accepted(t) || (winner >= 0 && t != winner));
-            outs[t].round           = round;
+            outs[t].dropped         = cand && !keep[(size_t) t];
+            outs[t].round           = slot_round[(size_t) t];
             outs[t].eos_rounds_used = round + 1;
-            outs[t].eos_fallback    = (t == fallback) && !outs[t].dropped;
+            outs[t].eos_fallback    = cand && fallback >= 0 && keep[(size_t) t];
+            outs[t].cand_capped     = n_capped_all;
+            outs[t].cand_short      = n_short_all;
+            if (slot_resc[(size_t) t] >= 0) {
+                const MM3Rescue & rs = resc[(size_t) slot_resc[(size_t) t]];
+                outs[t].rescued      = true;
+                outs[t].handoff_cue  = rs.cue;
+                outs[t].handoff_eos  = (double) ars[(size_t) t].n_frames / 25.0 - rs.cue;
+                outs[t].handoff_seed = ars[(size_t) t].seed;
+                ars[(size_t) t].seed = rs.orig.seed;
+                tk[(size_t) t].emit  = false;  // the stream would play the unspliced base render
+            }
+        }
+        int n_resc_kept = 0;
+        for (const MM3Rescue & rs : resc) {
+            n_resc_kept += rs.slot >= 0 ? 1 : 0;
+        }
+        for (int t = 0; t < K; t++) {
+            outs[t].cand_rescued = n_resc_kept;
         }
         if (cand && req.on_candidates) {
             std::vector<int> kept;
@@ -1796,6 +2044,44 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         }
     }
 
+    // Base handoff: each rendered rescue also needs its capped plan rendered up
+    // to just past the cue. That run uses the full-length window plan, so its
+    // windows and crops are exactly those of the take's own full render; only
+    // the windows that start after the crossfade are skipped (no later window
+    // reaches back before its own start).
+    std::vector<MM3GenResult> pre_outs(resc.size());
+    for (size_t i = 0; i < resc.size(); i++) {
+        if (resc[i].slot < 0) {
+            continue;
+        }
+        const int64_t F = resc[i].orig.n_frames;
+        const int64_t X = (int64_t) std::ceil((resc[i].cue + 0.5) * 25.0) + 1;
+        MM3TakeRun    st;
+        st.out        = &pre_outs[i];
+        st.plugin_run = plugin_proto;
+        st.seed       = resc[i].seed;
+        st.emit       = false;
+        st.F          = F;
+        const MM3ArResult * op = &resc[i].orig;
+        st.hiddens    = [op]() -> const float * { return op->frame_hiddens.data(); };
+        if (F <= win_frames) {
+            st.starts.push_back(0);
+        } else {
+            for (int64_t s = 0; s < F - ov_frames; s += hop_frames) {
+                st.starts.push_back(s);
+            }
+        }
+        st.NW      = (int64_t) st.starts.size();
+        st.NW_stop = 0;
+        while (st.NW_stop < st.NW && st.starts[(size_t) st.NW_stop] <= X) {
+            st.NW_stop++;
+        }
+        pre_outs[i].sample_rate = (int) vc.sampling_rate;
+        tk.push_back(std::move(st));
+        fprintf(stderr, "[MM3-Pipe] base handoff: slot %d renders windows 0..%lld of its capped plan (to %.1f s), then "
+                        "the base plan\n", resc[i].slot, (long long) tk.back().NW_stop - 1, (double) X / 25.0);
+    }
+
     // -- stage-1 -> stage-2 residency handover --
     //
     // The AR stage is finished with the LM and the depth decoder: everything
@@ -1828,13 +2114,13 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
     // out of windows are simply skipped.
     {
         int64_t max_nw = 0;
-        for (int t = 0; t < K; t++) {
-            max_nw = tk[(size_t) t].NW > max_nw ? tk[(size_t) t].NW : max_nw;
+        for (const MM3TakeRun & st : tk) {
+            max_nw = st.NW > max_nw ? st.NW : max_nw;
         }
         for (int64_t k = 0; k < max_nw; k++) {
-            for (int t = 0; t < K; t++) {
+            for (int t = 0; t < (int) tk.size(); t++) {
                 MM3TakeRun & st = tk[(size_t) t];
-                if (k < st.windows_done || k >= st.NW) {
+                if (k < st.windows_done || k >= st.NW || (st.NW_stop >= 0 && k >= st.NW_stop)) {
                     continue;
                 }
                 const int64_t cs = st.starts[(size_t) k];
@@ -1848,10 +2134,10 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
 
     // ── stage 3: vocode + stitch (fact 4), per take ──
     // Already done, window by window, when a streaming sink is installed.
-    for (int t = 0; t < K; t++) {
+    for (int t = 0; t < (int) tk.size(); t++) {
         MM3TakeRun &   st  = tk[(size_t) t];
         MM3GenResult * out = st.out;
-        const int64_t  NW  = st.NW;
+        const int64_t  NW  = st.NW_stop >= 0 ? st.NW_stop : st.NW;  // windows rendered
 
         if (!streaming) {
             const auto t_v = std::chrono::steady_clock::now();
@@ -1877,7 +2163,7 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
         std::vector<int64_t> keep_left((size_t) NW), keep_len((size_t) NW);
         int64_t              total = 0;
         for (int64_t k = 0; k < NW; k++) {
-            mm3_window_crop(k, NW, out->window_L[(size_t) k], UP, &keep_left[(size_t) k], &keep_len[(size_t) k],
+            mm3_window_crop(k, st.NW, out->window_L[(size_t) k], UP, &keep_left[(size_t) k], &keep_len[(size_t) k],
                             geom);
             total += keep_len[(size_t) k];
         }
@@ -1924,6 +2210,48 @@ static bool mm3_generate_takes(const MM3Model & m, const MM3GenRequest & req, MM
                 (long long) total, (double) total / (double) (out->sample_rate > 0 ? out->sample_rate : 1),
                 out->sample_rate, out->ar_ms, out->ar_cached ? " (cached)" : "", out->cond_ms, out->flow_ms,
                 out->voc_ms, out->total_ms);
+    }
+
+    // Base handoff: the take's own render up to the cue, the base plan's render
+    // after it, a 1 s linear crossfade centred on the cue (ffmpeg acrossfade
+    // c1=tri c2=tri, the splice that was listened to).
+    for (size_t i = 0; i < resc.size(); i++) {
+        if (resc[i].slot < 0) {
+            continue;
+        }
+        const MM3GenResult & a  = pre_outs[i];
+        MM3GenResult &       b  = outs[resc[i].slot];
+        const int64_t        n  = (int64_t) b.sample_rate;
+        const int64_t        x0 = (int64_t) std::llround((resc[i].cue - 0.5) * (double) b.sample_rate);
+        if (x0 < 0 || a.n_samples < x0 + n || b.n_samples < x0 + n) {
+            if (err) {
+                *err = "base handoff: a render is shorter than the crossfade it feeds";
+            }
+            return false;
+        }
+        double sum_sq = 0.0;
+        b.peak        = 0.0f;
+        for (int ch = 0; ch < 2; ch++) {
+            const float * pa = a.audio.data() + (int64_t) ch * a.n_samples;
+            float *       pb = b.audio.data() + (int64_t) ch * b.n_samples;
+            memcpy(pb, pa, (size_t) x0 * sizeof(float));
+            for (int64_t j = 0; j < n; j++) {
+                const double g1 = (double) j / (double) n, g0 = (double) (n - 1 - j) / (double) n;
+                pb[x0 + j]      = (float) ((double) pa[x0 + j] * g0 + (double) pb[x0 + j] * g1);
+            }
+            for (int64_t j = 0; j < b.n_samples; j++) {
+                b.peak = std::max(b.peak, std::fabs(pb[j]));
+                sum_sq += (double) pb[j] * (double) pb[j];
+            }
+        }
+        b.rms     = std::sqrt(sum_sq / (double) b.audio.size());
+        b.has_nan = b.has_nan || a.has_nan;
+        b.cond_ms += a.cond_ms;
+        b.flow_ms += a.flow_ms;
+        b.voc_ms += a.voc_ms;
+        b.flow_forwards += a.flow_forwards;
+        fprintf(stderr, "[MM3-Pipe] base handoff: slot %d spliced at %.2f s (1 s crossfade), base plan ends %.1f s "
+                        "after the cue\n", resc[i].slot, resc[i].cue, b.handoff_eos);
     }
 
     // Safe now: every window is rendered, so nothing reads `ars` again.

@@ -30,6 +30,10 @@ export const GENERATION_DEFAULTS = {
   adaptersOpen: false,
   inferenceSteps: 12,
   guidanceScale: 9.0,
+  cfgIntervalStart: 0.0,
+  cfgIntervalEnd: 1.0,
+  retakeSeed: -1,
+  retakeVariance: 0.0,
   cfgCutoffRatio: 1.0,
   lmCfgCutoffRatio: 1.0,
   cacheRatio: 0,
@@ -105,6 +109,7 @@ export const GENERATION_DEFAULTS = {
   masteringReference: '',
   timbreReference: false,
   timbreAudioPath: '',
+  timbreReferenceStrength: 1,
   vocalNaturalizerEnabled: false,
   gainOffsetDb: 0,
   naturalizeAmount: 0.5,
@@ -285,6 +290,10 @@ export function resolveGenerationParams(
       inferenceSteps: s.inferenceSteps, guidanceScale: s.guidanceScale, shift: s.shift,
       // ditSlidingWindow deliberately not sent while the feature is parked, so
       // requests are byte-identical to pre-feature generations.
+      cfgIntervalStart: s.cfgIntervalStart !== 0.0 ? s.cfgIntervalStart : undefined,
+      cfgIntervalEnd: s.cfgIntervalEnd !== 1.0 ? s.cfgIntervalEnd : undefined,
+      retakeSeed: s.retakeSeed !== -1 ? s.retakeSeed : undefined,
+      retakeVariance: s.retakeVariance !== 0.0 ? s.retakeVariance : undefined,
       cfgCutoffRatio: s.cfgCutoffRatio < 1.0 ? s.cfgCutoffRatio : undefined,
       lmCfgCutoffRatio: s.lmCfgCutoffRatio < 1.0 ? s.lmCfgCutoffRatio : undefined,
       cacheRatio: s.cacheRatio > 0 ? s.cacheRatio : undefined,
@@ -329,6 +338,8 @@ export function resolveGenerationParams(
       timbreReference: s.timbreAudioPath
         ? s.timbreAudioPath
         : (s.postProcessingEnabled && s.masteringEnabled && s.timbreReference && s.masteringReference) ? true : undefined,
+      timbreReferenceStrength: (s.timbreAudioPath || (s.postProcessingEnabled && s.masteringEnabled && s.timbreReference && s.masteringReference)) && s.timbreReferenceStrength !== 1
+        ? s.timbreReferenceStrength : undefined,
       dcwEnabled: s.dcwEnabled,
       dcwMode: s.dcwEnabled ? s.dcwMode : undefined,
       // Route the correct scaler to dcw_scaler based on mode:

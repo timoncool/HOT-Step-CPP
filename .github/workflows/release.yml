@@ -741,6 +741,13 @@ jobs:
 
           New-Item -ItemType Directory -Force "release/out" | Out-Null
 
+          # Protocol 1+ packages move into app/<id>/ under the stable launcher
+          # root; protocol 0 stays flat. Same script as build-release.ps1.
+          node release/updater/package-layout.mjs release/staging
+          if ($LASTEXITCODE) { throw "package-layout.mjs failed" }
+          node release/check-layout.mjs --package release/staging --os windows --variant $variant
+          if ($LASTEXITCODE) { throw "package layout check failed" }
+
           # Compress with .NET for better compression
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -847,7 +854,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $root = $env:CPU_TRIAL_ROOT
           $evidence = "$root/evidence"
-          $engine = "$root/app/engine"
+          $payload = node release/smoke-artifact.mjs payload-root "$root/app"
+          if ($LASTEXITCODE -ne 0) { throw 'CPU archive package check failed' }
+          $engine = Join-Path $payload 'engine'
           # The CPU archive supplies its DLLs; exclude build/toolkit search paths.
           $env:PATH = "$env:SystemRoot/System32;$env:SystemRoot"
           $env:GGML_BACKEND_PATH = $engine

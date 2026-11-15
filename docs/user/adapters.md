@@ -18,6 +18,11 @@ plans the song. On MiniMax-Music3 and YuE2 adapters act on the language model. S
 Audio 3 adapters act on its DiT and have no picker in the generation bar: the Training
 Studio trains them and renders auditions with them (see [File formats](#file-formats)).
 
+ACE DiT PEFT exports may repeat the `base_model.model.` wrapper after an
+adapter is wrapped more than once. The loader strips every leading PEFT or
+ComfyUI wrapper before matching base tensor names, so those exports reach the
+same weights as single-wrapped adapters.
+
 ## Where to find it
 
 The **Adapters** section of the generation bar. Its contents follow the active backend
@@ -277,6 +282,26 @@ for adapters that record no trigger.
 
 ## MiniMax-Music3
 
+PiSSA and HOT-PiZZA adapters need the exact residual file used in training,
+beside the language model. New adapters record its fingerprint. If a load
+reports a mismatch, restore that run's residual backup or retrain against
+the installed residual. A file with the same name and rank can still differ.
+Rank-128 PiSSA and HOT-PiZZA training on Q8_0 asks you to install the residual
+from the Model Manager if none is present. An existing residual is accepted,
+including one generated locally. Other ranks and bases still initialise their
+own factors because no registry residual is available for them.
+
+When the Model Manager replaces a residual whose hash differs from the
+catalogue, it keeps the previous file beside the language model as
+`mm3-lm-q8_0.pissa-r128.safetensors.backup-<timestamp>-<unique-id>` and logs
+the full path. It keeps this copy even if the replacement download fails.
+To restore it, wait for training and generation to finish, move the current
+residual to a safe location, and rename the kept copy back to
+`mm3-lm-q8_0.pissa-r128.safetensors` in the same folder. Load the adapter again.
+The loader's fingerprint mismatch means it needs that run's exact residual;
+re-downloading a different residual cannot repair the pairing. Keep a copy
+with your adapters. Older adapters cannot detect this mismatch.
+
 1. Put adapters in `adapters/mm3-lm-adapters/`, up to two folder levels deep. The Training
    Studio already writes there. The list is read when the panel opens, so reopen it after
    adding files.
@@ -306,13 +331,26 @@ trained position. Leave it on unless you are placing the trigger yourself. If a 
 recorded a trigger it never trained, the panel says so and does not add it.
 
 Adapters often stop songs from ending on their own: the render runs to the 5-minute cap.
-**Adapter Tail Fade** in the Generation dropdown (off by default) keeps the adapter at full
-strength until the lyrics should be done, then steps it down to the base model over 60 s
-so the base can close the song. The start comes from the word count: about 1.85 words a
-second plus 30 s, never later than 4:00. The fade keeps what has already been generated,
-so the timbre holds. In a test on one adapter, 9 of 12 plans ended on their own with the
-fade against 2 of 12 without. It needs lyrics, and it renders the adapter in Runtime mode
-even when Merge is picked, so planning is slower.
+The **Adapter Tail Fade** toggle that tried to fix this has been withdrawn. It handed the
+end of the song to the base model while keeping the adapter's planner cache, and on a
+tested adapter that ended no more takes and turned every capped one to static over its last
+two minutes. A preset saved with it still loads; the setting is ignored.
+
+**Base Model Ending** in the Generation dropdown (shown when an LM adapter is picked, on by
+default) takes its place. It only acts when **Require Natural Ending** is on, and only on a
+round of candidates where no take ended by itself: a round with even one natural ending
+renders the takes that ended and stops there. Otherwise the round's capped takes are rescued
+in order until the first rescue ends, and that one song is rendered. Each is cut 25 s after
+its last lyric line that the alignment places steadily, and the base model re-reads the song
+up to that point and plays it on until it ends. The take keeps your adapter's audio up to the
+switch, joined to the base model's audio with a 1 s crossfade, and the generation log names
+it. A take with no steady lyric line, or whose switch would come later than 4:40, is not
+rescued, and a rescue that still reaches the cap is dropped like any capped take. If no
+rescue ends, the next round is planned and the same steps repeat. Each rescue costs one more
+plan from the switch onward and one more render of that take. In Merge mode a rescue first
+reloads the unmerged base model, which adds a model load; the adapter is merged again only if
+another planning round follows. A render that needs no rescue keeps its mode and costs
+nothing extra.
 
 An adapter that fails to load fails the job. It never renders the base model silently.
 
@@ -382,12 +420,21 @@ one or both halves, in naming the engine does not load. **Import adapter…** co
 
 The trigger is read from the file's training tags, and the step count from its training
 info. A file with no alpha imports at the strength ComfyUI applies (alpha equal to the
-rank, scale 1.0); one whose modules carry different alphas is refused. If the adapter
+rank, scale 1.0). Each module retains its own alpha, including fused slider projections.
+Import reads `lora_alpha` or `alpha` from an adjacent `adapter_config.json`; a tensor's
+own alpha takes precedence, then file metadata, then the sidecar. If the adapter
 sounds too strong or too weak, use the **Strength** dials. LoRA and LoKr adapters are
 both supported. Import accepts fused and separate projection names, plus
 `lora_A`/`lora_B` and `lora_down`/`lora_up` names. Adapters trained in this app never
 need importing; a file that is already a native YuE2 adapter is refused, so point
 **Adapter folder** at it instead.
+
+Import also accepts ordinary distilled slider keys (`adapters.model-layers-*`), NAR
+`nar_self_attn` / `nar_mlp` keys, and `vae2llm` / `llm2vae` weights and biases. Flow-head
+`.diff` / `.diff_b` tensors add a delta at the global strength; `.weight` / `.bias`
+tensors replace the head independently of strength, except that zero disables the
+adapter. Imported flow heads turn off the automatic decoder companion to avoid applying
+it twice. Nonlinear particle sliders still need their own inference implementation.
 
 YuE2 weights are licensed CC BY-NC 4.0, with the authors' exception for individual
 creators, and an adapter trained on them carries the same terms. The panel shows the full

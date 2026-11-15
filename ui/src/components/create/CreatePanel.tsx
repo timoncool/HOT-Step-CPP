@@ -14,6 +14,8 @@ import { useAuth } from '../../context/AuthContext';
 import { generateApi } from '../../services/api';
 import { Yue2ScorePreviewModal, type Yue2ScorePreviewData } from './Yue2ScorePreviewModal';
 import { ContentSection } from './ContentSection';
+import { Yue2Continuation } from './Yue2Continuation';
+import type { Yue2Continuation as ContinuationSection } from '../../../../server/src/contracts/yue2Continuation';
 import { Fold } from '../shared/Fold';
 import { MetadataSection } from './MetadataSection';
 import { LatentImport } from '../shared/LatentImport';
@@ -21,10 +23,11 @@ import { CoverArtSubjectSection } from '../shared/CoverArtSubjectSection';
 import { AiGenerateModal, type AiGenerateResult } from './AiGenerateModal';
 import { Mm3ComposeButton } from './Mm3ComposeButton';
 import { TrainingDraftBar } from './TrainingDraftBar';
-import { applyCreateDraft, createContentParams, liveBackendRefusal } from './createContent';
+import { applyCreateDraft, createContentParams, createYue2Replay, liveBackendRefusal } from './createContent';
 import { useStudioDraftMirror } from '../../services/studioDraftMirror';
 import { StudioDraftPicker } from '../shared/StudioDraftPicker';
 import { useBackendStore } from '../../stores/backendStore';
+import { setBackendParamFor } from '../../stores/globalParamsStore';
 import { expandWildcards, hasWildcards, randomWildcardSeed } from '../../utils/wildcardUtils';
 import {
   MM3_CAPTION_SOURCES_KEY, clearMm3CaptionSources, pickNearestBpmTrack,
@@ -58,9 +61,11 @@ interface CreatePanelProps {
   onGenerate: (params: Partial<GenerationParams>, intent?: CreateIntent) => void;
   activeJobCount: number;
   reuseData?: { song: Song; timestamp: number } | null;
+  /** Filled with a function returning the content params Generate would send, for the Build by section tab. */
+  paramsRef?: React.MutableRefObject<(() => Partial<GenerationParams>) | null>;
 }
 
-export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobCount, reuseData }) => {
+export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobCount, reuseData, paramsRef }) => {
   const { t } = useTranslation();
   const mm3Mode = useBackendStore(s => s.activeBackendId === 'minimax-m3'
     && (s.capabilities[s.activeBackendId]?.core.captionSource ?? 'mm3-tracks') === 'mm3-tracks');
@@ -73,6 +78,7 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
   const [lyrics, setLyrics] = usePersistedState('hs-lyrics', '');
   const [negativePrompt, setNegativePrompt] = usePersistedState('hs-negative-prompt', '');
   const [instrumental, setInstrumental] = usePersistedState('hs-instrumental', false);
+  const [continuation, setContinuation] = useState<ContinuationSection>();
 
   // ── Compose-time caption helpers (MDMAchine) ──
   const [loraTrigger, setLoraTrigger] = usePersistedState('hs-lora-trigger', '');
@@ -383,12 +389,14 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     if (!reuseData) return;
     const gpData = reuseData.song.generationParams;
     if (!gpData) return;
+    const yue2Reuse = (reuseData.song.backend ?? gpData.backend) === YUE2_BACKEND_ID;
 
     // Style Description field ← user's original style input from generation_params
     // Priority: gpData.caption (original user input) → song.style (DB column)
     setCaption(gpData.caption || reuseData.song.style || '');
     // Lyrics
     setLyrics(gpData.lyrics || reuseData.song.lyrics || '');
+    if (yue2Reuse && gpData.instrumental !== undefined) setInstrumental(gpData.instrumental);
     // Song info metadata
     if (gpData.title || reuseData.song.title) setTitle(gpData.title || reuseData.song.title || '');
     if (gpData.artist) setArtist(gpData.artist);
@@ -402,21 +410,47 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     // Engine params — full reproducibility
     if (gpData.inferenceSteps) gp.setInferenceSteps(gpData.inferenceSteps);
     if (gpData.guidanceScale !== undefined) gp.setGuidanceScale(gpData.guidanceScale);
+    if (gpData.cfgIntervalStart !== undefined) gp.setCfgIntervalStart(gpData.cfgIntervalStart);
+    if (gpData.cfgIntervalEnd !== undefined) gp.setCfgIntervalEnd(gpData.cfgIntervalEnd);
+    if (gpData.retakeSeed !== undefined) gp.setRetakeSeed(gpData.retakeSeed);
+    if (gpData.retakeVariance !== undefined) gp.setRetakeVariance(gpData.retakeVariance);
     if (gpData.cfgCutoffRatio !== undefined) gp.setCfgCutoffRatio(gpData.cfgCutoffRatio);
     if (gpData.lmCfgCutoffRatio !== undefined) gp.setLmCfgCutoffRatio(gpData.lmCfgCutoffRatio);
     if (gpData.cacheRatio !== undefined) gp.setCacheRatio(gpData.cacheRatio);
     // baseSeed (the typed seed) over the rendered one, so reusing variation
     // 2.1 does not shift the base by one and re-roll the wildcard expansion.
-    if (gpData.baseSeed !== undefined) gp.setSeed(gpData.baseSeed);
+    if (yue2Reuse && gpData.seed !== undefined) gp.setSeed(gpData.seed);
+    else if (gpData.baseSeed !== undefined) gp.setSeed(gpData.baseSeed);
     else if (gpData.seed !== undefined) gp.setSeed(gpData.seed);
-    if (gpData.randomSeed !== undefined) gp.setRandomSeed(gpData.randomSeed);
+    if (yue2Reuse && gpData.seed !== undefined) gp.setRandomSeed(false);
+    else if (gpData.randomSeed !== undefined) gp.setRandomSeed(gpData.randomSeed);
     if (gpData.lmSeed !== undefined) gp.setLmSeed(gpData.lmSeed);
     if (gpData.lmSeedFollowsDit !== undefined) gp.setLmSeedFollowsDit(gpData.lmSeedFollowsDit);
     if (gpData.shift !== undefined) gp.setShift(gpData.shift);
     if (gpData.inferMethod) gp.setInferMethod(gpData.inferMethod);
     if (gpData.scheduler) gp.setScheduler(gpData.scheduler);
     if (gpData.guidanceMode) gp.setGuidanceMode(gpData.guidanceMode);
-    if (gpData.batchSize) gp.setBatchSize(gpData.batchSize);
+    if (yue2Reuse) {
+      const replay = createYue2Replay(gpData);
+      setContinuation(replay.continuation);
+      // Planning and composing share an engine RNG. Replay the same path:
+      // an engine-planned track must plan again before composing.
+      for (const [key, value] of Object.entries(replay.shared)) {
+        setBackendParamFor(YUE2_BACKEND_ID, key, value);
+      }
+      // Older rows have these provenance flags but no explicit origin.
+      // With neither, conservatively rerun the engine planner.
+      const scoreOrigin = gpData.yue2ScoreOrigin
+        ?? (gpData.yue2?.abc_supplied || gpData.yue2?.abc_planned ? 'supplied' : 'engine');
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2ScoreOrigin', scoreOrigin);
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2AutoReplan', gpData.yue2AutoReplan !== false);
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2Abc', scoreOrigin === 'supplied'
+        ? gpData.yue2Abc ?? gpData.yue2Request?.abc ?? '' : '');
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2NoiseSeed', gpData.yue2NoiseSeed ?? gpData.yue2Request?.noise_seed ?? gpData.seed);
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2BatchSize', 1);
+      setBackendParamFor(YUE2_BACKEND_ID, 'yue2Variations', 1);
+      gp.setBatchSize(1);
+    } else if (gpData.batchSize) gp.setBatchSize(gpData.batchSize);
     if (gpData.useCotCaption !== undefined) gp.setUseCotCaption(gpData.useCotCaption);
     if (gpData.skipLm !== undefined) gp.setSkipLm(gpData.skipLm);
     // Adapter
@@ -437,6 +471,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     if (gpData.postProcessingEnabled !== undefined) gp.setPostProcessingEnabled(gpData.postProcessingEnabled);
     if (gpData.masteringEnabled !== undefined) gp.setMasteringEnabled(gpData.masteringEnabled);
     if (gpData.masteringReference !== undefined) gp.setMasteringReference(gpData.masteringReference);
+    // Songs from before the dial, or rendered without a reference, carry no value: 1 is the old behaviour.
+    gp.setTimbreReferenceStrength(typeof gpData.timbreReferenceStrength === 'number' ? gpData.timbreReferenceStrength : 1);
   }, [reuseData?.timestamp]);
 
   // ── AI generation result handler ──
@@ -461,7 +497,8 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
     ? { autoExpand: false, loraTrigger: '', beatIntro: false, introBars }
     : { autoExpand, loraTrigger, beatIntro, introBars };
 
-  const handleGenerate = () => {
+  /** The content params a render would send, as Generate assembles them. */
+  const assembleParams = () => {
     // Wildcard auto-expand: reproducible from the DiT seed when it's locked,
     // fresh randomness when the seed is random anyway
     const wcSeed = gp.randomSeed ? randomWildcardSeed() : Number(gp.seed);
@@ -472,13 +509,19 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
 
     const params = createContentParams({
       caption, lyrics, negativePrompt, instrumental, loraTrigger: compose.loraTrigger, beatIntro: compose.beatIntro, introBars,
-      title, artist, subject, bpm, keyScale, timeSignature, duration, vocalLanguage, sourceLatentUrl,
+      title, artist, subject, bpm, keyScale, timeSignature, duration, vocalLanguage, sourceLatentUrl, yue2Continuation: continuation,
     }, { mm3Mode, yue2Active: activeBackendId === YUE2_BACKEND_ID,
       durationMax: useBackendStore.getState().capabilities[activeBackendId]?.core.duration.max,
       resolvedCaption, resolvedLyrics });
+    return params;
+  };
+  if (paramsRef) paramsRef.current = assembleParams;
+
+  const handleGenerate = () => {
+    const params = assembleParams();
     // A pasted lead sheet (#181) is the score; previewing would plan a new one
     // and throw it away.
-    if (yue2Mode && yue2PreviewScore && !yue2AbcSupplied) {
+    if (yue2Mode && !continuation && yue2PreviewScore && !yue2AbcSupplied) {
       void planScore(params, false);
       return;
     }
@@ -748,11 +791,15 @@ export const CreatePanel: React.FC<CreatePanelProps> = ({ onGenerate, activeJobC
       </div>
 
       {/* Generate button */}
+      {yue2Ui && <div className="px-4 pb-3"><Yue2Continuation value={continuation} onChange={setContinuation} /></div>}
       <div className="px-4 py-3 border-t border-zinc-200 dark:border-white/5 space-y-2">
         <button
           className="w-full flex items-center justify-center gap-2 py-3 rounded-xl font-semibold text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 hover:shadow-lg hover:shadow-pink-500/20 text-white"
           onClick={handleGenerate}
-          disabled={!caption.trim() && !lyrics.trim() && !instrumental}
+          disabled={yue2Ui ? !!continuation && (!continuation.sourceAudioUrl || !Number.isFinite(continuation.start)
+            || !Number.isFinite(continuation.end) || continuation.start < 0 || continuation.end <= continuation.start
+            || continuation.end - continuation.start > 30 || Math.floor(continuation.end * 25) <= Math.floor(continuation.start * 25))
+            : !caption.trim() && !lyrics.trim() && !instrumental}
         >
           {activeJobCount > 0 ? (
             <>

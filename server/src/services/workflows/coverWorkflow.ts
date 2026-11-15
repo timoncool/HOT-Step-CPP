@@ -24,7 +24,7 @@ import {
   type CoverRenderInput, type CoverDraft,
 } from '../../contracts/studioWorkflows.js';
 import { instrumentalConflict, preparedPair } from '../../contracts/yue2Prepare.js';
-import { tryAbcCoverLeadSheet, coverRenderRolls, clearCoverScore } from '../coverLeadSheet.js';
+import { tryAbcCoverLeadSheet, coverRenderRolls, clearCoverScore, sameAbc } from '../coverLeadSheet.js';
 import { sheetTranscriberSetting } from '../training/yue2Sheet.js';
 import { heartmulaCoverLyrics, heartmulaCoverTags } from '../backends/heartmula/cover.js';
 import { mm3PlankDir, mm3PlankSiblings, readMm3PlankMeta } from '../backends/minimax/plank.js';
@@ -210,7 +210,7 @@ export function effectiveCoverRequest(i: CoverRenderInput, d: CoverDraft, url: s
     title: coverTitle(i), caption, style: caption, lyrics: i.instrumental ? '' : i.lyrics,
     ...(i.lyricsSource ? { lyricsSource: i.lyricsSource } : {}),
     ...scoreMetadata,
-    leadSheetRenderingPath: d.leadSheet && d.leadSheet.abc !== d.approvedAbc ? 'abc-edited' : 'abc',
+    leadSheetRenderingPath: d.leadSheet && !sameAbc(d.leadSheet.abc, d.approvedAbc) ? 'abc-edited' : 'abc',
     instrumental: i.instrumental, source: 'cover-studio', sourceAudioUrl: url,
     // The covering band names the saved file and tags it, as on the ACE path.
     artistName: i.targetArtistName || i.artistName, sourceArtist: i.artistName,
@@ -230,7 +230,7 @@ export interface CoverDeps {
   analyze?: (path: string, signal: AbortSignal) => Promise<{ bpm: number | null; key: string; scale: string } | null>;
   datasetAnalysis?: (path: string) => { bpm: number; key: string; scale: string } | null;
   metadata?: (path: string) => Promise<{ artist: string; title: string; album: string; duration: number | null }>;
-  transcribe?: (url: string, label: string, user: string, signal: AbortSignal, force: boolean, source?: CoverLeadSheetSource) => Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult }>;
+  transcribe?: (url: string, label: string, user: string, signal: AbortSignal, force: boolean, source?: CoverLeadSheetSource) => Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult; notice?: string }>;
   leadSheetDefault?: () => CoverLeadSheetSource;
   capability?: (backend: string) => Promise<boolean>;
   caption?: (artistId: number, provider: string, model: string, force: boolean, signal: AbortSignal) => Promise<{ text: string; generatedProfileId?: number }>;
@@ -243,8 +243,12 @@ async function defaultMetadata(path: string) {
     return { artist: m.common.artist || '', title: m.common.title || '', album: m.common.album || '', duration: m.format.duration ?? null };
   } catch { return { artist: '', title: '', album: '', duration: null }; }
 }
-async function defaultTranscribe(url: string, label: string, user: string, signal: AbortSignal, force: boolean, source: CoverLeadSheetSource = 'sheetsage2'): Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult }> {
-  if (source === 'yourmt3-chordnet') throw new WorkflowError(400, yue2CoverService.readiness(source).message!);
+async function defaultTranscribe(url: string, label: string, user: string, signal: AbortSignal, force: boolean, source: CoverLeadSheetSource = 'sheetsage2'): Promise<{ abc: string; scoreSource?: string; leadSheet?: CoverLeadSheetResult; notice?: string }> {
+  if (source === 'yourmt3-chordnet') {
+    const { message } = yue2CoverService.readiness(source);
+    if (message) throw new WorkflowError(400, message);
+    return (await import('../leadSheetNative.js')).transcribeNativeLeadSheet(url, signal);
+  }
   if (source === 'muscriptor') {
     const { transcribeCoverMidi } = await import('../../routes/midiStudio.js');
     return transcribeCoverMidi(url, signal);
@@ -357,12 +361,13 @@ export function createCoverKinds(deps: CoverDeps = {}): WorkflowKind<any>[] {
     const selected = asset(input.assetId || data.assetId, ctx.userId);
     const changed = selected.sha256 !== data.sha256 || (input.assetId || data.assetId) !== data.assetId;
     const next = changed || input.leadSheetSource !== data.leadSheetSource
-      ? clearCoverScore(data, input.leadSheetSource) : data;
+      ? clearCoverScore(data, input.leadSheetSource, changed) : data;
     const updated = docs().update(input.documentId, ctx.userId, input.revision, {
       ...next, assetId: input.assetId || data.assetId, sha256: selected.sha256,
       ...(changed ? { sourceLabel: selected.filename, analysis: null, metadata: null } : {}),
     });
-    return { documentId: updated.id, revision: updated.revision, leadSheetSource: input.leadSheetSource };
+    return { documentId: updated.id, revision: updated.revision, leadSheetSource: input.leadSheetSource,
+      abc: next.abc, scoreSource: next.scoreSource, leadSheet: next.leadSheet };
   } }, { kind: 'cover-caption', input: captionInput, async run(ctx) {
     const input = ctx.input as z.infer<typeof captionInput>;
     const data = draft(docs(), input.documentId, input.revision, ctx.userId);
@@ -393,6 +398,7 @@ export function createCoverKinds(deps: CoverDeps = {}): WorkflowKind<any>[] {
     const result = await (dep('transcribe') || defaultTranscribe)(source.url, data.sourceLabel || source.filename,
       ctx.userId, ctx.signal, input.force, leadSheetSource);
     ctx.throwIfCancelled();
+    if (result.notice) ctx.emit('stage', { stage: result.notice });
     const updated = docs().update(input.documentId, ctx.userId, input.revision, current => {
       if (current.assetId !== data.assetId) throw new WorkflowError(409, 'Cover source changed');
       if (asset(data.assetId, ctx.userId).sha256 !== data.sha256) throw new WorkflowError(409, 'Cover source changed');
@@ -423,7 +429,10 @@ export function createCoverKinds(deps: CoverDeps = {}): WorkflowKind<any>[] {
     const finished = await ctx.audio.wait(item.id);
     ctx.throwIfCancelled();
     if (finished.status !== 'succeeded') throw new Error(finished.error || `Audio ${finished.status}`);
-    return { request, audioIntentId: item.id, audio: finished.result, elapsedSeconds: finished.elapsedSeconds };
+    const { heartmulaCover, ...recorded } = request;
+    const rolls = heartmulaCover as import('../../contracts/studioWorkflows.js').HeartmulaCoverRolls | undefined;
+    return { request: { ...recorded, ...(rolls ? { heartmulaCoverRows: rolls.length, heartmulaCoverBpm: rolls.bpm } : {}) },
+      audioIntentId: item.id, audio: finished.result, elapsedSeconds: finished.elapsedSeconds };
   } }];
 }
 export function registerCoverWorkflows(deps: CoverDeps = {}) {

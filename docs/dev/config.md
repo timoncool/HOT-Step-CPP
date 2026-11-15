@@ -39,7 +39,7 @@ app runs; see [Settings page and hot reload](#settings-page-and-hot-reload).
 
 ### Update notices
 
-Settings > General > Updates reads `GET /api/updates/status` (cached, never calls GitHub) and refreshes with `POST /api/updates/check`, optionally `{ channel }` to switch the feed (`release` or `master`). The wire shapes are in `server/src/contracts/updates.ts`; the UI copy is `ui/src/services/updatesApi.ts`, and the panel is `ui/src/components/settings/UpdatesPanel.tsx`. Notices only: no download, prepare or apply endpoint exists. The installed identity comes from `build-info.json` beside `VERSION` (a git checkout reports its own HEAD); a missing file means unknown identity and the UI never guesses a variant.
+Settings > Updates reads `GET /api/updates/status` (cached, never calls GitHub) and refreshes with `POST /api/updates/check`, optionally `{ channel }` to switch the feed (`release` or `master`). The wire shapes are in `server/src/contracts/updates.ts`; the UI copy is `ui/src/services/updatesApi.ts`, and the panel is `ui/src/components/settings/UpdatesPanel.tsx`. A Windows portable install on updater protocol 1, started by its stable launcher, can also download (`POST /api/updates/prepare`) and install (`POST /api/updates/apply`) a release; every other install, protocol 0 included, gets notices only ([HTTP API index](api.md), [Windows updater layout](releasing.md#windows-updater-layout-protocol-1)). The installed identity comes from `build-info.json` beside `VERSION` (a git checkout reports its own HEAD); a missing file means unknown identity and the UI never guesses a variant.
 
 ## Settings page and hot reload
 
@@ -180,6 +180,11 @@ Two unpacked releases that share one profile folder share one library: the launc
 only `HOT_STEP_ROOT` (their own folder) and never `HOT_STEP_DATA_ROOT` or
 `HOT_STEP_PROFILE_DIR`, so the pointer in the profile decides, not the new app folder's
 sibling default. `release/check-layout.mjs` fails a launcher that sets either variable.
+The stable launcher of an updater-capable install (`release/updater/launcher.mjs`) is
+the exception: every payload lives in `app/<id>/`, so it pins `HOT_STEP_PROFILE_DIR`,
+records `<parent of install>/HOT-Step-Data` in the profile pointer on a first start, and
+pins `HOT_STEP_DATA_ROOT` only when the saved folder is missing (the server would
+otherwise fall back inside `app/`) and while an update's candidate is checked.
 
 - **Reuse** is the upgrade path: the same profile and pointer, nothing copied. Tokens come
   with the folder: service keys in `settings/.env`, the Hugging Face token for MuScriptor in
@@ -232,9 +237,31 @@ checkout back at its own folders; data that already moved stays in the data fold
 | Variable | Default | Settings | Effect |
 |---|---|---|---|
 | `SERVER_PORT` | `3001` | Environment, Restart | Port the Node server listens on. The Vite proxy in `ui/vite.config.ts` is hard-coded to `3001`, so dev mode breaks if you change it |
-| `SERVER_HOST` | `0.0.0.0` | env only | Interface the Node server binds to |
+| `SERVER_HOST` | `127.0.0.1` | env only | Interface the Node server binds to. Loopback by default |
+| `ALLOWED_HOSTS` | empty | env only | Comma list of extra hostnames accepted in the `Host` header (LAN names, Tailscale MagicDNS) |
+| `CORS_ORIGINS` | empty | env only | Comma list of extra browser origins allowed to call the API, for example `http://192.168.1.20:3000` |
 | `ACESTEPCPP_PORT` | `8085` | Environment, Restart | Engine port. Passed as `--port`; the server connects to `http://<host>:<port>` |
 | `ACESTEPCPP_HOST` | `127.0.0.1` | Environment, Restart | Engine bind address, passed as `--host`, and the host the server connects to |
+
+### LAN and Tailscale access (opt-in)
+
+The server binds `127.0.0.1` and only answers other machines when you opt in:
+
+- `SERVER_HOST=0.0.0.0` to listen beyond loopback. Do not bind a single LAN or Tailscale IP:
+  the server then stops listening on `127.0.0.1`, which breaks the local DAW plugin and the
+  server's calls to itself. To limit who can connect, use a firewall rule instead.
+- Requests whose `Host` is not loopback, an IP literal, `SERVER_HOST`, a `CORS_ORIGINS` host or
+  an `ALLOWED_HOSTS` entry get 403. This blocks DNS rebinding. Reaching the server by IP needs
+  nothing extra; a name such as `mybox` or `mybox.tail1234.ts.net` must be in `ALLOWED_HOSTS`.
+- Loopback browser origins are trusted only on this server's port and the Vite dev port 3000; other local tools (another localhost port) must be listed in `CORS_ORIGINS`.
+- Browser pages from a non-loopback origin may only read (GET/HEAD) unless the origin is in
+  `CORS_ORIGINS`. A page served by this server and opened by IP counts as same-origin.
+- Vite dev from another machine: `ui/vite.config.ts` proxies with `changeOrigin`, so the server
+  sees the browser's `http://<lan-ip>:3000` Origin. Set `CORS_ORIGINS=http://<lan-ip>:3000`.
+- Using the UI by name (MagicDNS or a LAN hostname): set `CORS_ORIGINS=http://<name>:3001`.
+  `ALLOWED_HOSTS` alone lets GET requests through, but writes from that page get 403.
+  `CORS_ORIGINS` also adds the name to the `Host` allowlist, so one setting covers both.
+- Using the UI by Tailscale or LAN IP needs nothing beyond `SERVER_HOST`.
 
 `.env.example` also lists `VITE_PORT` and `VITE_HOST`. Nothing reads them: `dev.bat` starts
 Vite with `--port 3000 --host`, and `ui/vite.config.ts` sets port 3000 and host `0.0.0.0`.
@@ -249,7 +276,7 @@ Vite with `--port 3000 --host`, and `ui/vite.config.ts` sets port 3000 and host 
 | `YUE2_NO_OVERLAP` | unset | Engine process | Any value keeps every YuE2 render on the work thread instead of the NAR lane (engine/docs/ARCHITECTURE.md) |
 | `YUE2_OVERLAP_MIN_FREE_GB` | `4` | Engine process | Free VRAM the NAR lane needs at the handoff; below it the render runs inline |
 | `ACESTEPCPP_DRAFT_LM` | empty | env only | Passed as `--draft-lm` when the file exists. Speculative decoding is off on purpose: per-call GGML overhead cancels the gain |
-| `CUDA_VISIBLE_DEVICES` | empty (Auto) | Environment, Restart | GPU for the engine and for `ace-train` (`services/gpuDevices.ts`). Auto leaves the choice to the engine when `nvidia-smi` lists fewer than two GPUs; with two or more it passes the UUID of the one with the most VRAM, ties going to the lower index. The Settings picker writes a GPU UUID, passed as given. An index-only value is translated to UUIDs through `nvidia-smi`; any other value is passed through as given, and the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless you set it yourself) so indices match `nvidia-smi`. The child environment is rebuilt from the live `config` value on every spawn, so a training job started after saving uses the new GPU. A YuE2 joint training job can name its own GPU UUID, which overrides this for that job |
+| `CUDA_VISIBLE_DEVICES` | empty (Auto) | Environment, Restart | GPU for the engine and for `ace-train` (`services/gpuDevices.ts`). Auto leaves the choice to the engine when `nvidia-smi` lists fewer than two GPUs; with two or more it passes the UUID of the one with the most VRAM, ties going to the lower index. The Settings picker writes a GPU UUID, passed as given. `all` (any case) leaves `CUDA_VISIBLE_DEVICES` unset for every child, so all GPUs stay visible. An index-only value is translated to UUIDs through `nvidia-smi`; any other value is passed through as given, and the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` (unless you set it yourself) so indices match `nvidia-smi`. The child environment is rebuilt from the live `config` value on every spawn, so a training job started after saving uses the new GPU. A YuE2 joint training job can name its own GPU UUID, which overrides this for that job |
 | `ACESTEPCPP_WORKER_GPUS` | empty | Environment, Restart | Experimental multi-GPU opt-in (GH #13): comma-separated `GPU-` or `MIG-` UUIDs, one `ace-server` per card. Empty keeps the single engine. UUIDs that `nvidia-smi` does not report, and duplicates, are dropped; if none are left the single engine runs. With the opt-in set, `w0` is pinned to the first UUID on the configured port and `w1`.. take the next free ports, logging to `ace_engine.wN.log`. Each model must fit in one card; nothing is split across cards. With two or more cards listed, jobs run concurrently, one per worker; training, post-processing and previews hold every worker. See [Multi-GPU workers](engine.md#multi-gpu-workers-experimental) |
 | `TENSORRT_LIBS` | In a release, `<data folder>/tools/runtime`. Otherwise `engine/deps/tensorrt_libs` if it contains `nvinfer_10.dll` or `libnvinfer.so.10`, else empty | env only | Prepended to the engine's `PATH` so TensorRT can load. If a `trtllm-libs` folder exists two levels above the engine binary, it is prepended too |
 
@@ -298,7 +325,7 @@ them are hot-reloaded when saved from Settings.
 | Variable | Default | Settings | Effect |
 |---|---|---|---|
 | `DEFAULT_LLM_PROVIDER` | `gemini` | AI Services | Provider used when a request does not name one |
-| `LLM_TIMEOUT_MS` | `300000` | AI Services | Abort limit for one completion call, every provider. Values below 10000 are raised to 10000 |
+| `LLM_TIMEOUT_MS` | `300000` | AI Services | Completion timeout, every provider. Streaming calls allow this long between response or reasoning tokens; non-streaming calls have a total time limit. The same timer covers headers and body without a separate five-minute HTTP cap. Values below 10000 are raised to 10000 |
 | `GENIUS_ACCESS_TOKEN` | empty | AI Services | Genius API token for lyric lookup |
 | `GEMINI_API_KEY` | empty | AI Services | Google Gemini key |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | AI Services | Gemini model |
@@ -359,6 +386,8 @@ Exposed in Settings > Environment > Server and hot-reloaded. Code: `server/src/s
 | `TRAINING_WORKER_TOKEN` | empty | Sent as `x-hotstep-worker-token` on every call to a worker |
 | `WORKER_TOKEN` | empty | Set = this machine is a worker: every `/api` request from a non-loopback address must carry this token (401 otherwise) |
 
+The server binds `127.0.0.1` by default, so a worker must also set `SERVER_HOST=0.0.0.0` or the controller cannot reach it. Set `WORKER_TOKEN` too. The server logs a warning at startup when `WORKER_TOKEN` is set but it is bound to loopback.
+
 A worker keeps pushed datasets under `<TRAINING_DIR>/worker-datasets/<slug>`, with the controller's dataset id and slug. Every machine records the last linked YuE2 pair per slug in `<TRAINING_DIR>/yue2-linked.json`; the controller's pull reads the worker's copy.
 
 The Workers panel calls `GET /api/workers`, which requests each worker's token-gated `GET /api/training/worker/status`. The controller compares the reported startup commit with its own Git HEAD using ancestry, and reports current, behind with commit count, or diverged. `POST /api/workers/:name/update` creates a bundle from the worker commit to local master and uploads it to the worker's token-gated `POST /api/training/worker/update`. The worker checks for queued and running jobs before the reset, then discards tracked checkout changes with submodule recursion disabled. Only when the bundle changes the recorded ggml commit does it sync the submodule URL, check out the committed HOT-ggml fork revision, and require hook verification to pass before the engine build. The checkout replaces tracked changes in `engine/ggml`; files committed in the fork remain in place. It installs dependencies when lockfiles changed, builds the UI, conditionally rebuilds the engine, and writes the restart marker last: `RESTART_MARKER_PATH` (`<root>/.restart-requested` in a checkout), the same file the restart loop (`server/restart-loop.cmd`, `dev.sh` on macOS) consumes. On macOS the updater checks hooks with `pwsh -NoProfile -File engine/verify-hooks.ps1`, runs plain `npm`, and builds with `bash engine/build-mac.sh`; Windows commands are unchanged. `GET` and `DELETE /api/workers/:name/update` read progress or cancel during preparation. A worker without these endpoints needs a one-time bootstrap. Before an engine rebuild the updater stops ace-server, which suspends the engine supervisor so it does not restart the engine mid-build. After the reset, a failed build keeps training writes returning 409 (reads still pass) until a person repairs the checkout; a failure before the reset releases the gate. The first migration to the fork requires a manual bootstrap while the worker is idle and the app and engine supervisor are stopped.
@@ -367,9 +396,13 @@ The Workers panel calls `GET /api/workers`, which requests each worker's token-g
 
 | Variable | Default | Read in | Effect |
 |---|---|---|---|
-| `HOT_STEP_ROOT` | unset | `config.ts` | Project root. Setting it turns on portable mode, which among other things downloads the CUDA runtime DLLs on a Windows CUDA build's first launch. Set by the portable launchers `release/HOT-Step.bat` and `release/HOT-Step.sh` |
-| `HOT_STEP_DATA_ROOT` | unset | `dataroot/bootstrap.ts` | Release only. Use this data folder for this process, ignoring `data-location.json`. A scheduled move does not run while it is set |
-| `HOT_STEP_PROFILE_DIR` | unset | `dataroot/paths.ts` | Replaces the profile folder that holds `data-location.json` and the dev pointers. Meant for test fixtures |
+| `HOT_STEP_ROOT` | unset | `config.ts` | Project root. Setting it turns on portable mode, which among other things downloads the CUDA runtime DLLs on a Windows CUDA build's first launch. Set by the portable launchers `release/HOT-Step.bat` and `release/HOT-Step.sh`, and by the stable launcher to the selected `app/<id>` |
+| `HOT_STEP_DATA_ROOT` | unset | `dataroot/bootstrap.ts` | Use this data folder for this process (release and dev; it must exist), ignoring `data-location.json`. A scheduled move does not run while it is set |
+| `HOT_STEP_PROFILE_DIR` | unset | `dataroot/paths.ts` | Replaces the profile folder that holds `data-location.json` and the dev pointers. Meant for test fixtures; the stable launcher also pins it |
+| `HOT_STEP_INSTALL_ROOT` | unset | `routes/updates.ts` | Set by the stable launcher (`release/updater/launcher.mjs`) to its install folder, the parent of `app/<id>/`. Updater state lives in its `updater/` folder |
+| `HOT_STEP_UPDATER_DIR` | unset | `services/updates/maintenance.ts` | Set by the stable launcher to `<install>/updater`. Startup reads the maintenance lease and `transaction.json` there before opening SQLite |
+| `HOT_STEP_MAINTENANCE_TOKEN` | unset | `services/updates/maintenance.ts` | Set by the stable launcher only for an update's candidate (and for a restart after a crash past commit). Without it a process refuses to start while a lease exists; with it, `/api/health`, `/api/maintenance` and `/api/shutdown` pass the closed gate |
+| `HOT_STEP_LAUNCHER_PROTOCOL` | unset | `config.ts` | Set by the stable launcher. Read only with an IPC channel and `HOT_STEP_INSTALL_ROOT`; apply needs it to equal `updaterProtocol` in `build-info.json` |
 | `HOT_STEP_DEV` | unset | `routes/shutdown.ts` | Set to `1` by `dev.bat` and `dev.sh`. On Windows it lets `POST /api/shutdown` kill the Vite process on port 3000 after checking it is Node running Vite. It also gates `HOTSTEP_GENERATE_CAPTURE` and `HOTSTEP_YUE2_COVER_FORCE_FALLBACK` |
 | `HOTSTEP_GENERATE_CAPTURE` | unset | `services/generation/requestCapture.ts` | Dev only, honoured only when `HOT_STEP_DEV` is set. `record` saves every `POST /api/generate` body as a fixture under `<data dir>/dev-captures/generate/`, then generates as normal; `capture-only` saves it and queues nothing. See [Generation API contracts](api-contracts.md#fixture-capture-dev-only) |
 | `HOTSTEP_YUE2_COVER_FORCE_FALLBACK` | unset | `services/training/yue2ArTrainRunner.ts` | Dev only: `1`, with `HOT_STEP_DEV=1`, sends every Cover Studio YuE2 lead-sheet transcription down its fallback path, which waits for the GPU lane and frees the engine for the transcriber. Tests that path on a card where both fit |

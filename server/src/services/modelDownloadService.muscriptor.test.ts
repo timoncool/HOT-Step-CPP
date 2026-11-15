@@ -31,10 +31,11 @@ function sandbox(net: Net = {}) {
   const roots = muscriptorRoots(undefined, path.join(base, 'models'), path.join(base, 'library'));
   const cls = svc.constructor as any;
   const saved = {
-    roots: svc._muscriptorRoots, simple: svc._downloadSimple, weights: svc._downloadWithRedirects,
+    installed: svc.getInstalledFiles, roots: svc._muscriptorRoots, simple: svc._downloadSimple, weights: svc._downloadWithRedirects,
     jobs: new Map<string, any>(svc.jobs), delays: [...cls.RETRY_DELAYS],
   };
   svc._muscriptorRoots = () => roots;
+  svc.getInstalledFiles = () => new Set<string>(); // Keep background checks off the real model library.
   svc._downloadSimple = net.simple ?? (async () => { throw new Error('network used'); });
   svc._downloadWithRedirects = net.weights ?? (async () => { throw new Error('network used'); });
   svc.jobs.clear();
@@ -43,6 +44,7 @@ function sandbox(net: Net = {}) {
     shared: roots.shared,
     legacy: roots.legacy,
     restore() {
+      svc.getInstalledFiles = saved.installed;
       svc._muscriptorRoots = saved.roots; svc._downloadSimple = saved.simple; svc._downloadWithRedirects = saved.weights;
       svc.jobs.clear();
       for (const [k, v] of saved.jobs) svc.jobs.set(k, v);
@@ -75,7 +77,7 @@ test('the catalogue lists all four models under Shared with a required config', 
     assert.deepEqual(e.companions, [{ filename: 'config.json', required: true }]);
   }
   assert.ok(entries.find((f: any) => f.id === 'muscriptor-large').tags.includes('gated'));
-  assert.equal(entries.find((f: any) => f.id === 'muscriptor-large').sha256, undefined, 'gated hashes are not visible without access');
+  assert.match(entries.find((f: any) => f.id === 'muscriptor-large').sha256, /^[a-f0-9]{64}$/, 'HF exposes the LFS hash even for gated weights');
   assert.match(entries.find((f: any) => f.id === 'muscriptor-beat-this').sha256, /^[a-f0-9]{64}$/);
   assert.deepEqual(catalogue.packs.find((p: any) => p.id === 'midi-transcription').fileIds, ['muscriptor-small', 'muscriptor-beat-this']);
 });
@@ -102,12 +104,38 @@ test('a complete pre-#228 copy shows as installed and is reused without any netw
   const sb = sandbox();
   try {
     put(path.join(sb.legacy, 'small'), { 'model.safetensors': 'w', 'config.json': '{}' });
+    // This fixture represents an already verified legacy install.
+    svc._writeSidecar(path.join(sb.legacy, 'small', 'model.safetensors'),
+      catalogue.files.find((f: any) => f.id === 'muscriptor-small').sha256);
     assert.deepEqual(installedIds(), ['muscriptor-small']);
     assert.deepEqual(svc.startMuscriptorDownload('small'), { started: false, error: 'Already downloaded' });
     const job = await settle(svc.startDownload('muscriptor-small'));
     assert.equal(job.status, 'completed');
     assert.equal(fs.existsSync(path.join(sb.shared, 'small')), false, 'nothing was fetched or copied into shared');
   } finally { sb.restore(); }
+});
+
+test('wrong legacy bytes without a current sidecar are refused by the reuse path', async () => {
+  for (const staleSidecar of [false, true]) {
+    const requested: string[] = [];
+    const sb = sandbox({
+      simple: async (url) => { requested.push(url); throw new Error('replacement fetch attempted'); },
+    });
+    const dir = path.join(sb.legacy, 'small');
+    const weights = path.join(dir, 'model.safetensors');
+    try {
+      put(dir, { 'model.safetensors': 'wrong legacy bytes', 'config.json': '{}' });
+      const expected = catalogue.files.find((f: any) => f.id === 'muscriptor-small').sha256;
+      if (staleSidecar) fs.writeFileSync(`${weights}.sha256`, `${expected} 0:0\n`);
+      assert.equal(svc._cachedSha(weights), null);
+      const job = await settle(svc.startDownload('muscriptor-small'));
+      assert.equal(job.status, 'failed', 'corrupt legacy weights cannot count as completed');
+      assert.match(job.error, /replacement fetch attempted/);
+      assert.ok(requested.length > 0, 'refusing reuse must attempt a replacement');
+      assert.equal(svc._cachedSha(weights), sha('wrong legacy bytes'));
+      assert.equal(fs.readFileSync(weights, 'utf8'), 'wrong legacy bytes');
+    } finally { sb.restore(); }
+  }
 });
 
 test('a download fetches config.json with the token before the weights, into the shared folder', async () => {

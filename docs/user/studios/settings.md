@@ -20,7 +20,7 @@ See [Terminal](#terminal), [Theme, restart, and shutdown](#theme-restart-and-shu
 
 ## Workflow
 
-1. Open Settings and pick a tab: General, Environment, AI Services, Storage & Data, Performance, or Report an issue.
+1. Open Settings and pick a tab: General, Environment, AI Services, Storage & Data, Performance, Updates, or Report an issue.
 2. On the Environment tab, edit any field, then click **Save Environment** (or **Save Changes** on the AI Services tab, which shares the same save bar). Only changed keys are written to `.env`.
 3. If a changed key needs a restart to take effect, the save bar shows which one and a **Restart now** button appears. Click it to restart the server and engine; the UI reconnects on its own once they are back.
 4. General, Performance, and language/theme changes apply immediately and do not need a restart.
@@ -28,6 +28,8 @@ See [Terminal](#terminal), [Theme, restart, and shutdown](#theme-restart-and-shu
 A small reset arrow appears beside a General or Performance setting whenever its value has moved
 from the default; click it to snap that one field back. The reset persists like any other change;
 it is not a page reload. The Environment and AI Services fields have no reset arrow.
+
+Settings use a grid of cards, including paths, GPU selection, storage actions and update information. Labels and controls stay side by side when they fit inside a card; otherwise the control drops below its label. Multi-line text, the training-worker list, the Report form and status banners keep the full width. Tabs wrap so Updates and its notification dot stay visible with the sidebars open.
 
 ## Settings and Lyric Studio backup
 
@@ -39,7 +41,6 @@ The Storage & Data tab can export a versioned JSON backup of application setting
 
 | Control | What it does |
 |---|---|
-| Updates | Shows the installed build (release tag or source commit, plus the build variant), a Release / Master selector, the time of the last successful check and **Check now**. When something newer exists a banner links to its GitHub release notes or commit. Changing the selector only changes which feed is checked, never your installation. It is a notice only: nothing is downloaded or installed. A copy with no build record, a source checkout with uncommitted changes, and a failed check each get a plain message, and a failed check is never shown as "up to date". At startup the app checks again only when the last successful check is more than a day old; **Check now** asks GitHub at most once a minute per feed and shows the saved result in between. |
 | Display Language | Sets the application interface language: English, Russian, Chinese, Japanese or Korean. Applies immediately. |
 | Generic artwork | Which set of stand-in cover images a track shows until it has one of its own, Cyberpunk (the default) or Scenic; each track keeps the same image within a set. |
 | "Disco Mode": Extract drum stems for visualisations | After generation, extracts kick, snare, and hi-hat stems to drive the beat-reactive visual effects (rainbow borders, snare flash, hi-hat particles). Adds roughly 60 to 90 seconds per song. |
@@ -50,6 +51,14 @@ The Storage & Data tab can export a versioned JSON backup of application setting
 | Use filename as trigger word | Auto-injects the adapter's filename (minus the `.safetensors` extension) into the style description at generation time. |
 | Trigger word placement | Only shown when the trigger toggle above is on. Prepend, Append, or Replace, controlling where the trigger word lands relative to your style description. |
 
+### Updates tab
+
+The Updates tab holds build information and update checks. A small dot appears on its tab label only when an update is available. General stays in place while the status loads.
+
+| Control | What it does |
+|---|---|
+| Updates | Shows the installed build, the last successful check and **Check now**. Portable installs follow Release only; source checkouts can also check Master. When supported by the Windows portable launcher, **Download update** shows the download size, progress and **Cancel**, then **Restart and install** asks for confirmation. Finish or cancel any listed jobs before retrying. A full-window screen follows the restart, reports the result and offers **Reload** to load the new UI. The last outcome, time and message remain here after reload. Older portable builds, Linux and macOS show a reason and a release link for a manual upgrade. Source checkouts tell you to close HOT-Step and run `update.bat` in the install folder. A failed check is never shown as "up to date". Startup checks only when the last success is more than a day old; **Check now** asks GitHub at most once a minute per feed. |
+
 ### Environment tab
 
 This tab is a structured editor for `.env`, in four collapsible groups: Engine, Server, Dataset Labeling and Paths. Fields marked "Restart required" below need the app to restart before the new value takes effect; only some of them carry a "Restart" badge in the UI. The save bar's **Restart now** button (see [Workflow](#workflow)) does that without leaving the page. Every field here has a matching entry in [Configuration](../../dev/config.md), which also lists the keys this tab does not expose.
@@ -59,7 +68,7 @@ This tab is a structured editor for `.env`, in four collapsible groups: Engine, 
 | Models / Adapters directory | Where the engine looks for model and adapter files. Restart required. |
 | Engine port / host | Address `ace-server` binds to. Restart required. Defaults to `8085` / `127.0.0.1`. |
 | VAE chunk size / overlap | Tuning knobs for the VAE decoder's chunked decode, useful for reducing memory use on Vulkan or low-VRAM GPUs. Restart required. Defaults to `1024` / `64`. |
-| GPU Device | Which GPU the engine uses. Lists detected NVIDIA cards by name and VRAM; "Auto (most VRAM)" picks the card with the most VRAM. Restart required. Stores a stable GPU UUID rather than an index, see [Tips and limits](#tips-and-limits). Falls back to a plain text field when no GPU is detected (AMD, Intel, Apple, or CPU-only). |
+| GPU Device | Which GPU the engine uses. Lists detected NVIDIA cards by name and VRAM; "Auto (most VRAM)" picks the card with the most VRAM; "All GPUs" keeps every card visible to the engine, for picking one with `GGML_BACKEND` in `.env`. Restart required. Stores a stable GPU UUID rather than an index, see [Tips and limits](#tips-and-limits). Falls back to a plain text field when no GPU is detected (AMD, Intel, Apple, or CPU-only). |
 | Multi-GPU workers | Experimental, off by default. Shown only when two or more NVIDIA cards are detected. Ticking cards starts one engine per ticked card instead of one engine in total. With two or more cards ticked, jobs run in parallel, one per card; training, post-processing and previews still take every card. Each model must fit in a single card's VRAM; a model is never split across cards, so a 24 GB card still cannot run something that needs 30 GB. CUDA only: Vulkan, CPU and Apple Silicon keep the single engine. Leave all unticked for the normal behaviour, where the GPU Device pick above applies. Restart required. |
 | Engine workers | Read-only status, shown once more than one engine is running: worker name, card, port, ready or its status text, and "busy" while a job runs on it. With two or more workers, jobs run in parallel, one per worker. |
 | Keep Models in VRAM | Passes `--keep-loaded` to the engine so the DiT, adapter, and VAE stay resident between generations instead of being reloaded each time. Cuts the roughly 17-second adapter precompute paid per render, at the cost of holding around 13 GB of VRAM continuously. Off by default. Restart required. This is a different control from the "Keep DiT & VAE loaded" toggle on the Performance tab, see [Tips and limits](#tips-and-limits). |
@@ -68,7 +77,7 @@ This tab is a structured editor for `.env`, in four collapsible groups: Engine, 
 | Training workers / Training worker token | Other PCs this one can train YuE2 batches on, as `Name=http://address:3001`, comma-separated, and the token sent to them. Applies live. See [training on another PC](../training/yue2.md#training-on-another-pc). |
 | Worker token (this PC as a worker) | Set only on a PC that trains for another. API calls from other machines must then carry this token; the PC itself and a browser on it are not affected. Applies live. |
 | Dataset labeling throughput (Essentia / Genius / caption concurrency and intervals) | Rate limits for the background dataset-labeling queue used by Training Studio. Defaults: Essentia concurrency 2, Genius concurrency 1 with a 400 ms minimum interval, AI caption concurrency 1 with a 250 ms minimum interval. Applies live, no restart. |
-| Download folder | Absolute folder that downloaded tracks are saved into, with a toast showing where each one went. Empty (the default) keeps normal browser downloads, which also stay the route for the library's zip export. The folder is checked when you save, and an existing file is never overwritten (the new one becomes `name (2).ext`). Applies live. |
+| Download folder | Absolute folder that downloaded tracks are saved into, with a toast showing where each one went and an Open folder link that opens it in the file manager on the PC running HOT-Step, with the file selected on Windows and macOS. Empty (the default) keeps normal browser downloads, which also stay the route for the library's zip export. The folder is checked when you save, and an existing file is never overwritten (the new one becomes `name (2).ext`). Applies live. |
 | Lyrics export directory | Where Lyric Studio exports lyric files. Applies live. |
 | MuScriptor models directory | Where MIDI Studio's transcription models live. Empty keeps the default, `models/muscriptor` under the data directory. Restart required. |
 

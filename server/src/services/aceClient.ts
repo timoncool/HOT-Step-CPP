@@ -139,6 +139,7 @@ export interface AceRequest {
   audio_cover_strength?: number;
   cover_noise_strength?: number;
   cover_noise_method?: string;
+  timbre_reference_strength?: number;  // 1 by default; 0 = no reference, above 1 pulls past it
   repainting_start?: number;
   repainting_end?: number;
   seed_strength?: number;
@@ -214,6 +215,10 @@ export interface AceRequest {
   latent_shift?: number;       // 0.0 = no bias
   latent_rescale?: number;     // 1.0 = no scaling
   custom_timesteps?: string;   // CSV of descending floats, overrides scheduler
+  cfg_interval_start?: number;
+  cfg_interval_end?: number;
+  retake_seed?: number;
+  retake_variance?: number;
   cfg_cutoff_ratio?: number;   // CFG step scheduling: 1.0 = full CFG, 0.5 = 50% CFG then cond-only
   cache_ratio?: number;        // Step-level velocity caching: 0.0 = off, 0.5 = skip ~50% of passes
   // Post-VAE spectral denoiser (HOT-Step)
@@ -313,8 +318,9 @@ export interface PluginParamSchema {
   // conditional visibility
   /** Show only while another param equals (or does not equal) a value,
    *  compared as strings. `not_equals` exists for "hide when off" cases
-   *  where off is one value and on is a whole range. */
-  visible_when?: { key: string; equals?: string; not_equals?: string };
+   *  where off is one value and on is a whole range. Numeric bounds are read
+   *  by the backend extension renderer. */
+  visible_when?: { key: string; equals?: string; not_equals?: string; greater_than?: number; less_than?: number };
 }
 
 /** Plugin metadata from Lua plugin files */

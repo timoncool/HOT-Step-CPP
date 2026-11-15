@@ -58,6 +58,36 @@ narrow screen, the **Queue** button on the artist list). See
 [Bulk operations](#bulk-operations) below. Esc steps back from an album to
 its artist, and from an artist to the artist list.
 
+### Instrumental collections
+
+Training Studio exports instrumental tracks with empty lyrics, an instrumental
+flag, captions in all available formats, BPM, key and duration. You can edit the
+artist and album names before exporting, including when the source is a
+collection. Re-exporting a mixed album adds its instrumental tracks; existing
+albums stay as they are until re-exported.
+
+Open the tracks on **Source Lyrics** to read their captions. The album preset
+accepts adapters and a reference track without a lyric profile. Export links
+the saved MM3 checkpoint and YuE2 pair as well as ACE-Step adapters while
+preserving other preset settings. An assigned MM3 adapter makes the album
+available in the MM3 Cover Studio grid.
+
+Lyric profiles and lyric statistics use vocal songs only. An album with no
+lyric songs builds a **Sound profile** from its source captions and measured
+tempo, keys, genres, signatures and duration range, without lyric analysis.
+In **Generated Lyrics**, **Generate instrumental** creates a title, mood or
+scene, BPM, key, duration and separate ACE-Step, MM3 and YuE2 captions. The
+planner reads the source captions in all three formats and avoids repeating
+past subjects, tempos, keys, durations and titles. Subject and extra instructions
+still steer the result. Duration stays within the source tracks' range.
+
+Instrumental generations keep the `[Instrumental]` marker in place of lyrics.
+Refine and the lyric editor are unavailable with an explanation. **Write Lyrics**
+points to the sound-profile generation path. Captions and metadata remain
+editable; audio generation, bulk queues, presets and **Send to Custom-Gen**
+carry the instrumental setting. MM3 still offers automatic, named-track and
+custom caption sources. Mixed albums keep their vocal lyric profile.
+
 ## Controls
 
 ### Write lyrics from a prompt
@@ -82,17 +112,18 @@ the whole song; it does not regenerate individual sections.
 |---|---|
 | Fetch Lyrics (artist grid's "Add Artist", or an artist's "Add Album") | Pulls songs from Genius by artist name/URL and optional album name/URL, up to a max-songs cap (1-100, default 50). Needs `GENIUS_ACCESS_TOKEN`. |
 | Add Manually (artist / album / song) | Creates an artist, album, or a single song's lyrics without Genius. |
+| Has *engine* adapter (left artist list, under the name filter) | Off by default. On, the list shows only artists with at least one album whose preset assigns an adapter for the active engine: the MM3 adapter on MiniMax-Music3, either YuE2 half on YuE2, the adapter on ACE-Step and the rest. The album counts in that list and the artist's album page narrow to the same albums. Switch engines and the list follows. Stays set for the browser session. |
 | Build New Profile | Runs the profiling LLM over every source song in the album and saves a style profile: themes, common subjects, tone and mood, vocabulary notes, structural and narrative patterns, rhyme schemes, meter and repetition statistics. Streams its output live. |
 | Generate Lyrics / Generate (No Thinking) | Writes a new song from the album's newest profile with the generation LLM, using past generations for that artist to avoid repeating subjects, keys, titles, BPMs and durations. "No Thinking" asks the model to skip its reasoning phase, when it has one. The Count selector (1 to 5, 8 or 10) writes several in a row. The subject field steers the topic without dictating content. |
 | Skip Thinking (live output) | Shown while a generation or refinement is in the model's thinking phase. Cuts that LLM call short; the step goes on with whatever answer text had already arrived, which can be none. |
 | Refine | Rewrites a generated song's lyrics and title with the refinement LLM, keeping its captions and other metadata; the result is saved as a new generation linked back to the original. |
 | Title / Subject / BPM / Key / Duration | Editable inline on an expanded song; blur to save. |
 | Caption (ACE-Step / YuE2) | The caption box that ACE-Step and YuE2 both render from. On YuE2, when the album's dataset has per-track captions, a source picker offers the track nearest in tempo, a named track, or this song's own caption. Until you pick, it uses the nearest-tempo track when the album preset names a YuE2 adapter, and the song's own caption when it does not. |
-| MM3 Caption | MiniMax-Music3's three-heading Structured Caption, a different text from the ACE-Step/YuE2 caption above, generated alongside the lyrics. Carries the same source picker (nearest tempo / named track / custom) when the album has captioned source tracks. |
+| MM3 Caption | MiniMax-Music3's three-heading Structured Caption, a different text from the ACE-Step/YuE2 caption above, generated alongside the lyrics. Carries the same source picker (nearest tempo / named track / custom) when the album has captioned source tracks. Until you pick, the song renders with its own MM3 caption; a song without one uses the nearest-tempo track. |
 | YuE2 Caption | YuE2's one-sentence planner caption (language, genre, vocal, instruments, mood, production, BPM in that order). Plain text; no source picker of its own, because a song with one no longer borrows a dataset track's caption. |
 | Generate Audio | Queues an audio render of this song through the active backend, using the current global generation parameters plus the album's adapter preset. |
 | Send to Custom-Gen | Opens [Custom-Gen](create.md) with this song's lyrics, caption, title, artist, subject, key/BPM/duration and the album's adapter preset (or MM3/YuE2 adapter) already applied. |
-| Render as… (on an expanded song) | Renders this song with another album's settings: pick the album, then Generate Audio or Send to Custom-Gen. The song keeps its lyrics, captions, tempo and key; the adapters, reference track and artist name come from the chosen album, and on MiniMax-Music3 and YuE2 so does the caption source (nearest tempo among that album's tracks, unless the song is set to its own caption). The recording is listed in the chosen album's Generated Songs tab, marked with the album the song came from, and not under its own album. |
+| Render as… (on an expanded song) | Renders this song with another album's settings: pick the album, then Generate Audio or Send to Custom-Gen. The song keeps its lyrics, captions, tempo and key; the adapters, reference track and artist name come from the chosen album, and on YuE2 so does the caption source (nearest tempo among that album's tracks). On MiniMax-Music3 the song keeps its own MM3 caption unless you pick Automatic or a named track, which then come from the chosen album. The recording is listed in the chosen album's Generated Songs tab, marked with the album the song came from, and not under its own album. |
 | Render from… (Generated Lyrics toolbar) | The same thing from the other side: in the album you want to render as, pick another album and one of its written songs. |
 | Album Preset | Per-album settings for the active backend: on ACE-Step, a DiT adapter folder with per-group scale sliders (self-attn, cross-attn, MLP, cond-embed), a planner-LM adapter folder, and a reference audio track for timbre conditioning; on MiniMax-Music3, one LM adapter, picked from the runs trained on this album's own dataset or any other installed adapter; on YuE2, the AR (song planner) and NAR (audio renderer) adapter halves, picked from the installed adapters or filled in from an Adapter folder you point at (for example `yue2-joint-adapters\refined`), which is scanned for both halves. See [Adapters](../adapters.md) and [Backends](../backends.md). |
 | Edit System Prompts | Views and overrides the four Lyric Studio system prompts (Generation, Metadata Planning, Artist Profiler, Refinement), with a reset to the built-in prompt. The code icon beside Bulk Operations opens it. |
@@ -159,9 +190,17 @@ OpenAI-compatible entry once it has a base URL, and Unsloth Studio once it has
 both a username and a password or `UNSLOTH_KEYLESS=1` ("Keyless local Studio"
 in Settings). Ollama, LM Studio and llama.cpp are always listed, whether or not
 they are running. Three roles, Profiling, Generation and Refinement, each get an independent
-provider and model choice, all persisted locally in the browser. `LLM_TIMEOUT_MS`
-sets how long a single call may run (default 300 s). Raise it if a local
-model shares the GPU with the engine and needs longer to respond.
+provider and model choice, all persisted locally in the browser.
+
+Settings > AI Services > "LLM call timeout (ms)" sets `LLM_TIMEOUT_MS`, which
+defaults to 300000 ms, or 5 minutes. For streamed calls this limits the pause
+before the first token and between later response or reasoning tokens. An active
+stream can run longer than 5 minutes. Keepalive messages alone do not extend it.
+Calls without streaming keep a total time limit. HTTP header and body waits use
+the same budget, so a larger setting also works before a model starts replying.
+Raise the setting if a local model needs longer to load or process a large prompt,
+or shares the GPU with the engine. Timeout errors name the setting, and changes
+apply to the next call without a restart.
 
 ## Tips and limits
 

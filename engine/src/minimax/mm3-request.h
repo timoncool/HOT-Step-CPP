@@ -611,10 +611,15 @@ struct MM3SynthRequest {
      *  rather than rejected, so a caller that asks for more gets fewer songs
      *  and a log line, not an error. Take t uses seed + t. */
     int     takes  = 1;
+    /** Store the planner's KV cache as Q8_0 (MM3GenRequest::lm_kv_q8). */
+    bool    lm_kv_q8 = false;
     /** Natural-ending candidates: see MM3GenRequest::require_eos. */
     bool    require_eos = false;
     bool    stop_after_first_eos = false;
     int     eos_rounds  = 4;
+    /** Base handoff for capped adapter takes: see MM3GenRequest::eos_handoff. */
+    bool    eos_handoff  = false;
+    int64_t handoff_seed = -1;
     /** Shortest plan worth rendering, in frames (25 fps). 0 = no floor.
      *  A plan that stops after a second or two has "ended" as far as the model
      *  is concerned and is useless as the song that was asked for, so it is
@@ -626,10 +631,11 @@ struct MM3SynthRequest {
     // present together, with acoustic == semantic * 7. Entry 0 is the
     // un-emitted iteration, so I codes render I-1 frames (mm3-ar-loop.h).
     //
-    // NOTE this does NOT make the render faster. The AR loop still executes
-    // every per-frame forward pass; forcing fixes which TOKENS come out, not
-    // how much compute runs. Its value is reproducibility — an identical
-    // semantic bed to A/B flow-stage solver/scheduler/guidance against.
+    // Both arrays together (hard pin, no lm_force_bias, no -1 frames) skip the
+    // frame loop: the AR stage re-derives the hiddens in one teacher-forced
+    // pass (mm3-ar-loop.h, "Fully forced codes"). Semantic-only or soft forcing
+    // still runs every frame. Either way the value is reproducibility — an
+    // identical semantic bed to A/B flow-stage solver/scheduler/guidance against.
     std::vector<int32_t> forced_semantic;  // [I]
     std::vector<int32_t> forced_acoustic;  // [I * 7], flat, iteration-major
 
@@ -661,7 +667,8 @@ struct MM3SynthRequest {
     // reads the adapter rows. Runtime mode only (merge has no base weights to
     // mask back to); ignored with a log line otherwise, and for an adapter that
     // carries a soft prompt. Doubles the LM rows and KV, so takes clamp to 2
-    // with a CFG pair (mm3_max_takes); in the AR cache key when below 1.
+    // with a CFG pair at f16; lm_kv_q8 lets 4 fit (mm3_max_takes); in the AR
+    // cache key when below 1.
     float              lm_adapter_plan  = 1.0f;
     // "runtime" (default) = low-rank deltas in-graph, live dials, +28 %/step
     // at r256. "merge" = fold scale·B·A into the resident weights once
@@ -997,6 +1004,26 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
             }
             out->require_eos = yyjson_get_bool(v);
         }
+        yyjson_val * ho = yyjson_obj_get(root, "eos_handoff");
+        if (ho && !yyjson_is_null(ho)) {
+            if (!yyjson_is_bool(ho)) {
+                if (err) {
+                    *err = "\"eos_handoff\" must be a boolean";
+                }
+                return false;
+            }
+            out->eos_handoff = yyjson_get_bool(ho);
+        }
+        yyjson_val * hs = yyjson_obj_get(root, "handoff_seed");
+        if (hs && !yyjson_is_null(hs)) {
+            if (!yyjson_is_int(hs) || yyjson_get_sint(hs) < 0) {
+                if (err) {
+                    *err = "\"handoff_seed\" must be a non-negative integer";
+                }
+                return false;
+            }
+            out->handoff_seed = yyjson_get_sint(hs);
+        }
         yyjson_val * r = yyjson_obj_get(root, "eos_rounds");
         yyjson_val * first = yyjson_obj_get(root, "stop_after_first_eos");
         if (first && !yyjson_is_null(first)) {
@@ -1046,6 +1073,16 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
                 return false;
             }
             out->takes = (int) t;
+        }
+        yyjson_val * kq = yyjson_obj_get(root, "lm_kv_q8");
+        if (kq && !yyjson_is_null(kq)) {
+            if (!yyjson_is_bool(kq)) {
+                if (err) {
+                    *err = "\"lm_kv_q8\" must be a boolean";
+                }
+                return false;
+            }
+            out->lm_kv_q8 = yyjson_get_bool(kq);
         }
     }
 
@@ -1455,6 +1492,8 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     out->gen.require_eos = out->require_eos;
     out->gen.stop_after_first_eos = out->stop_after_first_eos;
     out->gen.eos_rounds  = out->eos_rounds;
+    out->gen.eos_handoff  = out->eos_handoff;
+    out->gen.handoff_seed = out->handoff_seed;
     out->gen.min_frames  = out->min_frames;
     out->gen.plugins    = plug;
     // MM3 Plank replay. MM3GenRequest holds these by value, and the job worker
@@ -1471,6 +1510,7 @@ static bool mm3_parse_synth_request(const MM3Model & m, yyjson_val * root, MM3Sy
     out->gen.lm_adapter_scales = out->lm_adapter_scales;
     out->gen.lm_adapter_sched  = out->lm_adapter_sched;
     out->gen.lm_adapter_plan   = out->lm_adapter_plan;
+    out->gen.lm_kv_q8          = out->lm_kv_q8;
     out->gen.a2a_strength      = (float) a2a_strength;
     out->gen.a2a_hold          = (float) a2a_hold;
 

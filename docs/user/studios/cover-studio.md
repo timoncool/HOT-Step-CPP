@@ -6,7 +6,7 @@ reviewed score. Stable Audio 3 transforms the source audio using a caption,
 Transform strength, seed and optional DoRA adapter. Its output is instrumental
 and follows the source's feel, with no melody guarantee. HeartMuLa's MuLaCover
 mode uses the approved Prepare lead sheet, four style tag fields and lyrics;
-rendering awaits engine support and its separate non-commercial model pack.
+it needs its separate non-commercial model pack.
 YuE2 and HeartMuLa share a lead-sheet source picker for SheetSage2,
 SheetSage2-Refined, MuScriptor and YourMT3+/ChordNet. Saved drafts keep their
 source choice; MuScriptor chords are estimates.
@@ -32,7 +32,7 @@ Unavailable sources stay selectable; the score panel says what is missing.
 | SheetSage2 | The SheetSage2 model in Model Manager. |
 | SheetSage2-Refined | SheetSage2 and its Refined overlay in Model Manager. |
 | MuScriptor | A MuScriptor transcription model, Beat This! and a build containing `ace-midi`. The readiness message names the chosen model and missing files. |
-| YourMT3+ / ChordNet | Not installed yet. No download entry is offered while model rights and native installation are pending. |
+| YourMT3+ / ChordNet | `yourmt3-F32.gguf` and `chordnet-F32.gguf` in the `muscriptor` folder of your models folder, Beat This! and a build containing `ace-midi`. You convert the two models yourself with `engine/tools/convert-yourmt3.py` and `convert-chordnet.py`. There is no download, because we cannot yet redistribute them. The readiness message names each missing file. |
 
 A new draft uses the picker's choice, or snapshots the **Models** default if
 you have not selected a source. Changing that default later does not change an
@@ -68,8 +68,9 @@ adapters do not condition this mode. **Seed** is -1 for random, or a fixed whole
 number. Tags and seed are saved with the cover draft separately from SA3 settings.
 
 Use Intro, Verse, Chorus, Bridge and Outro lyric section markers. Unmarked
-lyrics start as Verse. An instrumental cover uses Intro. Generation keeps
-the 240-second ceiling. The approved ABC supplies melody, chords and tempo.
+lyrics start as Verse. An instrumental cover uses Intro. A cover stops at the
+lead sheet's length, up to 300 seconds; the model can end it earlier. Trailing
+padding does not extend the song. The approved ABC supplies melody, chords and tempo.
 Chord roots and slash chords accept ASCII or Unicode flats and sharps, including
 the symbols produced by SheetSage2 score parsing.
 HeartMuLa uses the same confirmed score/lyrics checks as YuE2, with no YuE2
@@ -78,9 +79,11 @@ currently needs the workflow draft created by uploading source audio.
 
 The MuLaCover card in Model Manager and Cover Studio shows **CC BY-NC 4.0**:
 weights and outputs are for non-commercial use. MuLaCover is a separate model
-pack, not included in the normal HeartMuLa generation models. No download is
-offered yet. You can prepare and save drafts, but submitted renders currently
-report "HeartMuLa covers are not available yet" until engine support lands.
+pack, not included in the normal HeartMuLa generation models. Download
+**MuLaCover cover model** from the **HeartMuLa** tab in Model Manager. The pack
+includes the HeartMuLa codec and tokenizer. A render needs the MuLaCover model
+files and the Qwen3 Embedding BF16 text encoder; without them you can prepare and save drafts, and a submitted
+render reports which file is missing.
 Submission errors remain visible beside Generate cover and in the queue.
 
 ## Stable Audio 3 audio transform
@@ -839,8 +842,8 @@ its value has moved from the default; click it to snap that one field back.
 
 ## Tips and limits
 
-- Cover generation needs ACE-Step 1.5, YuE2, Stable Audio 3 or MiniMax-Music3
-  active. HeartMuLa offers Prepare while MuLaCover rendering awaits engine support.
+- Cover generation needs ACE-Step 1.5, YuE2, Stable Audio 3, MiniMax-Music3 or
+  HeartMuLa active. HeartMuLa covers also need the MuLaCover model pack.
 - For ACE-Step and YuE2, splitting into stems is step one of two. The split by itself does not change the
   render; the mixer is where muting or lowering a stem actually removes it from
   the cover.

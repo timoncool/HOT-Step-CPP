@@ -147,7 +147,7 @@ if(NOT DEFINED GGML_LLAMAFILE)
     set(GGML_LLAMAFILE_DEFAULT ON)
 endif()
 # ── HOT-Step's ggml fork ─────────────────────────────────────────────────────
-# engine/ggml is pinned to HOT-ggml's hot-step-neutral branch, which carries the ggml
+# engine/ggml is pinned to HOT-ggml's hot-step-0.29 branch, which carries the ggml
 # changes the engine needs (training ops, BF16 out_prod, quant copies ...) as
 # commits; see docs/dev/ggml-fork.md. A plain ggml-org checkout lacks them and
 # fails much later, at ace-train's link step, so refuse it here. The usual
@@ -494,6 +494,11 @@ else()
     target_link_libraries(ace-server PRIVATE acestep-core httplib supersep)
 endif()
 link_ggml_backends(ace-server)
+# Every backend's server is one translation unit; it outgrew MSVC's default
+# COFF section limit (C1128), as ace-train did. /bigobj lifts it.
+if(MSVC)
+  target_compile_options(ace-server PRIVATE /bigobj)
+endif()
 # CUDA runtime for GET /vram (cudaMemGetInfo)
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
@@ -798,6 +803,10 @@ link_ggml_backends(heartcodec-encode-probe)
 add_executable(yue2-vae-lifetime-test tests/test-yue2-vae-lifetime.cpp)
 target_link_libraries(yue2-vae-lifetime-test PRIVATE yyjson)
 link_ggml_backends(yue2-vae-lifetime-test)
+add_executable(yue2-empty-style-test tests/test-yue2-empty-style.cpp)
+target_include_directories(yue2-empty-style-test PRIVATE src/yue2)
+target_link_libraries(yue2-empty-style-test PRIVATE yyjson)
+link_ggml_backends(yue2-empty-style-test)
 # yue2-nar-graph.h also contains the optional Lua sampler dispatch. The probe
 # includes that header for parity fixtures even though it uses native midpoint.
 target_link_libraries(yue2-probe PRIVATE yyjson luajit)
@@ -1015,25 +1024,23 @@ if(APPLE)
     target_link_libraries(vst-host PRIVATE ${COCOA_FRAMEWORK} ${COREFOUNDATION_FRAMEWORK})
 endif()
 
-# Embed the long-path manifest in every engine executable, so training and
-# adapter paths past 260 characters open when Windows long paths are enabled.
-if(MSVC)
-    get_property(_hs_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-    foreach(_hs_target IN LISTS _hs_targets)
-        get_target_property(_hs_type ${_hs_target} TYPE)
-        if(_hs_type STREQUAL "EXECUTABLE")
-            target_sources(${_hs_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/long-paths.manifest)
-        endif()
-    endforeach()
-endif()
-
 # Monitor chain unit test (no VST plugins needed). Off by default so it is not
 # part of the ALL build; configure with -DBUILD_TESTING=ON to build and run it.
 option(BUILD_TESTING "Build the engine unit tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
+    # No models or GPU required: residual identity, delta export and legacy load.
+    add_executable(pissa-residual-test tests/test-pissa-residual.cpp)
+    link_ggml_backends(pissa-residual-test)
+    target_link_libraries(pissa-residual-test PRIVATE yyjson)
+    add_test(NAME pissa-residual COMMAND pissa-residual-test)
+    set_tests_properties(pissa-residual PROPERTIES ENVIRONMENT "GGML_BACKEND=CPU" TIMEOUT 60)
+
     add_executable(test-monitor-chain tests/test-monitor-chain.cpp)
     add_test(NAME monitor-chain COMMAND test-monitor-chain)
+
+    add_executable(yue2-lyrics-instrumental-test tests/test-yue2-lyrics-instrumental.cpp)
+    add_test(NAME yue2-lyrics-instrumental COMMAND yue2-lyrics-instrumental-test)
 
     # DoRA norm-refresh freeze fixture (dora-common.h vs the pre-extraction
     # graphs). GGML_BACKEND picks the device; see the test's header.
@@ -1089,4 +1096,26 @@ if(BUILD_TESTING)
     target_link_libraries(yue2-recompose-test PRIVATE yyjson luajit)
     link_ggml_backends(yue2-recompose-test)
     add_test(NAME yue2-recompose COMMAND yue2-recompose-test)
+
+    # plan_continue: request parse, section stop rule, tokenizer prefix
+    # property. No GPU, no model; the tokenizer part needs YUE2_TOKENIZER_DIR
+    # (the yue2/tokenizer folder) and skips (77) without it.
+    add_executable(yue2-plan-continue-test tests/test-yue2-plan-continue.cpp)
+    target_include_directories(yue2-plan-continue-test PRIVATE src/yue2)
+    target_link_libraries(yue2-plan-continue-test PRIVATE yyjson)
+    link_ggml_backends(yue2-plan-continue-test)
+    add_test(NAME yue2-plan-continue COMMAND yue2-plan-continue-test)
+    set_tests_properties(yue2-plan-continue PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+endif()
+
+# Keep this after every executable, including optional test targets. Enable
+# long paths and UTF-8 narrow file APIs throughout each engine process.
+if(MSVC)
+    get_property(_hs_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_hs_target IN LISTS _hs_targets)
+        get_target_property(_hs_type ${_hs_target} TYPE)
+        if(_hs_type STREQUAL "EXECUTABLE")
+            target_sources(${_hs_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/long-paths.manifest)
+        endif()
+    endforeach()
 endif()

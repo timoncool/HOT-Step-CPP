@@ -241,10 +241,14 @@ empirically on the teacher. On 21 layers, 24 does not exist — the replay loop 
 teacher-specific and the timestamps are not to be trusted. Re-discovery
 (`MM3_ALIGN_DUMP=1`) would be needed per variant. Audio is unaffected.
 
-**Not yet judged by ear.** Renders staged in
-`_experiments/_LISTENING/2026-08-22_mm3-distilled-lm/`. Remember trap #10 before drawing any
-conclusion from them: this is a **planner** swap, so 02/03 are different takes, not degraded
-copies of 01, and a single seed proves nothing.
+**Judged by ear 2026-11-14 (HOTSTEP-1218/1220/1222): shelved, stay on the 8B.** q8_0 lr3e5 and
+lr6e5 arms vs stock, 3 captions x 2 seeds at 120 s: about 1.5x faster AR, but Rob did not rate
+the output. Single-row also drops the depth decoder's guidance (7 of 8 codebooks unguided);
+`MM3_DEPTH_CFG=1.5` (env, experiment; forces 2 rows, semantic draw stays at 1.0) helped
+(EOS endings 5/6 vs 3/6) but not enough. Renders in
+`_experiments/_LISTENING/2026-11-14_mm3-distilled-lm/`. Teacher adapters do NOT transfer
+(layer indices, PiSSA residuals, 36-layer trainer); see HOTSTEP-1218 for the options if this
+is ever reopened.
 
 ## Low step counts go THIN, not dull — and why (root-caused + fixed 2026-08-21)
 
@@ -574,8 +578,13 @@ Output** (`mm3ReuseAr`, default ON).
 
 **Why this works where the plank does not:** the flow DiT never sees the codes.
 Its real input is the `[F, 8, 4096]` hidden block the condition encoder eats
-(`mm3-pipeline.h`), so pinning codes still re-runs every AR forward pass to
-regenerate them. Caching the hiddens skips the work.
+(`mm3-pipeline.h`), so pinning codes still has to regenerate it. Caching the
+hiddens skips the work. Since HOTSTEP-1119 a full plank (both streams, hard pin)
+regenerates it in one teacher-forced pass instead of the frame loop: on a 3090,
+q8_0 LM, 188 s of codes took 2.8 s against 117 to 140 s. Hiddens match the loop to
+cos 0.9999 (q8_0) or 0.9999998 (F16 LM); the q8_0 gap is the quantized matmul
+kernels, the same size as the loop's own flash-vs-manual attention spread.
+A semantic-only or soft plank still runs every frame.
 
 **Measured on a 12 s clip, q8_0, RTX 5090:**
 

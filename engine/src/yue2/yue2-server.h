@@ -90,6 +90,7 @@ static void yue2_json_add_file(yyjson_mut_doc * doc, yyjson_mut_val * parent, co
 
 static void yue2_handle_props(const httplib::Request &, httplib::Response & res) {
     std::lock_guard<std::mutex> lock(g_yue2_mutex);
+    yue2_discover_missing_vae(&g_yue2);  // a VAE downloaded since startup
 
     yyjson_mut_doc * doc  = yyjson_mut_doc_new(NULL);
     yyjson_mut_val * root = yyjson_mut_obj(doc);
@@ -124,6 +125,8 @@ static void yue2_handle_props(const httplib::Request &, httplib::Response & res)
     yyjson_mut_obj_add_int(doc, root, "max_lm_batch", YUE2_MAX_LM_BATCH);
     yyjson_mut_obj_add_int(doc, root, "max_synth_batch", YUE2_MAX_SYNTH_BATCH);
     yyjson_mut_obj_add_int(doc, root, "max_plan_batch", YUE2_MAX_PLAN_BATCH);
+    // plan_only + plan_continue + abc plans one section on from a kept score.
+    yyjson_mut_obj_add_bool(doc, root, "plan_continue", true);
     // The checkpoint's own sampler defaults per stage, so the LM tab can show
     // and reset to them (yue2.sampling.<stage>.* in the GGUF).
     if (g_yue2.lm_file.probe_ok) {
@@ -162,6 +165,7 @@ static void yue2_handle_props(const httplib::Request &, httplib::Response & res)
     yue2_json_add_file(doc, files, "vae_standard", g_yue2.vae_file[YUE2_VAE_STANDARD]);
     yue2_json_add_file(doc, files, "vae_legacy", g_yue2.vae_file[YUE2_VAE_LEGACY]);
     yue2_json_add_file(doc, files, "vae_dec2x", g_yue2.vae_file[YUE2_VAE_DEC2X]);
+    yue2_json_add_file(doc, files, "vae_rs_x3", g_yue2.vae_file[YUE2_VAE_RS_X3]);
 
     // Quant catalogue — what the UI's LM quant picker is built from. Mirrors
     // minimax/mm3-server.h's own "variants" block (add_role), scoped to just
@@ -478,12 +482,8 @@ static void yue2_handle_select_model(const httplib::Request & req, httplib::Resp
         }
     }
     Yue2VaeVariant variant_req = YUE2_VAE_STANDARD;
-    if (variant_str == "legacy") {
-        variant_req = YUE2_VAE_LEGACY;
-    } else if (variant_str == "dec2x") {
-        variant_req = YUE2_VAE_DEC2X;
-    } else if (!variant_str.empty() && variant_str != "standard") {
-        yue2_json_error(res, 400, "vae_variant must be \"standard\"|\"legacy\"|\"dec2x\"");
+    if (!variant_str.empty() && !yue2_vae_variant_from_name(variant_str, &variant_req)) {
+        yue2_json_error(res, 400, YUE2_VAE_VARIANT_ERROR);
         return;
     }
 

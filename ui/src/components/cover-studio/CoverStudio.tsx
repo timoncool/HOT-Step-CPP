@@ -79,6 +79,7 @@ import { Yue2BuildPage, buildCaption, buildNext, draftText, finishSavedBuild, on
 import { barRanges } from '../../utils/abcSectionMove';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { Toggle } from '../shared/Toggle';
+import { notify } from '../shared/Toast';
 import { ParamLabel } from '../shared/ParamLabel';
 import { AbcChart } from './AbcChart';
 import { coverWorkflowApi, waitForCoverJob, type CoverDraftResult } from '../../services/coverWorkflowApi';
@@ -342,7 +343,6 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
   const [genProgress, setGenProgress] = useState(0);
   const [genStage, setGenStage] = useState('');
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [toast, setToast] = useState('');
   const [queueItemId, setQueueItemId] = useState<string | null>(null);
 
 
@@ -634,7 +634,7 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     }
   };
 
-  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 4000); };
+  const showToast = notify;
 
   const applyDatasetMetadata = (data: Yue2CoverDatasetMetadata, lyricEdit: number, instrumentalEdit: number): boolean => {
     if (!data.matched) return false;
@@ -801,10 +801,12 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
       const result = done.result as CoverDraftResult;
       sourceHydratedRef.current = result.documentId;
       setCoverDraftRevision(result.revision); setLeadSheetSource(result.leadSheetSource ?? choice);
+      setApprovedSheet(null); setSheetAudioUrl('');
+      // An imported score (dataset or MusicXML) is the user's own notation: only the transcriber label moves.
+      if (sheetScoreSource === 'dataset' || sheetScoreSource === 'musicxml') return;
       const score = leadSheetScoreUpdate(result);
-      setApprovedSheet(score.approved); setSheetAbc(score.abc); setScoreSections([]);
+      setSheetAbc(score.abc); setScoreSections([]);
       setSheetScoreSource(score.scoreSource); setChordQuality(score.chordQuality);
-      setSheetAudioUrl('');
     } catch (err) { if (sourceLookupRef.current === lookup) setSheetError((err as Error).message); }
     finally { sourceChangeRef.current = false; setSourceChanging(false); }
   };
@@ -1497,9 +1499,9 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     if (typeof built === 'string') { showToast(built); return null; }
     return built.params;
   };
-  const generateBuildTakes = (to: number, count: number, caption: string, lyrics: Record<string, string>) => {
+  const generateBuildTakes = (to: number, count: number, caption: string, lyrics: Record<string, string>, newChords: boolean) => {
     const params = buildParams();
-    return params ? build.generate(params, to, count, caption, lyrics).then(Boolean) : Promise.resolve(false);
+    return params ? build.generate(params, to, count, caption, lyrics, newChords).then(Boolean) : Promise.resolve(false);
   };
   const setPrepareSettings = (s: BuildSettings) => {
     setCoverVoices(s.voices);
@@ -2028,11 +2030,6 @@ export const CoverStudio: React.FC<CoverStudioProps> = ({ coverSource }) => {
     <BackendCapabilityGate feature="cover">
     <div className="flex flex-col w-full h-full bg-zinc-50 dark:bg-suno overflow-hidden">
       {/* Toast */}
-      {toast && (
-        <div className="absolute top-16 right-6 z-50 max-w-[500px] px-4 py-2 rounded-xl bg-white dark:bg-zinc-900 text-white text-sm shadow-xl border border-zinc-300 dark:border-white/10 animate-in fade-in slide-in-from-top-2 whitespace-normal break-words">
-          {toast}
-        </div>
-      )}
 
       {yue2Mode && <div className="flex items-center gap-1 border-b border-zinc-200 dark:border-white/10 px-4 pt-2">
         {([[false, 'Prepare'], [true, 'Build']] as const).map(([on, label]) =>

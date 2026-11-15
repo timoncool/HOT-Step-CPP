@@ -17,6 +17,14 @@ the named symbol when one has drifted.
 
 ## Glossary (read first — no prior context assumed)
 
+YuE2 ComfyUI import preserves per-module alpha, ordinary distilled slider keys and
+NAR flow heads. It captures `lora_alpha` or `alpha` from adjacent `adapter_config.json`
+with tensor alpha taking precedence, followed by file metadata and then the sidecar.
+Native `yue2.{vae2llm,llm2vae}.{diff,diff_b}` are scaled deltas;
+`weight` and `bias` are full replacements independent of nonzero strength. A flow-head
+import sets `decoder_companion=off` so it does not stack on the automatic companion.
+Validate imports with the published adapter, including an output comparison.
+
 Album-preset maintenance: Settings > General > Adapters > **Update adapter references**
 calls `POST /api/lireek/presets/update-adapter-references`. The service in
 `server/src/services/lireek/adapterReferences.ts` checks all five adapter columns in
@@ -140,9 +148,21 @@ slices of the trajectory ("structure" expert early / "timbre" expert late — TD
 
 ## Planner (LM) adapters
 
+MM3 PiSSA delta adapters now carry `hot_step.pissa.fingerprint`. Preserve the
+exact residual used for training: matching names/ranks/base sizes do not imply
+matching frozen factors. The loader refuses mismatches; legacy files without
+the tensor retain the old checks. See `pissa-residual.h` and the PiSSA residual
+section of `docs/dev/training-internals.md`. The CPU `pissa-residual-test`
+exercises generated/read identity, export and mismatch/legacy loading.
+
 `engine/src/lm-adapter.h` loads adapters for the 5 Hz planner LM: PEFT LoRA (also LoKr and DoRA), applied at graph-build time through `qwen3_linear_lora()` and never merged, so the base LM can be any quant. The request carries `lm_adapter` / `lm_adapter_scale` in `AceRequest` itself, not the sideband, so they survive the LM echo by construction (`translateParams.ts:172-177`). The LM `ModelKey` includes the adapter path and the scale's bit pattern (`model-store.cpp:47-54`). The loader refuses, rather than guesses at, a LoHa or HiRA file (not low-rank, and this LM has no merge mode), a PiSSA delta adapter (MM3-only), a DiT LoKr (`carries cross_attn sites`), a marker that disagrees with `adapter_config.json`, and a `use_dora` flag that disagrees with the tensors. With an LM adapter the server defaults `lm_rep_penalty` to 1.05, and the plan guard in `services/backends/ace/generate.ts` resamples a degenerate plan up to twice with a shifted seed and a firmer penalty, then renders anyway with a warning. The UI list comes from `GET /api/adapters/lm`.
 
 ## Key files
+
+ACE DiT LoRA key normalization lives in `engine/src/adapter-names.h`.
+It strips all repeated leading PEFT/ComfyUI wrappers before adding `decoder.`.
+`engine/tests/test-ace-parity.cpp` covers double-wrapped keys. Both merge and
+runtime loaders keep using the same `lora_base_name` helper.
 
 | Path | Role |
 |---|---|

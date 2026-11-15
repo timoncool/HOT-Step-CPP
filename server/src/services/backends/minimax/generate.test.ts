@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  MM3_DEFAULT_FLOW_HOP, MM3_DEFAULT_STEPS, MM3_FP8_CALIB_PATH, mapMinimaxParams, mm3LowStepShift,
-  mm3TailFadeStartSec,
+  MM3_DEFAULT_FLOW_HOP, MM3_DEFAULT_STEPS, MM3_FP8_CALIB_PATH, mapMinimaxParams, minimaxStageText, mm3LowStepShift,
+  mm3StripTagDescriptors,
 } from './generate.js';
 import { mm3PlankDir } from './plank.js';
 import { listMm3LmAdapters } from './lmAdapter.js';
@@ -84,19 +84,39 @@ test('MM3 audio to audio: source and dials travel only with a strength, and the 
   }
 });
 
-test('MM3 sends the LM adapter fade only when set, and a fade forces runtime mode', (t) => {
+test('MM3 ignores the retired adapter fade params from saved presets', (t) => {
   const installed = listMm3LmAdapters()[0];
   if (!installed) return t.skip('no MM3 LM adapter installed');
-  const params = { prompt: 'x', seed: 42, mm3LmAdapter: installed.file, mm3LmAdapterMode: 'merge' };
+  const params = { prompt: 'x', seed: 42, lyrics: 'word '.repeat(336), mm3LmAdapter: installed.file, mm3LmAdapterMode: 'merge' };
   const plain = mapMinimaxParams(params).req as unknown as Record<string, unknown>;
-  assert.equal(plain.lm_adapter_mode, 'merge');
-  assert.equal(Object.keys(plain).some((k) => k.startsWith('lm_adapter_fade')), false);
-  const faded = mapMinimaxParams({ ...params, mm3LmAdapterFadeOut: 150, mm3LmAdapterFadeLen: 60, mm3LmAdapterFadeFloor: 7 })
-    .req as unknown as Record<string, unknown>;
-  assert.equal(faded.lm_adapter_mode, 'runtime');
-  assert.equal(faded.lm_adapter_fade_out, 150);
-  assert.equal(faded.lm_adapter_fade_len, 60);
-  assert.equal(faded.lm_adapter_fade_floor, undefined);  // out of range is dropped
+  const stale = mapMinimaxParams({ ...params, mm3AdapterTailFade: true, mm3LmAdapterFadeIn: 10,
+    mm3LmAdapterFadeOut: 150, mm3LmAdapterFadeLen: 60, mm3LmAdapterFadeFloor: 0.5 }).req as unknown as Record<string, unknown>;
+  assert.deepEqual(stale, plain);
+  assert.equal(stale.lm_adapter_mode, 'merge');
+  assert.equal(Object.keys(stale).some((k) => k.startsWith('lm_adapter_fade')), false);
+});
+
+test('MM3 base handoff rides Require Natural Ending, only with an LM adapter', (t) => {
+  const plain = mapMinimaxParams({ prompt: 'x', seed: 42 }).req as unknown as Record<string, unknown>;
+  assert.equal(Object.hasOwn(plain, 'eos_handoff'), false);  // a base render is untouched
+  const installed = listMm3LmAdapters()[0];
+  if (!installed) return t.skip('no MM3 LM adapter installed');
+  const params = { prompt: 'x', seed: 42, mm3LmAdapter: installed.file };
+  const req = (p: Record<string, unknown>) => mapMinimaxParams({ ...params, ...p }).req as unknown as Record<string, unknown>;
+  assert.equal(req({}).eos_handoff, true);
+  assert.equal(req({}).require_eos, true);
+  const off = req({ mm3BaseHandoff: false });
+  assert.equal(Object.hasOwn(off, 'eos_handoff'), false);
+  assert.deepEqual({ ...req({}), eos_handoff: undefined }, { ...off, eos_handoff: undefined });
+  assert.equal(Object.hasOwn(req({ mm3RequireEnding: false }), 'eos_handoff'), false);
+  assert.equal(Object.hasOwn(req({ mm3LmAdapter: 'no-such-run/adapter_model.safetensors' }), 'eos_handoff'), false);
+});
+
+test('MM3 base handoff progress is labelled as the base ending, not another planning round', () => {
+  const d = { stage: 'handoff', window: 2, n_windows: 4, step: 100, n_steps: 7500, require_eos: true, takes: 4 } as any;
+  const t = minimaxStageText(d, 0).stage;
+  assert.match(t, /base model ending take 3 of 4/);
+  assert.doesNotMatch(t, /planning/);
 });
 
 test('MM3 sends the plan dial only below 1, and it forces runtime mode', (t) => {
@@ -114,20 +134,46 @@ test('MM3 sends the plan dial only below 1, and it forces runtime mode', (t) => 
   assert.equal(noAdapter.lm_adapter_plan, undefined);
 });
 
-test('MM3 tail fade toggle times the fade from the lyrics', (t) => {
-  assert.equal(mm3TailFadeStartSec(''), null);
-  assert.equal(mm3TailFadeStartSec('[Verse] ' + 'word '.repeat(336)), 212);  // the 2026-11-08 test sheet: ~210 s
-  assert.equal(mm3TailFadeStartSec('word '.repeat(10)), 60);
-  assert.equal(mm3TailFadeStartSec('word '.repeat(2000)), 240);
+test('MM3 plan dial: compact cache applies below 1 while one or two songs keep their candidate budget', (t) => {
   const installed = listMm3LmAdapters()[0];
   if (!installed) return t.skip('no MM3 LM adapter installed');
-  const base = { prompt: 'x', seed: 42, mm3LmAdapter: installed.file, mm3AdapterTailFade: true };
-  const sung = mapMinimaxParams({ ...base, lyrics: 'word '.repeat(336) }).req as unknown as Record<string, unknown>;
-  assert.equal(sung.lm_adapter_fade_out, 212);
-  assert.equal(sung.lm_adapter_fade_len, 60);
-  assert.equal(sung.lm_adapter_mode, 'runtime');
-  const inst = mapMinimaxParams({ ...base, lyrics: '' }).req as unknown as Record<string, unknown>;
-  assert.equal(inst.lm_adapter_fade_out, undefined);
+  const params = { prompt: 'x', seed: 42, mm3LmAdapter: installed.file };
+  const req = (p: Record<string, unknown>) => mapMinimaxParams({ ...params, ...p }).req as unknown as Record<string, unknown>;
+  const four = req({ mm3LmAdapterScalePlan: 0.25, mm3Takes: 4 });
+  assert.equal(four.takes, 4);
+  assert.equal(four.lm_kv_q8, true);
+  const off = req({ mm3LmAdapterScalePlan: 0.25, mm3Takes: 4, mm3KvQ8: false });
+  assert.equal(off.takes, 2);
+  assert.equal(Object.hasOwn(off, 'lm_kv_q8'), false);
+  // Compact cache must not raise the ending check's candidate count to three.
+  const one = req({ mm3LmAdapterScalePlan: 0.25 });
+  assert.equal(one.takes, 2);
+  assert.equal(one.lm_kv_q8, true);
+  for (const mm3Takes of [1, 2]) {
+    for (const mm3LmAdapterScalePlan of [0, 0.25, 0.75]) {
+      for (const mm3RequireEnding of [false, true]) {
+        const settings = { mm3Takes, mm3LmAdapterScalePlan, mm3RequireEnding };
+        const compact = req(settings);
+        assert.equal(compact.takes ?? 1, mm3RequireEnding ? 2 : mm3Takes);
+        assert.equal(compact.lm_kv_q8, true);
+        const full = req({ ...settings, mm3KvQ8: false });
+        assert.equal(full.takes, compact.takes);
+        assert.equal(Object.hasOwn(full, 'lm_kv_q8'), false);
+      }
+    }
+  }
+  const three = req({ mm3LmAdapterScalePlan: 0.75, mm3Takes: 3 });
+  assert.equal(three.takes, 3);
+  assert.equal(three.lm_kv_q8, true);
+  // Plan 1: no base rows, nothing changes.
+  const plain = req({ mm3LmAdapterScalePlan: 1, mm3Takes: 4 });
+  assert.equal(plain.takes, 4);
+  assert.equal(Object.hasOwn(plain, 'lm_kv_q8'), false);
+  assert.equal(req({ mm3LmAdapterScalePlan: 1 }).takes, 3);
+  // A missing adapter renders the base model: no base rows, so no q8 cache.
+  const missing = req({ mm3LmAdapter: 'no-such-run/adapter_model.safetensors', mm3LmAdapterScalePlan: 0.25, mm3Takes: 4 });
+  assert.equal(missing.takes, 4);
+  assert.equal(Object.hasOwn(missing, 'lm_kv_q8'), false);
 });
 
 test('MM3 source guide: sent only from the plank folder, with its dials, and endings stand down', () => {
@@ -164,3 +210,20 @@ test('MM3 cover modes: state fix, product rule, guide trim and the state blend r
   assert.equal(Object.hasOwn(req({ mm3BlendPath: 'a.mm3hiddens', mm3BlendAmount: 0 }), 'lm_blend_file'), false);
   assert.equal(Object.hasOwn(req({ mm3BlendPath: '../x.mm3hiddens', mm3BlendAmount: 0.5 }), 'lm_blend_file'), false);
 });
+
+test('MM3 strips descriptors from section tags and leaves everything else alone', () => {
+  const sheet = [
+    '[Intro]', '[Verse 1: soft, breathy]', 'line one', '[Chorus - High Energy]', 'line two',
+    '[Pre-Chorus]', '[Bridge (half time)]', '[Female Vocal - airy]', '[Chorus]', '(oh - oh)',
+  ].join('\n');
+  const { lyrics, stripped } = mm3StripTagDescriptors(sheet);
+  assert.equal(lyrics, [
+    '[Intro]', '[Verse 1]', 'line one', '[Chorus]', 'line two',
+    '[Pre-Chorus]', '[Bridge]', '[Female Vocal - airy]', '[Chorus]', '(oh - oh)',
+  ].join('\n'));
+  assert.deepEqual(stripped, ['[Verse 1: soft, breathy]', '[Chorus - High Energy]', '[Bridge (half time)]']);
+  const m = mapMinimaxParams({ prompt: 'x', seed: 42, lyrics: '[Chorus - High Energy]\nla la' });
+  assert.equal(m.req.lyrics, '[Chorus]\nla la');
+  assert.ok(m.notes.some(n => n.includes('[Chorus - High Energy]')));
+});
+

@@ -4,8 +4,10 @@
 // the profile pointer; the caller then restarts the app gracefully and
 // bootstrap.ts carries it out before the DB opens.
 
+import fs from 'fs';
 import path from 'path';
 import { RUNTIME } from './bootstrap.js';
+import { pointerLocation } from './locate.js';
 import { ENV_PATH_KEYS, isInside, readPointer, writePointer, type OperationKind, type PendingOperation } from './paths.js';
 import { planOperation, sharedRoot, sizeOperation } from './transfer.js';
 
@@ -59,6 +61,26 @@ export function getDataLocation(env: NodeJS.ProcessEnv = process.env): DataLocat
   return { mode: RUNTIME.mode, appRoot: RUNTIME.appRoot, dataRoot: RUNTIME.dataRoot, override: RUNTIME.override, pending, externals };
 }
 
+// ── Update preflight ─────────────────────────────────────────────────
+
+/** Why this install cannot open an update transaction (empty when it can).
+ *  Paths are compared after links resolve. */
+export function updatePreflight(env: NodeJS.ProcessEnv = process.env): string[] {
+  const { appRoot, dataRoot, pending } = getDataLocation(env);
+  if (RUNTIME.mode !== 'release' || !appRoot) return ['only a portable release installs updates'];
+  if (!dataRoot) return ['this install has no data folder'];
+  if (pending) return ['a data-folder change is scheduled; restart to finish it first'];
+  let app: string, data: string;
+  try { app = fs.realpathSync.native(appRoot); data = fs.realpathSync.native(dataRoot); } catch (e: any) { return [`cannot resolve the install or data folder: ${e.message}`]; }
+  const errors: string[] = [];
+  if (isInside(app, data) || isInside(data, app)) errors.push(`the data folder ${dataRoot} overlaps the app folder ${appRoot}`);
+  for (const key of ENV_PATH_KEYS) {
+    const v = env[key];
+    if (v && path.isAbsolute(v) && isInside(app, v)) errors.push(`${key} points inside the app folder (${v}); move it to the data folder first`);
+  }
+  return errors;
+}
+
 // ── Preview / schedule / cancel ──────────────────────────────────────
 
 export interface OperationPreview {
@@ -80,7 +102,10 @@ function plan(kind: ScheduleKind, target: string, currentDb: string | null) {
   if (!RUNTIME.appRoot) throw Object.assign(new Error('The data folder cannot be changed in this app'), { status: 400 });
   const dev = RUNTIME.mode === 'dev';
   const k: OperationKind = dev && kind === 'move' && !RUNTIME.dataRoot ? 'migrate' : kind;
-  return planOperation(k, target, { appRoot: RUNTIME.appRoot, currentRoot: RUNTIME.dataRoot, currentDb, dev });
+  // Import identifies the old install against this payload; destinations must
+  // stay outside the whole extracted install, including its stable launcher.
+  const appRoot = kind === 'import' ? RUNTIME.appRoot : pointerLocation().installRoot;
+  return planOperation(k, target, { appRoot, currentRoot: RUNTIME.dataRoot, currentDb, dev });
 }
 
 /** Validate an operation and size it. Writes nothing. `currentDb` is

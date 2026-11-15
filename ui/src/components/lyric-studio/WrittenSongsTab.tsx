@@ -72,10 +72,9 @@ const GenerationStatusBadge: React.FC<{ gen: Generation }> = ({ gen }) => {
  * The MM3 caption for one written song, plus WHERE it comes from.
  *
  * On MiniMax-Music3 the caption that renders is a choice. Rendering new lyrics
- * under one of the artist's own training-track captions — verbatim, not a fresh
- * caption in the same style — is what reliably produces a song in the band's
- * style and, especially, one that ends naturally. So the default is a source
- * track picked by tempo, and this song's own caption becomes the opt-in.
+ * under one of the artist's own training-track captions, verbatim, is a strong
+ * style prompt and tends to end naturally. The default is this song's own
+ * caption; a source track (by tempo, or a named one) is the opt-in.
  *
  * On ACE-Step none of this appears and the box behaves exactly as it always has.
  */
@@ -346,6 +345,7 @@ export function resolveGenerationProvider(
 }
 
 interface WrittenSongsTabProps {
+  instrumentalOnly?: boolean;
   generations: Generation[];
   profiles: Profile[];
   /** The album these songs belong to. Its preset owns the YuE2 adapter, and
@@ -367,7 +367,7 @@ interface WrittenSongsTabProps {
 }
 
 export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
-  generations, profiles, lyricsSetId, mm3SourceTracks = [], onRefresh, onGenerateAudio,
+  generations, profiles, lyricsSetId, mm3SourceTracks = [], onRefresh, onGenerateAudio, instrumentalOnly = false,
   onSendToCreate, onRenderAs, onRenderFrom, onViewRecordings, showToast, generationModel, refinementModel,
 }) => {
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -565,7 +565,7 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
           ) : (
             <>
               <Wand2 className="w-4 h-4" />
-              {t('lyric.generateLyrics')}
+              {instrumentalOnly ? t('lyric.generateInstrumental', 'Generate instrumental') : t('lyric.generateLyrics')}
             </>
           )}
         </button>
@@ -592,7 +592,7 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
             className="w-16"
           />
         </div>
-        {profiles.length === 0 && (
+        {(profiles.length === 0) && (
           <span className="text-xs text-amber-400/60">{t('lyric.buildProfileFirst')}</span>
         )}
         {onRenderFrom && (
@@ -862,9 +862,9 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
                         )}
                         <button
                           onClick={() => handleRefine(gen)}
-                          disabled={refiningId === gen.id}
+                          disabled={refiningId === gen.id || gen.lyrics?.trim() === '[Instrumental]'}
                           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 text-sm font-medium transition-colors disabled:opacity-50"
-                          title="Refine these lyrics using the refinement LLM"
+                          title={gen.lyrics?.trim() === '[Instrumental]' ? t('lyric.instrumentalNoRefine', 'Instrumental tracks have no lyrics to refine') : t('lyric.refineHint', 'Refine these lyrics using the refinement LLM')}
                         >
                           {refiningId === gen.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
                           {t('lyric.refine')}
@@ -890,6 +890,7 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
 
                       {/* Editable lyrics */}
                       <div>
+                        {gen.lyrics?.trim() === '[Instrumental]' ? <p className="text-sm text-zinc-500">{t('lyric.instrumentalNoRefine', 'Instrumental tracks have no lyrics to refine')}</p> : <>
                         <h3 className="text-sm font-semibold text-zinc-600 dark:text-zinc-400 uppercase tracking-wider mb-2">{t('lyric.lyrics')}</h3>
                         <textarea
                           className="w-full p-4 rounded-xl bg-black/20 dark:bg-black/40 border border-zinc-200 dark:border-white/5 text-sm text-zinc-800 dark:text-zinc-200 font-mono leading-relaxed focus:outline-none focus:border-pink-500/30 resize-y transition-colors"
@@ -897,6 +898,7 @@ export const WrittenSongsTab: React.FC<WrittenSongsTabProps> = ({
                           defaultValue={gen.lyrics || ''}
                           onBlur={(e) => { if (e.target.value !== (gen.lyrics || '')) handleSaveField(gen.id, 'lyrics', e.target.value); }}
                         />
+                        </>}
                       </div>
                     </div>
                   </div>

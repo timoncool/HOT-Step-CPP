@@ -180,6 +180,8 @@ function _expandTakes(item: AudioQueueItem, status: GenerationJob): void {
   item.mm3Take = 0;
   item.mm3TakeCount = takes;
   item.mm3TakeSeed = seeds[0];
+  // One render, so one box in the queue, like a coalesced YuE2 batch.
+  item.batchId ??= item.jobId;
 
   const at = _state.items.findIndex(i => i.id === item.id);
   if (at < 0) return;
@@ -581,6 +583,11 @@ function _claimSongDelivery(songId: string): boolean {
   return true;
 }
 
+function serverItemTitle(server: AudioIntentItem, take: number): string {
+  const view = server.meta?.view as AudioQueueItem | undefined;
+  return server.songTitles?.[take] ?? view?.generation?.title ?? String(server.request.title ?? 'Untitled');
+}
+
 function projectServerItem(server: AudioIntentItem, previous?: AudioQueueItem): AudioQueueItem {
   const view = server.meta?.view as AudioQueueItem | undefined;
   const base = view?.generation ? view : {
@@ -602,6 +609,7 @@ function projectServerItem(server: AudioIntentItem, previous?: AudioQueueItem): 
   const take = base.mm3Take ?? 0;
   return {
     ...base, ...previous, id: base.id, serverQueueId: server.id, status,
+    generation: { ...(previous?.generation ?? base.generation), title: serverItemTitle(server, take) },
     jobId: server.jobId ?? undefined,
     stage: server.waiting ?? (server.status === 'held' ? 'Waiting for resume' : status === 'succeeded' ? 'Complete!' : previous?.stage),
     error: server.error ?? undefined,
@@ -615,6 +623,48 @@ function projectServerItem(server: AudioIntentItem, previous?: AudioQueueItem): 
     // of whether a client ever observed the job mid-run — see F19.
     elapsed: server.elapsedSeconds ?? previous?.elapsed ?? base.elapsed,
   };
+}
+
+/** The extra rows of a multi-song render (MM3 variations, a YuE2 or ACE
+ *  batch). The server queue holds one intent per render, so the siblings
+ *  _expandTakes made live only here: rebuilt from the last snapshot's rows on
+ *  every refresh, or the next refresh drops them. A finished render fans out
+ *  by its song count too, so a reload keeps one row per song. */
+function projectTakeSiblings(item: AudioQueueItem, server: AudioIntentItem, previous: Map<string, AudioQueueItem>): AudioQueueItem[] {
+  const result = server.result as { audioUrls?: string[]; songIds?: string[]; masteredAudioUrls?: string[];
+    noAdapterAudioUrls?: string[]; durations?: number[] } | null;
+  const songIds = server.status === 'succeeded' ? result?.songIds ?? [] : [];
+  const count = Math.max(item.mm3TakeCount ?? 1, songIds.length);
+  if (item.mm3TakeOf || count <= 1) return [];
+  item.mm3Take = 0;
+  item.mm3TakeCount = count;
+  item.batchId ??= item.jobId ?? item.id;
+  const siblings: AudioQueueItem[] = [];
+  for (let t = 1; t < count; t++) {
+    const id = `${item.id}:take${t}`;
+    const s: AudioQueueItem = previous.get(id) ?? {
+      ...item, id, mm3Take: t, mm3TakeSeed: undefined, audioUrl: undefined, songId: undefined,
+      masteredAudioUrl: undefined, noAdapterAudioUrl: undefined, audioDuration: undefined, coverUrl: undefined,
+    };
+    Object.assign(s, { mm3TakeCount: count, mm3TakeOf: item.id, batchId: item.batchId, jobId: item.jobId,
+      serverQueueId: item.serverQueueId, elapsed: item.elapsed });
+    s.generation = { ...s.generation, title: serverItemTitle(server, t) };
+    if (songIds[t]) {
+      Object.assign(s, { status: 'succeeded', progress: 100, stage: 'Complete!', error: undefined, songId: songIds[t],
+        audioUrl: result?.audioUrls?.[t] ?? s.audioUrl,
+        masteredAudioUrl: result?.masteredAudioUrls?.[t] ?? s.masteredAudioUrl,
+        noAdapterAudioUrl: result?.noAdapterAudioUrls?.[t] ?? s.noAdapterAudioUrl,
+        audioDuration: result?.durations?.[t] ?? s.audioDuration });
+    } else if (item.status === 'succeeded') {
+      Object.assign(s, { status: 'failed', progress: 0, stage: 'No natural ending',
+        error: 'Reached the length cap without ending; dropped by Require Natural Ending' });
+    } else {
+      // Live progress: _syncTakeSiblings refines this from the job poll below.
+      Object.assign(s, { status: item.status, progress: item.progress, stage: item.stage, error: item.error });
+    }
+    siblings.push(s);
+  }
+  return siblings;
 }
 
 /** Reconcile one server snapshot into the local rows. The Query projection
@@ -637,9 +687,10 @@ async function applyServerItemsNow(items: AudioIntentItem[]): Promise<void> {
     const claimed = new Set(items.flatMap(server => [server.jobId, server.meta?.workflowJobId]).filter(Boolean));
     const local = _state.items.filter(item => _manualIds.has(item.id) && !item.serverQueueId
       && !claimed.has(item.jobId) && !claimed.has(item.workflowJobId));
-    _state.items = items.map(server => {
+    _state.items = items.flatMap(server => {
       const id = (server.meta?.view as AudioQueueItem | undefined)?.id ?? server.id;
-      return projectServerItem(server, previous.get(id));
+      const item = projectServerItem(server, previous.get(id));
+      return [item, ...projectTakeSiblings(item, server, previous)];
     }).concat(local);
     _heldIds.clear();
     for (const server of items) if (server.status === 'held') {
@@ -938,6 +989,19 @@ window.addEventListener('song-postprocess-reverted', (e: Event) => {
   if (songId) _syncMastered(songId, '');
 });
 
+// Apply menu renames immediately; server snapshots also read current song titles.
+window.addEventListener('song-renamed', (e: Event) => {
+  const { songId, title } = (e as CustomEvent).detail || {};
+  if (!songId || !title) return;
+  let touched = false;
+  _state.items = _state.items.map(item => {
+    if (item.songId !== songId && item.id !== songId) return item;
+    touched = true;
+    return { ...item, generation: { ...item.generation, title } };
+  });
+  if (touched) _emit(true);
+});
+
 function _getSnapshot(): AudioGenQueueState { return _state; }
 function _subscribe(listener: () => void): () => void {
   _listeners.add(listener);
@@ -1077,7 +1141,9 @@ export function forceFailQueueItem(id: string): void {
 
 export function clearFinishedFromAudioQueue(): void {
   if (queueOwner() === 'server') {
-    if (_lastToken) void Promise.all(_state.items.filter(item => item.serverQueueId
+    // Take rows share their render's server item; it goes once, with its owner
+    // row, and the projection drops the takes with it.
+    if (_lastToken) void Promise.all(_state.items.filter(item => item.serverQueueId && !item.mm3TakeOf
       && (item.status === 'succeeded' || item.status === 'failed'))
       .map(item => audioQueueApi.dismiss(item.serverQueueId!)))
       .then(() => refreshServerProjection());
@@ -1092,7 +1158,8 @@ export function clearFinishedFromAudioQueue(): void {
  *  no longer exists, so there is nothing worth reconnecting to. */
 export function retryFailedInAudioQueue(): number {
   if (queueOwner() === 'server') {
-    const failed = _state.items.filter(item => item.status === 'failed' && item.serverQueueId);
+    // A failed take row (a dropped candidate) belongs to its owner's render.
+    const failed = _state.items.filter(item => item.status === 'failed' && item.serverQueueId && !item.mm3TakeOf);
     if (_lastToken) void Promise.all(failed.map(item => audioQueueApi.retry(item.serverQueueId!)))
       .then(() => refreshServerProjection());
     return failed.length;
@@ -2177,7 +2244,7 @@ async function _executeItem(item: AudioQueueItem): Promise<void> {
   const renderingAs = !!item.sourceLyricsSetId && item.sourceLyricsSetId !== item.lyricsSetId;
   params.caption = captionForBackend(gen, backendId, item.lyricsSetId, yue2AdapterInForce, renderingAs);
   params.title = gen.title || '';
-  params.instrumental = false;
+  params.instrumental = gen.lyrics?.trim() === '[Instrumental]';
   // Duration is an ACE-only field now.
   //
   // The lyric-derived estimate is a TARGET for ACE, which is told a length and

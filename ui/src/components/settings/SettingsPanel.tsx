@@ -8,11 +8,11 @@ import { useQuery } from '@tanstack/react-query';
 import {
   Zap, Download, Tag, Loader2, Settings2,
   ChevronRight, Save,
-  Key, Database, Globe, Gauge, Bug, Image as ImageIcon
+  Key, Database, Globe, Gauge, Bug, RefreshCw, Disc3, Image as ImageIcon
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { FALLBACK_LANGUAGE, SUPPORTED_LANGUAGES } from '../../i18n';
-import { engineWorkersOptions, healthOptions } from '../../queries/shell-queue/settings';
+import { engineWorkersOptions, healthOptions, updatesStatusOptions } from '../../queries/shell-queue/settings';
 import { useEnvSettingsForm } from './useEnvSettingsForm';
 import { DataFolderPanel } from './DataFolderPanel';
 import { SettingsBackupPanel } from './SettingsBackupPanel';
@@ -88,6 +88,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   const [coverSet, setCoverSetState] = useState<CoverSet>(getCoverSet);
   // The release tag the server reports; a git checkout says "dev" (#185).
   const appVersion = String(useQuery(healthOptions()).data?.version || '');
+  const updateStatus = useQuery({
+    ...updatesStatusOptions(),
+    refetchInterval: q => (q.state.data?.checking ? 2000 : false),
+  }).data?.status;
 
   const update = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
     onSettingsChange({ ...settings, [key]: value });
@@ -132,11 +136,13 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
   // option rather than silently reading as "Auto".
   const gpuRaw = (envValues.CUDA_VISIBLE_DEVICES || '').trim();
   const gpuMatch = gpuRaw
-    ? detectedGpus.find(g => g.uuid && g.uuid.toLowerCase() === gpuRaw.toLowerCase())
-      ?? detectedGpus.find(g => String(g.index) === gpuRaw)
+    ? gpuRaw.toLowerCase() === 'all'
+      ? undefined  // 'all' is valid, handled separately
+      : detectedGpus.find(g => g.uuid && g.uuid.toLowerCase() === gpuRaw.toLowerCase())
+        ?? detectedGpus.find(g => String(g.index) === gpuRaw)
     : undefined;
-  const gpuSelectValue = gpuRaw ? (gpuMatch ? (gpuMatch.uuid || String(gpuMatch.index)) : gpuRaw) : '';
-  const gpuSelectUnknown = !!gpuRaw && !gpuMatch;
+  const gpuSelectValue = gpuRaw.toLowerCase() === 'all' ? 'all' : (gpuRaw ? (gpuMatch ? (gpuMatch.uuid || String(gpuMatch.index)) : gpuRaw) : '');
+  const gpuSelectUnknown = !!gpuRaw && gpuRaw.toLowerCase() !== 'all' && !gpuMatch;
 
   // Multi-GPU opt-in: comma-separated UUIDs, same stable ids as the picker above.
   const workerGpuSet = new Set((envValues.ACESTEPCPP_WORKER_GPUS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean));
@@ -157,7 +163,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     setBrowseKey(null);
   };
 
-  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance' | 'report';
+  type TabId = 'general' | 'environment' | 'ai' | 'storage' | 'performance' | 'updates' | 'report';
   const [activeTab, setActiveTab] = useState<TabId>('general');
 
   const tabs: Array<{ id: TabId; label: string; icon: React.ReactNode }> = [
@@ -166,6 +172,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
     { id: 'ai',          label: t('settings.tabs.ai'),     icon: <Key size={15} className="settings-tab-icon" /> },
     { id: 'storage',     label: t('settings.tabs.storage'),  icon: <Database size={15} className="settings-tab-icon" /> },
     { id: 'performance', label: 'Performance', icon: <Gauge size={15} className="settings-tab-icon" /> },
+    { id: 'updates', label: t('settings.tabs.updates', 'Updates'), icon: <RefreshCw size={15} className="settings-tab-icon" /> },
     { id: 'report',      label: t('settings.tabs.report', 'Report an issue'), icon: <Bug size={15} className="settings-tab-icon" /> },
   ];
 
@@ -180,14 +187,15 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
 
       {/* ── Tab Navigation ── */}
       <div className="settings-tabs">
-        {tabs.map((t) => (
+        {tabs.map((tab) => (
           <button
-            key={t.id}
-            className={`settings-tab${activeTab === t.id ? ' settings-tab--active' : ''}`}
-            onClick={() => setActiveTab(t.id)}
+            key={tab.id}
+            className={`settings-tab${activeTab === tab.id ? ' settings-tab--active' : ''}`}
+            onClick={() => setActiveTab(tab.id)}
           >
-            {t.icon}
-            {t.label}
+            {tab.icon}
+            {tab.label}
+            {tab.id === 'updates' && updateStatus === 'update-available' && <span className="settings-update-dot" aria-label={t('settings.updates.available', { version: '' })} />}
           </button>
         ))}
       </div>
@@ -228,7 +236,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                   <ParamLabel
                     label="GPU Device"
                     className="setting-label"
-                    info="Which GPU the engine should use. Auto picks the card with the most VRAM. Pick a specific card to pin the engine to it instead, useful with more than one GPU in the machine. Requires a restart to take effect."
+                    info="Which GPU the engine should use. Auto picks the card with the most VRAM. All keeps every GPU visible (use GGML_BACKEND in .env to pick one). Pick a specific card to pin the engine to it instead. Requires a restart to take effect."
                   />
                 </div>
                 {detectedGpus.length > 0 ? (
@@ -240,6 +248,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                     className="min-w-[180px] max-w-[360px]"
                     options={[
                       { value: '', label: 'Auto (most VRAM)' },
+                      { value: 'all', label: 'All GPUs (keep all visible)' },
                       ...detectedGpus.map((gpu) => ({
                         value: gpu.uuid || String(gpu.index),
                         label: `GPU ${gpu.index}: ${gpu.name} (${Math.round(gpu.memoryMB / 1024)} GB)`,
@@ -337,7 +346,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
                 value={envValues.SERVER_PORT || ''} onChange={handleEnvChange} type="number" placeholder="3001" />
               <EnvPathRow envKey="DATA_DIR" label={t('settings.env.dataDir')} description={t('settings.env.dataDirDesc')}
                 value={envValues.DATA_DIR || ''} onChange={handleEnvChange} onBrowse={handleBrowse} placeholder="./data" />
-              <EnvTextRow envKey="TRAINING_WORKERS" label={t('settings.env.trainingWorkers', 'Training workers')}
+              <EnvTextRow fullWidth envKey="TRAINING_WORKERS" label={t('settings.env.trainingWorkers', 'Training workers')}
                 description={t('settings.env.trainingWorkersDesc', 'Other PCs running HOT-Step that this PC can train on, as Name=http://address:3001, comma-separated. They appear under "Train on" in the Training Studio.')}
                 value={envValues.TRAINING_WORKERS || ''} onChange={handleEnvChange} placeholder="LivingRoom=http://192.168.1.50:3001" />
               <EnvPasswordRow envKey="TRAINING_WORKER_TOKEN" label={t('settings.env.trainingWorkerToken', 'Training worker token')}
@@ -445,7 +454,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <Settings2 size={16} className="settings-section-icon" />
           <span className="settings-section-title">{t('settings.ai.llmConfig')}</span>
         </div>
-        <div className="setting-row">
+        <div className="setting-row setting-row--compact">
           <div className="setting-info">
             <ParamLabel
               label={t('settings.ai.defaultProvider')}
@@ -573,7 +582,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           <span className="settings-section-title">Pipeline Parallelism</span>
         </div>
 
-        <div className="setting-row">
+        <div className="setting-row setting-row--wide">
           <div className="setting-info">
             <div className="setting-description" style={{ marginTop: 0 }}>
               Run independent pipeline stages concurrently instead of sequentially.
@@ -681,7 +690,6 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       {/* ═══════════════ GENERAL TAB ═══════════════ */}
       {activeTab === 'general' && (
       <>
-      <UpdatesPanel />
       {/* Language Section */}
       <div className="settings-section">
         <div className="settings-section-header">
@@ -719,7 +727,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
           defaultValue={FALLBACK_SET}
         />
 
-        <div className="flex gap-1.5 mt-3">
+        <div className="flex flex-wrap gap-1.5 mt-3">
           {[0, 7, 13, 21, 34, 42].map(i => (
             <img key={i} src={`/covers/${coverSet}/${String(i).padStart(2, '0')}.webp`}
               alt="" loading="lazy"
@@ -729,10 +737,11 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       </div>
 
       {/* Disco Mode */}
-      <div className="border-t border-zinc-200 dark:border-white/5 pt-4 mt-4">
-        <h4 className="text-sm font-medium text-zinc-900 dark:text-white mb-3 flex items-center gap-2">
-          🪩 Disco Mode
-        </h4>
+      <div className="settings-section">
+        <div className="settings-section-header">
+          <Disc3 size={16} className="settings-section-icon" />
+          <span className="settings-section-title">Disco Mode</span>
+        </div>
         <SettingRow
           id="setting-disco-kick-extract"
           label="Extract drum stems for visualisations"
@@ -877,6 +886,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({
       )}
 
       {activeTab === 'report' && <ReportIssuePanel />}
+      {activeTab === 'updates' && <UpdatesPanel />}
 
       {/* ═══════════════ STORAGE & DATA TAB ═══════════════ */}
       {activeTab === 'storage' && (

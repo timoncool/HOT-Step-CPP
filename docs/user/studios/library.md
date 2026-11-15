@@ -19,8 +19,8 @@ disk.
 1. Open Library from the sidebar.
 2. Pick a view (grid, list, or table) and, optionally, a source filter tab to
    narrow the list to one studio's output.
-3. Click a track to open its details in the right sidebar, or hover it for
-   quick play/download/menu controls.
+3. Click a track's i button to open its details in the right sidebar, or
+   hover it for quick play/download/menu controls.
 4. Use the track's action menu (or the right sidebar) for edit, download,
    send-to-Cover-Studio, metadata, or delete.
 5. To bring in audio from outside the app, click Upload into Library and drop
@@ -31,12 +31,13 @@ disk.
 | Control | What it does |
 |---|---|
 | View toggle (grid / list / table) | Switches how the song list renders. Remembered per browser. |
+| Card size (grid view) | A short slider on the pagination row, left of Per page, that makes grid cards bigger or smaller; the cards glide to their new places as the column count changes. One setting for every song grid, remembered per browser. Double-click it to reset. Hidden on phones. |
 | Source filter tabs | All, Custom-Gen, Auto-Gen, Lyric Studio, Cover Studio, Repaint, Stem Build, Song Builder, Imported. Each tab shows a count and filters client-side; only shown on the Library page, not on the Generations lists beside Custom-Gen and Auto-Gen. |
 | Select | Enters multi-select mode: check tracks, then Compare (two or more tracks, opens a new [Compare](compare-studio.md) session with them picked), Add to playlist, Zip (one zip of the selected tracks' original audio, up to 500 tracks and 256 MB), Download or Delete the selection. Select all / deselect all toggles from the checkbox at the left of the bulk action bar; Select all visible and Clear sit beside it. Shift+click selects the range from the last clicked track, Ctrl/Cmd+click toggles one. On touch, long-press a track to start selecting, tap to toggle, and long-press a second track to select the range between them. |
 | Per page | 20, 40 (the default), 60, 80, 100, or All. Remembered per browser. |
 | Columns (table view only) | Choose which columns show. The cover thumbnail, Title and Actions are always on. Style, BPM, Key, Model, Quality, Time and Date (and Source on the All tab) show by default; the generation details, such as seed, LM seed, steps, CFG, shift, solver, scheduler, guidance, LoRA, LM and VAE, are off until you tick them. Column widths are drag-resizable and persist. |
 | Rename (pencil icon) | Inline title edit, on the card, row, or table cell. |
-| Track menu (⋯) | Run Post-Processing (shown greyed out, with the reason on hover, when it cannot run), Remove Post-Processed Version (when one exists), Download ABC Lead Sheet (YuE2 renders), Edit (loads the track's parameters back into Custom-Gen), Add to Playlist, Download, Send to Cover Studio, Edit Metadata, Export Params, Retranscribe Lyrics (the item spins and a toast names the Whisper model it picked, with a Cancel button; the same toast then reports the line and word counts), Download .LRC (when the track has synced lyrics), Generate/Regenerate Cover Art, Set as Track A / Track B, Delete. The same menu sits on grid cards, list rows, table rows, the playlist and the right sidebar, with the items that surface supports. On phones (1023px wide or less) it opens as a bottom sheet instead of a dropdown: drag the handle down, tap the backdrop or press Esc to close it. |
+| Track menu (⋯) | Run Post-Processing (shown greyed out, with the reason on hover, when it cannot run), Remove Post-Processed Version (when one exists), Download ABC Lead Sheet (YuE2 renders), Edit (loads the track's parameters back into Custom-Gen), Add to Playlist, Download, Send to Cover Studio, Rename (edits the title inside the menu: Enter or clicking away saves, Esc cancels), Edit Metadata, Export Params, Retranscribe Lyrics (the item spins and a toast names the Whisper model it picked, with a Cancel button; the same toast then reports the line and word counts), Download .LRC (when the track has synced lyrics), Generate/Regenerate Cover Art, Set as Track A / Track B, Delete. The same menu sits on grid cards, list rows, table rows, Recent Songs, the Lyric Studio queue, the playlist and the right sidebar, with the items that surface supports. On phones (1023px wide or less) it opens as a bottom sheet instead of a dropdown: drag the handle down, tap the backdrop or press Esc to close it. |
 | Set as Track A / Track B | Pins two tracks for the A/B comparison bar above the list, with a Play A/B button and a Compare button that opens a parameter diff modal. |
 | Upload into Library | Opens the import dialog (see below). Only on the Library page. |
 
@@ -44,6 +45,10 @@ A track still being rendered by MiniMax-Music3's streaming mode appears in
 the list before its file exists, with a live percentage badge and progress
 bar; the grid card hides its menu until then. It is already playable, just
 not downloadable yet.
+
+Renaming a finished song also updates its server-owned generation queue row
+after a page reload. Each take in a multi-song render uses its own saved title.
+If the song record is missing, the queue shows the title captured at submission.
 
 ## Comparing generation settings
 
@@ -82,12 +87,12 @@ across every view, not just Library.
 | 48k / 44.1k | Previews how the 48 kHz render sounds clocked out at 44.1 kHz, pitched down about 1.47 semitones with tempo unchanged. A quick way to A/B a resample artifact without actually resampling. |
 | Variant switch (No Adapter / Unmastered / Mastered) | Only shown when a track has that variant. Each segment plays it and carries its own small download button for that exact render. |
 | A / B (after Play A/B) | Takes the variant switch's place: shows which pinned track is playing and flips to the other; the x beside it leaves A/B mode. |
-| Trim/crop | Toggles trim mode; the waveform below becomes clickable to set in/out points. |
+| Crop and fade | Toggles crop and fade mode. Pick Intro or Outro, then press and drag on the waveform to set where that end is cut; the cut part is dimmed and the start and end show as green and red lines. Set a fade length (0 to 30 s, measured inwards from the cut) and a curve (Linear, Exponential, Logarithmic, S-curve) for that end; the waveform shades the fade and draws its curve. Each end keeps its own settings, so set both before finishing. The player follows the edit while the mode is on (silent where it will be cut, faded where it will fade), so play the track to hear it first. Done writes the crop and both fades into the audio file (and the mastered file, if there is one) and cuts the lyric sidecars to match. There is no confirmation and it cannot be undone. |
 | Volume | Slider plus mute toggle. |
 | Edit / Download / Delete | Quick actions on the currently loaded track. |
 
 Above the transport, a collapsible area (only expands while something is
-playing, or trim mode is on) holds section markers, the waveform, a
+playing, or crop and fade mode is on) holds section markers, the waveform, a
 synced lyrics bar, and, when both slots are filled, the A/B mini-bar.
 
 On a phone, tap the song title or cover in the mini player to open the
@@ -236,18 +241,29 @@ playlist** to move that snapshot to server storage; the browser copy stays in
 place. A save error shows under the header, and **Reload and reapply** retries
 the pending edit against the latest saved revision.
 
+On a phone, the playlist button in the top bar (a count badge shows how many tracks
+are queued) opens the queue full screen, with the player still at the bottom. Swipe
+a track right to take it off the queue, or left to delete the song itself. Deleting
+asks first; tick **Don't ask again** to skip the prompt in that browser from then on.
+Esc or the close button returns to the app.
+
 ## Song details
 
-Click a track (outside of selection mode) to open the right sidebar.
+Click the i button on a track (on the grid card's footer, or among a list or
+table row's hover actions) to open the right sidebar. Playing or clicking a
+track does not open it. Once open, it follows the track you click or play,
+until you close it.
 
 - Cover art, inline-editable title, a backend chip (ACE-Step 1.5,
   MiniMax-Music3, YuE2 or Stable Audio 3), the artist name if set, and the
   subject or description text.
 - Play/pause, Edit, and the same track action menu as everywhere else.
 - Chips for length, tempo, key, and time signature, shown only when the
-  backend that made the track actually measures them. ACE-Step reports all
-  three; the other backends store no tempo, key or time signature, so those
-  chips are omitted rather than showing a meaningless value.
+  track has a saved value. ACE-Step reports all three; the other backends
+  store no tempo, key or time signature, so those chips are omitted rather
+  than showing the BPM and key that were set in the panel. A BPM or key you
+  save in Edit Metadata shows for any backend. The BPM and key on list rows
+  and in the table columns follow the same rule.
 - Collapsible sections: Prompt (the style/caption text), How it was made
   (the parameters that render's own backend used, grouped as Models,
   Sampling, Planner, Adapters, Reproduction for ACE-Step; Render, Adapter,
@@ -366,7 +382,8 @@ editor instead.
 
 ## Tips and limits
 
-- Deleting one track from its menu happens immediately, with no
+- Deleting one track from its menu, or with the x in a grid card's top
+  right corner (shown on hover), happens immediately, with no
   confirmation. Bulk delete (via Select) does ask first.
 - The playlist queue's local pointer is per-browser, even though its order
   now saves to the server. It is not the place to keep a track safe. Use the

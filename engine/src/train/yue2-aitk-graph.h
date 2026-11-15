@@ -50,7 +50,7 @@ inline bool & bf16_attention_supported() { static bool on = false; return on; }
 // Set once by the runner: true (the default) unless the backend refuses the
 // BF16 ConvRot8 training op. Its BF16 kernels need Ampere tensor cores
 // (sm_80+); on Turing (sm_75) the backward faults "backend does not support"
-// and LoRA training on an int8 ConvRot base dies (#199). Where it is false the
+// and LoRA training on an int8 ConvRot base dies. Where it is false the
 // ConvRot8 nodes build on the F32 path, which every backend runs.
 inline bool & bf16_convrot_supported() { static bool on = true; return on; }
 // Training precision (S2a, 2026-10-13). Default: every training GEMM is a

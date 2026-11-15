@@ -641,7 +641,7 @@ static int run_impl(Config config, std::string * error) {
         }
         // ConvRot8's BF16 training kernels need Ampere tensor cores (sm_80+);
         // on Turing (sm_75) the backward faults "backend does not support" and
-        // LoRA training on an int8 ConvRot base dies (#199). Probe both
+        // LoRA training on an int8 ConvRot base dies. Probe both
         // directions at a production shape; where the backend refuses BF16 the
         // ConvRot8 nodes keep the F32 path, which every backend runs.
         {
@@ -656,7 +656,7 @@ static int run_impl(Config config, std::string * error) {
                 ggml_backend_supports_op(backend.value, cbwd);
         }
         if (!yue2_aitk_graph::bf16_convrot_supported()) {
-            std::fprintf(stderr, "[yue2-aitk] ConvRot8 BF16 unsupported on this backend; using the F32 path (#199)\n");
+            std::fprintf(stderr, "[yue2-aitk] ConvRot8 BF16 unsupported on this backend; using the F32 path\n");
         }
         ggml_free(probe);
     }

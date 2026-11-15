@@ -101,6 +101,7 @@ static volatile int * _hotstep_guard_ = &hotstep_sampler_linked_;
 // after minimax/mm3-server.h and yue2/yue2-model.h (see hot-step-families.h's
 // own comment on why).
 #include "hot-step-families.h"
+#include "hot-step-origin-guard.h"  // Host/Origin checks for browser-reachable requests
 
 #include <algorithm>   // std::sort (HOT-Step /sa3/props adapter list)
 #include <cctype>      // std::tolower (HOT-Step /sa3-synth synth_model guard)
@@ -595,13 +596,24 @@ static void teardown_log_capture() {
 // safe on any exit path (early arg errors, model load failures, normal shutdown).
 struct LogCapture {
     std::thread reader;
+    inline static LogCapture * active = nullptr;
+
+    static void drain_at_exit() {
+        if (active) active->drain();
+    }
 
     LogCapture() {
         setup_log_capture();
-        reader = std::thread(log_reader_main);
+        if (g_real_stderr_fd >= 0) {
+            reader = std::thread(log_reader_main);
+            active = this;
+            std::atexit(drain_at_exit);
+        }
     }
 
-    ~LogCapture() {
+    void drain() {
+        if (active != this) return;
+        active = nullptr;
         teardown_log_capture();
         cv_log.notify_all();
         if (reader.joinable()) {
@@ -614,6 +626,8 @@ struct LogCapture {
             g_real_stderr_fd = -1;
         }
     }
+
+    ~LogCapture() { drain(); }
 };
 
 // GET /logs: SSE stream of stderr lines.
@@ -3162,6 +3176,10 @@ static void usage(const char * prog) {
             "Server:\n"
             "  --host <addr>           Listen address (default: 127.0.0.1)\n"
             "  --port <N>              Listen port (default: 8080)\n"
+            "  --allow-origin <csv>    Extra browser origins allowed to call the server,\n"
+            "                          e.g. http://myhost:3001 (also env ACESTEPCPP_ALLOWED_ORIGINS)\n"
+            "  --allow-host <csv>      Extra hostnames accepted in the Host header, e.g. myhost\n"
+            "                          (case-insensitive, port ignored; also env ACESTEPCPP_ALLOWED_HOSTS)\n"
             "  --max-batch <N>         LM batch limit (default: %d)\n"
             "  --max-seq <N>           KV cache size (default: %d)\n"
             "\n"
@@ -3179,6 +3197,8 @@ int main(int argc, char ** argv) {
     ace_synth_default_params(&g_synth_params);
 
     const char * host         = "127.0.0.1";
+    std::string  allow_origin_csv;
+    std::string  allow_host_csv;
     int          port         = 8080;
     const char * models_dir         = nullptr;
     const char * adapters_dir       = nullptr;
@@ -3220,6 +3240,10 @@ int main(int argc, char ** argv) {
             host = argv[++i];
         } else if (!strcmp(argv[i], "--port") && i + 1 < argc) {
             port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--allow-host") && i + 1 < argc) {
+            allow_host_csv = argv[++i];
+        } else if (!strcmp(argv[i], "--allow-origin") && i + 1 < argc) {
+            allow_origin_csv = argv[++i];
         } else if (!strcmp(argv[i], "--max-batch") && i + 1 < argc) {
             g_max_batch = atoi(argv[++i]);
 
@@ -3263,6 +3287,14 @@ int main(int argc, char ** argv) {
 
     // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
     LogCapture log_capture;
+
+    // Probe the same device selection used by the model loaders, before serving jobs.
+    {
+        BackendPair bp = backend_init("Startup");
+        bool ok = backend_check::self_test(bp.backend);
+        backend_release(bp.backend, bp.cpu_backend);
+        if (!ok) return 1;
+    }
 
     // scan models directory (reads GGUF metadata only)
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
@@ -3441,12 +3473,11 @@ int main(int argc, char ** argv) {
     svr.set_read_timeout(600);
     svr.set_write_timeout(600);
 
-    // SO_REUSEADDR: allow rebind after TIME_WAIT (normal restart).
-    // no SO_REUSEPORT: fail if another process is actively listening.
+    // Windows SO_REUSEADDR permits two active listeners on the same port.
     svr.set_socket_options([](socket_t sock) {
         int one = 1;
 #ifdef _WIN32
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof(one));
+        setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *) &one, sizeof(one));
 #else
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
@@ -3454,6 +3485,48 @@ int main(int argc, char ** argv) {
 
     // reject oversized bodies (256 MB: src + ref audio, up to 10min WAV each)
     svr.set_payload_max_length(256 * 1024 * 1024);
+
+    // Host and Origin guard. Refuses requests whose Host header is a
+    // non-IP hostname (DNS rebinding) or whose Origin is a web page other
+    // than the engine's own built-in UI. Extra hostnames: --allow-host or
+    // ACESTEPCPP_ALLOWED_HOSTS. Extra origins: --allow-origin or
+    // ACESTEPCPP_ALLOWED_ORIGINS (comma separated).
+    {
+        std::vector<std::string> allowed = origin_guard::parse_csv(allow_origin_csv);
+        if (const char * env = getenv("ACESTEPCPP_ALLOWED_ORIGINS")) {
+            for (auto & o : origin_guard::parse_csv(env)) {
+                allowed.push_back(o);
+            }
+        }
+        std::vector<std::string> allowed_hosts = origin_guard::parse_csv(allow_host_csv);
+        if (const char * env = getenv("ACESTEPCPP_ALLOWED_HOSTS")) {
+            for (auto & h : origin_guard::parse_csv(env)) {
+                allowed_hosts.push_back(h);
+            }
+        }
+        std::vector<int> trusted_ports = origin_guard::default_trusted_ports(port);
+        std::string      cfg_host      = host;
+        svr.set_pre_routing_handler([allowed, allowed_hosts, trusted_ports, cfg_host](const httplib::Request & req,
+                                                                       httplib::Response &      res) {
+            const char * why = nullptr;
+            if (req.has_header("Host") && !origin_guard::host_allowed(req.get_header_value("Host"), cfg_host, allowed_hosts)) {
+                why = "host";
+            } else if (req.has_header("Origin") &&
+                       !origin_guard::origin_allowed(req.get_header_value("Origin"), trusted_ports, allowed)) {
+                why = "origin";
+            }
+            if (!why) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            res.status = 403;
+            res.set_content(std::string("{\"error\":\"forbidden ") + why +
+                                "; allow extra hosts with --allow-host or ACESTEPCPP_ALLOWED_HOSTS, extra origins with "
+                                "--allow-origin or ACESTEPCPP_ALLOWED_ORIGINS\"}",
+                            "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        });
+    }
+
 
     // all endpoints are always registered. handlers return 501 when the
     // backing pipeline has no models in the registry.
@@ -4176,6 +4249,7 @@ int main(int argc, char ** argv) {
         // Acquire model + run
         std::vector<float> out44;
         bool ok;
+        std::string finite_error;
         Timer refine_timer;
         {
             ModelKey k{};
@@ -4192,13 +4266,13 @@ int main(int argc, char ** argv) {
             refine_timer.reset();
             ok = sa3_refine_run_ggml(sa3, p44, T44, ids.data(), n_tokens,
                                      strength, steps, pingpong, seed, zero_noise, out44, sp_ptr,
-                                     req.is_connection_closed);
+                                     req.is_connection_closed, &finite_error);
         }
         fprintf(stderr, "[Server] SA3 refine compute (%s): %.0f ms\n",
                 "gguf", refine_timer.ms());
         if (!ok) {
             free(p44);
-            json_error(res, 500, "SA3 refine failed");
+            json_error(res, 500, finite_error.empty() ? "SA3 refine failed" : finite_error.c_str());
             return;
         }
 
@@ -4718,6 +4792,7 @@ int main(int argc, char ** argv) {
         // Acquire model + run. Same ModelKey / store / ModelHandle as refine.
         std::vector<float> out44;
         bool ok;
+        std::string finite_error;
         Timer synth_timer;
         {
             ModelKey k{};
@@ -4731,11 +4806,11 @@ int main(int argc, char ** argv) {
             ok = sa3_synth_run_ggml(sa3, T44, ids.data(), n_tokens,
                                     steps, pingpong, seed, zero_noise, out44, sp_ptr,
                                     dump_latent_path.empty() ? nullptr : dump_latent_path.c_str(),
-                                    req.is_connection_closed);
+                                    req.is_connection_closed, &finite_error);
         }
         fprintf(stderr, "[Server] SA3 synth compute (gguf): %.0f ms\n",
                 synth_timer.ms());
-        if (!ok) { json_error(res, 500, "SA3 synth failed"); return; }
+        if (!ok) { json_error(res, 500, finite_error.empty() ? "SA3 synth failed" : finite_error.c_str()); return; }
 
         // Encode. Same format/saturation convention as refine: f32 keeps peaks,
         // integer formats clamp (audio_encode_wav would anyway).
@@ -5240,7 +5315,8 @@ int main(int argc, char ** argv) {
             have_understand ? " /understand" : "");
     fprintf(stderr, "[Server] Models: %zu LM, %zu Text-Enc, %zu DiT, %zu VAE, %zu Adapter\n", g_registry.lm.size(),
             g_registry.text_enc.size(), g_registry.dit.size(), g_registry.vae.size(), g_registry.adapters.size());
-    if (!svr.listen(host, port)) {
+    const bool listened = svr.listen(host, port);
+    if (!listened) {
         fprintf(stderr, "[Server] FATAL: cannot bind %s:%d\n", host, port);
     }
 
@@ -5258,5 +5334,5 @@ int main(int argc, char ** argv) {
     store_free(g_store);
     fprintf(stderr, "[Server] Done\n");
 
-    return 0;
+    return listened ? 0 : 1;
 }

@@ -37,7 +37,8 @@ test('all five generation backends have complete packs referencing real catalogu
 test('every HeartMuLa download agrees with the measured publication inventory', () => {
   const manifest = JSON.parse(fs.readFileSync(new URL('../../../docs/dev/heartmula-hf-manifest.json', import.meta.url), 'utf8'));
   const weights = manifest.files.filter((f: any) => f.upload && f.path.endsWith('.gguf'));
-  const entries = catalogue.files.filter((f: any) => f.family === 'heartmula');
+  // MuLaCover was published later under its own licence and is not in this manifest.
+  const entries = catalogue.files.filter((f: any) => f.family === 'heartmula' && !f.id.startsWith('heartmula-mulacover-'));
   assert.equal(entries.length, weights.length);
   for (const file of weights) {
     const entry = entries.find((f: any) => f.filename === file.path);
@@ -166,5 +167,172 @@ test('a model already on disk still gets its missing companion files, side by si
     assert.ok(fetched.every(u => u.endsWith('/o/r/resolve/main/LICENSE')));
   } finally {
     svc.getTargetDir = realTarget; svc._downloadSimple = realSimple;
+  }
+});
+
+function hashSandbox() {
+  const service = new (svc.constructor as any)();
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.test-model-hashes-'));
+  service._installedDir = () => dir;
+  service.getInstalledFiles = () => new Set(fs.readdirSync(dir));
+  return { service, dir, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+test('replacing a stale residual keeps its bytes; other stale models are removed', async () => {
+  const service = new (svc.constructor as any)();
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.test-residual-backup-'));
+  service.getTargetDir = () => dir;
+  try {
+    for (const variant of ['residual', 'lm']) {
+      const filename = `${variant}.safetensors`;
+      const target = path.join(dir, filename);
+      fs.writeFileSync(target, 'old bytes needed by adapters');
+      const job = { status: 'queued', bytesDownloaded: 0, totalBytes: 0 };
+      // Stop at the network boundary, after the replacement decision.
+      service._downloadWithRedirects = async (_url: string, _dest: string, active: any) => { active.status = 'cancelled'; };
+      await service._executeDownload(job, {
+        filename, variant, repo: 'fixture/model', sha256: sha('published bytes'), sizeBytes: 0,
+      });
+      assert.equal(fs.existsSync(target), false);
+      const backups = fs.readdirSync(dir).filter(name => name.startsWith(`${filename}.backup-`));
+      assert.equal(backups.length, variant === 'residual' ? 1 : 0);
+      if (variant === 'residual') {
+        assert.equal(fs.readFileSync(path.join(dir, backups[0]), 'utf8'), 'old bytes needed by adapters');
+        // A second replacement cannot overwrite the first backup.
+        fs.writeFileSync(target, 'second residual');
+        await service._executeDownload({ ...job, status: 'queued' }, {
+          filename, variant, repo: 'fixture/model', sha256: sha('published bytes'), sizeBytes: 0,
+        });
+        assert.equal(fs.readdirSync(dir).filter(name => name.startsWith(`${filename}.backup-`)).length, 2);
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a residual that cannot be backed up is never replaced', async () => {
+  const service = new (svc.constructor as any)();
+  const dir = fs.mkdtempSync(path.join(process.cwd(), '.test-residual-rename-'));
+  const target = path.join(dir, 'residual.safetensors');
+  fs.writeFileSync(target, 'only copy');
+  service.getTargetDir = () => dir;
+  let fetched = false;
+  service._downloadWithRedirects = async () => { fetched = true; };
+  const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (source === target) throw new Error('backup rename refused');
+    return rename(source, destination);
+  };
+  try {
+    await assert.rejects(service._executeDownload({ status: 'queued' }, {
+      filename: 'residual.safetensors', variant: 'residual', sha256: sha('published bytes'),
+    }), /backup rename refused/);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'only copy');
+    assert.equal(fetched, false);
+  } finally {
+    fs.renameSync = rename;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+async function hashesSettled(service: any) {
+  for (let i = 0; i < 500 && service._hashing.size; i++) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(service._hashing.size, 0, 'background hashes must settle');
+}
+
+test('a same-size GGUF with a valid header becomes outdated after its background hash', async () => {
+  const { service, dir, cleanup } = hashSandbox();
+  const file = catalogue.files.filter((f: any) => f.sha256 && f.filename.endsWith('.gguf'))
+    .sort((a: any, b: any) => a.sizeBytes - b.sizeBytes)[0];
+  const bytes = Buffer.alloc(file.sizeBytes);
+  bytes.write('GGUF');
+  const p = path.join(dir, file.filename);
+  fs.writeFileSync(p, bytes);
+  try {
+    service._validateDownload(p, file);
+    const row = () => service.getRegistry().files.find((f: any) => f.id === file.id);
+    assert.equal(row().installed, true);
+    assert.equal(row().outdated, false, 'unknown until the hash finishes');
+    await hashesSettled(service);
+    assert.equal(row().outdated, true);
+    assert.equal(fs.readFileSync(`${p}.sha256`, 'utf8').split(/\s+/)[0],
+      createHash('sha256').update(bytes).digest('hex'));
+  } finally { cleanup(); }
+});
+
+test('background hashes run serially, smallest first, and duplicate reads stay queued once', async () => {
+  const { service, dir, cleanup } = hashSandbox();
+  const started: string[] = [];
+  let active = 0, peak = 0;
+  service._hashFile = async (p: string) => {
+    started.push(path.basename(p));
+    peak = Math.max(peak, ++active);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    active--;
+    return sha(fs.readFileSync(p, 'utf8'));
+  };
+  try {
+    for (const [filename, sizeBytes] of [['large.gguf', 32], ['small.gguf', 8], ['medium.gguf', 16]] as const) {
+      const contents = 'x'.repeat(sizeBytes);
+      fs.writeFileSync(path.join(dir, filename), contents);
+      const file = { filename, sizeBytes, sha256: sha(contents) };
+      service._isKnownStale(file);
+      service._isKnownStale(file);
+    }
+    await hashesSettled(service);
+    assert.equal(peak, 1);
+    assert.deepEqual(started, ['small.gguf', 'medium.gguf', 'large.gguf']);
+  } finally { cleanup(); }
+});
+
+test('a fresh service trusts current sidecars and rechecks sidecars before draining queued files', async () => {
+  const { service, dir, cleanup } = hashSandbox();
+  const files = ['small.gguf', 'large.gguf'].map((filename, i) => {
+    const contents = 'x'.repeat(8 + i * 8);
+    fs.writeFileSync(path.join(dir, filename), contents);
+    return { filename, sizeBytes: contents.length, sha256: sha(contents) };
+  });
+  const started: string[] = [];
+  service._hashFile = async (p: string) => {
+    started.push(path.basename(p));
+    // A download or another instance can finish a queued file first.
+    service._writeSidecar(path.join(dir, files[1].filename), files[1].sha256);
+    return files[0].sha256;
+  };
+  try {
+    for (const file of files) service._isKnownStale(file);
+    await hashesSettled(service);
+    assert.deepEqual(started, ['small.gguf']);
+    const restarted = new (svc.constructor as any)();
+    restarted._installedDir = () => dir;
+    restarted._hashFile = async () => { assert.fail('a current sidecar must prevent disk reads'); };
+    for (const file of files) assert.equal(restarted._isKnownStale(file), false);
+    assert.equal(restarted._hashing.size, 0);
+  } finally { cleanup(); }
+});
+
+test('background hashing waits for registered jobs, then resumes', async () => {
+  const { registerBusyCheck } = await import('../dataroot/pointer.js');
+  const { service, dir, cleanup } = hashSandbox();
+  const contents = 'GGUFvalid';
+  const file = { filename: 'model.gguf', sizeBytes: contents.length, sha256: sha(contents) };
+  fs.writeFileSync(path.join(dir, file.filename), contents);
+  let busy = true, reads = 0;
+  registerBusyCheck('model-hash-test', () => busy ? ['test generation running'] : []);
+  service._hashFile = async () => { reads++; return file.sha256; };
+  try {
+    service._isKnownStale(file);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(reads, 0);
+    busy = false;
+    await hashesSettled(service);
+    assert.equal(reads, 1);
+  } finally {
+    busy = false;
+    registerBusyCheck('model-hash-test', () => []);
+    cleanup();
   }
 });

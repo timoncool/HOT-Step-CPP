@@ -29,8 +29,9 @@ response fields it does not know. The one versioned surface is the DAW facade un
 | Lifetime | Tokens live in server memory only. Every server restart invalidates them; the next call answers `401 { "error": "Unauthorized" }` and the client fetches a new token from `/api/auth/auto`. |
 | Unauthenticated routes | Job status (`GET /api/generate/status/:id`), cancel, cancel-all, queue, reset-queue, the STORM and MM3 stream routes, `/api/download/:id` and the media mounts below do not check the token. |
 
-Exposure today: the Node server binds `SERVER_HOST`, default `0.0.0.0` (`server/src/config.ts:221-224`),
-CORS is open (`server/src/index.ts:80`), and the Vite dev server binds `0.0.0.0:3000`
+Exposure today: the Node server binds `SERVER_HOST`, default `127.0.0.1` (`server/src/config.ts`).
+Foreign Origins and unknown `Host` headers are refused (`server/src/services/security/originPolicy.ts`,
+see [Configuration](config.md#lan-and-tailscale-access-opt-in)), and the Vite dev server binds `0.0.0.0:3000`
 (`ui/vite.config.ts`). A few gates look at where a call comes from:
 
 - The training-worker token gate (`workerTokenGate`, `server/src/services/training/trainingWorkers.ts`)
@@ -476,6 +477,12 @@ Each item also carries `elapsedSeconds`, its generation time in seconds, compute
 server. It is null until the job starts running (queue wait does not count), counts up while
 it runs, and is frozen once the item reaches a final status, from the job's own start and end
 times when the job is still known.
+
+Every item read includes `songTitles`, the current titles in `result.songIds` order.
+An entry is null when the song is missing or belongs to a different user; no song IDs
+means an empty array. The browser uses these titles for each take, falling back to the
+captured title when an entry is null. Older snapshots may omit the field. Renames never
+change the stored `request`, request hash, `meta` or job `result`.
 
 How each transition happens:
 - **Submit.** A claim (pending to submitting) is one guarded update, so a cancel racing a

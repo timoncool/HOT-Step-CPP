@@ -202,6 +202,12 @@ struct MM3TakeOutput {
     bool     has_nan     = false;
     /** Natural-ending candidates: the planning round this take came from. */
     int      round       = 0;
+    /** Base handoff (MM3GenRequest::eos_handoff): this capped take was cut at
+     *  handoff_cue s and the base plan ended handoff_eos s later. */
+    bool     rescued      = false;
+    double   handoff_cue  = 0.0;
+    double   handoff_eos  = 0.0;
+    uint64_t handoff_seed = 0;
 
     /** This take's live chunk queue. One per take, because the takes render in
      *  lockstep and a reader subscribes to ONE of them — a shared queue would
@@ -246,6 +252,8 @@ struct MM3JobState {
      *  — a distinct failure from hitting the cap, and the one worth telling a
      *  user about, because it means the planner keeps ending the song early. */
     int      takes_short     = 0;
+    /** Capped takes the base handoff rescued and rendered. */
+    int      takes_rescued   = 0;
     /** True when NO candidate was ever accepted and the longest capped plan was
      *  rendered anyway. The job succeeded, but not as the user asked. */
     bool     eos_fallback    = false;
@@ -310,12 +318,13 @@ static std::shared_ptr<MM3JobState> mm3_job_state_get(const std::string & id) {
 // Exact KV-cache cost per row: K and V [key_length, n_ctx, head_count_kv]
 // F16 tensors per block, multiplied by cfg_rows * n_takes for this run.
 // n_ctx is bucketed the same way mm3_lm_prepare() buckets it.
-static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed, int rows) {
+// `kv_q8`: a Q8_0 cache (mm3_lm_kv_type) is 34 bytes per 32 values against f16's 64.
+static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed, int rows, bool kv_q8 = false) {
     const MM3LmConfig & c = m.lm_cfg;
     const int64_t       b = MM3_LM_KV_BUCKET;
     const int64_t       n = ((n_ctx_needed + b - 1) / b) * b;
     return (size_t) c.block_count * (size_t) c.key_length * (size_t) c.head_count_kv * 2 /*K+V*/ * 2 /*f16*/ *
-           (size_t) n * (size_t) rows;
+           (size_t) n * (size_t) rows / (kv_q8 ? 64 : 2) * (kv_q8 ? 34 : 2);
 }
 
 // Weights + KV + compute headroom. Distinct files only — in bundle mode the
@@ -324,7 +333,8 @@ static size_t mm3_kv_bytes_estimate(const MM3Model & m, int64_t n_ctx_needed, in
 // `stage2_only` is the AR-cache-hit shape: the LM is never loaded and there is
 // no KV cache, so asking for the full figure would evict the ACE side for
 // VRAM this run will not touch.
-static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, int rows, bool stage2_only = false) {
+static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, int rows, bool stage2_only = false,
+                            bool kv_q8 = false) {
     uint64_t weights = mm3_total_tensor_bytes(m);
     // TensorRT uses BF16 weights plus its execution context; reserve additional
     // workspace before deciding whether planner/render streaming can co-reside.
@@ -333,7 +343,7 @@ static size_t mm3_vram_need(const MM3Model & m, int64_t n_ctx_needed, int rows, 
         weights -= m.lm_file.found ? m.lm_file.tensor_bytes : 0;  // the LM is never a role file
         return (size_t) weights + MM3_VRAM_COMPUTE_HEADROOM;
     }
-    return (size_t) weights + mm3_kv_bytes_estimate(m, n_ctx_needed, rows) + MM3_VRAM_COMPUTE_HEADROOM;
+    return (size_t) weights + mm3_kv_bytes_estimate(m, n_ctx_needed, rows, kv_q8) + MM3_VRAM_COMPUTE_HEADROOM;
 }
 
 static bool mm3_cuda_free_bytes(size_t * free_b, size_t * total_b) {
@@ -370,11 +380,11 @@ static bool mm3_cuda_free_bytes(size_t * free_b, size_t * total_b) {
 // unconditional whenever ACE modules are resident and MM3 is cold, which is
 // the conservative choice.
 static void mm3_arbitrate_vram(const MM3Model & m, int64_t n_ctx_needed, int rows, MM3JobState * st,
-                               bool stage2_only = false) {
+                               bool stage2_only = false, bool kv_q8 = false) {
     if (m.loaded) {
         return;  // already resident: whatever fit before still fits
     }
-    const size_t need = mm3_vram_need(m, n_ctx_needed, rows, stage2_only);
+    const size_t need = mm3_vram_need(m, n_ctx_needed, rows, stage2_only, kv_q8);
 
     size_t free_b = 0, total_b = 0;
     const bool have_cuda = mm3_cuda_free_bytes(&free_b, &total_b);
@@ -483,6 +493,11 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
         if (f.active()) {
             add_f("fd_in", f.in_sec);  add_f("fd_out", f.out_sec); add_f("fd_len", f.out_len_sec);
             add_f("fd_fl", f.floor);   add_f("fd_st", f.step_sec);
+            // A merged fade (correction ops) renders differently from a runtime one,
+            // and an older merge-mode key with fade fields holds a full-strength render.
+            if (req.lm_adapter_mode == "merge") {
+                add_i("fd_merged", 1);
+            }
         }
         if (req.lm_adapter_plan < 1.0f) {
             add_f("ad_p", req.lm_adapter_plan);
@@ -502,6 +517,11 @@ static void mm3_ar_key_add_models(std::string & k, const MM3Model & m, const MM3
     // still refuses rather than reading a differently-shaped file as valid.
     add_i("cb", (long long) m.lm_cfg.num_codebooks);
     add_i("emb", (long long) m.lm_cfg.embedding_length);
+    // A Q8_0 KV cache rounds every attention read: a different plan. Only when
+    // on, so every f16 key from before it existed still hits.
+    if (mm3_lm_kv_type(req.lm_kv_q8) != GGML_TYPE_F16) {
+        add_i("kv_q8", 1);
+    }
 }
 
 /** The model half alone — what a `.mm3hiddens` file must match to be usable. */
@@ -551,6 +571,9 @@ static std::string mm3_ar_cache_key(const MM3Model & m, const MM3SynthRequest & 
     add_i("require_eos", req.gen.require_eos ? 1 : 0);
     add_i("eos_rounds", req.gen.require_eos ? req.gen.eos_rounds : 0);
     add_i("first_eos", req.gen.stop_after_first_eos ? 1 : 0);
+    if (req.gen.eos_handoff && req.gen.require_eos && !req.lm_adapter.empty()) {
+        add_i("handoff", 1);  // decides which plan a capped round keeps; absent when off, so old keys stand
+    }
     // A length floor decides which round's plan is kept, so two requests that
     // differ only here can end on different codes — a shared slot would hand
     // one of them the other's answer.
@@ -762,15 +785,13 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         release_if_transient();
     };
 
-    // MM3 Plank replay. Worth saying out loud what this does and does not buy:
-    // the AR loop still runs every per-frame forward pass, so the planning
-    // progress bar will still crawl to 100%. Forcing pins which TOKENS come out,
-    // not how much compute runs — the win is an identical semantic bed to A/B
-    // the flow stage against, not latency.
+    // MM3 Plank replay: an identical semantic bed to A/B the flow stage
+    // against. A full plank (both streams, hard pin) replays in one
+    // teacher-forced pass; semantic-only or soft forcing still runs every frame.
     if (!req.forced_semantic.empty()) {
-        fprintf(stderr,
-                "[MM3-Job] %s: AR replay — %zu forced iterations (codes pinned; AR compute still runs)\n",
-                job->id.c_str(), req.forced_semantic.size());
+        fprintf(stderr, "[MM3-Job] %s: AR replay — %zu forced iterations (%s)\n", job->id.c_str(),
+                req.forced_semantic.size(),
+                req.forced_acoustic.empty() ? "semantic only; the frame loop runs" : "codes pinned");
     }
 
     if (job->cancel.load()) {
@@ -974,9 +995,10 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // over-reserves.
     const bool plan_rows = req.lm_adapter_plan < 1.0f && !req.lm_adapter.empty() && req.lm_adapter_mode != "merge";
     const int  rows      = mm3_cfg_rows(g_mm3.lm_cfg) * st->n_takes * (plan_rows ? 2 : 1);
+    const bool kv_q8     = mm3_lm_kv_type(req.lm_kv_q8) == GGML_TYPE_Q8_0;
 
     const auto t_arb = std::chrono::steady_clock::now();
-    mm3_arbitrate_vram(g_mm3, n_ctx_needed, rows, st.get(), /*stage2_only=*/ar_hit);
+    mm3_arbitrate_vram(g_mm3, n_ctx_needed, rows, st.get(), /*stage2_only=*/ar_hit, kv_q8);
     const double arb_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_arb).count();
 
     if (job->cancel.load()) {
@@ -1027,7 +1049,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             // The co-resident figure is what mm3_vram_need already computes with
             // stage2_only=false: every role file + this run's KV + compute
             // headroom. Whatever is already ours does not need finding again.
-            const size_t need     = mm3_vram_need(g_mm3, n_ctx_needed, rows, /*stage2_only=*/false);
+            const size_t need     = mm3_vram_need(g_mm3, n_ctx_needed, rows, /*stage2_only=*/false, kv_q8);
             const size_t resident = mm3_vram_bytes(g_mm3);
             const size_t want     = need > resident ? need - resident : 0;
             size_t       free_b = 0, total_b = 0;
@@ -1085,7 +1107,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     const int flow_total_hint = req.gen.steps;
     MM3ProgressCb progress = [&](const MM3GenProgress & p) {
         const std::string stage = p.stage;
-        if (stage == "ar") {
+        if (stage == "ar" || stage == "handoff") {
             job_set_phase(*job, JobPhase::ENCODING_COND, (int) p.step, (int) p.n_steps);
         } else if (stage == "cond") {
             job_set_phase(*job, JobPhase::ENCODING_COND, (int) (p.window + 1), (int) p.n_windows);
@@ -1136,13 +1158,50 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // Skipped wholesale on an AR cache hit: there is no LM to adapt, and the
     // adapter's identity and dials are already baked into the cache key, so a
     // hit means "this exact adapter produced this exact block".
-    const bool merge_mode = !req.lm_adapter.empty() && req.lm_adapter_mode == "merge";
+    bool merge_mode = !req.lm_adapter.empty() && req.lm_adapter_mode == "merge";
     if (!ar_hit) {
         // hs_stat: a >= 2 GiB adapter must not read as missing (see above) —
         // stat_ok false here means the mtime revalidation below never fires and
         // a retrained checkpoint under the same path is served from cache.
         HS_STAT_T   asb {};
         const bool  stat_ok  = !req.lm_adapter.empty() && hs_stat(req.lm_adapter, &asb) == 0;
+        // Loaded before the merge tag is settled: whether a fade can ride a
+        // merge depends on what the adapter is. The adapter owns its own
+        // buffer, so the pristine reload below leaves it alone.
+        if (!req.lm_adapter.empty()) {
+            const bool cached = g_mm3_lm_adapter && g_mm3_lm_adapter->path == req.lm_adapter && stat_ok &&
+                                (int64_t) asb.st_mtime == g_mm3_lm_adapter->mtime;
+            if (!cached) {
+                mm3_lm_adapter_drop();
+                std::string aerr;
+                const auto adapter_load_start = std::chrono::steady_clock::now();
+                g_mm3_lm_adapter = mm3_lm_adapter_load(req.lm_adapter.c_str(), &aerr,
+                                                       g_mm3.lm_file.found ? g_mm3.lm_file.path.c_str() : nullptr);
+                fprintf(stderr, "[MM3-Job] %s: LM adapter load %.0f ms (%s)\n", job->id.c_str(),
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - adapter_load_start).count(),
+                        g_mm3_lm_adapter ? "success" : "failed");
+                if (!g_mm3_lm_adapter) {
+                    fail(2, "lm_adapter", aerr);  // fail() handles transient release
+                    return;
+                }
+            }
+        }
+        // Merge mode with a fade (MM3ArOptions::lm_adapter_merged) needs a
+        // delta the graph can take back out linearly. DoRA's rescale is not
+        // linear in the delta, so it renders the fade in runtime mode, as it
+        // always has. LoHa and HiRA have no runtime path at all: they merge at
+        // full strength and the schedule is ignored.
+        if (merge_mode && req.lm_adapter_sched.active() && !mm3_lm_merge_fade_ok(g_mm3_lm_adapter) &&
+            !g_mm3_lm_adapter->is_lokr) {  // LoKr: the merge refuses it with its own message
+            if (g_mm3_lm_adapter->dora_n > 0) {
+                fprintf(stderr, "[MM3-Job] %s: DoRA adapter with a fade: rendering in runtime mode\n", job->id.c_str());
+                merge_mode          = false;
+                req.lm_adapter_mode = "runtime";
+            } else {
+                fprintf(stderr, "[MM3-Job] %s: %s adapter cannot fade once merged: schedule ignored\n",
+                        job->id.c_str(), g_mm3_lm_adapter->is_loha ? "LoHa" : "HiRA");
+            }
+        }
         std::string want_tag;  // "" = this render wants a pristine base
         if (merge_mode) {
             want_tag = mm3_lm_merge_make_tag(req.lm_adapter, stat_ok ? (int64_t) asb.st_mtime : 0,
@@ -1162,22 +1221,6 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         }
 
         if (!req.lm_adapter.empty()) {
-            const bool cached = g_mm3_lm_adapter && g_mm3_lm_adapter->path == req.lm_adapter && stat_ok &&
-                                (int64_t) asb.st_mtime == g_mm3_lm_adapter->mtime;
-            if (!cached) {
-                mm3_lm_adapter_drop();
-                std::string aerr;
-                const auto adapter_load_start = std::chrono::steady_clock::now();
-                g_mm3_lm_adapter = mm3_lm_adapter_load(req.lm_adapter.c_str(), &aerr,
-                                                       g_mm3.lm_file.found ? g_mm3.lm_file.path.c_str() : nullptr);
-                fprintf(stderr, "[MM3-Job] %s: LM adapter load %.0f ms (%s)\n", job->id.c_str(),
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - adapter_load_start).count(),
-                        g_mm3_lm_adapter ? "success" : "failed");
-                if (!g_mm3_lm_adapter) {
-                    fail(2, "lm_adapter", aerr);  // fail() handles transient release
-                    return;
-                }
-            }
             if (merge_mode) {
                 if (g_mm3.lm_merge_tag != want_tag) {
                     set_stage("merging", -1, 0, 0, 0);
@@ -1194,6 +1237,38 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                     g_mm3.lm_merge_tag = want_tag;
                 }
                 req.gen.lm_adapter = nullptr;  // baked in; no runtime deltas on top
+                // ...except a fade's correction, below full strength only.
+                req.gen.lm_adapter_merged = req.lm_adapter_sched.active() && mm3_lm_merge_fade_ok(g_mm3_lm_adapter)
+                                                ? g_mm3_lm_adapter
+                                                : nullptr;
+                // Base handoff on a merged LM: the rescue needs the true base,
+                // and the merged delta cannot be taken back out of quantized
+                // weights. So the first rescue reloads the pristine LM (as a
+                // stale merge does above) and a later planning round merges
+                // again. A render that needs no rescue never calls this. The
+                // tag is kept truthful for the next job either way.
+                if (req.gen.eos_handoff && req.gen.require_eos) {
+                    req.gen.handoff_swap = [&req, &job, staged, want_tag](bool to_base, std::string * e) -> bool {
+                        if (to_base) {
+                            fprintf(stderr, "[MM3-Job] %s: base handoff: reloading the pristine LM for the rescue\n",
+                                    job->id.c_str());
+                            mm3_lm_free(&g_mm3_lm);
+                            mm3_free_lm(&g_mm3);
+                            g_mm3.lm_merge_tag.clear();
+                            return mm3_load_parts(&g_mm3, /*lm=*/true, /*depth=*/true, /*rest=*/!staged, e);
+                        }
+                        fprintf(stderr, "[MM3-Job] %s: base handoff: merging the adapter again for the next round\n",
+                                job->id.c_str());
+                        if (!mm3_lm_merge_apply(&g_mm3, g_mm3_lm_adapter, req.gen.lm_adapter_scales,
+                                                req.lm_adapter_merge_gpu, e)) {
+                            mm3_lm_free(&g_mm3_lm);  // part-way merge: the next job reloads pristine
+                            mm3_free_lm(&g_mm3);
+                            return false;
+                        }
+                        g_mm3.lm_merge_tag = want_tag;
+                        return true;
+                    };
+                }
                 // The soft-prompt halves survive the merge. A token is a
                 // conditioning input on k prompt positions and a prefix is n KV
                 // columns; neither is a weight delta, so mm3_lm_merge_apply
@@ -1350,15 +1425,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     if ((req.gen.require_eos || req.gen.min_frames > 0) && !st->interleaved) {
         std::vector<MM3GenResult> kept;
         std::string               dropped_seeds;
-        int capped = K * (rs[0].eos_rounds_used - 1);
-        int too_short = 0;
+        // Every round's count: earlier rounds may have kept plans too.
+        const int capped    = rs[0].cand_capped;
+        const int too_short = rs[0].cand_short;
         for (MM3GenResult & x : rs) {
             if (x.dropped) {
-                if (!x.ar.eos_hit && x.ar.n_frames >= req.gen.max_frames) {
-                    capped++;
-                } else if (req.gen.min_frames > 0 && x.ar.n_frames > 0 && x.ar.n_frames < req.gen.min_frames) {
-                    too_short++;
-                }
                 dropped_seeds += (dropped_seeds.empty() ? "" : ", ") + std::to_string(x.ar.seed);
             } else {
                 kept.push_back(std::move(x));
@@ -1389,6 +1460,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
             st->takes_dropped   = planned - K;
             st->takes_capped    = capped;
             st->takes_short     = too_short;
+            st->takes_rescued   = rs[0].cand_rescued;
             st->eos_fallback    = rs[0].eos_fallback;
         }
         if (rs[0].eos_fallback) {
@@ -1398,9 +1470,9 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
                     job->id.c_str(), (long long) rs[0].ar.n_frames, (double) rs[0].ar.n_frames / 25.0);
         }
         const std::string tail = dropped_seeds.empty() ? std::string() : " (dropped seeds in the last round: " + dropped_seeds + ")";
-        fprintf(stderr, "[MM3-Job] %s: candidates - %d planned over %d round(s), %d kept and rendered, "
-                        "%d capped, %d too short, %d other candidates not selected%s\n",
-                job->id.c_str(), planned, rs[0].eos_rounds_used, K, capped, too_short,
+        fprintf(stderr, "[MM3-Job] %s: candidates - %d planned over %d round(s), %d kept and rendered (%d rescued "
+                        "by the base handoff), %d capped, %d too short, %d other candidates not selected%s\n",
+                job->id.c_str(), planned, rs[0].eos_rounds_used, K, rs[0].cand_rescued, capped, too_short,
                 planned - K - capped - too_short, tail.c_str());
     }
     // Take 0 is the job's primary result: it fills the upstream Job exactly as
@@ -1421,6 +1493,11 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         r.ar.lrc          = g_mm3_ar_cache.lrc;
         r.ar.n_frames     = g_mm3_ar_cache.frames;
         r.ar.eos_hit      = g_mm3_ar_cache.eos_hit;
+    } else if (r.rescued && (req.reuse_ar || req.save_frame_hiddens)) {
+        // A rescued take is a splice of two conditioning histories; one hidden
+        // block cannot replay it, so it neither fills the slot nor saves a plan.
+        fprintf(stderr, "[MM3-Job] %s: AR cache not filled and no plan saved - take 0 was rescued by the base "
+                        "handoff (two conditioning histories)\n", job->id.c_str());
     } else if ((req.reuse_ar || req.save_frame_hiddens) && r.frames > 0 && !r.ar.frame_hiddens.empty()) {
         // `save_frame_hiddens` fills the slot too, and it has to: the save below
         // writes FROM the slot, so gating the fill on `reuse_ar` alone would
@@ -1452,7 +1529,7 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     //
     // A failed save is a WARNING, never a failure: the audio is already rendered
     // and the file was a convenience.
-    if (req.save_frame_hiddens && !req.frame_hiddens_save_path.empty()) {
+    if (req.save_frame_hiddens && !req.frame_hiddens_save_path.empty() && !r.rescued) {
         const int64_t want = g_mm3_ar_cache.frames * (int64_t) g_mm3.lm_cfg.num_codebooks *
                              (int64_t) g_mm3.lm_cfg.embedding_length;
         if (g_mm3_ar_cache.frames <= 0 || (int64_t) g_mm3_ar_cache.hiddens.size() != want) {
@@ -1543,6 +1620,10 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
         to.peak        = rt.peak;
         to.eos         = rt.ar.eos_hit;
         to.has_nan     = rt.has_nan;
+        to.rescued      = rt.rescued;
+        to.handoff_cue  = rt.handoff_cue;
+        to.handoff_eos  = rt.handoff_eos;
+        to.handoff_seed = rt.handoff_seed;
         to.seed        = rt.ar.seed ? rt.ar.seed : req.gen.seed + (uint64_t) t;
         to.lrc         = rt.ar.lrc;
         if (t == 0) {
@@ -1892,6 +1973,7 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
     yyjson_mut_obj_add_int(o, orot, "takes_dropped", st->takes_dropped);
     yyjson_mut_obj_add_int(o, orot, "takes_capped", st->takes_capped);
     yyjson_mut_obj_add_int(o, orot, "takes_short", st->takes_short);
+    yyjson_mut_obj_add_int(o, orot, "takes_rescued", st->takes_rescued);
     yyjson_mut_obj_add_bool(o, orot, "eos_fallback", st->eos_fallback);
     if (st->n_takes > 1 || st->require_eos) {
         yyjson_mut_val * arr = yyjson_mut_arr(o);
@@ -1907,6 +1989,12 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
             yyjson_mut_obj_add_real(o, e, "duration_s", to.duration_s);
             yyjson_mut_obj_add_bool(o, e, "eos", to.eos);
             yyjson_mut_obj_add_int(o, e, "round", to.round);
+            yyjson_mut_obj_add_bool(o, e, "rescued", to.rescued);
+            if (to.rescued) {
+                yyjson_mut_obj_add_real(o, e, "handoff_cue_s", to.handoff_cue);
+                yyjson_mut_obj_add_real(o, e, "handoff_eos_s", to.handoff_eos);
+                yyjson_mut_obj_add_strcpy(o, e, "handoff_seed", std::to_string(to.handoff_seed).c_str());
+            }
             yyjson_mut_obj_add_real(o, e, "rms", to.rms);
             yyjson_mut_obj_add_real(o, e, "peak", to.peak);
             // Take 0's audio comes from the shared GET /job?id=&result=1; the

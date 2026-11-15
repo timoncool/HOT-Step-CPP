@@ -14,8 +14,9 @@ ACE-Step 1.5 is the default and the only backend that supports every studio.
 YuE2 also supports Cover Studio, through a reviewed lead sheet rather than audio
 conditioning. Stable Audio 3 also offers an instrumental source-audio refine
 in Cover Studio. HeartMuLa's MuLaCover mode uses the approved Prepare ABC lead
-sheet, four style tag fields and lyrics; its engine route and separate CC BY-NC
-model pack are pending. MiniMax-Music3 covers in Cover Studio by forcing the
+sheet, four style tag fields and lyrics. It needs the separate MuLaCover model pack
+(CC BY-NC 4.0, non-commercial, downloadable as MuLaCover cover model from the HeartMuLa tab in Model Manager) and the
+Qwen3 Embedding BF16 text encoder. MiniMax-Music3 covers in Cover Studio by forcing the
 source's encoded codes on its planner, blending the source audio into its flow
 stage, or both.
 
@@ -111,13 +112,34 @@ What sets it apart:
   caption and lyrics share a 5,000-token budget. The Compose Caption button under the
   caption box turns a plain-English description into a Structured Caption with no AI
   model involved.
+- A section tag is sent as the section name alone: `[Chorus - High Energy]` becomes
+  `[Chorus]` and `[Verse 1: soft]` becomes `[Verse 1]`, because MiniMax-Music3 sings a
+  descriptor inside a tag as a lyric line. Put the direction in the caption's
+  Arrangement timeline instead; Lyric Studio already builds that timeline from the full
+  tags. The generation log lists every tag that was shortened.
 - The song decides its own length, up to 300 seconds, and there is no duration
-  control.
+  control. A very long prompt lowers that ceiling: prompt tokens plus 25 frames per
+  second must fit the planner's 10,240-position context, so a 3,000-token prompt caps
+  the song at about 290 seconds. Past that context the planner was measured drifting
+  into repetition.
 - Play While Rendering (Generation cluster, off by default) starts playback a few
   seconds in, while later windows are still being rendered. The full file is saved as
   usual.
 - Variations Per Render (1 to 4) renders several different songs from one prompt in a
-  single pass, sharing the planner. Each request is otherwise one take.
+  single pass, sharing the planner. Each request is otherwise one take. With the LM
+  adapter's Plan dial below 1 the planner runs two models per variation, which doubles
+  its memory. Compact Planner Cache is on by default whenever an LM adapter is
+  selected and Plan is below 1, including one- and two-song renders. It stores
+  planner memory at 8 bits. One or two requested songs still use at most two
+  candidates per planning round; three or four variations can use up to four.
+  Turn the toggle off for the f16 cache and a maximum of two takes. Switching
+  cache precision changes what a seed renders. On an idle 24 GB RTX 4090, a
+  one-song request with two candidates at Plan 0.75 and a full-strength runtime
+  PiSSA rank-256 adapter measured 20.7 ms per LM step and 24,002 MiB peak VRAM
+  with f16, versus 19.5 ms and 19,612 MiB with compact cache. The queue shows
+  each variation as its own row inside one batch box, as it does for a YuE2 batch, and
+  each finished variation is saved and listed as its own song (and sent to the playlist
+  as its own track when that option is on).
 - Flow Steps (default 20, range 2 to 60) is the main speed control. The checkpoint's
   own value is 30; an ear test heard no difference at 20. Below 30, Low-Step
   Compensation reshapes the schedule so short renders keep their low end and stereo
@@ -238,7 +260,9 @@ What sets it apart:
   renders whatever it is, with no redraw. With Chain of Thought off there is no score
   to move, so the melody may still come out as wordless vocals.
 - Without the preview, the app plans first anyway and redraws the seed when the lead sheet
-  is a runaway, has no vocal line, or hit its cap, up to **Re-plan tries** (3 by default). A
+  is a runaway, has no vocal line, or hit its cap, up to **Re-plan tries** (3 by default).
+  A missing `M:` meter is filled with `2/4` and logged; a missing `L:` note length or
+  `K:` key, a malformed header, or stray colons in note runs triggers a redraw. A
   single unnamed ABC voice, such as `V:1`, counts as the vocal melody; in a multi-voice
   score, an unnamed voice with `w:` lyric lines counts as vocal too. With
   **Re-plan flagged scores** (on by default) it also redraws a plan that passes but is
@@ -499,7 +523,7 @@ component and adapter choices when the picker changes or another backend is sele
 | Post-processing | Shared chain, including VST, mastering and StableStep |
 | Shared Lua sampler plugins | Solvers, schedulers and guidance on the codec decode, opt-in |
 | PP-VAE, Spectral Lifter | No |
-| Cover Studio | Yes, lead-sheet conditioning from approved Prepare ABC; engine route pending |
+| Cover Studio | Yes, MuLaCover lead-sheet cover from approved Prepare ABC, capped at the sheet length and 300 s; the model can end earlier. Needs the MuLaCover pack and Qwen3 Embedding BF16 |
 | Repaint, streaming, training, lyric alignment | No |
 | Output | 48 kHz stereo |
 

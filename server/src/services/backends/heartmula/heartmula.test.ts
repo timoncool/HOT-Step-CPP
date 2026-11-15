@@ -48,7 +48,7 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
       }});
       if (route === '/heartmula/props') return Response.json({ synth_ready: true, available: true, encode_ready: false,
         ...(residentBytes === undefined ? {} : { vram: { resident_bytes: residentBytes } }) });
-      if (route === '/heartmula/synth') {
+      if (route === '/heartmula/synth' || route === '/heartmula/cover') {
         if (cancelOnSubmit) controller.abort();
         return Response.json({ id: 'engine-fixture' });
       }
@@ -116,9 +116,33 @@ test('HeartMuLa contract, queued picks, validation, persistence, cancellation an
       ]) assert.throws(() => heartmulaBackend.resolveRequest({...raw, ...bad}), undefined, JSON.stringify(bad));
       assert.equal((await heartmulaBackend.capabilities()).features.cover, true);
       const callsBeforeCover = calls.length;
-      assert.throws(() => buildEnvelope({...raw, backendOverride: 'heartmula', taskType: 'cover'}, 'fixture-user', 'other', Date.now()), /HeartMuLa covers are not available yet/);
-      assert.throws(() => heartmulaBackend.resolveRequest({...raw, heartmulaCover: {}}), /HeartMuLa covers are not available yet/);
-      assert.equal(calls.length, callsBeforeCover, 'cover must not call a missing endpoint or fall back to synth');
+      assert.throws(() => buildEnvelope({...raw, backendOverride: 'heartmula', taskType: 'cover'}, 'fixture-user', 'other', Date.now()), /lead-sheet rolls/);
+      assert.throws(() => heartmulaBackend.resolveRequest({...raw, heartmulaCover: {}}), /lead-sheet rolls/);
+      assert.equal(calls.length, callsBeforeCover, 'a cover without rolls never reaches the engine');
+      // A cover takes MuLaCover's pair, no adapter, the sheet length and top-k 250; rolls ride along.
+      const rolls = {version: 1, bpm: 96, length: 1, dtype: 'float32', pianoroll: Array(256).fill(0),
+        chord: Array(12).fill(0), drum_pianoroll: Array(128).fill(0), context_mask: [0]};
+      const coverWire = heartmulaBackend.resolveRequest({...raw, heartmulaAdapter: adapter, taskType: 'cover', heartmulaCover: rolls}).options;
+      assert.deepEqual([coverWire.variant, coverWire.global_type, coverWire.local_type, coverWire.adapter, coverWire.duration_s, coverWire.topk],
+        ['MuLaCover', '', '', '', 1, 250]);
+      assert.equal(coverWire.rolls, rolls);
+      const coverDuration = (length, bpm, context_mask = Array(length).fill(0), duration = -1) =>
+        heartmulaBackend.resolveRequest({...raw, taskType: 'cover', duration,
+          heartmulaCover: {...rolls, length, bpm, context_mask}}).options.duration_s;
+      assert.equal(coverDuration(112, 85), 112 * 15 / 85);
+      assert.equal(coverDuration(5000, 85), 300, 'long sheets clamp to the cover maximum');
+      assert.equal(coverDuration(120, 85, [...Array(112).fill(0), ...Array(8).fill(1)]), 112 * 15 / 85);
+      assert.equal(coverDuration(16, 120, [0, 1, ...Array(14).fill(0)]), 2, 'internal masks do not shorten the timeline');
+      assert.equal(coverDuration(112, 85, undefined, 10), 10, 'a shorter caller duration wins');
+      assert.equal(coverDuration(112, 85, undefined, 120), 112 * 15 / 85);
+      assert.equal(coverDuration(16, 120, Array(16).fill(1)), 1, 'fully padded sheets retain the minimum');
+      for (const bad of [{length: 0}, {bpm: 0}, {bpm: NaN}, {context_mask: []}]) {
+        assert.throws(() => heartmulaBackend.resolveRequest({...raw, taskType: 'cover', heartmulaCover: {...rolls, ...bad}}));
+      }
+      assert.throws(() => heartmulaBackend.resolveRequest({...raw, taskType: 'cover', heartmulaCover: rolls, duration: 301}), /duration/);
+      await heartmulaClient.synth(coverWire);
+      assert.equal(calls.at(-1).route, '/heartmula/cover', 'a cover never falls back to plain synth');
+      assert.equal(calls.at(-1).body.rolls.length, 1);
       assert.equal(heartmulaBackend.resolveRequest({...raw, instrumental: true}).common.lyrics, '');
       // Adapter dials ride on the wire only with an adapter; plugin picks only with the toggle on.
       const dialled = heartmulaBackend.resolveRequest({...raw, heartmulaAdapter: adapter, heartmulaAdapterScaleMlp: 0, heartmulaAdapterScaleLate: 1.5}).options;

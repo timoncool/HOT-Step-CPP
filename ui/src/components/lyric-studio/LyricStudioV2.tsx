@@ -17,6 +17,7 @@ import { snapshotOptions } from '../../queries/cover-lyrics/reads';
 import type { AlbumPreset } from '../../services/lireekApi';
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ChevronLeft } from 'lucide-react';
+import { notify } from '../shared/Toast';
 import { useTranslation } from 'react-i18next';
 import { lireekApi } from '../../services/lireekApi';
 import type { Artist, LyricsSet, Profile, Generation, SongLyric } from '../../services/lireekApi';
@@ -51,6 +52,9 @@ import { restoreLyricQueue } from '../../stores/streamingStore';
 import { loadSelections, saveSelections, type ModelSelections } from './ProviderSelector';
 import { useDisguiseMode } from '../../hooks/useDisguiseMode';
 import { cacheMm3SourceTracks, collectMm3SourceTracks } from '../../utils/mm3CaptionSource';
+import { useBackendStore } from '../../stores/backendStore';
+import { MM3_BACKEND_ID } from '../../utils/captionForBackend';
+import { YUE2_BACKEND_ID } from '../../utils/yue2CaptionSource';
 
 // ── URL helpers ──────────────────────────────────────────────────────────────
 
@@ -69,6 +73,16 @@ async function fillMissingArtwork(items: Array<{ id: number; image_url?: string 
 }
 
 const LS_BASE = '/lyric-studio';
+const ADAPTER_FILTER_KEY = 'ls-artist-sidebar-adapter-filter';
+
+/** The adapter an album preset assigns to this engine, if any. MM3 and YuE2
+ *  keep their own columns; every other engine renders with `adapter_path`, the
+ *  field the preset modal shows for it. */
+function presetAdapterFor(p: AlbumPreset, backendId: string): string | undefined {
+  if (backendId === MM3_BACKEND_ID) return p.mm3_adapter_path;
+  if (backendId === YUE2_BACKEND_ID) return p.yue2_ar_adapter_path || p.yue2_nar_adapter_path;
+  return p.adapter_path;
+}
 
 function buildUrl(artistId?: number, albumId?: number, tab?: TabId): string {
   if (artistId && albumId && tab) return `${LS_BASE}/artist/${artistId}/album/${albumId}/${tab}`;
@@ -171,7 +185,27 @@ export const LyricStudioV2: React.FC = () => {
   const allProfiles = allProfilesQuery.data ?? [];
 
   const presetsQuery = useQuery(snapshotOptions<{ presets: Array<AlbumPreset & { artist_id?: number }> }>('lireek', '/lireek/presets'));
-  const artistIdsWithAdapters = new Set((presetsQuery.data?.presets ?? []).filter(p => p.adapter_path && p.artist_id).map(p => p.artist_id!));
+  // Per engine: the field that engine's renders read from the album preset.
+  const activeBackendId = useBackendStore(s => s.activeBackendId);
+  const activeBackendName = useBackendStore(s => s.backends.find(b => b.id === s.activeBackendId)?.displayName ?? s.activeBackendId);
+  const adapterPresets = (presetsQuery.data?.presets ?? []).filter(p => presetAdapterFor(p, activeBackendId));
+  const adapterAlbumIds = new Set(adapterPresets.map(p => p.lyrics_set_id));
+  const adapterAlbumCounts = new Map<number, number>();
+  for (const p of adapterPresets) {
+    if (p.artist_id) adapterAlbumCounts.set(p.artist_id, (adapterAlbumCounts.get(p.artist_id) ?? 0) + 1);
+  }
+
+  // The "Has <engine> adapter" switch. Off by default; lasts for the session.
+  // On, it narrows the artist list, the artists' album counts and the album
+  // grid alike to albums whose preset assigns this engine an adapter.
+  const [adapterOnly, setAdapterOnlyState] = useState(() => {
+    try { return sessionStorage.getItem(ADAPTER_FILTER_KEY) === '1'; } catch { return false; }
+  });
+  const setAdapterOnly = useCallback((on: boolean) => {
+    setAdapterOnlyState(on);
+    try { sessionStorage.setItem(ADAPTER_FILTER_KEY, on ? '1' : '0'); } catch { /* ignore */ }
+  }, []);
+  const shownAlbums = adapterOnly ? albums.filter(a => adapterAlbumIds.has(a.id)) : albums;
 
   // ── Playback (for backdrop effect) ──
   const isPlaying = usePlaybackSelector(s => s.isPlaying);
@@ -182,12 +216,8 @@ export const LyricStudioV2: React.FC = () => {
   useEffect(() => { if (token) void restoreLyricQueue(token).catch(console.error); }, [token]);
   const completionCounter = useAudioGenQueueSelector(s => s.completionCounter);
 
-  // ── Toast ──
-  const [toast, setToast] = useState<string | null>(null);
-  const showToast = useCallback((msg: string) => {
-    setToast(msg);
-    setTimeout(() => setToast(null), 3500);
-  }, []);
+  // ── Toast ── (the app-wide stack, top right)
+  const showToast = notify;
 
   // ── Initial artwork + URL restore from the artists observer ──
   const initialLoad = useRef({ path: window.location.pathname, artworkStarted: false, restored: false });
@@ -573,6 +603,8 @@ export const LyricStudioV2: React.FC = () => {
   }, [nav.level, fetchModalOpen, handleBackToAlbums, handleBackToArtists]);
 
   const sourceLyricsCount = nav.selectedAlbum ? parseSongs(nav.selectedAlbum.songs).length : 0;
+  const instrumentalOnly = !!nav.selectedAlbum && parseSongs(nav.selectedAlbum.songs).length > 0
+    && parseSongs(nav.selectedAlbum.songs).every(song => song.instrumental || !song.lyrics?.trim());
 
   // ── MM3 caption sources ──
   // The album's own source tracks that carry an MM3 Structured Caption. A
@@ -599,12 +631,6 @@ export const LyricStudioV2: React.FC = () => {
   // ── Render ──
   return (
     <div className="h-full w-full flex flex-col relative bg-white dark:bg-zinc-950">
-      {/* Toast */}
-      {toast && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-50 px-5 py-2.5 rounded-xl bg-zinc-100/90 dark:bg-zinc-800/90 backdrop-blur-sm border border-zinc-300 dark:border-white/10 text-sm text-white shadow-2xl ls2-slide-up">
-          {toast}
-        </div>
-      )}
 
       {/* Fetch-lyrics indicator */}
       {fetchingLyrics && (
@@ -624,7 +650,8 @@ export const LyricStudioV2: React.FC = () => {
             <div className="w-48 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-hidden max-[1023px]:hidden portrait-wide:hidden">
               <ArtistSidebar artists={artists} selectedArtistId={-1}
                 onSelectArtist={handleSelectArtist} onBack={handleBackToArtists}
-                artistIdsWithAdapters={artistIdsWithAdapters} />
+                adapterAlbumCounts={adapterAlbumCounts} adapterEngineName={activeBackendName}
+                adapterOnly={adapterOnly} onAdapterOnlyChange={setAdapterOnly} />
             </div>
             <div className="flex-1 flex flex-col overflow-hidden min-w-0">
               {/* Header bar — spans above ArtistPageSidebar + Grid, matches ContentTabs height */}
@@ -668,7 +695,8 @@ export const LyricStudioV2: React.FC = () => {
             <div className="w-48 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-hidden max-[1023px]:hidden portrait-wide:hidden">
               <ArtistSidebar artists={artists} selectedArtistId={nav.selectedArtist.id}
                 onSelectArtist={handleSelectArtist} onBack={handleBackToArtists}
-                artistIdsWithAdapters={artistIdsWithAdapters} />
+                adapterAlbumCounts={adapterAlbumCounts} adapterEngineName={activeBackendName}
+                adapterOnly={adapterOnly} onAdapterOnlyChange={setAdapterOnly} />
             </div>
             <div className="flex-1 flex flex-col overflow-hidden min-w-0">
               {/* Header bar — spans above ArtistPageSidebar + Grid, matches ContentTabs height */}
@@ -679,21 +707,21 @@ export const LyricStudioV2: React.FC = () => {
                   All Artists
                 </button>
                 <span className="text-sm font-medium text-zinc-600 dark:text-zinc-400 truncate min-w-0">{disguiseArtist(nav.selectedArtist.name)}</span>
-                {albums.length > 0 && (
+                {shownAlbums.length > 0 && (
                   <span className="ml-2 min-w-[20px] h-5 px-1.5 rounded-full text-[11px] font-bold flex items-center justify-center bg-white/10 text-zinc-600 dark:text-zinc-400 flex-shrink-0">
-                    {albums.length}
+                    {shownAlbums.length}
                   </span>
                 )}
               </div>
               <div className="flex-1 flex min-h-0">
                 <div className="w-64 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-hidden max-[1023px]:hidden portrait-wide:hidden">
-                  <ArtistPageSidebar artist={nav.selectedArtist} albumCount={albums.length}
+                  <ArtistPageSidebar artist={nav.selectedArtist} albumCount={shownAlbums.length}
                     onOpenQueue={openQueuePanel} onOpenPromptEditor={() => setPromptEditorOpen(true)}
                     modelSelections={modelSelections} onModelSelectionsChange={handleSelectionsChange} />
                 </div>
                 <div className="flex-1 overflow-y-auto">
                   <AlbumGrid
-                    albums={albums} loading={albumsLoading} artistName={nav.selectedArtist.name}
+                    albums={shownAlbums} loading={albumsLoading} artistName={nav.selectedArtist.name}
                     onSelectAlbum={handleSelectAlbum} onAddAlbum={openFetchForArtist}
                     onAddManual={() => setAddAlbumModalOpen(true)}
                     onDeleteAlbum={handleDeleteAlbum} onRefreshImage={handleRefreshAlbumImage}
@@ -721,7 +749,8 @@ export const LyricStudioV2: React.FC = () => {
               <div className="w-48 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-hidden max-[1023px]:hidden portrait-wide:hidden">
                 <ArtistSidebar artists={artists} selectedArtistId={nav.selectedArtist.id}
                   onSelectArtist={handleSelectArtist} onBack={handleBackToArtists}
-                  artistIdsWithAdapters={artistIdsWithAdapters} />
+                  adapterAlbumCounts={adapterAlbumCounts} adapterEngineName={activeBackendName}
+                adapterOnly={adapterOnly} onAdapterOnlyChange={setAdapterOnly} />
               </div>
               <div className="w-64 flex-shrink-0 border-r border-zinc-200 dark:border-white/5 overflow-hidden relative max-[1023px]:hidden portrait-wide:hidden">
                 <div className="relative z-[1] h-full">
@@ -759,15 +788,18 @@ export const LyricStudioV2: React.FC = () => {
                     )}
                     {activeTab === 'profiles' && (
                       <ProfilesTab lyricsSetId={nav.selectedAlbum.id} profiles={profiles}
+                        instrumentalOnly={instrumentalOnly}
                         onRefresh={refreshAlbumData} showToast={showToast}
                         profilingModel={modelSelections.profiling} />
                     )}
                     {activeTab === 'write-lyrics' && (
-                      <WriteLyricsTab key={nav.selectedAlbum.id} lyricsSetId={nav.selectedAlbum.id}
-                        onRefresh={refreshAlbumData} onViewLyrics={() => handleTabChange('written-songs')} />
+                      instrumentalOnly ? <p className="p-4 text-sm text-zinc-500">{t('lyric.instrumentalWriteHint', 'Generate instrumental tracks from the sound profile in Written Songs. Freeform lyric writing is unavailable for this album.')}</p>
+                        : <WriteLyricsTab key={nav.selectedAlbum.id} lyricsSetId={nav.selectedAlbum.id}
+                          onRefresh={refreshAlbumData} onViewLyrics={() => handleTabChange('written-songs')} />
                     )}
                     {activeTab === 'written-songs' && (
                       <WrittenSongsTab generations={generations} profiles={profiles}
+                        instrumentalOnly={instrumentalOnly}
                         lyricsSetId={nav.selectedAlbum.id}
                         mm3SourceTracks={mm3SourceTracks}
                         onRefresh={refreshAlbumData} onGenerateAudio={handleGenerateAudio}

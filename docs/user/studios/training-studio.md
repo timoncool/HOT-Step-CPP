@@ -106,6 +106,11 @@ The ladder shows the dataset name from the Review list as a static heading above
 | Send to Lyric Studio (Build step) | Exports the dataset's artist/album metadata into Lyric Studio, optionally linking the dataset's trained adapters and a reference track as that album's generation preset. |
 | Monitor queue | Read-only view of the batch pipeline: one row per dataset, a status chip per stage, live progress on whichever stage is currently running. |
 
+Instrumental tracks are included in the Lyric Studio export as captions only.
+Vocal tracks without lyrics are skipped. Artist and album names remain editable,
+so collections can be named before export. The album preset receives the saved
+MM3 checkpoint and YuE2 adapter pair along with any ACE-Step adapters.
+
 ## Tips and limits
 
 ### Updating a training worker
@@ -121,6 +126,8 @@ starting a fresh batch does not remove these source files.
 Trained adapters are written under the app's adapters folder, split by base architecture and size (for example a 4B ACE-Step planner LoRA lands under `lm-4b/<name>/<run>/`, a DiT LoRA under `dit-<base>/<name>/<run>/`), with a timestamped subfolder per run so retraining never overwrites an earlier adapter. They show up in the adapter pickers used elsewhere in the app (Create, Custom-Gen, the audition card here) without any extra step; see [Adapters](../adapters.md) for how adapters are selected, scaled, and stacked at generation time.
 
 ACE-Step preprocessing and training, MiniMax-Music3 codes export and training, the YuE2 preparation stages and Stable Audio 3 training stop the local engine by default while `ace-train` runs and restart it afterward, so expect generation to be unavailable for the duration. MiniMax-Music3 and Stable Audio 3 pause training to bring the engine back for each checkpoint preview. YuE2 Joint Training leaves the engine running by default so its previews render in parallel; see [YuE2 training](../training/yue2.md#recommended-settings). Labeling does not require the engine unless a local captioner (MOSS or Music Flamingo) or local lyric transcription is selected. The local captioners are told each file's own genre tag, because without it they recognise a cover from its lyrics and describe the original song's genre instead of the arrangement; they also write the YuE2 caption themselves, so a local caption run makes no call to a chat provider. A dataset with no genre tags gets no hint.
+
+Local caption jobs show their stage and engine status lines live in the progress card. A single-file job shows **loading model / encoding audio**, then **writing caption** when the engine reports that encoding has finished. Batch jobs also report when each file starts encoding. The engine does not report individual generated tokens. Single-file label and caption jobs use a pulsing bar and omit the file-based ETA until they finish; the file count still advances on completion.
 
 What settings to actually use for a given backend (rank, steps, optimizer, crop length, and the rest of the Advanced drawer) is not this page's concern; see the backend-specific guide: [ACE-Step training](../training/ace-step.md), [MiniMax-Music3 training](../training/minimax-music3.md), [YuE2 training](../training/yue2.md), or [Stable Audio 3 training](../training/sa3.md).
 

@@ -283,6 +283,7 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
     const double sqrt_s     = (L->scale > 0.0f) ? sqrt((double) L->scale) : 1.0;
     const double inv_sqrt_s = 1.0 / sqrt_s;
     L->pissa_residual.clear();
+    L->pissa_fingerprint.clear();
     L->pissa_base_size = 0;
 
     std::string residual_base;
@@ -305,7 +306,7 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
                     "rank %d q %d iters %d layers %d-%d base %lld B. Not used; the export will be standalone.\n",
                     residual_path.c_str(), rm.rank, rm.q, rm.iters, rm.layer_lo, rm.layer_hi, rm.base_size, r, q,
                     iters, L->layer_lo, L->layer_hi, base_size);
-        } else if (!pissa_residual_read(residual_path, &rm, &rsites, &rerr)) {
+        } else if (!pissa_residual_read(residual_path, &rm, &rsites, &rerr, true)) {
             fprintf(stderr, "[pissa] residual %s unreadable (%s); falling back\n", residual_path.c_str(), rerr.c_str());
         } else {
             bool ok = true;
@@ -345,6 +346,7 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
             }
             if (ok) {
                 L->pissa_residual  = residual_base;
+                L->pissa_fingerprint = rm.fingerprint;
                 L->pissa_base_size = rm.base_size;
                 if (stats) {
                     stats->sites       = n;
@@ -362,7 +364,8 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
 
     // Canonical, f16-rounded copies of every site's frozen pair, for the
     // residual write. Only collected when there is somewhere to write them.
-    const bool                     want_write = !residual_path.empty();
+    // A fallback must not overwrite a residual that existing adapters still need.
+    const bool                     want_write = !residual_path.empty() && !hs_file_exists(residual_path);
     std::vector<PissaResidualSite> res_out;
     std::vector<ggml_fp16_t>       h16;
     // Takes trainer-space host factors, rounds them through the canonical F16
@@ -416,10 +419,19 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
         wm.energy_min  = e_min;
         std::string werr;
         if (lm_pissa_residual_write(residual_path, wm, res_out, &werr)) {
-            L->pissa_residual  = residual_base;
-            L->pissa_base_size = base_size;
-            fprintf(stderr, "[pissa] residual written: %s (%zu sites, F16; later runs at this rank read it and "
-                    "export adapter-only files)\n", residual_path.c_str(), res_out.size());
+            STFile written;
+            if (st_open(&written, residual_path.c_str())) {
+                L->pissa_fingerprint = pissa_residual_fingerprint(written);
+                st_close(&written);
+                L->pissa_residual  = residual_base;
+                L->pissa_base_size = base_size;
+                fprintf(stderr, "[pissa] residual generated: %s (%zu sites, F16). Adapters from this run fit "
+                        "ONLY this exact file. Back it up with the adapters; another residual with the same "
+                        "name, rank and base is not interchangeable.\n", residual_path.c_str(), res_out.size());
+            } else {
+                fprintf(stderr, "[pissa] cannot fingerprint generated residual %s; exporting standalone rank-2r files\n",
+                        residual_path.c_str());
+            }
         } else {
             fprintf(stderr, "[pissa] residual NOT written (%s); this run exports standalone rank-2r files\n",
                     werr.c_str());
@@ -585,22 +597,50 @@ static bool lm_pissa_init(LmLora * L, ggml_backend_sched_t sched, int oversample
             host.assign((size_t) in * (size_t) q, 0.0f);
             lm_rng_fill_normal(&rng, host, 1.0f);
             ggml_backend_tensor_set(t_omega, host.data(), 0, host.size() * sizeof(float));
-            {
+            // One graph per pass, with Y's columns brought back to norm [0.5, 1)
+            // on the host in between. The power iteration grows Y by about
+            // sigma_max^2 a pass (2.5e6 on layer 0's q_proj), and a GPU matmul
+            // that stages F32 operands through f16 turns that into inf: cuBLAS's
+            // F16 path did (hence both operands F32 below), and Metal's
+            // kernel_mul_mm_f32_f32 stages BOTH operands as half whatever the
+            // dtype (GH #335, mlp.up_proj on layer 0). The range finder only uses
+            // Y's column space, and a power-of-two factor is exact in F32, so a
+            // backend that multiplies in F32 gives the same bits as the old
+            // single graph (the CPU cache is byte-identical). That does not hold
+            // through half: the rescaled entries round differently there, and
+            // small ones go subnormal or to zero, with no overflow involved.
+            for (int it = 0; it <= iters; it++) {
+                if (it > 0) {
+                    host.resize((size_t) out * (size_t) q);
+                    ggml_backend_tensor_get(t_y, host.data(), 0, host.size() * sizeof(float));
+                    for (int k = 0; k < q; k++) {
+                        float * col = host.data() + (size_t) k * (size_t) out;
+                        double  n2  = 0.0;
+                        for (int j = 0; j < out; j++) {
+                            n2 += (double) col[j] * (double) col[j];
+                        }
+                        int e = 0;
+                        std::frexp(std::sqrt(n2), &e);
+                        if (std::isfinite(n2) && n2 > 0.0 && e != 0) {
+                            for (int j = 0; j < out; j++) {
+                                col[j] = std::ldexp(col[j], -e);
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t_y, host.data(), 0, host.size() * sizeof(float));
+                }
                 ggml_init_params ip  = { arena.size(), arena.data(), true };
                 ggml_context *   ctx = ggml_init(ip);
                 ggml_cgraph *    gf  = ggml_new_graph_custom(ctx, 256, false);
-                // BOTH operands are F32 here, and that is not tidiness. Using
-                // the base in its own F16 dtype sends src1 through cuBLAS's F16
-                // conversion, and the power iteration deliberately grows Y — it
-                // reached 2.5e6 on layer 0's q_proj — so the SECOND iteration's
-                // src1 goes over f16's 65504 and the whole SVD comes back NaN.
-                // It surfaced as a dead depth-loss gradient forty lines later.
-                ggml_tensor * wf  = qwen3_f32(ctx, w);
-                ggml_tensor * wtv = view2(ctx, t_wt, out, in);
-                ggml_tensor * y   = ggml_mul_mat(ctx, wf, view2(ctx, t_omega, in, q));  // [out, q]
-                for (int it = 0; it < iters; it++) {
-                    ggml_tensor * z = ggml_mul_mat(ctx, wtv, y);                        // [in, q]
-                    y               = ggml_mul_mat(ctx, wf, z);                         // [out, q]
+                // BOTH operands are F32 here, and that is not tidiness: the base
+                // in its own F16 dtype sends src1 through cuBLAS's F16 conversion.
+                ggml_tensor * wf = qwen3_f32(ctx, w);
+                ggml_tensor * y;
+                if (it == 0) {
+                    y = ggml_mul_mat(ctx, wf, view2(ctx, t_omega, in, q));                    // [out, q]
+                } else {
+                    ggml_tensor * z = ggml_mul_mat(ctx, view2(ctx, t_wt, out, in), view2(ctx, t_y, out, q));  // [in, q]
+                    y               = ggml_mul_mat(ctx, wf, z);                                // [out, q]
                 }
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, y, view2(ctx, t_y, out, q)));
                 if (!compute(gf, ctx)) {
@@ -882,8 +922,8 @@ static bool lm_export_pissa(const LmLora & L, const Qwen3LMConfig & cfg, const L
 static bool lm_export_pissa_delta(const LmLora & L, const Qwen3LMConfig & cfg, const LmExportMeta & meta,
                                   const std::string & out_dir, LmExportResult * res, std::string * err,
                                   const LmExtraExport * extra = nullptr) {
-    if (L.pissa_residual.empty()) {
-        *err = "PiSSA delta export: the init did not read or write a residual file";
+    if (L.pissa_residual.empty() || L.pissa_fingerprint.size() != 5) {
+        *err = "PiSSA delta export: no residual fingerprint was captured at initialization";
         return false;
     }
     const int          r = L.rank;
@@ -896,6 +936,7 @@ static bool lm_export_pissa_delta(const LmLora & L, const Qwen3LMConfig & cfg, c
     float hi = 0.0f, lo = 0.0f;
     pissa_size_split(L.pissa_base_size, &hi, &lo);
     ovr.pissa_meta = { (float) r, L.scale, (float) L.layer_lo, (float) L.layer_hi, hi, lo };
+    ovr.pissa_fingerprint = L.pissa_fingerprint;
     ovr.cfg_extra  = "  \"hot_step_pissa_residual\": \"" + lm_json_escape(L.pissa_residual) + "\",\n";
     ovr.site       = [&](int l, int s, LmPeftFactors * f, std::string * e) -> bool {
         const QwLoraPair & pr = L.layers[l].p[s];

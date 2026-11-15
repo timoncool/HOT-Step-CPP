@@ -1,5 +1,10 @@
 # Engine request and CLI reference
 
+YuE2 `style` and `lyrics` can both be empty. `codec_ids` without `abc` skips score
+planning, even if `cot` is enabled. With `continue_codec_ids: true`, these raw IDs in
+`[0, 32768)` become a forced prefix followed by sampled semantic frames. Recording
+continuations send `cot: "off"` and one song; NAR variations remain available.
+
 This page is the reference for the engine's request JSON, generation modes, CLI
 flags and HTTP endpoints. For how the engine is put together (binaries, pipelines,
 hook files, plugins, adapters, TensorRT, training, the HOT-ggml fork), read the
@@ -265,6 +270,24 @@ toward `1 - lss_strength`, with optional per-channel DC removal.
 
 **`track`** (string, default `""`). Stem name for `lego`, `extract` and `complete`.
 
+**`timbre_reference_window`** (bool, default false). Experimental timbre reference
+selection for both raw `ref_audio` and pre-encoded `ref_latents`. Repeat short
+inputs to at least 30 seconds, then join the centre 10 seconds of each third.
+The resulting reference has 750 frames at 25 Hz. Raw audio is selected before
+VAE encoding; cached whole-file latents are selected after loading. The default
+retains whole-file conditioning. Node accepts `timbreReferenceWindow` on an ACE
+generation request; there is no UI control.
+
+**`timbre_reference_strength`** (float, default 1.0, clamped to 0-1). Blends the
+condition encoder's timbre token between the no-reference token (0) and the
+reference's token (1). 1 is bit-identical to a request without the field; 0 is
+bit-identical to a request without a reference. Non-finite values are ignored.
+Applies to every ACE task that reads a timbre reference, covers included.
+
+ACE synth fails on non-finite DiT output, latent post-processing or decoded
+audio. The `[Synth-Finite]` diagnostic names the stage and invalid-value count;
+Node includes it in the generation failure. No output is saved for that job.
+
 **`audio_cover_strength`** (float, default 1.0). Fraction of DiT steps that see the
 source as context. Below 1.0 the remaining steps switch to silence context and the
 text2music instruction.
@@ -356,6 +379,9 @@ only the first object's sideband fields are read.
 | `scheduler` | `""` | Scheduler plugin name, or `composite:<a>+<b>:<crossover>:<split>` to blend two. Empty uses the shift schedule; an unknown name uses `linear` |
 | `guidance_mode` | `"apg"` | Guidance plugin name. Unknown names fall back to `apg` |
 | `plugin_params` | `{}` | Plugin parameters, `{"pluginName:key": value}`. Values may be strings, numbers or booleans |
+| `cfg_interval_start`, `cfg_interval_end` | 0, 1 | Inclusive diffusion timestep bounds for ACE guidance; outside uses conditional prediction. Inverted bounds disable guidance. Restricted intervals disable velocity caching. |
+| `retake_variance`, `retake_seed` | 0, -1 | Variance-preserving initial-noise mixing; zero leaves noise unchanged, one uses the retake seed alone. -1 resolves randomly only when variance > 0. |
+| `guidance_mode: "adg"` | opt-in | ACE base-model angle guidance; needs guidance > 1 and a null conditioning embedding. Implemented by the GGML and TensorRT samplers. |
 | `apg_momentum`, `apg_norm_threshold` | 0.75, 2.5 | APG tuning |
 | `stork_substeps`, `beat_stability`, `frequency_damping`, `temporal_smoothing` | 10, 0.25, 0.4, 0.13 | Copied into the solver state |
 | `cfg_cutoff_ratio` | 1.0 | Fraction of DiT steps that run CFG |
@@ -389,7 +415,7 @@ are reported, not ignored.
 |---|---|---|
 | `caption` | required | Structured caption. Markdown formatting is cleaned before use |
 | `lyrics` | `""` | Empty means instrumental |
-| `duration` | required unless `max_frames` | Seconds. Rendered at 25 frames per second, capped at 9000 frames |
+| `duration` | required unless `max_frames` | Seconds. Rendered at 25 frames per second, capped at 9000 frames, and a sampled plan also at the LM's 10240-position context minus the prompt tokens (logged as `frames capped`). Forced codes replay as given, with a warning past the context |
 | `max_frames` | none | Frame count; wins over `duration` |
 | `seed` | -1 | `-1` draws a random seed |
 | `ar_seed` | -1 | Separate seed for the planner stage; `-1` ties it to `seed` |
@@ -410,10 +436,12 @@ are reported, not ignored.
 | `lm_temperature`, `lm_top_k`, `lm_top_p` | 1.0, 0, 0.0 | Planner sampling. `lm_top_k` 0 uses the checkpoint's value |
 | `lm_rep_penalty`, `lm_rep_window`, `lm_rep_mode`, `lm_dry_base`, `lm_dry_min_len` | 1.0, 320, `"dry"`, 1.75, 15 | Planner repetition penalty, in 25 fps frames |
 | `takes` | 1 | Songs from one planner pass, 1 to 8, clamped to the checkpoint's row budget. Take t uses `seed + t`; fetch with `GET /mm3/take` |
+| `lm_kv_q8` | false | Store the planner's KV cache as Q8_0: about half the VRAM, about 7% slower per step at 300 s, and a different (equally valid) plan from the same seed. `MM3_LM_KV_TYPE` overrides it. In the AR cache key when on. `/mm3/lm-plan` takes it too |
 | `require_eos`, `stop_after_first_eos`, `eos_rounds`, `min_frames` | false, false, 4, 0 | Natural-ending controls. `eos_rounds` is 1 to 16; `min_frames` drops plans shorter than that |
+| `eos_handoff`, `handoff_seed` | false, absent | Base handoff, with `require_eos` and an LM adapter: when round 1 ends fewer takes than wanted, its capped takes (in take order, until the count is met) are cut at a lyric cue, the base model re-reads the prefix on its own KV cache and samples on, and a take that ends renders as its own audio up to the cue plus the base plan's audio after it (1 s crossfade). The job JSON adds `takes_rescued`, and per take `rescued`, `handoff_cue_s`, `handoff_eos_s` and `handoff_seed`. `handoff_seed` (tests) replaces the continuation seed, otherwise `take seed XOR 0x9E3779B97F4A7C15`. `/mm3/lm-plan` takes `handoff_cue: true` (with `lrc`) and returns `handoff_cut` / `handoff_cue` per take |
 | `reuse_ar` | false | Reuse the previous planner output when every planner input matches |
 | `forced_frame_hiddens_file`, `save_frame_hiddens`, `frame_hiddens_save_path` | | Load or save the planner output as a `.mm3hiddens` file |
-| `forced_semantic`, `forced_acoustic` | | Replay captured codes; `forced_acoustic` has 7 entries per semantic entry. `forced_semantic` alone pins content and samples the acoustic codes from the caption. A `-1` entry is a free frame |
+| `forced_semantic`, `forced_acoustic` | | Replay captured codes; `forced_acoustic` has 7 entries per semantic entry. `forced_semantic` alone pins content and samples the acoustic codes from the caption. A `-1` entry is a free frame. Both arrays with no bias and no free frame replay in one teacher-forced pass instead of the frame loop (`MM3_FORCED_REPLAY=0` forces the loop) |
 | `lm_force_bias` | absent | Semantic-only soft forcing, 0 to 1000: adds this to the forced code's guided logit and samples instead of pinning. Absent = hard pin. With a bias or a `-1` frame, `forced_acoustic` is refused |
 | `lm_guide_file`, `lm_guide_scale`, `lm_guide_k`, `lm_guide_outside`, `lm_guide_gate_file`, `lm_guide_trace_file` | absent, 0.5, 0, 0 | Source guide: a Y2GD file from `ace-train mm3-codes`/`mm3-launder --guide-k N` (top N encoder codes and log-softmax per frame). Each draw mixes `(1 - scale) * p_LM + scale * p_encoder` over the candidates (`yue2_guide_apply`). `lm_guide_k` 0 uses every candidate in the file; `lm_guide_outside` at -100 or below allows candidates only. The gate file is raw f32, one scale multiplier per frame. The trace file receives per-frame JSON (rank of the drawn code, overlap, LM mass on the candidates, gap, surprise). Length = guide frames, EOS masked. Exclusive with `forced_semantic` and `forced_frame_hiddens_file`. Scale 1 with k 1 reproduces the hard pin exactly |
 | `lm_depth_greedy`, `lm_state_fix` | false, 0 | Probes on guided frames, read only with `lm_guide_file`. `lm_depth_greedy` takes argmax acoustic codes. `lm_state_fix` moves the conditional hidden row until the drawn code is in its top 10: 1 = depth decoder input, 2 = emitted stream 0, 3 = both. The LM's KV cache never sees the moved row, but under 1 or 3 the acoustic codes it produces are fed back |
@@ -426,8 +454,8 @@ are reported, not ignored.
 | `lm_adapter_mode` | `"runtime"` | `runtime` or `merge` |
 | `lm_adapter_merge_gpu` | true | Merge mode: merge on the GPU |
 | `lm_adapter_scale`, `lm_adapter_scale_attn`, `lm_adapter_scale_mlp`, `lm_adapter_scale_early`, `lm_adapter_scale_mid`, `lm_adapter_scale_late` | 1.0 each | Adapter scales, -4 to 4: overall, by module group, and by depth third |
-| `lm_adapter_fade_in`, `lm_adapter_fade_out`, `lm_adapter_fade_len`, `lm_adapter_fade_floor`, `lm_adapter_fade_step` | 0, 0, 0, 0, 10 | Adapter strength along the song, in seconds: the base alone for the first `fade_in`, full strength for the body, then from `fade_out` a ramp to `fade_floor` (0 to 1, a multiplier on `lm_adapter_scale`) over `fade_len` (0 = a hard handoff), in `fade_step` steps (1 to 60). Times 0 to 360. Runtime mode only; ignored with a log line in merge mode. In the AR cache key when set. `/mm3/lm-plan` takes the same keys, plus `lrc: true` for each take's LRC |
-| `lm_adapter_plan` | 1.0 | Plan dial, 0 to 1: how much the adapter plans the song. Below 1 each take gets a base CFG pair (adapter delta masked off), the semantic draw samples `base + plan * (adapter - base)` guided logits, and the depth decoder reads the adapter rows, so 0 = the base plans and the adapter sings. Doubles the LM rows and KV, so `takes` is clamped to 2 (with a CFG pair) while it applies. Runtime mode only; ignored with a log line in merge mode or for an adapter with an artist token or KV prefix. In the AR cache key below 1. `/mm3/lm-plan` takes it too |
+| `lm_adapter_fade_in`, `lm_adapter_fade_out`, `lm_adapter_fade_len`, `lm_adapter_fade_floor`, `lm_adapter_fade_step` | 0, 0, 0, 0, 10 | Diagnostic: the app no longer sends these. Adapter strength along the song, in seconds: the base alone for the first `fade_in`, full strength for the body, then from `fade_out` a ramp to `fade_floor` (0 to 1, a multiplier on `lm_adapter_scale`) over `fade_len` (0 = a hard handoff), in `fade_step` steps (1 to 60). Times 0 to 360. In merge mode a plain LoRA or PiSSA adapter stays merged and the faded stretch subtracts the missing share in-graph; a DoRA adapter renders the fade in runtime mode, LoHa and HiRA ignore it with a log line. In the AR cache key when set. `/mm3/lm-plan` takes the same keys, plus `lrc: true` for each take's LRC |
+| `lm_adapter_plan` | 1.0 | Plan dial, 0 to 1: how much the adapter plans the song. Below 1 each take gets a base CFG pair (adapter delta masked off), the semantic draw samples `base + plan * (adapter - base)` guided logits, and the depth decoder reads the adapter rows, so 0 = the base plans and the adapter sings. Doubles the LM rows and KV: up to 16 LM rows (4 takes with a CFG pair), and past 2 takes the cache only fits with `lm_kv_q8`. Runtime mode only; ignored with a log line in merge mode or for an adapter with an artist token or KV prefix. In the AR cache key below 1. `/mm3/lm-plan` takes it too |
 | `lm_soft_off` | false | Run the adapter's weight delta without its artist token or KV prefix |
 | `adapter_runtime_dora` | false | The same key ACE reads, here for the LM adapter: true recomputes a DoRA adapter's column norms at the dialled scale instead of its base scale |
 
@@ -451,7 +479,8 @@ Parsed by `yue2_parse_request` in `engine/src/yue2/yue2-request.h`.
 | `lyrics` | `""` | Lyrics |
 | `cot` | `"off"` | `off`, `melody` or `full`. `melody` and `full` run the ABC plan stage |
 | `abc` | none | ABC text to use instead of running the plan stage |
-| `plan_only` | false | Stop after the plan stage and return the ABC score. Needs `cot` other than `off`; cannot be combined with `abc` or `semantic_only` |
+| `plan_only` | false | Stop after the plan stage and return the ABC score. Needs `cot` other than `off`; cannot be combined with `abc` (unless `plan_continue`) or `semantic_only` |
+| `plan_continue` | false | With `plan_only`: plan one section on from a kept score. `abc` (or, with `songs`, every entry's `abc`) is the score so far, ending in the label line of the section to write and its newline (`"% chorus\n"`); anything else is a 400. The planner prefills it after `ABC_START`, samples on, and stops before the next line that starts with `%`. The result `abc` is the prefix byte-for-byte plus the new section, which keeps its last newline. `stage_end_reasons.plan` is `section_end`, `eos` (`ABC_END` first) or `limit_hit`. `plan_max_tokens` caps generated tokens only. `/yue2/props` reports `plan_continue: true` |
 | `semantic_only` | false | Stop after the semantic stage and return the codec ids |
 | `semantic_retries` | 0 | 0 to 20. Redraws per song whose semantic stage runs away, up to 4 side by side; the first to end cleanly wins |
 | `plan_cutoff` | 1.5 | 0 to 10. A stream past this x its plan's length + 20 s is a runaway (`limit_hit`); 0 = only the stage cap |
@@ -485,7 +514,7 @@ Parsed by `yue2_parse_request` in `engine/src/yue2/yue2-request.h`.
 | `continue_codec_ids` | false | Treat `codec_ids` as a shared prefix for 1 to 4 songs and keep sampling after it, at any `cfg_scale`. No `semantic_retries` |
 | `preview_max_frames` | 0 | Bound on semantic frames, 0 to 9000 (training previews) |
 | `render_from_frame` | 0 | 0 to 9000. The NAR and VAE start at this codec frame (clamped to the stream), so the audio covers only the frames from it to the end. The composer still reads every frame. Section takes send their lead-in |
-| `vae_variant` | `"standard"` | `standard`, `legacy`, or `dec2x` (a local fine-tuned decoder; only when `yue2-vae-dec2x-*.gguf` is present) |
+| `vae_variant` | `"standard"` | `standard`, `legacy`, `rs-x3` (Ruach Studio's YuE2-VAE-RS x3 decoder, `yue2-vae-rs-x3-*.gguf`), or `dec2x` (a local fine-tuned decoder; only when `yue2-vae-dec2x-*.gguf` is present) |
 | `noise_source`, `noise_fixture_path` | `"native"` | Validation only: `fixture` reads NAR noise from a raw f32 file |
 | `id` | `"yue2"` | Request label |
 
@@ -827,6 +856,10 @@ Output:
 Server:
   --host <addr>           Listen address (default: 127.0.0.1)
   --port <N>              Listen port (default: 8080)
+  --allow-origin <csv>    Extra browser origins allowed to call the server,
+                          e.g. http://myhost:3001 (also env ACESTEPCPP_ALLOWED_ORIGINS)
+  --allow-host <csv>      Extra hostnames accepted in the Host header, e.g. myhost
+                          (case-insensitive, port ignored; also env ACESTEPCPP_ALLOWED_HOSTS)
   --max-batch <N>         LM batch limit (default: 1)
   --max-seq <N>           KV cache size (default: 8192)
 
@@ -837,6 +870,14 @@ Debug:
   --clamp-fp16            Clamp hidden states to FP16 range
   --backend-check         Load GGML backends without models, print a JSON report, exit
 ```
+
+The Host check refuses any Host header that is not loopback, an IP literal
+(IPv6 may include a %zone), or the --host value. If the engine is reached by
+hostname (a remote Node server with ACESTEPCPP_HOST=<name>, or a reverse
+proxy), start it with --allow-host <name> (or ACESTEPCPP_ALLOWED_HOSTS).
+When Node spawns the engine itself it passes ACESTEPCPP_HOST as --host, so a
+hostname set there is already accepted. Browser pages served from another
+origin also need --allow-origin.
 
 Notes the usage text does not cover:
 
@@ -1012,7 +1053,10 @@ POST /mm3/imatrix                Activation statistics for quantize --imatrix.
 POST /mm3/voc-decode, /mm3/dit-forward, /mm3/flow-sample, /mm3/depth-frame,
      /mm3/cond-encode, /mm3/lm-plan, /mm3/synth-e2e
                                  Bring-up and parity endpoints. They run outside
-                                 the job queue.
+                                 the job queue. /mm3/lm-plan also takes
+                                 "caption" + "lyrics" (assembled like training)
+                                 and "eos_trace": true (per-iteration EOS and
+                                 emitted-code statistics for every take).
 
 GET  /yue2/props                 YuE2 files, config, what is loaded.
 POST /yue2/warm, /yue2/unload    Load or free YuE2 weights.
@@ -1111,6 +1155,66 @@ Usage: mp3-codec -i <input> -o <output> [options]
 mp3-codec -i song.wav -o song.mp3 -b 192
 mp3-codec -i song.mp3 -o song.wav --format wav32
 ```
+
+## ace-midi chords reference
+
+ChordNet chord recognition, CPU only; no MuScriptor model is loaded. Design, admitted
+rates, output schema and parity status: [ace-midi chords](../../docs/dev/engine.md#ace-midi-chords-chordnet).
+
+```
+Usage: ace-midi --chords <audio> --chord-model <gguf> --chord-vocab <tsv> [--out chords.json]
+       ace-midi --validate-chords <capture dir> --chord-model <gguf> --chord-vocab <tsv>
+
+  --chords <audio>           WAV or MP3 at any rate (exact from 22050 and 44100 Hz)
+  --chord-model <gguf>       Five-fold f32 GGUF from engine/tools/convert-chordnet.py
+  --chord-vocab <tsv>        Chord templates (server/src/data/lead-sheet/chordnet-templates.tsv)
+  --out <file>               Segments JSON (default chords.json)
+  --validate-chords <dir>    PARITY rows against a tools/lead-sheet-reference capture
+```
+
+Exit codes: 0 success (including a capture skipped for a recorded upstream rejection);
+1 unreadable audio, model, templates or capture, or a failed parity row. Other source
+rates print an approximation notice on stderr. `GGML_N_THREADS` sets the CPU thread count.
+
+## ace-midi YourMT3+ reference
+
+YourMT3+ end to end, and the native lead-sheet source built on it (YourMT3+ notes,
+ChordNet chords and upstream's BPM). It loads no MuScriptor model. Design, JSON schema,
+rejections, parity findings, placement and times:
+[ace-midi YourMT3+](../../docs/dev/engine.md#ace-midi-yourmt3).
+
+```
+Usage: ace-midi --lead-sheet <audio> --yourmt3-model <gguf> --chord-model <gguf> --chord-vocab <tsv>
+                [--out lead-sheet.json] [--device cpu] [--beat-model <dir> --abc-out <score.abc> [--abc-chordnet]]
+       ace-midi --validate-yourmt3 <capture dir> --yourmt3-model <gguf> [--device cpu] [--yourmt3-dump <dir>]
+       ace-midi --yourmt3-encode <audio> --yourmt3-model <gguf> [--device cpu]
+
+  --lead-sheet <audio>        WAV or MP3 at any rate: notes, program-100 vocal, drums, ChordNet
+                              chord segments and the librosa BPM in raw seconds, as one JSON
+  --out <file>                lead-sheet JSON (default lead-sheet.json)
+  --chord-model, --chord-vocab  ChordNet GGUF and templates, as for --chords
+  --beat-model <dir>          Beat This! weights; needed for --abc-out
+  --abc-out <score.abc>       also write the YuE2 ABC on the Beat This! grid: Vocal = program 100,
+                              Ins = the busiest melodic instrument (or --abc-ins)
+  --abc-chordnet              with --abc-out: ChordNet's labels in place of the template chords
+  --beats-out, --abc-ins, --abc-melody-only and the tempo options apply as for --transcribe
+  --yourmt3-model <gguf>      f32 GGUF from engine/tools/convert-yourmt3.py (local only)
+  --validate-yourmt3 <dir>    PARITY rows against a tools/lead-sheet-reference capture: padded
+                              waveform, spectrogram, pre-encoder, encoder, pre-decoder, prefill
+                              and cached-step logits, token streams per batch; codec table,
+                              merged notes, program-100 vocal, drums, BPM
+  --yourmt3-dump <dir>        with --validate-yourmt3: write b<k>.{chained,fed}.<point>.f32 and
+                              b<k>.{chained,fed}.tokens.json
+  --yourmt3-encode <audio>    WAV or MP3 at any rate through the encoder; prints
+                              PLACEMENT and TIMING lines, writes nothing
+  --device auto|cpu|<name>    backend for YourMT3+ (default auto = best available); ChordNet
+                              and the BPM run on the CPU
+```
+
+Exit codes: 0 success (including a capture skipped for a recorded upstream rejection, and
+a lead sheet whose BPM or vocal is rejected: the JSON states why); 1 unreadable audio,
+model or capture, non-finite logits, or a failed parity row; 2 a YourMT3 mode without
+`--yourmt3-model`, or `--lead-sheet` without its models.
 
 ## quantize reference
 

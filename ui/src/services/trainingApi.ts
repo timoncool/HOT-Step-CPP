@@ -2327,6 +2327,7 @@ export interface CaptionOptions {
 export type LyricStudioFieldSource = 'tags' | 'default' | 'filename' | 'folder' | 'dataset-name';
 
 export interface LyricStudioExportSong {
+  instrumental: boolean;
   sampleId: string;
   title: string;
   album: string;              // per-song album (own tag first, set album else)
@@ -2341,6 +2342,7 @@ export interface LyricStudioAdapterHit {
 }
 
 export interface LyricStudioExportPreview {
+  mm3Adapter: string | null;
   artist: string;             // detected, pre-fills the override field
   album: string;
   artistSource: LyricStudioFieldSource;
@@ -3110,18 +3112,20 @@ export async function getDatasetJson(id: string, reqOpts?: TrainingReadOptions):
 
 // ── Lyric Studio export ──────────────────────────────────────────────────
 
-export async function getLyricStudioPreview(id: string, reqOpts?: TrainingReadOptions): Promise<LyricStudioExportPreview> {
-  return request<LyricStudioExportPreview>(`/datasets/${encodeURIComponent(id)}/lyric-studio`, undefined, reqOpts);
+// Always this PC, never the "Train on" worker: the album lands in this
+// machine's Lyric Studio, and a worker holds only the copy pushed for training.
+export async function getLyricStudioPreview(id: string, reqOpts?: ReadOptions): Promise<LyricStudioExportPreview> {
+  return localRequest<LyricStudioExportPreview>(`/datasets/${encodeURIComponent(id)}/lyric-studio`, undefined, reqOpts);
 }
 
 export async function exportToLyricStudio(
-  id: string, input: LyricStudioExportInput, reqOpts?: TrainingTarget,
+  id: string, input: LyricStudioExportInput,
 ): Promise<LyricStudioExportResult> {
   // SendToLyricStudio renders failures itself (the modal's error line), so the
   // transport stays quiet — one notifier per failure.
-  return request<LyricStudioExportResult>(
+  return localRequest<LyricStudioExportResult>(
     `/datasets/${encodeURIComponent(id)}/lyric-studio`,
-    { method: 'POST', ...jsonBody(input), silent: true }, reqOpts,
+    { method: 'POST', ...jsonBody(input), silent: true },
   );
 }
 

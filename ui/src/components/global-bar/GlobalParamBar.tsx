@@ -8,7 +8,7 @@ import { aceModelsOptions } from '../../queries/global-models/options';
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
-import { Cpu, Plug, Sliders, Brain, AudioWaveform, Bookmark, AlertTriangle, Download, X, Menu, ChevronDown, Settings } from 'lucide-react';
+import { Cpu, Plug, Sliders, Brain, AudioWaveform, Bookmark, AlertTriangle, Download, X, Menu, ChevronDown, Settings, ListMusic } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { BarSection, ToggleSwitch, ACCENT_STYLES } from './BarSection';
 import { useGlobalParams, useGlobalParamsStore } from '../../context/GlobalParamsContext';
@@ -31,6 +31,9 @@ import { MonitorBar } from './MonitorBar';
 import { useVstChainStore } from '../../stores/vstChainStore';
 import { ProfilesModal } from './ProfilesModal';
 import { QueryError } from '../shared/QueryError';
+import { healthOptions } from '../../queries/shell-queue/settings';
+import { engineNotice, noModelsRefetchInterval } from '../shared/noModelsPoll';
+import { usePlaylist } from '../lyric-studio/playlistStore';
 
 type SectionId = 'models' | 'adapters' | 'generation' | 'lm' | 'postprocessing' | null;
 
@@ -120,8 +123,9 @@ const SheetSection: React.FC<SheetSectionProps> = ({
   );
 };
 
-export const GlobalParamBar: React.FC<{ onOpenMobileNav?: () => void }> = ({ onOpenMobileNav }) => {
+export const GlobalParamBar: React.FC<{ onOpenMobileNav?: () => void; onOpenMobilePlaylist?: () => void }> = ({ onOpenMobileNav, onOpenMobilePlaylist }) => {
   const { t } = useTranslation();
+  const { items: playlistItems } = usePlaylist();
   const [openSection, setOpenSection] = useState<SectionId>(null);
   const gp = useGlobalParams();
   const monitoring = useVstChainStore(s => s.monitoring);
@@ -248,6 +252,8 @@ export const GlobalParamBar: React.FC<{ onOpenMobileNav?: () => void }> = ({ onO
   }, []);
 
   const modelsQuery = useQuery(aceModelsOptions());
+  const healthQuery = useQuery({ ...healthOptions(), refetchInterval: noModelsRefetchInterval });
+  const notice = engineNotice(healthQuery.data?.engine);
   const availableModels = modelsQuery.data;
   useEffect(() => {
     const models = availableModels?.models;
@@ -264,17 +270,13 @@ export const GlobalParamBar: React.FC<{ onOpenMobileNav?: () => void }> = ({ onO
   // the engine time to start, there are genuinely no models available.
   useEffect(() => {
     if (sessionStorage.getItem('mm-auto-dismissed')) return;
+    if (notice !== 'no-models') return;
 
     const timer = setTimeout(() => {
-      if (modelsQuery.isPending) return;
-      const allModels = [
-        ...(availableModels?.models?.dit ?? []), ...(availableModels?.models?.lm ?? []),
-        ...(availableModels?.models?.vae ?? []),
-      ];
-      if (!allModels.length) setShowModelManager(true);
+      setShowModelManager(true);
     }, 8000);
     return () => clearTimeout(timer);
-  }, [availableModels, modelsQuery.isPending]);
+  }, [notice]);
 
   // ── "Models missing" banner (generic — any backend) ─────────────────
   // capabilities().core.modelsMissing is true only when the ACTIVE backend is
@@ -338,6 +340,19 @@ export const GlobalParamBar: React.FC<{ onOpenMobileNav?: () => void }> = ({ onO
         </button>
         <img src="/logo.webp" alt="HOT-Step" style={{ height: '28px' }} className="w-auto object-contain" draggable={false} />
         <div className="flex-1" />
+        <button
+          onClick={onOpenMobilePlaylist}
+          className="relative p-2 rounded-lg bg-zinc-200 dark:bg-white/5 hover:bg-zinc-300 dark:hover:bg-white/10 text-zinc-600 dark:text-zinc-400 transition-colors"
+          aria-label={t('playlist.title')}
+          title={t('playlist.title')}
+        >
+          <ListMusic size={20} />
+          {playlistItems.length > 0 && (
+            <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-0.5 flex items-center justify-center rounded-full bg-pink-500 text-white text-[8px] font-bold">
+              {playlistItems.length}
+            </span>
+          )}
+        </button>
         <button
           onClick={() => setShowMobileSettings(true)}
           className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-100 dark:bg-white/10 hover:bg-zinc-200 dark:hover:bg-white/15 text-zinc-600 dark:text-zinc-400 transition-colors text-[12px] font-semibold"

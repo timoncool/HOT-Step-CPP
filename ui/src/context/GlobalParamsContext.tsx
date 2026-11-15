@@ -65,6 +65,10 @@ export interface GlobalParams {
   // Generation
   inferenceSteps: number; setInferenceSteps: (v: number) => void;
   guidanceScale: number; setGuidanceScale: (v: number) => void;
+  cfgIntervalStart: number; setCfgIntervalStart: (v: number) => void;
+  cfgIntervalEnd: number; setCfgIntervalEnd: (v: number) => void;
+  retakeSeed: number; setRetakeSeed: (v: number) => void;
+  retakeVariance: number; setRetakeVariance: (v: number) => void;
   cfgCutoffRatio: number; setCfgCutoffRatio: (v: number) => void;
   lmCfgCutoffRatio: number; setLmCfgCutoffRatio: (v: number) => void;
   cacheRatio: number; setCacheRatio: (v: number) => void;
@@ -143,6 +147,7 @@ export interface GlobalParams {
   masteringReference: string; setMasteringReference: (v: string) => void;
   timbreReference: boolean; setTimbreReference: (v: boolean) => void;
   timbreAudioPath: string; setTimbreAudioPath: (v: string) => void;
+  timbreReferenceStrength: number; setTimbreReferenceStrength: (v: number) => void;
   // Naturalizer
   vocalNaturalizerEnabled: boolean; setVocalNaturalizerEnabled: (v: boolean) => void;
   // Pre-VST gain offset

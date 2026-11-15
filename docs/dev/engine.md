@@ -11,6 +11,35 @@ This page is the map. For the request JSON and every CLI flag, see
 tiers fit together, see [architecture.md](architecture.md). For build scripts and
 toolchains, see [building.md](building.md).
 
+## ACE-Step parity controls
+
+`AceRequest` parses and serializes `cfg_interval_start`/`cfg_interval_end`
+(0/1), `retake_variance` (0), and `retake_seed` (-1). The two interval bounds
+and variance clamp to [0,1]; inverted bounds select no guidance. They are request
+fields, so the LM echo retains them. The Node translation and defaults mirror
+the generation store; the current request remains the base for post-LM rebuilds.
+Node resolves a random retake seed per track before synth and saves it in song
+parameters. CLI seed resolution does the same only for nonzero variance.
+
+`retake-noise.h` mixes a second Philox draw before cover/repaint initialization.
+Zero returns without touching the original bytes; one copies the second draw.
+`guidance/adg-core.h` implements the local ACE-Step 1.5 base
+`apg_guidance.py:adg_forward`, including its 3.14/6 angle clip and sigma<1e-4
+CFG fallback. ADG has a Lua registry descriptor and native dispatch in the GGML
+and TRT ACE samplers. Other family bridges use the descriptor's ordinary CFG
+fallback because their guidance callback has no current latent argument.
+Both ACE samplers gate guidance using the actual evaluation sigma, not step
+fraction, and use conditional velocity outside the interval. Restricted
+intervals bypass velocity caching; the old CFG cutoff still applies.
+
+The local custom Python build predates retake. Its sin/cos mixing and placement
+were checked against the [official base model implementation](https://github.com/ace-step/ACE-Step-1.5/blob/main/acestep/models/base/modeling_acestep_v15_base.py).
+CPU regression checks are in `engine/tests/test-ace-parity.cpp`:
+`make -C engine/tests test-ace-parity && engine/tests/test-ace-parity`.
+The ADG golden vector comes from the local PyTorch reference on CPU, with an
+absolute tolerance of 3e-5. Render comparisons still need the same GPU, model,
+request, pin and backend settings.
+
 ## Layout
 
 | Path | Contents |
@@ -42,11 +71,11 @@ All targets are defined in `engine/CMakeLists.txt`.
 | `ace-synth` | `tools/ace-synth.cpp` | ACE-Step text encoder, DiT and VAE from the command line: request JSONs in, MP3 or WAV out |
 | `ace-understand` | `tools/ace-understand.cpp` | Reverse pipeline: audio in, caption, lyrics and metadata out |
 | `ace-caption` | `tools/ace-caption.cpp` | Local captioning with MOSS-Music or Music Flamingo (`--family`, else picked by the files in `--models`): audio in, prose caption, MM3-format caption, YuE2 fields or section-tagged lyrics out. `--hint` (or a third `--src-list` column) is appended to every non-lyrics prompt. Decoding is greedy unless `--temperature` > 0, then nucleus sampling (`--top-p`, `--seed`). Weights come from `tools/convert-moss.py` / `tools/convert-flamingo.py` |
-| `ace-midi` | `tools/ace-midi.cpp` | MuScriptor audio-to-MIDI transcription (`--transcribe`), plus parity modes against a Python oracle. With `--beat-model` it also runs Beat This! (see below) |
+| `ace-midi` | `tools/ace-midi.cpp` | MuScriptor audio-to-MIDI transcription (`--transcribe`), plus parity modes against a Python oracle. With `--beat-model` it also runs Beat This! (see below). `--chords` runs ChordNet chord recognition on the CPU (see [ace-midi chords](#ace-midi-chords-chordnet)). `--lead-sheet` runs YourMT3+, ChordNet and the BPM estimate for the native lead-sheet source; `--validate-yourmt3` and `--yourmt3-encode` check and time YourMT3+ (see [ace-midi YourMT3+](#ace-midi-yourmt3)) |
 | `ace-train` | `tools/ace-train.cpp` | Training toolchain, one subcommand per job (see [Training subcommands](#training-subcommands)) |
 | `neural-codec` | `tools/neural-codec.cpp` | ACE-Step VAE encode and decode, with optional Q8/Q4 latent compression |
 | `mp3-codec` | `tools/mp3-codec.cpp` | Standalone MP3 encoder and decoder |
-| `quantize` | `tools/quantize.cpp` | GGUF requantizer for ACE-Step, MM3, YuE2 and SA3 DiT files, with optional `--imatrix` |
+| `quantize` | `tools/quantize.cpp` | GGUF requantizer for ACE-Step, MM3, YuE2, SheetSage2 and SA3 DiT files, with optional `--imatrix` |
 | `mastering` | `tools/mastering.cpp` | Reference-based mastering (the matchering algorithm) |
 | `vst-host` | `tools/vst-host.cpp` | VST3 host: `--scan`, `--gui`, `--process`, `--process-chain`, `--monitor`. Each plugin gets a 10 s warm-up pre-roll of the track's opening, fed time-reversed so plugin buffers hold the song's own start when the real pass begins. `--monitor` (Windows, WASAPI) plays a track through the chain live, driven by a control file the server rewrites atomically with an increasing `seq`; see the note below |
 | `yue2-probe` | `tools/yue2-probe.cpp` | YuE2 bring-up and parity CLI (`--info`, `--load`, `--tokenize`, `--ar-parity` and more) |
@@ -149,6 +178,322 @@ fixed 120 BPM file, byte for byte (`--validate-midi`).
 | `--track <audio>` | Beats and grid only (needs `--beat-model` and `--beats-out`) |
 | `--self-test-grid` | Grid maths on synthetic beats with known answers |
 
+### ace-midi chords (ChordNet)
+
+`ace-midi --chords` is a native port of the chord recogniser MuLaCover uses for its
+lead sheets: Music X Lab's ISMIR 2019 large-vocabulary ChordNet (MIT code), five folds
+averaged. It runs on the CPU only and needs no MuScriptor model. The code is in
+`engine/src/chordnet/`; its notices are in `engine/src/chordnet/LICENSE`.
+
+```
+ace-midi --chords <audio> --chord-model <chordnet-F32.gguf> --chord-vocab <templates.tsv> [--out chords.json]
+ace-midi --validate-chords <capture dir> --chord-model <gguf> --chord-vocab <tsv>
+```
+
+The pipeline follows upstream up to its beat rounding: mono audio at 22,050 Hz,
+librosa's tuning estimate, the hybrid CQT (288 bins, 36 per octave from F#0, hop 512),
+the 18:270 crop, then per fold a CNN (InstanceNorm, SELU) and a bidirectional LSTM with
+six chord-factor heads. The fold mean of the head probabilities feeds a Viterbi decode
+over 301 chord templates with transition penalty 30. The CNN and the LSTM input
+projections run as a GGML graph on the CPU backend; the recurrence, heads and decode are
+plain loops. `GGML_N_THREADS` sets the thread count.
+
+Output (`--out`, default `chords.json`):
+
+```json
+{"tuning": 0.06, "frames": 690, "segments": [["N", 0, 0.0929], ["C#:maj", 0.0929, 0.6734]]}
+```
+
+`tuning` is in bins of 1/36 octave. Segments are contiguous `[label, onset, offset]` in
+seconds, at CQT frame resolution (512 / 22,050 s). No beat snapping happens here: the
+caller rounds to its own grid.
+
+**Input rates.** Every source rate is accepted; only 22,050 and 44,100 Hz match librosa
+exactly. librosa resamples with soxr's HQ recipe. Its 2:1 stage is a Kaiser-windowed sinc
+that the port reproduces to 3e-8. For other ratios soxr runs a cascade with an
+interpolated polyphase stage, which the same sinc only approximates, and the tool prints
+a `[chordnet] ... approximates librosa` notice. Matching those paths exactly would mean
+shipping soxr (LGPL), which was not taken; a resampling step in the caller would move
+the approximation, not remove it. Reviewer's measured figures (2 s of seeded tone or
+noise; maximum absolute error against librosa) are a record, not a pass:
+
+| Source rate | Signal | Waveform | CQT |
+|---|---|---|---|
+| 8,000 | tone / noise | 1.9e-3 / 3.7e-3 | 7.1e-5 / 1.2e-3 |
+| 16,000 | tone / noise | 5.2e-4 / 2.0e-3 | 6.8e-5 / 2.6e-4 |
+| 22,050 | tone / noise | 0 / 0 | 1.9e-6 / 1.9e-7 |
+| 32,000 | tone / noise | 1.2e-4 / 3.3e-4 | 9.2e-6 / 2.3e-5 |
+| 44,100 | tone / noise | 1.5e-7 / 7.5e-8 | 2.9e-6 / 1.7e-7 |
+| 48,000 | tone / noise | 1.2e-4 / 1.7e-3 | 1.1e-5 / 1.5e-4 |
+| 96,000 | tone / noise / clipped noise | 1.7e-4 / 5.0e-3 / 1.8e-2 | 1.4e-5 / 3.7e-4 / 1.3e-3 |
+
+The tuning estimate and the frame count matched in every row. The model reads the CQT,
+not the waveform. On the two 48 kHz reference captures the waveform is within 2.8e-4 and
+the CQT within 2.6e-5, and the chord labels match exactly.
+
+**Weights.** `engine/tools/convert-chordnet.py --weights <dir> --inventory
+tools/lead-sheet-reference/inventory.json --out chordnet-F32.gguf` writes the five
+checkpoints into one f32 GGUF after a strict inventory check (names, shapes, 500,772
+parameters per fold). `condition_linear` is left out because upstream never calls it.
+The checkpoints' terms are unconfirmed, so the GGUF is a local file only: it is not in
+the repository, the model registry or any download. The templates come from
+`--vocab-out <tsv> --upstream <MuLaCover chord dir>` and ship as
+`server/src/data/lead-sheet/chordnet-templates.tsv`, with its MIT notice beside it.
+
+**Validation.** `--validate-chords` reads a capture written by
+`tools/lead-sheet-reference/` and prints one `PARITY` row per capture point. Each row runs
+twice: chained from the capture's source audio, and fed from that stage's captured input.
+The gates are those in `tools/lead-sheet-reference/tolerances.json`: below 1e-3 for
+arrays and tuning, exact labels, 1e-6 s for seconds. A capture is skipped, with exit 0,
+only when its manifest records the upstream rejection that stopped it before ChordNet.
+Anything missing or unreadable fails.
+
+On the reference captures, `v2-vocal`, `v2-instrumental` and `v2-silent` pass every row
+(worst error 2.8e-4). `library-vocal` is a recorded upstream rejection (no positive BPM).
+`v2-vocal-stem` fails eight rows: the CNN on folds 0, 1 and 4 (1.45e-3, 1.76e-3, 1.74e-3)
+and the chained LSTM on all five folds. Its heads, frame labels and segments pass.
+
+That miss is a discrepancy in the reference, recorded as a finding rather than a pass.
+The captured float32 CNN output differs from the same network run in float64 by 1.45e-3,
+1.76e-3, 9.8e-4, 8.4e-4 and 1.73e-3 on folds 0 to 4. Running only conv1a and its norm in
+float64 brings that to between 2.5e-6 and 3.0e-6. The stem is quiet (CQT median 8e-5), so conv1a's
+per-channel spread is about 1e-4 next to biases up to 0.53. The float32 bias add loses
+the signal, and InstanceNorm, whose variance sits far below its eps of 1e-5, scales that
+rounding by about 316. The port leaves the conv biases out, because an affine-free
+InstanceNorm cancels them exactly, and lands within 2.3e-6 of float64. Its miss against
+the reference therefore equals the reference's own error. The gate and `tolerances.json`
+are unchanged. The check is `_experiments/lead-sheet-port/f64-check.py <capture> <fold>`,
+run in the reference venv.
+
+Measured CPU time for a 240 s, 48 kHz stereo file, all five folds, 16 threads on a Ryzen 9
+9950X3D: features 2.4 s, model 7.8 s, decode 0.04 s, peak working set about 790 MB.
+
+### ace-midi YourMT3+
+
+The melody transcriber MuLaCover uses is YourMT3+ (the YPTF.MoE+Multi checkpoint). It is
+ported end to end: audio in; notes, the program-100 vocal and the drums out in seconds.
+With ChordNet and upstream's BPM estimate beside it, this is the engine side of the
+native lead-sheet source (`--lead-sheet`, below). The code is in `engine/src/yourmt3/`
+and `engine/src/chordnet/tempo.h`; the notices are in their `LICENSE` files.
+
+```
+ace-midi --lead-sheet <audio> --yourmt3-model <yourmt3-F32.gguf> --chord-model <chordnet-F32.gguf>
+         --chord-vocab <templates.tsv> [--out lead-sheet.json] [--device cpu]
+         [--beat-model <dir> --abc-out <score.abc> [--abc-chordnet]]
+ace-midi --validate-yourmt3 <capture dir> --yourmt3-model <yourmt3-F32.gguf> [--device cpu] [--yourmt3-dump <dir>]
+ace-midi --yourmt3-encode <audio> --yourmt3-model <gguf> [--device cpu]
+```
+
+`--yourmt3-encode` runs the front half and prints the backend placement and stage
+times. It writes nothing. `--device` picks the backend as for MuScriptor (`auto` is the
+best available).
+
+**Pipeline.** The audio is reduced to mono float32 (the channel mean), then resampled
+to 16 kHz with `torchaudio.functional.resample`, which is what upstream calls. That is a
+Hann-windowed sinc on the gcd-reduced ratio, with nothing that depends on the rate, so
+every integer source rate takes the exact path and no notice is printed. On synthetic
+captures at 8, 11.025, 22.05, 32 and 96 kHz (music and white noise) and on the
+44.1 and 48 kHz references, the padded waveform is within 3.6e-7. The audio is
+zero-padded to whole 32,767-sample segments and handled in batches of 8, as upstream
+does. Each segment gets a magnitude STFT (n_fft 2048, hop 300, periodic Hann, centred
+with reflect padding): DC dropped, `log(x + 1e-5)`, min-max normalised per segment, 110
+frames by 1024 bins. The FFT runs in double on the host. The conv pre-encoder (three
+residual 3x3 blocks, eval BatchNorm, ReLU, 1x2 average pooling) and the Perceiver-TF
+encoder (26 latents; three blocks of spectral cross-attention, two local and two
+temporal layers, each with a top-2 mixture of eight experts; partial RoPE on the
+queries) run as two GGML graphs. The 6b spike's numerics rules apply: strict F32 on every
+matmul, and two-pass LayerNorm. The pre-encoder's F32 convolutions use ggml-cuda's fp32
+direct kernel.
+
+**Weights.** `engine/tools/convert-yourmt3.py --ckpt <last.ckpt> --inventory
+tools/lead-sheet-reference/inventory.json --out yourmt3-F32.gguf` checks the state
+dictionary against the inventory (655 names, shapes and dtypes; 47,078,022 parameters)
+and writes one f32 GGUF. Two kinds of entry are left out: the six BatchNorm
+`num_batches_tracked` counters, unused in eval, and the 15 per-layer
+`rotary_emb.freqs`, which are the same shared parameters as the three encoder-level
+ones (the converter checks that they are equal). Training state in the checkpoint
+(optimizer, schedulers, hyper-parameters, tokenizer objects) is never read into the GGUF.
+The loader checks the full tensor set, decoder included, and uploads it. Redistribution
+of the checkpoint is not cleared, so the GGUF is a local file only: it is not in the
+repository, the model registry or any download.
+
+**Validation.** `--validate-yourmt3` reads a capture written by
+`tools/lead-sheet-reference/`. It checks every capture file's size and sha256 against
+`tensors.json`. It then prints one `PARITY` row per point and batch: padded waveform,
+linear spectrogram, pre-encoder and encoder. Each row runs twice: chained from the
+capture's source audio, and fed from that stage's captured input. The gate is below 1e-3
+(`tolerances.json`), and any non-finite value fails. The capture must hold every batch the
+source audio makes, with no gaps, and each batch must have exactly the segments that
+audio gives it. A capture is skipped, with exit 0, only when upstream rejected the input
+before YourMT3 ran. That means the manifest records a rejection, has no YourMT3 timing
+and lists no `mt3.*` entry. The reference rejections (no BPM, no melody) come after
+YourMT3, so those captures are validated. Anything missing or corrupt fails and is named. `--yourmt3-dump <dir>` writes this run's chained and fed
+outputs.
+
+Results on the five reference captures (max abs error, chained / fed; the waveform row
+has no fed run):
+
+| Capture | Waveform | Spectrogram | Pre-encoder CPU | Pre-encoder CUDA | Encoder CPU | Encoder CUDA |
+|---|---|---|---|---|---|---|
+| `library-vocal` | 1.5e-7 | 6.8e-3 / 8.1e-3 | 11.4 / 1.25e-3 | 11.4 / 1.83e-3 | 2.08 / 3.6e-5 | 2.08 / 3.1e-5 |
+| `v2-instrumental` | 3.6e-7 | 1.05e-3 / 1.01e-3 | 2.22 / 1.80e-3 | 2.22 / 2.08e-3 | 0.60 / 4.2e-5 | 0.60 / 3.5e-5 |
+| `v2-silent` | 2.4e-7 | 5.8e-4 / 5.1e-4 | 0.66 / 1.53e-3 | 0.66 / 2.08e-3 | 1.16 / 3.4e-5 | 1.16 / 2.7e-5 |
+| `v2-vocal` | 2.4e-7 | 5.8e-4 / 5.1e-4 | 0.66 / 1.53e-3 | 0.66 / 2.08e-3 | 1.16 / 3.4e-5 | 1.16 / 3.9e-5 |
+| `v2-vocal-stem` | 7e-10 | 4.0e-5 / 3.3e-5 | 0.040 / 7.9e-4 | 0.040 / 1.65e-3 | 3.8e-4 / 7.8e-5 | 3.9e-4 / 3.6e-5 |
+
+The waveform and the fed encoder pass everywhere. The waveform and spectrogram are
+computed on the host, so CPU and CUDA give the same figures for them. The other misses
+come from the reference, and they are recorded as a finding. The gate and `tolerances.json` are unchanged. The evidence
+comes from upstream's own modules run in float64 on the same inputs:
+
+- Spectrogram: torch's float32 STFT is up to 8.1e-3 from float64 (5.0e-4 on `v2-vocal`).
+  The port's double FFT is within 1.7e-7 of float64 on every capture. The error sits in
+  near-silent bins, where `log(x + 1e-5)` magnifies float32 rounding.
+- Pre-encoder: one block-0 BatchNorm channel has running variance 8.5e-5 (scale 412), and
+  outputs reach 2508, where one float32 ulp is 2.4e-4. Fed the same captured spectrogram,
+  torch float32 is 6.7e-4 to 1.07e-3 from float64. The port is 6.9e-4 to 1.28e-3 on the
+  CPU, and 1.8e-3 to 2.1e-3 on CUDA, whose direct kernel sums 1,152 terms in sequence.
+- Chained rows: a 1e-5 change in the spectrogram moves the pre-encoder by 0.67. So every
+  float32 implementation lands far from every other one. Torch's own float32 chain is
+  0.03 to 10.7 from a float64 chain on the pre-encoder, and 2.8e-4 to 1.18 on the
+  encoder.
+
+What matters downstream is the tokens. Upstream's float32 decoder, fed the port's chained
+encoder states (CPU or CUDA), decodes 104 of 104 streams equal to the reference on
+`library-vocal`, `v2-instrumental` and `v2-vocal-stem`. On `v2-vocal` and `v2-silent`
+it decodes 103 of 104; the stream that differs is segment 0, channel 5. A float64 torch
+chain from the same audio differs on that same stream, so there the port agrees with
+float64 rather than with the float32 reference. Fed from the captured pre-encoder, every
+stream matches. The port's own decoder gives the same result; see the token rows below. The
+checks are `_experiments/lead-sheet-port/yourmt3-f64-check.py` and
+`yourmt3-token-check.py`, run from the upstream clone in the reference venv on a
+`--yourmt3-dump` directory.
+
+**Placement.** Both graphs place every node on the compute backend, with one split each:
+35 nodes for the pre-encoder and 891 for the encoder, nothing on the CPU under CUDA.
+The scheduler pins graph inputs to the CPU. Left there, the encoder's channel-token
+permute and its cross-attention LayerNorm statistics followed them (6 splits), so the
+inputs are allocated on the compute backend.
+
+**Time.** For a 240 s, 48 kHz stereo file on an RTX 5090 with nothing else on the card,
+the full front half takes 7.0 s, which is 118 segments in 15 batches. The parts are
+model load 0.36 s, resample 0.05 s, spectrogram 0.25 s, pre-encoder 5.7 s and encoder
+0.91 s. The peak is 1.7 GB of VRAM above idle. On 16 CPU threads, a 16 s clip takes
+about 2.3 s in the pre-encoder and 1.8 s in the encoder. An im2col and strict SGEMM
+pre-encoder would probably be several times faster (an estimate, not measured). It was
+not built, because 7 s sits well inside the 300 s Prepare budget.
+
+**Decoder.** `yourmt3/decoder.h` pairs the 26 latents into 13 channels and projects them
+to 512 (one shared linear). Each T5 layer's cross-attention K and V are computed once per
+batch. A step embeds one token per stream and adds the learned position. It then runs 8
+T5 layers: RMS norm with eps 1e-6, unscaled attention over 6 heads of 64 against a KV
+cache, and a gated tanh-GELU feed-forward. After the final norm it scales by 1/sqrt(512)
+and applies the LM head. A full batch is 104 streams (8 segments by 13 channels). Greedy
+decoding follows upstream's `task_cond_dec_generate`: BOS 0 for every stream, the prefill
+token kept as it is, then PAD for a stream once it has emitted EOS. The batch stops when
+every stream has emitted EOS, or at 256 tokens. The spike's numerics rules hold here too.
+Every matmul is strict F32. On the CPU backend the GELU is built from basic ops, because
+ggml-cpu's `ggml_gelu` reads an fp16 table.
+
+**Events and notes.** `yourmt3/events.h` is integer work with float64 times, following
+upstream's `event_codec.py`, `event2note.py` and `note2event.py`. Ids map to the mt3
+codec's 596 events (PAD, EOS, UNK, 206 shifts, 128 pitches, 2 velocities, tie, 128
+programs, 128 drums). Each segment has a tie section, listing notes still sounding from
+the segment before, then timed events at 100 ticks per second. The start tick is
+`round(start * 100)` with ties to even, as Python rounds. Per channel the segments are
+merged in order. A note the previous segment left sounding, and that the next segment's
+tie section does not carry, gets a note-off at the next segment's start time. Note events
+then become notes: notes over 10 s are cut to 0.01 s, short and inverted notes are fixed,
+and overlaps on one pitch and program are trimmed. Last, the 13 channels are mixed. Every
+sort is stable, so equal keys keep upstream's order. Upstream counts decoding errors and
+drops the offending event, and so does the port. The vocal is the non-drum program-100
+notes. The drums are the drum notes.
+
+**BPM.** MuLaCover's BPM is the tempo `librosa.beat.beat_track` returns at the source
+sample rate. `chordnet/tempo.h` ports the part that sets it: `onset_strength` (power
+STFT 2048/512, 128 Slaney mel bands to sr/2, `power_to_db` with top_db 80, positive
+difference, median over bands) and `feature.tempo`. That second step builds an 8 s
+autocorrelation tempogram, max-normalised per frame and averaged over time, scored as
+`log1p(1e6 tg)` plus a log-normal prior at 120 BPM, with lags faster than 320 BPM excluded.
+The beat positions are not ported: `beat_track` estimates the tempo before it tracks
+beats and returns that estimate unchanged. An onset envelope with no positive value gives
+0, as librosa does. librosa runs the STFT and mel stages in float32; the port runs them
+in float64. On the reference clips and a four-minute song the envelopes differ by up to
+1.1e-5, while the winning lag leads the runner-up by 0.066 to 0.29 in score. The BPM is
+60 sr / (512 lag), so it is exact once the lag is.
+
+**Lead sheet (`--lead-sheet`).** One audio file in, one JSON out (`--out`, default
+`lead-sheet.json`). Everything is in raw seconds of the audio, with no snapping and no
+rolls: the server quantises.
+
+```
+{"version": 1, "duration": s, "sample_rate": hz, "bpm": x, "bpm_rejection": null | reason,
+ "notes": [{onset, offset, pitch, program, is_drum, velocity}], "vocal": [same, program 100],
+ "vocal_rejection": null | reason, "drums": [same], "chords": [[label, onset, offset]]}
+```
+
+Upstream's two rejections are stated, not worked around. A BPM of 0 gives
+`bpm_rejection` "Could not determine a positive BPM; provide bpm explicitly". An empty
+program-100 selection gives `vocal_rejection` "Melody must contain at least one note.".
+Both are upstream's own messages. The raw events stay as transcribed either way. The
+Vocal-to-Ins fallback is the server's. YourMT3+ is released before ChordNet loads, as
+upstream does. ChordNet runs as `--chords` does, on the CPU. Non-finite logits fail the run.
+
+With `--beat-model` and `--abc-out` the same run writes the YuE2 ABC through
+`midi_to_yue2_abc` on the Beat This! grid. Program 100 is the Vocal voice. Ins is the
+busiest melodic instrument, using the MuScriptor rule (no drums, bass or vocal), or
+`--abc-ins`. The chords are the template estimate by default. With `--abc-chordnet` they
+are ChordNet's segments, each end snapped to the notation's subbeat grid, with the root
+spelt for the key and an inversion's bass written as a note name. The server's lead-sheet
+parser reads maj, min, 7, maj7, min7, dim, aug, sus2, sus4 and a slash bass. The ChordNet
+qualities it cannot read are reduced to chord tones it can: 9, 11 and 13 to 7, maj9 to
+maj7, min9 to min7, hdim7 and dim7 to dim, sus4(b7) to sus4. All 301 template labels,
+in sharp and flat keys, pass the notation's `chord_symbol_to_abc`, and all 306 resulting
+chord texts parse with the server's `abcLeadSheetEvents`. Without these options
+`midi_to_yue2_abc` is unchanged: a MuScriptor transcription writes the same ABC, MIDI and
+`beats.json` bytes as before.
+
+**Decoder validation.** `--validate-yourmt3` adds these rows after the front-half rows,
+per batch: pre-decoder (fed from the captured encoder), prefill and cached-step logits
+(fed from the captured pre-decoder), and the token streams. Streams are exact up to EOS,
+with the batch length shown. A fed run must also match the batch length. The rows then
+cover the codec table against `event-vocabulary.json`; the merged notes, the program-100
+vocal and the drums (fed from the captured tokens, chained from this run's own tokens),
+exact with times within 1e-6 s; and the BPM against the manifest's `librosa_bpm`, within
+1e-3. The 6d rules still hold. The capture writes the notes, both selections and the BPM
+right after YourMT3, before either reference rejection, so once YourMT3 has run every one is
+required. The token file is checked before use: integer ids inside the vocabulary, full
+batches of 8 segments except the last, 13 channels and one stream length per batch. A
+count that does not match the source audio fails the capture outright. A non-finite logit
+at any decode step fails, even when the tokens come out unchanged. `--yourmt3-dump` also
+writes the pre-decoder and both token sets.
+
+Fed, every row passes on all five captures, on CUDA strict F32 and on the CPU. The worst
+results are pre-decoder 6.7e-6, prefill logits 4.2e-4 and cached-step logits 3.4e-4. All
+104 streams of every capture match. The codec table, merged notes, vocal and drums are
+exact, and the BPM is exact everywhere, 0.0 on `library-vocal` included. Chained, CPU and
+CUDA give the same tokens and notes. Every stream matches except one: on `v2-vocal` and
+`v2-silent`, segment 0 channel 5 stops at EOS after 21 tokens, where the float32
+reference adds two more chord pairs. Upstream's own model, run in float64 from the
+captured waveform, gives the port's tokens on all 104 streams of both captures, so that
+stream follows float64 and the row stays FAIL as a recorded finding. It removes 14
+program-48 notes (two seven-note chords at 1.37 s and 1.73 s) from the merged notes. The
+vocal and drums are unchanged. The chained pre-decoder and logit rows fail because the
+chained encoder does (above). On a four-minute song, upstream's float32 transcriber and
+the port agree on 2,892 of 2,901 notes, with all 282 vocal notes equal. The 15 that
+differ are drum notes, which were not checked against float64. The scratch checks are
+`f64_tokens.py` and `four_min_notes.py` in `_experiments/lead-sheet-port/scratch/`.
+
+**Decoder placement.** The projection and cross-K/V graph is 69 nodes and the decoder
+step 327 (391 on the CPU, with the composite GELU). Each has one split, with nothing off
+CUDA0.
+
+**Lead-sheet time.** On the same 240 s, 48 kHz song, RTX 5090, no Unreal, about 6 GB of
+idle dev-stack models resident, two runs: model load 0.4 s; features 0.3 s; pre-encoder
+6.9 s; encoder 1.0 s; decode 7.9 to 8.2 s (2,145 steps over 15 batches); events and merge
+under 1 ms; BPM 1.0 s; ChordNet 10.1 to 10.3 s (CPU); Beat This! and ABC 0.6 s. That
+totals 28.4 to 28.9 s, against the 300 s Prepare budget.
+
 ## HeartMuLa
 
 `heartmula/pipeline.h` runs tags and lyrics through the global language model and
@@ -242,6 +587,122 @@ than torch BF16's does. These are the rules `heartmula-probe` uses for the plain
 model. The original rules are still evaluated and shown per key. A manifest that is
 unreadable, has fewer than 98 keys or lacks a key the engine produces fails the
 case.
+
+One row of the checker fails by design. On `synthetic-drums-cfg1.5`, the raw
+`s1.codebook1.logits` of the conditioned row flips one argmax against torch FP32:
+FP32 puts code 1064 at 18.4688 and code 3666 at 18.4625, 0.0063 apart. The engine's
+error on that key is 0.036, so it cannot resolve the gap, and the per-key near-tie
+test passes. Torch BF16 scores no flip only because both values round to the same
+BF16 number (18.5) and argmax takes the lower index, so the per-case flip count reads
+1 against 0. The guided logits, which sampling uses, agree with FP32. This row is an
+accepted exception and `mulacover-check` still exits 1 on that case; the gate stays
+per case, and any other failing row is a real finding.
+
+`POST /heartmula/cover` (`heartmula/server.h`, request and limits in the
+[HeartMuLa contract](../../engine/docs/HEARTMULA_CONTRACT.md)) runs a cover through
+the synth job path: the server sends the rolls Cover Studio builds from the approved
+score, the four-field tag line and the sectioned lyrics. The job encodes the tags with
+the BF16 Qwen3 embedding, frees it, binds the rolls after the KV reserve and samples
+with upstream's defaults (CFG 1.5, temperature 1.0, top-k 250). Admission counts
+the context cache on top of the KV. The engine allows up to 300 s (3750 frames).
+The Node wrapper sets `duration_s` to the unpadded sheet length, calculated as
+sixteenth-note rows times 15 divided by BPM, clamped to 1 through 300 s. A shorter
+caller duration wins, and audio EOS can end the song earlier. The cover workflow
+result stores the roll row count and BPM instead of the full arrays; the audio
+queue retains those arrays for generation. MuLaCover is not a
+plain-synth variant: `/heartmula/synth` and `select-model` refuse it, and
+`/heartmula/models` leaves it out of `variants`.
+
+## Startup checks and model validation
+
+Before accepting requests, `ace-server` runs a small F32 scale graph directly on
+the device selected by the model loaders, including a `GGML_BACKEND` override.
+It checks the returned values and exits with a diagnostic if initialization,
+allocation, kernel execution or validation fails. The `[Backend self-test]` line
+reports the kernel check's elapsed time. `--backend-check` runs the same probe
+and adds `kernel_ok` to its JSON report.
+
+A failed HTTP bind exits nonzero after worker cleanup. Windows sockets use
+`SO_EXCLUSIVEADDRUSE` so a second engine cannot listen on the same address and
+port. The Node launcher retries an unexpected nonzero exit up to its existing
+three-crash limit within 30 seconds.
+
+DiT GGUF and safetensors configurations must declare 1 to 32 layers. The GGUF
+reader checks the unsigned count before narrowing it. The LM loader accepts 1
+to 64 layers. Both DiT configuration readers enforce the bound before
+tensor-count arithmetic or array indexing.
+
+The server drains captured stderr on `exit()` as well as normal scope exit,
+preserving fatal loader messages. Every Windows engine executable, including
+optional test targets, embeds the UTF-8 active-code-page and long-path manifest.
+Filesystem wrappers that explicitly convert UTF-8 to UTF-16 keep their existing
+behavior.
+
+## VAE graph memory
+
+ACE-Step VAE encoding and decoding measure each new graph's backend buffers
+before allocation. If memory is insufficient or allocation fails, the full pass
+restarts with smaller tiles, down to 64 latent frames. A failure at the smallest
+tile reports insufficient memory. Compute failures and cancellation do not retry.
+A graph that fits keeps the existing untiled math. Tiling can introduce small
+differences at seams. Internal probes can set `VAEEncoder::graph_budget` or
+`VAEGGML::graph_budget` to a per-backend byte limit; zero uses device memory.
+Measurements use a separate scheduler and disposable graph metadata, because
+GGML's reservation query rewrites graph edges and allocator bookkeeping.
+
+## Timbre references and numerical failures
+
+The experimental ACE request field `timbre_reference_window` defaults to `false`.
+When enabled, references shorter than 30 seconds repeat to at least 30 seconds.
+The encoder input joins the centre 10 seconds of each third, giving 750 latent
+frames. Fixed centres make the selection reproducible. The Python reference
+chooses a random segment within each third instead.
+
+Raw audio is windowed before VAE encoding. Pre-encoded timbre latents are
+windowed after loading, so Node keeps caching the whole-file VAE result in
+both modes. The engine makes a separate feature buffer for each request;
+the cache never contains windowed features or rendered output. The Node
+generation parameter is `timbreReferenceWindow`; there is no UI control yet.
+
+`timbre_reference_strength` (default 1, clamped to 0 to 1) scales how far the
+reference moves the condition encoder's single timbre token from the token it
+gives for no reference: `token = none + k * (ref - none)`, where `none` comes
+from the same silence frame the no-reference path feeds the timbre encoder.
+`ops_encode_text` (`pipeline-synth-ops.cpp`) computes `none` with one extra
+condition-encoder pass and blends the token in the main, non-cover and
+negative-prompt encodings, so the GGML and TensorRT DiT paths both see it. At
+exactly 1 the blend is skipped and the render is bit-identical to a build
+without the field. At 0 the reference is dropped before encoding, so the render
+matches no reference bit for bit. The dial does not touch the reference latents,
+so it stays out of Node's latent cache key. Extrapolating the token past 1 was
+tried and rejected: the render moved away from the reference instead of further
+towards it, and the XL models clipped. A stronger pull would need guidance on
+the reference inside the DiT loop, at the cost of an extra DiT pass per
+evaluation. The Node parameter is `timbreReferenceStrength`, sent only with a
+timbre reference and only when it is not 1.
+
+All synthesis backends reject NaN or infinity in decoded PCM before encoding a
+successful result. The shared `synth-finite.h` check logs
+`[Synth-Finite] <stage>: N non-finite values out of M`; the Node job failure
+includes that stage and count. MM3 checks both vocoder paths, YuE2 checks full
+and tiled VAE output plus the final plugin result, HeartMuLa checks codec output,
+and SA3 checks native and plugin decoding. SA3 never falls back to native decode
+after a plugin callback returns invalid PCM. Finite samples are read without
+modification. `engine/tests/test-synth-finite.py` probes decoder assembly on the
+CPU with injected graph output, without model weights.
+
+SA3 returns the finite-check diagnostic in the HTTP 500 JSON `error` field for
+both `/sa3-synth` and `/sa3-refine`. The Node job reads the response body, so its
+stage and count do not depend on when stderr arrives.
+`engine/tests/test-sa3-finite-error.cpp` checks native decode, a swallowed Lua
+decode failure, invalid plugin output and finite recovery through the real SA3
+orchestration with a CPU graph double.
+
+ACE synthesis also rejects NaN or infinity in DiT output, after latent shift and
+rescale, and after native, plugin and PP-VAE decodes. It reports the stage
+and number of invalid values instead of letting the WAV writer replace them
+with silence. Node preserves the `[Synth-Finite]` diagnostic in the failed
+generation's error through the engine log subscription.
 
 ## How ace-server is organised
 
@@ -365,7 +826,12 @@ caption + lyrics -> prompt assembly and caption cleaning (mm3-request.h)
 (`mm3-{lm,depth,cond,dit,voc}-<quant>.gguf`) and older `mm3-synth-*` bundles still
 load. `mm3-plugins.h` lets the same Lua solvers, schedulers and guidance run on the
 MM3 flow stage. `mm3-ar-cache.h` and `mm3-hiddens-file.h` cache the planner output
-so a re-render can skip stage 1. Deeper notes, including the trap list, are in
+so a re-render can skip stage 1. When both code streams are forced (a full plank,
+hard pin), the planning loop is skipped too: `mm3_lm_replay_frames` re-derives the
+LM hiddens as a chunked teacher-forced prefill and `mm3_depth_replay_run` the seven
+depth hiddens as one 8-token forward per frame, in batches of 128 frames. The result
+matches the frame loop to rounding, not to the bit; `MM3_FORCED_REPLAY=0` runs the
+loop instead. Deeper notes, including the trap list, are in
 `.claude/skills/mm3-backend/SKILL.md`.
 
 ### MM3 latent refiner: audio in, audio out
@@ -445,13 +911,20 @@ include point in `hot-step-server.cpp`.
 
 ### YuE2: plan, compose, render
 
+YuE2 accepts an empty style, including in each entry of a batched request. A request
+with `codec_ids` and no ABC skips score planning even when CoT is enabled. Uploaded
+continuations use `continue_codec_ids: true` with CoT off. Node captures the source URL
+and section in `yue2Continuation`, tokenizes through the existing cached `yue2-guide`
+path, and slices the best raw code per frame at 25 Hz. Prefix jobs do not coalesce with
+other jobs and use a single song, preserving their own seed and variation noise seeds.
+
 ```
 style + lyrics (+ optional ABC) -> tokenizer and prompt assembly (yue2-tokenizer.h)
   -> plan stage: ABC lead sheet, only when cot is "melody" or "full"
   -> semantic stage: the AR "composer" (yue2-lm-graph.h) samples codec ids
   -> NAR stage: mixture-of-transformers flow matching with a midpoint ODE solver
      (yue2-nar-graph.h), optionally chunked (nar_chunk_frames)
-  -> Oobleck VAE decode, "standard", "legacy" or local "dec2x" variant (yue2-vae-graph.h)
+  -> Oobleck VAE decode, "standard", "legacy", "rs-x3" or local "dec2x" variant (yue2-vae-graph.h)
   -> stitch; a track that peaks past full scale is scaled to -0.3 dBFS (yue2_peak_scale)
   -> 16-bit WAV (yue2-pipeline.h, yue2-job.h)
 ```
@@ -546,7 +1019,24 @@ decoder's own unit list; the encoder keeps `res_dilations`) and a 40-frame decod
 because the extra units widen the receptive field to 29 frames. Build one with
 `tools/yue2-vae-train` (train, then `export.py`, then `convert-yue2.py --src-vae-dec2x`);
 `yue2-probe --vae-roundtrip <in.f32> <out.f32> --vae <variant>` measures what any VAE
-loses on real audio. The
+loses on real audio.
+
+`rs-x3` (`yue2-vae-rs-x3-f32.gguf`, on Hugging Face) is Ruach Studio's YuE2-VAE-RS x3
+decoder (goldhub/YuE2-VAE-RS-x3) with Standard's encoder. Its decoder adds three
+2048-wide units at the latent rate between `dec.conv_in` and the first block
+(`dec.pre.<i>.*`, listed by `yue2vae.dec_pre_dilations`) and has 6 units per block. Its
+receptive field is 60 frames, so the file sets a 60-frame halo; never lower it to save
+VRAM, lower the core instead. `yue2vae.strict_f32` marks every decoder GEMM with
+HOT-ggml's `GGML_HINT_STRICT_F32`: CUDA otherwise runs F32 products on TF32, about 1e-3
+off the reference, against the release's 1e-4 tolerance. Build it with
+`convert-yue2.py --src-vae <Standard dir> --src-vae-rs-x3 YuE2-VAE-RS-x3_v1.safetensors`.
+`yue2-probe --vae-parity <fixture> --variant rs-x3` checks a decode against a PyTorch
+fixture (`04_vae/input_latents.bin`, `04_vae/rs-x3/output_audio{,_full}_planar.bin`). The
+upstream kit's stride-5 transposed conv carries `output_padding=1`, so its output is
+1920·T samples against our 1920·T − 64; zero that padding when making the fixture. The
+release ships F32 only: weight-only F16 and BF16 copies miss its 1e-4 verify tolerance
+(5.9e-3 and 5.1e-2). `GET /yue2/props` header-probes any VAE slot that has no file
+yet, so a VAE downloaded after startup appears without an engine restart. The
 NAR stage can use Lua solvers and schedulers through `infer_method` and
 `scheduler`. A song's composer (semantic stage) stops at `plan_cutoff` (default 1.5)
 times its plan's length plus 20 s (`yue2_plan_cap_frames`, the bars x beats / tempo
@@ -568,7 +1058,16 @@ and logs any disagreement. A failed YuE2 job logs its reason
 as `[YuE2-Job] <id>: FAILED: <error>`. A `plan_only` request takes up to
 `YUE2_MAX_PLAN_BATCH` (8) `songs` entries against 4 for a render, reported by `/yue2/props`
 as `max_plan_batch`; the server's auto-replan uses it to draw every batch member's plan
-attempts in one pass. During the semantic stage, `GET /job` carries `songs_done`, a bitmask
+attempts in one pass. With `plan_continue`, a song that brought an `abc` joins the plan batch
+instead of skipping the model: its prompt is the planning prefix plus the encoded `abc`, and
+`history` starts at the `abc` ids, so the sampler's step, repetition window and `min_tokens`
+match a planner that reached the section by itself (the sampler's step is `history.size()`,
+which equals the loop step on the old path). Each sampled token's bytes are appended to a
+per-song string and `yue2_plan_section_cut` (`yue2-request.h`) looks for a newline followed by `%` from the new
+bytes, the prefix's last newline included; a hit cuts the text there, even inside a token,
+and ends the row as `section_end`. The returned score is that text, never a re-decode, so
+the prefix comes back byte-for-byte. `engine/tests/test-yue2-plan-continue.cpp` covers the
+parse, the stop rule and the tokenizer prefix property (`YUE2_TOKENIZER_DIR`). During the semantic stage, `GET /job` carries `songs_done`, a bitmask
 of the batch's songs that have ended and are waiting on the rest (0 in every other stage and
 family). `POST /job?id=N&drop_songs=MASK` takes songs out of a running batch
 (`Job::songs_dropped`, read through `Yue2Request::songs_dropped`): the plan and semantic
@@ -594,6 +1093,24 @@ GGUF. YuE2 generation captures the approved score as `yue2Abc` and source
 identity as `yue2Cover`; the engine composes from the score rather than
 conditioning its audio renderer on the recording. Without `--melody-only`,
 `yue2-sheet` retains its full-score training default.
+
+The merged `sheetsage2` GGUF can be requantized with
+`quantize sheetsage2-f16.gguf sheetsage2-q8_0.gguf Q8_0`.
+The quantizer preserves mel buffers, learned decoder positions, convolution
+kernels, including the converter's squeezed 2-D kernels, and the final encoder
+block's attention weights. That last group stays float for the loader's F32
+promotion. Other linear projections and the tied token embedding use Q8_0.
+The encoder and decoder remain in one file.
+
+Five 20-second clips covering pop, electronic, metal, reggae and acoustic music
+produced byte-identical full-score ABC at F16 and Q8_0 on Metal. This checks those
+clips only. The file shrank from 1,360,020,736 to 805,249,312 bytes; the Metal
+weight buffer under the default transcription settings shrank from 2,498.7 to
+919.9 MiB. These are weight allocations, not total unified-memory use. Quantized
+weights remain quantized when the default `exact` mode requests F32 promotion;
+the loader emits an unsupported-type warning and loads them as-is. That mode
+cannot recover precision discarded by quantization. Publication and a model
+catalogue entry require a separate decision.
 
 Source guidance is the optional second path from the recording to the render.
 `ace-train yue2-guide` runs MERT and the tokenizer head over the source with
@@ -866,12 +1383,36 @@ Other adapter paths:
   runtime DoRA gets a one-time norm pass (`mm3-lm-dora.h`), and `adapter_runtime_dora`
   re-normalises it for the request's scale dials. MM3 DiT LoRAs and DoRAs merge at
   load (`mm3-adapter.h`). A runtime MM3 LM adapter can change strength along the
-  song (`lm_adapter_fade_*`, `MM3LmAdapterSchedule` in `mm3-lm-adapter.h`): the AR
+  song (`lm_adapter_fade_*`, `MM3LmAdapterSchedule` in `mm3-lm-adapter.h`; a diagnostic
+  since the app's Adapter Tail Fade was withdrawn, because the base on the adapter's KV
+  cache collapsed capped plans into repetition and static): the AR
   loop re-sets the scales between iterations, which rebuilds the decode graph and
-  keeps the KV cache. The plan dial (`lm_adapter_plan` < 1) adds a base copy of every
+  keeps the KV cache. In merge mode (`MM3ArOptions::lm_adapter_merged`) the graph keeps
+  the merged weights and, below full strength, carries the adapter again at
+  `(mult - 1)` times its scale, so the body runs the plain merged graph; plain LoRA and
+  PiSSA only (`mm3_lm_merge_fade_ok`), DoRA falls back to runtime. The plan dial (`lm_adapter_plan` < 1) adds a base copy of every
   take's CFG pair (`MM3LmGraph::base_rows`), masks the adapter delta off on those rows
   with a resident `[1, 1, B]` tensor in the KV buffer, and mixes the two models' logits
-  before the semantic draw (`mm3-ar-loop.h`).
+  before the semantic draw (`mm3-ar-loop.h`). The LM may then run up to
+  `MM3_MAX_LM_ROWS` (16) rows. Past 8 rows ggml takes MMQ, which measured faster than
+  splitting into 8-row matrix-vector matmuls (`MM3_LM_ROW_SPLIT=1`): 31.5 against 38.2 ms
+  per AR iteration at 16 rows on a 5090. The request's `lm_kv_q8` stores the KV cache at
+  Q8_0 so 4 takes fit. The depth decoder and flow stage only see the adapter rows.
+- Natural endings (`require_eos`, `mm3-pipeline.h`): the first round with an ending wins.
+  Every take of that round that ended (and passes `min_frames`) renders, up to the count
+  asked for; no later round is planned for the rest (HOTSTEP-1201; before that, rounds ran
+  until every asked-for take had ended). A bare `min_frames` floor without `require_eos`
+  still banks and re-plans.
+- Base handoff (`eos_handoff`, `mm3-pipeline.h`): with `require_eos`, in any round where no
+  take ended by itself, capped adapter takes are rescued in take order until the first rescue
+  ends, which renders alone. Each gets a cue from `mm3_align_handoff_cue` (`mm3-align.h`): the LRC replay of the whole
+  take, and the DTW again on its first `cap - 50 s` columns (decode attention is causal, so no
+  second replay); the last line both place within 2 s, plus 25 s. The rescue pass is
+  `mm3_ar_plan_takes` with the prefix forced and `forced_continue`, one take, no adapter
+  (merge mode: `MM3GenRequest::handoff_swap` reloads the pristine LM first and merges again
+  before any later round; the delta is never subtracted from quantized weights), so the base
+  builds its own KV. A kept rescue renders its capped plan's windows up to the crossfade (the full-length
+  window plan, `MM3TakeRun::NW_stop`) and the base plan in full, then splices them.
 - YuE2 adapters merge at load (`yue2-adapter.h`): AR (composer) and NAR files in
   LoRA, LoKr or DoRA form (`yue2-{ar,nar}-{lora,lokr,dora}-v1`), chosen with
   `POST /yue2/select-model`. On a ConvRot INT8 base the LoRA factors are applied at
@@ -979,6 +1520,11 @@ used by `--weights bf16` on a q8_0 base). It writes machine-readable JSONL on st
 human logs on stderr, and exits 0 on success, 1 on a runtime failure and 2 on bad
 usage. `ace-train --help` prints the full option list.
 
+PiSSA delta adapters record the exact residual file used at initialization.
+The MM3 loader refuses a fingerprint mismatch; older adapters retain their
+existing checks. See [PiSSA residuals](training-internals.md#pissa-residual-the-frozen-half-shipped-once-2026-09-09)
+for the tensor format, generation warning and CPU regression check.
+
 | Subcommand | Purpose |
 |---|---|
 | `preprocess` | Build per-song tensor caches from an ACE-Step dataset |
@@ -1042,7 +1588,7 @@ behind them, are in [training-internals.md](training-internals.md).
 
 ## The ggml fork
 
-`engine/ggml` is a submodule pinned to the `hot-step-neutral` branch of HOT-ggml, a fork of
+`engine/ggml` is a submodule pinned to the `hot-step-0.29` branch of HOT-ggml, a fork of
 ggml-org/ggml. Every HOT-Step change to ggml is a commit on that branch, so a checkout and
 build leave `engine/ggml` clean and nothing is applied at configure time.
 
