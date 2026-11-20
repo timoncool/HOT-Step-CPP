@@ -11,7 +11,9 @@
 #include "hot-step-fsutf8.h"  // hs_fopen/hs_rename/hs_remove — UTF-8 paths
 #include "yyjson.h"
 
+#include <cerrno>
 #include <cstdint>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -90,46 +92,17 @@ static inline int64_t stw_numel(const std::vector<int64_t> & shape) {
     return shape.empty() ? 0 : n;
 }
 
-// Replace `path` with `tmp`, never leaving the destination missing.
-//
-// A bare remove(path) + rename(tmp, path) (needed because Windows rename()
-// fails onto an existing file) destroys a previously VALID cache whenever the
-// rename then loses -- an AV/indexer handle on the just-closed temp, a
-// read-only directory, a cross-volume temp. The caller reports song_fail and
-// the user ends up with fewer cached songs than before the run. So: move the
-// old file aside first, rename into place, and only then drop the aside copy;
-// on failure the old file is put back.
+// Publish a fully written sibling in one rename. A failed replacement leaves the previous file in place.
 static bool stw_replace_file(const char * tmp, const char * path) {
-    std::string aside;
-    bool        have_aside = false;
-
-    FILE * probe = hs_fopen(path, "rb");
-    if (probe) {
-        fclose(probe);
-        aside = std::string(path) + ".__old__";
-        hs_remove(aside);
-        have_aside = (hs_rename(path, aside) == 0);
-        if (!have_aside) {
-            hs_remove(path);  // could not move it aside; fall back to plain replace
-        }
+    std::error_code error;
+    std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), error);
+    if (error) {
+        fprintf(stderr, "[STWrite] rename %s -> %s failed: %s\n", tmp, path, error.message().c_str());
     }
-
-    if (hs_rename(tmp, path) != 0) {
-        if (have_aside) {
-            hs_rename(aside, path);  // put the good file back
-        }
-        return false;
-    }
-    if (have_aside) {
-        hs_remove(aside);
-    }
-    return true;
+    return !error;
 }
 
-// Write `tensors` (in order) + `__metadata__` to `path`. Returns false and
-// leaves no partial file on failure. Writes to `path + ".__writing__"` then
-// renames (removing an existing destination first -- Windows rename fails
-// otherwise).
+// Write tensors and metadata to a temporary sibling before publishing them together.
 static bool st_write_file(const char *                                             path,
                           const std::vector<STWTensor> &                           tensors,
                           const std::vector<std::pair<std::string, std::string>> & metadata,
@@ -203,7 +176,7 @@ static bool st_write_file(const char *                                          
     std::string tmp = std::string(path) + ".__writing__";
     FILE *      f   = hs_fopen(tmp, "wb");
     if (!f) {
-        fprintf(stderr, "[STWrite] cannot open %s for writing\n", tmp.c_str());
+        fprintf(stderr, "[STWrite] cannot open %s for writing: %s\n", tmp.c_str(), strerror(errno));
         return false;
     }
 
@@ -255,7 +228,7 @@ static bool st_write_file(const char *                                          
     if (ok) {
         ok = (fflush(f) == 0) && (ferror(f) == 0);
     }
-    fclose(f);
+    if (fclose(f) != 0) ok = false;
 
     if (!ok) {
         hs_remove(tmp);
@@ -264,7 +237,6 @@ static bool st_write_file(const char *                                          
     }
 
     if (!stw_replace_file(tmp.c_str(), path)) {
-        fprintf(stderr, "[STWrite] rename %s -> %s failed (previous file left intact)\n", tmp.c_str(), path);
         hs_remove(tmp);
         return false;
     }
