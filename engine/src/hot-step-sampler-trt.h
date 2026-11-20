@@ -168,6 +168,11 @@ static int dit_trt_generate(DitTrt *              trt,
     frequency_damping  = g_hotstep_params.frequency_damping;
     temporal_smoothing = g_hotstep_params.temporal_smoothing;
 
+    LuaPlugin *solver_plugin, *guidance_plugin;
+    if (!PluginRegistry::instance().resolve_dit_plugins(solver_name, guidance_mode, solver_plugin, guidance_plugin)) {
+        return -1;
+    }
+
     // Custom timesteps and the scheduler plugin are already applied to
     // `schedule` by ops_build_schedule (pipeline-synth-ops.cpp). Do not
     // rebuild it here (#124).
@@ -193,12 +198,6 @@ static int dit_trt_generate(DitTrt *              trt,
             batch_cfg ? ", CFG batched 2N" : (do_cfg ? ", CFG 2-pass" : ""));
 
     // ── Solver & guidance dispatch ──────────────────────────────────────
-    auto & plugin_reg = PluginRegistry::instance();
-    LuaPlugin * solver_plugin = plugin_reg.solver_lookup(solver_name);
-    if (!solver_plugin) {
-        fprintf(stderr, "[DiT-TRT] ERROR: unknown solver '%s', falling back to euler\n", solver_name);
-        solver_plugin = plugin_reg.solver_lookup("euler");
-    }
     fprintf(stderr, "[DiT-TRT] Solver: %s (%s)\n",
             solver_plugin->display_name.c_str(), solver_plugin->name.c_str());
 
@@ -212,11 +211,6 @@ static int dit_trt_generate(DitTrt *              trt,
     solver_state.frequency_damping = frequency_damping;
     solver_state.temporal_smoothing = temporal_smoothing;
 
-    LuaPlugin * guidance_plugin = plugin_reg.guidance_lookup(guidance_mode);
-    if (!guidance_plugin) {
-        fprintf(stderr, "[DiT-TRT] ERROR: unknown guidance '%s', falling back to apg\n", guidance_mode);
-        guidance_plugin = plugin_reg.guidance_lookup("apg");
-    }
     bool use_apg_native = (guidance_plugin && guidance_plugin->name == "apg");
     fprintf(stderr, "[DiT-TRT] Guidance: %s (%s)%s\n",
             guidance_plugin->display_name.c_str(), guidance_plugin->name.c_str(),

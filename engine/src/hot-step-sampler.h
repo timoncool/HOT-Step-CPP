@@ -93,6 +93,11 @@ static int dit_ggml_generate(DiTGGML *           model,
     frequency_damping  = g_hotstep_params.frequency_damping;
     temporal_smoothing = g_hotstep_params.temporal_smoothing;
 
+    LuaPlugin *solver_plugin, *guidance_plugin;
+    if (!PluginRegistry::instance().resolve_dit_plugins(solver_name, guidance_mode, solver_plugin, guidance_plugin)) {
+        return -1;
+    }
+
     // Custom timesteps and the scheduler plugin are already applied to
     // `schedule` by ops_build_schedule (pipeline-synth-ops.cpp), before the
     // cover blend picks its start sigma. Do not rebuild it here (#124).
@@ -706,12 +711,6 @@ static int dit_ggml_generate(DiTGGML *           model,
     struct ggml_tensor * t_t = ggml_graph_get_tensor(gf, "t");
 
     // ── Solver dispatch setup (Lua plugin system) ────────────────────────
-    auto & plugin_reg = PluginRegistry::instance();
-    LuaPlugin * solver_plugin = plugin_reg.solver_lookup(solver_name);
-    if (!solver_plugin) {
-        fprintf(stderr, "[DiT] ERROR: unknown solver '%s', falling back to euler\n", solver_name);
-        solver_plugin = plugin_reg.solver_lookup("euler");
-    }
     fprintf(stderr, "[DiT] Solver: %s (%s, %d NFE/step, order %d)\n",
             solver_plugin->display_name.c_str(), solver_plugin->name.c_str(),
             solver_plugin->nfe, solver_plugin->order);
@@ -728,11 +727,6 @@ static int dit_ggml_generate(DiTGGML *           model,
     solver_state.temporal_smoothing = temporal_smoothing;
 
     // ── Guidance mode dispatch setup (Lua plugin system) ─────────────────
-    LuaPlugin * guidance_plugin = plugin_reg.guidance_lookup(guidance_mode);
-    if (!guidance_plugin) {
-        fprintf(stderr, "[DiT] ERROR: unknown guidance mode '%s', falling back to apg\n", guidance_mode);
-        guidance_plugin = plugin_reg.guidance_lookup("apg");
-    }
     bool use_apg_native = (guidance_plugin && guidance_plugin->name == "apg");
     fprintf(stderr, "[DiT] Guidance: %s (%s)%s%s\n",
             guidance_plugin->display_name.c_str(), guidance_plugin->name.c_str(),

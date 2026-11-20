@@ -82,6 +82,26 @@ public:
         return (it != solvers_.end()) ? &it->second : nullptr;
     }
 
+    bool resolve_dit_plugins(const char *solver_name, const char *guidance_name,
+                             LuaPlugin *&solver, LuaPlugin *&guidance) {
+        solver = solver_lookup(solver_name);
+        if (!solver) {
+            fprintf(stderr, "[DiT] Unknown solver '%s', trying euler\n", solver_name);
+            solver = solver_lookup("euler");
+        }
+        guidance = guidance_lookup(guidance_name);
+        if (!guidance) {
+            fprintf(stderr, "[DiT] Unknown guidance '%s', trying apg\n", guidance_name);
+            guidance = guidance_lookup("apg");
+        }
+        if (!solver || !guidance) {
+            fprintf(stderr, "[DiT] Required %s plugin missing; restore the engine/plugins directory\n",
+                    !solver ? "solver" : "guidance");
+            return false;
+        }
+        return true;
+    }
+
     LuaPlugin * scheduler_lookup(const char * name) {
         if (!name || !name[0]) {
             return schedulers_.empty() ? nullptr : &schedulers_.begin()->second;
