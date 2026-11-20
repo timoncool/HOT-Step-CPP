@@ -1,0 +1,58 @@
+[
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "sa3-dit-BF16.gguf",
+    "dest": "sa3-dit-BF16.gguf",
+    "bytes": 2908308288,
+    "sha256": "550ecd0f7dd7b8bd30c3da8e6370e39393898fd1c9eace3e10714f5102e80492"
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "sa3-same-enc-F16.gguf",
+    "dest": "sa3-same-enc-F16.gguf",
+    "bytes": 852575904,
+    "sha256": "465257fdea87aa80a3fe77459e6130a6eeeb230e4249aea5854edb6ce63fc7a5"
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "sa3-same-dec-F16.gguf",
+    "dest": "sa3-same-dec-F16.gguf",
+    "bytes": 852574880,
+    "sha256": "c9e6ec019d0aa834c575e839f331ddca90cc3e080a8fddfcfd57db058b308a69"
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "sa3-text-enc-BF16.gguf",
+    "dest": "sa3-text-enc-BF16.gguf",
+    "bytes": 1183213792,
+    "sha256": "9945540fe3d89d3a2736c7125cf9e677775013607e7a53840a7f2deed055a3ef"
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "tokenizer.json",
+    "dest": "onnx/sa3/tokenizer.json",
+    "bytes": 34362429,
+    "sha256": "7794135caa3ea73918949c902a781cc61dab674a4b59c17d85931c77c1114cbd"
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "tokenizer_config.json",
+    "dest": "onnx/sa3/tokenizer_config.json",
+    "bytes": 46437,
+    "sha256": null
+  },
+  {
+    "repo": "scragnog/HOT-Step-CPP-StableStep",
+    "revision": "22f23e05097301a50df2d4c1573514333069c8e0",
+    "file": "special_tokens_map.json",
+    "dest": "onnx/sa3/special_tokens_map.json",
+    "bytes": 636,
+    "sha256": null
+  }
+]

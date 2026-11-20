@@ -1,0 +1,32 @@
+name: Stable Audio 3 on Windows CPU
+on:
+  push:
+    branches: [qa/sa3-windows-cpu-3ce6eebb]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - run: python -m pip install numpy psutil
+      - run: python .github/sa3-runner.py download
+      - name: Build and measure both revisions on the same CPU
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\Common7\Tools\VsDevCmd.bat" -arch=x64
+          for %%r in (c21ebabe 3ce6eebb) do (
+            git worktree add --detach source-%%r %%r || exit /b 1
+            git -C source-%%r submodule update --init --depth 1 engine/ggml || exit /b 1
+            cmake -S source-%%r/engine -B build-%%r -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_VULKAN=OFF || exit /b 1
+            cmake --build build-%%r --target ace-server --parallel 4 || exit /b 1
+            python .github/sa3-runner.py %%r || exit /b 1
+          )
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stable-audio-cpu-results
+          path: results/
