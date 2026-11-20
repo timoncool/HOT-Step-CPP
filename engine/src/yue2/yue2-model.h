@@ -738,8 +738,22 @@ static void yue2_probe_file(const std::string & path, Yue2FileInfo * fi, bool is
 
     fi->file_bytes = (uint64_t) gf.file_size;
     fi->arch       = gf_get_str(gf, "general.architecture");
+    // Native yue2.cpp stores a JSON configuration and may label the quant with a string.
+    // Its weights need conversion before this backend can use them.
+    if (is_lm && gguf_find_key(gf.gguf, "yue2.config_json") >= 0 &&
+        gguf_find_key(gf.gguf, "yue2.embedding_length") < 0) {
+        fi->probe_error = "native yue2.cpp GGUF; select a HOT-Step YuE2 conversion";
+        if (errs && errs->size() < 24) {
+            errs->push_back(fi->name + ": " + fi->probe_error);
+        }
+        gf_close(&gf);
+        return;
+    }
     fi->license    = gf_get_str(gf, "general.license");
-    fi->file_type  = gf_get_u32(gf, "general.file_type");
+    const int64_t type_idx = gguf_find_key(gf.gguf, "general.file_type");
+    if (type_idx >= 0 && gguf_get_kv_type(gf.gguf, type_idx) == GGUF_TYPE_UINT32) {
+        fi->file_type = gguf_get_val_u32(gf.gguf, type_idx);
+    }
     fi->n_tensors  = (int) gguf_get_n_tensors(gf.gguf);
 
     uint64_t bytes = 0;
