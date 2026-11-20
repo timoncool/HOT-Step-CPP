@@ -45,7 +45,7 @@
     "file": "tokenizer_config.json",
     "dest": "onnx/sa3/tokenizer_config.json",
     "bytes": 46437,
-    "sha256": null
+    "sha256": "9546baec0dfefec0e29873edea9488ecde153f846e18c06ea48cb44587bf408f"
   },
   {
     "repo": "scragnog/HOT-Step-CPP-StableStep",
@@ -53,6 +53,6 @@
     "file": "special_tokens_map.json",
     "dest": "onnx/sa3/special_tokens_map.json",
     "bytes": 636,
-    "sha256": null
+    "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351"
   }
 ]
