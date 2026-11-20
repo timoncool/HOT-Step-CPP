@@ -140,6 +140,16 @@ What sets it apart:
   each variation as its own row inside one batch box, as it does for a YuE2 batch, and
   each finished variation is saved and listed as its own song (and sent to the playlist
   as its own track when that option is on).
+- On a card short of VRAM, the planner is fitted before anything loads. If the render
+  does not fit as asked, planner memory switches to 8 bits; then, for a one-song render
+  with Require Natural Ending on, fewer ending candidates are planned per round, down to
+  one. The generation log says what changed, and the seed renders differently in that
+  shape. If one candidate at 8 bits still does not fit, the job fails before loading
+  weights with the shortfall in its error: ask for fewer variations (offered when that
+  alone would fit), pick a smaller LM quant, or close other apps using the GPU. The song
+  is never shortened to fit. By the arithmetic, an 8 GB card with the Q4_K_M pack fits
+  one candidate at 8 bits; that is not yet confirmed on a real 8 GB card. Only CUDA
+  builds check. Mac, Vulkan and CPU builds render as before.
 - Flow Steps (default 20, range 2 to 60) is the main speed control. The checkpoint's
   own value is 30; an ear test heard no difference at 20. Below 30, Low-Step
   Compensation reshapes the schedule so short renders keep their low end and stereo
@@ -216,7 +226,12 @@ What sets it apart:
   adapter trained without BPM and key: Song Info BPM and key are left out, and a
   "<bpm> BPM, key of <key>." tail already on the caption (from a dataset caption) is
   removed. Training captions are unchanged.
-- The song decides its own length, up to six minutes, and there is no duration control.
+- The song decides its own length. Max Song Length (Generation cluster, 6 minutes by
+  default, 1 to 15) is the ceiling, not a target: the model still ends the song when the
+  lyrics and lead sheet are done. The model's context holds about 16 minutes including the
+  prompt, so long lyrics or a dense lead sheet shorten a 15-minute budget, and the engine
+  log says by how much (`music budget reduced to ...`). Longer songs take longer and need
+  more VRAM, most of all with several songs per batch.
 - Chain of Thought (Generation cluster) sets how much the planner writes before audio:
   Full (the default), Melody only, or Off. Off skips the lead sheet but runs guidance,
   which makes it the slowest mode, not the fastest.
@@ -289,7 +304,7 @@ What sets it apart:
   Generation panel.
 - Recompose runaway songs (2 by default) handles a good lead sheet composed into a
   runaway. A song counts as one once its composition passes 1.5 times the lead sheet's own
-  length plus 20 seconds, or six minutes. The engine composes it again with new seeds, up to
+  length plus 20 seconds, or the Max Song Length. The engine composes it again with new seeds, up to
   4 at a time, and keeps the first attempt that ends properly. All of it happens before any
   audio is rendered. Songs of a batch that have finished composing stop costing GPU time
   while the others carry on.
@@ -307,6 +322,14 @@ What sets it apart:
   batch carries on. That holds for the song whose job started the batch too. Batched decoding rounds
   differently from solo decoding, so a seed rendered in a batch can differ from the same
   seed rendered alone; the Batch Size setting has always had the same property.
+- The plan stage (the app's score pass before the render, and Score preview) waits as long
+  as the engine's phase or progress keeps moving, so a cold load of the composer and its
+  adapters can take longer than ten minutes. It gives up after five minutes with no change
+  (or an hour in all), cancels the planner and waits up to 30 seconds for it to stop. If it
+  stops, the render falls back to the engine's own plan as before; if it does not, the job
+  fails with that reason instead of queueing a render behind a planner that is still running.
+  Cancelling every song of a batch while it plans stops the stage; cancelling one leaves
+  the others planning.
 - With Keep Models in VRAM on (Settings, Environment tab), a composed song renders on a
   second engine lane while the next queued YuE2 song starts composing. The output is
   identical to a solo render. The two lanes share one GPU, so composing slows while a
@@ -448,7 +471,7 @@ controls the UI shows for it. "?" means not yet confirmed.
 | Text to music | Yes | Yes | Yes | Yes |
 | Lyrics | Yes | Yes | Yes | No |
 | Caption format | Free text, plus BPM, key and time signature fields | Structured Caption | Free text; BPM and key folded into the style | Free text, up to 256 tokens |
-| Duration | Set by you, 10 to 600 s | Model-ended, ceiling 300 s | Model-ended, up to 360 s, no control | Set by you, up to 600 s; Auto gives 30 s |
+| Duration | Set by you, 10 to 600 s | Model-ended, ceiling 300 s | Model-ended, up to 6 min by default, ceiling settable to 15 min | Set by you, up to 600 s; Auto gives 30 s |
 | Songs per request | Up to 9 | 1, or up to 4 with Variations Per Render | Up to 4 with Batch Size | 1 |
 | Cover Studio | Yes, source-audio conditioning | Yes, planner code forcing and source-audio blend | Yes, reviewed ABC composition conditioning | Yes, source-audio refine |
 | Repaint | Yes (Repaint) | No | No | No |

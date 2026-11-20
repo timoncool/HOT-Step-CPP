@@ -134,8 +134,8 @@ export function yue2TrackReplayParams(
   };
 }
 
-/** Mirrors the capability manifest's core.duration (max 360, auto: true). */
-const YUE2_MAX_DURATION_SEC = 360;
+/** Mirrors the capability manifest's core.duration (max 900, auto: true). */
+const YUE2_MAX_DURATION_SEC = 900;
 
 const DETAIL_POLL_MS = 1_500;
 
@@ -330,7 +330,7 @@ export function yue2LmOverrides(params: Record<string, unknown>, notes: string[]
     ['yue2PlanMaxTokens', 'plan_max_tokens'],
     ['yue2SemTemperature', 'semantic_temperature'], ['yue2SemTopP', 'semantic_top_p'], ['yue2SemTopK', 'semantic_top_k'],
     ['yue2SemRepPenalty', 'semantic_repetition_penalty'], ['yue2SemRepWindow', 'semantic_penalty_window'],
-    ['yue2SemMinTokens', 'semantic_min_tokens'], ['yue2SemMaxTokens', 'semantic_max_tokens'],
+    ['yue2SemMinTokens', 'semantic_min_tokens'],
     ['yue2SemMinP', 'semantic_min_p'], ['yue2CfgMinP', 'cfg_min_p'], ['yue2CfgRescale', 'cfg_rescale'],
     ['yue2EndThreshold', 'end_threshold'], ['yue2EndBias', 'end_bias'],
     ['yue2EndBiasFrom', 'end_bias_from_sec'], ['yue2EndBiasRamp', 'end_bias_ramp_sec'],
@@ -557,6 +557,13 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
   const chunkRaw = Number(params.yue2NarChunkSeconds);
   const nar_chunk_frames = Number.isFinite(chunkRaw) && chunkRaw > 0 ? Math.round(Math.min(chunkRaw, 600) * 25) : undefined;
 
+  // Generation dropdown's Max Song Length (index.ts's yue2MaxMinutes): the
+  // composer's frame cap. Unset keeps the checkpoint's own 9000 frames (6 min).
+  // The engine shortens it further when the prompt leaves less model context.
+  const maxMinRaw = Number(params.yue2MaxMinutes);
+  const semantic_max_tokens = Number.isFinite(maxMinRaw) && maxMinRaw > 0
+    ? Math.round(Math.min(maxMinRaw * 60, YUE2_MAX_DURATION_SEC) * 25) : undefined;
+
   // From the job's pick (#204): the model picker's VAE, captured at submit.
   // '' (never chosen) renders standard.
   const vae_variant: Yue2SynthRequest['vae_variant'] =
@@ -666,6 +673,7 @@ export function mapYue2Params(params: any, pick: Yue2PersistedSelection = yue2Re
     lyrics: lyrics || undefined,
     cot,
     ...(lmOverrides as Partial<Yue2SynthRequest>),
+    ...(semantic_max_tokens !== undefined ? { semantic_max_tokens } : {}),
     ...(params.yue2CfgLogprob === true ? { cfg_logprob: true } : {}),
     ...(lm_batch_size > 1 ? { lm_batch_size } : {}),
     ...(synth_batch_size > 1 ? { synth_batch_size } : {}),
@@ -777,9 +785,24 @@ function yue2JobParams(job: GenerationJob): any {
     ...(captured.cover.cfgScale !== undefined ? { yue2CfgScale: captured.cover.cfgScale } : {}) } : job.params;
 }
 
+/** Plans finished for a follower whose batch lead was cancelled mid-plan. The
+ *  follower goes back to the queue and its request is rebuilt from its params,
+ *  so the chosen score and seed wait here (a re-plan could draw another seed). */
+const yue2RetainedPlans = new WeakMap<GenerationJob, { abc: string; seed: Yue2SynthRequest['seed']; autoReplan?: Yue2AutoReplan }>();
+
+function applyRetainedPlan(job: GenerationJob, req: Yue2SynthRequest): boolean {
+  const kept = yue2RetainedPlans.get(job);
+  if (!kept || req.abc) return false;
+  req.abc = kept.abc;
+  req.seed = kept.seed;
+  return true;
+}
+
 /** The /yue2/synth request a job would send, without sending it. */
 export function yue2RequestForJob(job: GenerationJob): Yue2SynthRequest {
-  return mapYue2Params(yue2JobParams(job), jobPick(job)).req;
+  const { req } = mapYue2Params(yue2JobParams(job), jobPick(job));
+  applyRetainedPlan(job, req);
+  return req;
 }
 
 async function prepareYue2Job(job: GenerationJob, attempt?: GenerationAttempt, signal?: AbortSignal): Promise<Yue2PreparedJob> {
@@ -860,7 +883,10 @@ async function prepareYue2Job(job: GenerationJob, attempt?: GenerationAttempt, s
   log('INFO', `[YuE2] Style sent: ${req.style}`);
   if (req.lyrics) log('DEBUG', `[YuE2] Lyrics sent (${req.lyrics.length} chars):\n${req.lyrics}`);
 
-  return { job, req, abcSupplied: section ? false : abcSupplied, caption, halves, timing, pipelineStart, log, attempt, cover: captured?.cover, trimStart };
+  const retained = applyRetainedPlan(job, req);
+  const autoReplan = retained ? yue2RetainedPlans.get(job)!.autoReplan : undefined;
+  yue2RetainedPlans.delete(job);
+  return { job, req, abcSupplied: section ? false : abcSupplied, ...(retained ? { abcPlanned: true } : {}), ...(autoReplan ? { autoReplan } : {}), caption, halves, timing, pipelineStart, log, attempt, cover: captured?.cover, trimStart };
 }
 
 // ── Auto-replan ──
@@ -914,7 +940,7 @@ export function yue2ReplanSeed(base: Yue2Seed, k: number): Yue2Seed {
 }
 
 /** @internal exported for tests */
-export async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
+export async function planYue2Jobs(members: Yue2PreparedJob[], _leadSignal?: AbortSignal, wait: Yue2PlanWaitOpts = {}): Promise<void> {
   type Pending = {
     m: Yue2PreparedJob; maxAttempts: number; replanFlags: boolean; instrumental: boolean;
     once: boolean; sheets: string[]; done: boolean; seedBase?: Yue2Seed;
@@ -980,8 +1006,16 @@ export async function planYue2Jobs(members: Yue2PreparedJob[]): Promise<void> {
     try {
       plans = await runYue2PlanBatch(live[0].m.req, jobPick(live[0].m.job), draws.map(d => ({
         style: d.p.m.req.style, ...(d.p.m.req.lyrics ? { lyrics: d.p.m.req.lyrics } : {}), seed: d.seed,
-      })));
+      })), {
+        // The lead's signal is one song's X (the cancel route sets its status too): the rest keep
+        // planning, and the stage stops only when nobody is left.
+        cancelled: () => pending.every(p => (p.m.job.status as string) === 'cancelled'), ...wait,
+      });
     } catch (err: any) {
+      // A planner that will not stop would hold the engine: no fallback render behind it.
+      if (err instanceof Yue2PlanStuckError) throw err;
+      // Cancelled (not a failure): the caller sees the status and winds the batch down.
+      if (err?.message === 'Cancelled') break;
       for (const p of live) {
         p.m.log('WARNING', `[YuE2] Auto-replan round ${round} failed (${err?.message || err}); `
           + (p.m.autoReplan!.attempts.length ? 'picking from the plans already drawn' : "rendering with the engine's own plan"));
@@ -1178,7 +1212,8 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
   const releaseFollowers = (reason: string) => {
     for (const m of members.slice(1)) {
       if ((m.job.status as string) === 'cancelled') { failYue2Job(m.job, new Error('Cancelled')); continue; }
-      m.log('WARNING', `[YuE2] ${reason}; this song goes back to the queue to render on its own`);
+      if (m.abcPlanned && m.req.abc) yue2RetainedPlans.set(m.job, { abc: m.req.abc, seed: m.req.seed, autoReplan: m.autoReplan });
+      m.log('WARNING', `[YuE2] ${reason}; this song goes back to the queue to render on its own${m.abcPlanned ? ', keeping its finished plan' : ''}`);
       m.job.coalescedInto = undefined;
       deps.assignFollower?.(m.job, null);
       m.job.status = 'pending';
@@ -1189,7 +1224,13 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
   };
 
   // ── Plan ── every member at once (planYue2Jobs)
-  await planYue2Jobs(members);
+  try {
+    await planYue2Jobs(members, deps.signal);
+  } catch (err: any) {
+    // Planner stuck: fail every member (followers too, they would queue behind it).
+    for (const m of members) failYue2Job(m.job, err);
+    return;
+  }
   if ((job.status as string) === 'cancelled') {
     releaseFollowers('The batch lead was cancelled while planning');
     failYue2Job(job, new Error('Cancelled'));
@@ -1336,8 +1377,8 @@ export async function runYue2Generation(job: GenerationJob, deps: Yue2Generation
 
     try {
       await deps.pollUntilDone(sub.job_id, pollView, deps.signal, timeoutMinutes, {
-        // No chunk cap means the engine can render the full 360 s song at 25 fps.
-        narChunkFrames: req.nar_chunk_frames || 9000,
+        // No chunk cap means the engine can render the whole song at 25 fps.
+        narChunkFrames: req.nar_chunk_frames || req.semantic_max_tokens || 9000,
         // Decode and output can stay silent while processing a whole batch.
         // Keep the wall-clock deadline, rather than cancelling at 15 minutes.
         quietCompletionPhases: ['vae_decode', 'vae', 'encoding_output'],
@@ -1559,6 +1600,7 @@ async function finishYue2Job(
     // Spectral Lifter stay excluded regardless — both are ACE-VAE-coupled,
     // not rate-coupled.
     let masteredUrls: string[] = [];
+    let ppQualityScores: Array<{ unmastered?: unknown; mastered?: unknown }> = [];
     try {
       const ppParams: PostProcessParams = {
         ...job.params,
@@ -1574,6 +1616,7 @@ async function finishYue2Job(
           log, (stage) => { job.stage = stage; },
         );
         masteredUrls = ppResult.masteredUrls ?? [];
+        ppQualityScores = ppResult.qualityScores ?? [];
         const ppMs = Math.round(performance.now() - ppStart);
         if (masteredUrls.some(Boolean)) log('INFO', `[YuE2] Post-processing produced ${masteredUrls.filter(Boolean).length} file(s) in ${ppMs} ms`);
         timing.push({ name: 'Post-processing', ms: ppMs });
@@ -1714,7 +1757,7 @@ async function finishYue2Job(
         songId, job.userId, trackTitle, req.lyrics || '', style, req.style,
         audioUrls[i], duration, 0, '', '',
         JSON.stringify([]), 'yue2', JSON.stringify(trackParams),
-        masteredUrls[i] || '', '', '',
+        masteredUrls[i] || '', '', (q => (q?.unmastered || q?.mastered) ? JSON.stringify(q) : '')(ppQualityScores[i]),
         '', 'yue2',
       );
       songIds.push(songId);
@@ -1816,7 +1859,7 @@ export async function runYue2PlanPreview(params: any, signal?: AbortSignal): Pro
   delete planReq.abc;
 
   const sub = await yue2Synth(planReq);
-  await waitYue2PlanJob(sub.job_id, signal);
+  await waitYue2PlanJob(sub.job_id, { signal, cancelMessage: 'Score preview cancelled' });
   const detail = await yue2FinalDetail(sub.job_id);
   const abc = (detail.abc ?? '').trim();
   if (!abc) throw new Error('YuE2 returned no score for the plan stage');
@@ -1830,38 +1873,74 @@ export async function runYue2PlanPreview(params: any, signal?: AbortSignal): Pro
   return { abc, seed: detail.tracks?.[0]?.seed ?? planReq.seed ?? -1, end_reason, stage_end_reasons: detail.stage_end_reasons, health: classifyYue2Score(abc, end_reason, planReq.lyrics ?? '', activeStyleNorms(pick)), notes, ...(semantic_ids ? { semantic_ids } : {}) };
 }
 
-async function waitYue2PlanJob(jobId: string, signal?: AbortSignal): Promise<void> {
+/** The planner could not be confirmed stopped after a cancel or timeout. The
+ *  engine is single-threaded, so a render submitted now would queue behind it:
+ *  callers fail instead of falling back. */
+export class Yue2PlanStuckError extends Error {}
+
+/** Plan-stage waits. The stage is seconds warm, but a cold load of the LM and
+ *  its adapters can run for many minutes with the phase and its counters
+ *  moving, so the limit is silence, not total time; the hard cap only stops a
+ *  planner that keeps moving forever. */
+export const YUE2_PLAN_WAIT = { inactivityMs: 5 * 60_000, hardCapMs: 60 * 60_000, graceMs: 30_000, pollMs: 750 };
+
+export interface Yue2PlanWaitOpts extends Partial<typeof YUE2_PLAN_WAIT> {
+  signal?: AbortSignal;
+  /** True once nobody wants the result (every batch member cancelled). */
+  cancelled?: () => boolean;
+  /** Message thrown on a confirmed cancel. */
+  cancelMessage?: string;
+}
+
+/** @internal exported for tests */
+export async function waitYue2PlanJob(jobId: string, opts: Yue2PlanWaitOpts = {}): Promise<void> {
+  const o = { ...YUE2_PLAN_WAIT, ...opts };
   const started = Date.now();
-  // ponytail: 10-minute ceiling on a stage that takes seconds; the shared
-  // pollUntilDone watchdog is built around a GenerationJob this call has none of.
+  let lastKey = '', lastMove = started;
+  let why: string;
   for (;;) {
-    if (signal?.aborted) {
-      await aceClient.cancelJob(jobId).catch(() => {});
-      throw new Error('Score preview cancelled');
+    if (o.signal?.aborted || o.cancelled?.()) { why = 'cancel'; break; }
+    let status: Awaited<ReturnType<typeof aceClient.pollJob>>;
+    try { status = await aceClient.pollJob(jobId); } catch (e: any) {
+      // The planner may still be running: stop it and see it stop before anyone falls back.
+      why = `status poll failed: ${e?.message || e}`; break;
     }
-    const status = await aceClient.pollJob(jobId);
     if (status.status === 'done') return;
     if (status.status === 'failed' || status.status === 'cancelled') {
       const detail = (status as { error?: string }).error;
       throw new Error(`YuE2 plan ${status.status}${detail ? `: ${detail}` : ''}`);
     }
-    if (Date.now() - started > 10 * 60_000) {
-      await aceClient.cancelJob(jobId).catch(() => {});
-      throw new Error('YuE2 plan stage timed out after 10 minutes');
-    }
-    await new Promise(r => setTimeout(r, 750));
+    // Only a changed phase or advancing counter is life; the same answer twice is not.
+    const key = [status.phase, status.phase_step, status.phase_total, status.adapter_progress].join('|');
+    const now = Date.now();
+    if (key !== lastKey) { lastKey = key; lastMove = now; }
+    if (now - started > o.hardCapMs) { why = `timed out after ${Math.round(o.hardCapMs / 60_000)} minutes`; break; }
+    if (now - lastMove > o.inactivityMs) { why = `stalled: no progress for ${Math.round(o.inactivityMs / 60_000)} minutes`; break; }
+    await new Promise(r => setTimeout(r, o.pollMs));
   }
+  // Stop it and see it stop before anyone submits more work behind it.
+  let cancelErr = '';
+  try { await aceClient.cancelJob(jobId, true); } catch (e: any) { cancelErr = ` (cancel request failed: ${e?.message || e})`; }
+  const deadline = Date.now() + o.graceMs;
+  for (;;) {
+    try { if ((await aceClient.pollJob(jobId)).status !== 'running') break; } catch { /* retry until the grace ends */ }
+    if (Date.now() >= deadline) throw new Yue2PlanStuckError(`YuE2 plan stage ${why === 'cancel' ? 'cancelled' : why}, but the planner did not stop within ${Math.round(o.graceMs / 1000)} s${cancelErr}; not rendering behind it`);
+    await new Promise(r => setTimeout(r, Math.min(o.pollMs, 250)));
+  }
+  // Stopped, but a failed cancel request is still worth telling.
+  if (cancelErr) throw new Error(`YuE2 plan stage ${why === 'cancel' ? 'cancelled' : why}${cancelErr}`);
+  throw new Error(why === 'cancel' ? (o.cancelMessage ?? 'Cancelled') : `YuE2 plan stage ${why}`);
 }
 
 /** One plan_only pass over several songs (up to props.max_plan_batch), each
  *  with its own prompt and seed, sharing `req`'s settings. Scores come back
  *  in entry order. */
-async function runYue2PlanBatch(req: Yue2SynthRequest, pick: Yue2PersistedSelection, songs: NonNullable<Yue2SynthRequest['songs']>): Promise<Array<{ abc: string; end_reason: string }>> {
+async function runYue2PlanBatch(req: Yue2SynthRequest, pick: Yue2PersistedSelection, songs: NonNullable<Yue2SynthRequest['songs']>, wait: Yue2PlanWaitOpts = {}): Promise<Array<{ abc: string; end_reason: string }>> {
   // Planner strength: the score is written under its own adapter load.
   const planReq: Yue2SynthRequest = { ...req, plan_only: true, songs, lm_adapter: yue2AdapterWire(yue2PlanStackFrom(pick.adapters)) };
   for (const k of ['lyrics', 'abc', 'seed', 'noise_seed', 'lm_batch_size', 'synth_batch_size'] as const) delete planReq[k];
   const sub = await yue2Synth(planReq);
-  await waitYue2PlanJob(sub.job_id);
+  await waitYue2PlanJob(sub.job_id, wait);
   const tracks = (await yue2FinalDetail(sub.job_id)).tracks ?? [];
   if (tracks.length !== songs.length) throw new Error(`YuE2 returned ${tracks.length} plan(s) for ${songs.length} song(s)`);
   return tracks.map(t => {

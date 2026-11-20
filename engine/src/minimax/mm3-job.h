@@ -69,6 +69,7 @@
 #include "mm3-lm-merge.h"
 #include "mm3-request.h"
 #include "mm3-server.h"
+#include "mm3-vram-fit.h"
 #include "audio-resample.h"
 #include "model-store.h"
 
@@ -257,6 +258,11 @@ struct MM3JobState {
     /** True when NO candidate was ever accepted and the longest capped plan was
      *  rendered anyway. The job succeeded, but not as the user asked. */
     bool     eos_fallback    = false;
+    /** VRAM fit (mm3-vram-fit.h): the planner's KV type and candidates per
+     *  round as this job runs them, and a note when the fit changed either. */
+    std::string lm_kv_type = "f16";
+    int         fit_takes  = 0;
+    std::string vram_note;
 
     bool    have_result = false;
     int64_t frames      = 0;
@@ -856,7 +862,8 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // through the mid-run handover.
     const std::string merge_backend = !req.lm_adapter.empty() && req.lm_adapter_mode == "merge" &&
         mm3_lm_merge_device_enabled(req.lm_adapter_merge_gpu) ? mm3_lm_merge_backend_identity() : "";
-    const std::string ar_key = mm3_ar_cache_key(g_mm3, req, merge_backend);
+    // Not const: the VRAM fit below may switch the KV type, which is in the key.
+    std::string ar_key = mm3_ar_cache_key(g_mm3, req, merge_backend);
 
     // ── AR cache, primed from disk ──────────────────────────────────────────
     //
@@ -956,12 +963,134 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     // `ar_from_file` stands in for `reuse_ar` here: loading a saved plan is an
     // explicit request to skip stage 1, so it must not also require the toggle
     // that governs the in-memory slot to be on.
-    const bool        ar_hit = (req.reuse_ar || ar_from_file) && st->n_takes <= 1 &&
-                        !g_mm3_ar_cache.key.empty() &&
-                        g_mm3_ar_cache.key == ar_key && g_mm3_ar_cache.frames > 0 &&
-                        (int64_t) g_mm3_ar_cache.hiddens.size() ==
-                            g_mm3_ar_cache.frames * (int64_t) g_mm3.lm_cfg.num_codebooks *
-                                (int64_t) g_mm3.lm_cfg.embedding_length;
+    //
+    // `slot_hit(q8, takes)`: the test above for a given KV type, whose key
+    // differs only by that flag.
+    auto slot_hit = [&](bool q8, int takes) {
+        std::string k = ar_key;
+        if (q8 != req.lm_kv_q8) {
+            const bool keep = req.lm_kv_q8;
+            req.lm_kv_q8    = q8;
+            k               = mm3_ar_cache_key(g_mm3, req, merge_backend);
+            req.lm_kv_q8    = keep;
+        }
+        return (req.reuse_ar || ar_from_file) && takes <= 1 && !g_mm3_ar_cache.key.empty() &&
+               g_mm3_ar_cache.key == k && g_mm3_ar_cache.frames > 0 &&
+               (int64_t) g_mm3_ar_cache.hiddens.size() ==
+                   g_mm3_ar_cache.frames * (int64_t) g_mm3.lm_cfg.num_codebooks *
+                       (int64_t) g_mm3.lm_cfg.embedding_length;
+    };
+
+    // n_ctx the AR stage will want: prompt + every frame it may emit, plus the
+    // slack mm3_lm_prepare() adds for the feedback position.
+    const int64_t n_ctx_needed = req.n_tokens + req.max_frames + 8;
+    // The plan dial doubles the LM rows (base pairs). Counted whenever it could
+    // apply; the AR loop may still stand it down (soft prompt), which only
+    // over-reserves.
+    const bool plan_rows = req.lm_adapter_plan < 1.0f && !req.lm_adapter.empty() && req.lm_adapter_mode != "merge";
+
+    // ── VRAM fit: does stage 1 fit, and in what shape? ──────────────────────
+    //
+    // mm3_vram_admit (mm3-vram-fit.h) takes the decisions in order. A valid hit
+    // as sent skips stage 1 and is never refused. Anything that plans fresh is
+    // fitted, including a saved plan ignored or rejected above. A changed shape
+    // is looked up again under its own key. The budget is what stage 1 can
+    // have: free VRAM, plus the ACE modules arbitration would evict, plus the
+    // MM3 parts and KV cache this run reuses. Stage 1 holds the LM and the depth
+    // decoder when staged, everything under keep-loaded. No measurement (Metal,
+    // Vulkan, CPU) means no gate unless MM3_VRAM_BUDGET_GB stands in for the
+    // whole budget. mm3_vram_need stays the eviction figure; it adds every role
+    // file and a 3 GB headroom, so as a gate it would refuse 24 GB cards that work.
+    bool ar_hit = false;
+    {
+        const bool   q8_in    = mm3_lm_kv_type(req.lm_kv_q8) == GGML_TYPE_Q8_0;
+        const bool   one_song  = req.gen.require_eos && req.gen.stop_after_first_eos;
+        const int    rows_take = mm3_cfg_rows(g_mm3.lm_cfg) * (plan_rows ? 2 : 1);
+        const size_t kv_row    = mm3_kv_bytes_estimate(g_mm3, n_ctx_needed, 1);
+        const size_t weights   = g_keep_loaded
+            ? (size_t) mm3_total_tensor_bytes(g_mm3) + (g_mm3.dit_backend == "tensorrt" ? (size_t) 1 << 30 : 0)
+            : (size_t) (g_mm3.lm_file.tensor_bytes + g_mm3.role_file[MM3_R_DEPTH].tensor_bytes);
+        const size_t resident  =
+            (g_keep_loaded ? mm3_vram_bytes(g_mm3) : g_mm3.vram_lm + g_mm3.vram_depth) + g_mm3_lm.kv_bytes;
+        const size_t ace = !g_mm3.loaded && g_store ? store_vram_bytes(g_store) : 0;
+
+        const char * env_b    = std::getenv("MM3_VRAM_BUDGET_GB");
+        const double env_gb   = env_b && env_b[0] ? atof(env_b) : 0.0;
+        size_t       free_b   = 0, total_b = 0;
+        const bool   measured = env_gb > 0.0 || mm3_cuda_free_bytes(&free_b, &total_b);
+        const size_t budget   = env_gb > 0.0 ? (size_t) (env_gb * 1073741824.0) : free_b + ace + resident;
+        const double GB       = 1073741824.0;
+        const int    takes_in = st->n_takes;
+
+        // The fit reports the effective type; the slot is keyed on the flag.
+        // Same flag when the type is unchanged, true when the fit switched it.
+        const MM3AdmitResult adm = mm3_vram_admit(
+            [&](bool q8, int takes) { return slot_hit(q8 == q8_in ? req.lm_kv_q8 : true, takes); }, measured,
+            budget, weights, kv_row, rows_take, takes_in, q8_in, mm3_lm_kv_type(true) == GGML_TYPE_Q8_0, one_song);
+        const MM3VramFit & f = adm.fit;
+
+        std::string note;
+        if (adm.fitted) {
+            char head[256];
+            if (env_gb > 0.0) {
+                snprintf(head, sizeof(head), "budget %.2f GB (MM3_VRAM_BUDGET_GB)", (double) budget / GB);
+            } else {
+                snprintf(head, sizeof(head), "budget %.2f GB (%.2f free, %.2f ACE, %.2f MM3 reused)",
+                         (double) budget / GB, (double) free_b / GB, (double) ace / GB, (double) resident / GB);
+            }
+            fprintf(stderr, "[MM3-Job] %s: VRAM fit - %s; stage 1 asked %d take(s) %s, %s %d take(s) %s at %.2f GB "
+                            "(%.2f GB weights)%s\n",
+                    job->id.c_str(), head, takes_in, q8_in ? "q8_0" : "f16", f.ok ? "runs" : "smallest tried",
+                    f.takes, f.q8 ? "q8_0" : "f16", (double) f.need / GB, (double) weights / GB,
+                    adm.what == MM3Admit::HIT ? "; that shape's plan is in the AR cache" : "");
+        }
+        if (adm.what == MM3Admit::REFUSE) {
+            const bool fewer = !one_song && takes_in > 1 && mm3_fit_need(weights, kv_row, rows_take, f.q8) <= budget;
+            char       msg[512];
+            snprintf(msg, sizeof(msg),
+                     "Not enough GPU memory for MiniMax-Music3: planning needs %.2f GB and %.2f GB is available. %s",
+                     (double) f.need / GB, (double) budget / GB,
+                     fewer ? "Ask for fewer variations, use a smaller LM quant, or close other apps using the GPU."
+                           : "Use a smaller LM quant, or close other apps using the GPU.");
+            fprintf(stderr, "[MM3-Job] %s: refused before loading - %s\n", job->id.c_str(), msg);
+            fail(2, "failed", msg);
+            return;
+        }
+        if (f.q8 != q8_in || f.takes != takes_in) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                     "Not enough GPU memory to plan as asked (%.2f GB available): %s%s%s. A seed sounds different "
+                     "in this shape.",
+                     (double) budget / GB, f.q8 != q8_in ? "planner cache at Q8_0" : "",
+                     f.q8 != q8_in && f.takes != takes_in ? ", " : "",
+                     f.takes != takes_in
+                         ? ("ending candidates per round cut from " + std::to_string(takes_in) + " to " +
+                            std::to_string(f.takes)).c_str()
+                         : "");
+            note = msg;
+            fprintf(stderr, "[MM3-Job] %s: %s\n", job->id.c_str(), msg);
+            if (f.q8 != q8_in) {
+                req.lm_kv_q8     = true;
+                req.gen.lm_kv_q8 = true;
+                ar_key           = mm3_ar_cache_key(g_mm3, req, merge_backend);  // the plan is stored under what ran
+            }
+            if (f.takes != takes_in) {
+                std::lock_guard<std::mutex> lock(st->mtx);
+                for (size_t t = (size_t) f.takes; t < st->takes.size(); t++) {
+                    if (st->takes[t].stream) {
+                        mm3_stream_close(*st->takes[t].stream, "candidate dropped: not enough GPU memory");
+                    }
+                }
+                st->takes.resize((size_t) f.takes);
+                st->n_takes = f.takes;
+            }
+        }
+        ar_hit = adm.what == MM3Admit::HIT;
+        std::lock_guard<std::mutex> lock(st->mtx);
+        st->lm_kv_type = mm3_lm_kv_type(req.lm_kv_q8) == GGML_TYPE_Q8_0 ? "q8_0" : "f16";
+        st->fit_takes  = st->n_takes;
+        st->vram_note  = note;
+    }
     if (ar_hit) {
         g_mm3_ar_cache.hits++;
         req.gen.cached_hiddens = g_mm3_ar_cache.hiddens.data();
@@ -987,13 +1116,8 @@ static void mm3_synth_worker(std::shared_ptr<Job> job, std::shared_ptr<MM3JobSta
     job_set_phase(*job, JobPhase::LOADING_DIT);
     set_stage("arbitrating", -1, 0, 0, 0);
 
-    // n_ctx the AR stage will want: prompt + every frame it may emit, plus the
-    // slack mm3_lm_prepare() adds for the feedback position.
-    const int64_t n_ctx_needed = req.n_tokens + req.max_frames + 8;
-    // The plan dial doubles the LM rows (base pairs). Counted whenever it could
-    // apply; the AR loop may still stand it down (soft prompt), which only
-    // over-reserves.
-    const bool plan_rows = req.lm_adapter_plan < 1.0f && !req.lm_adapter.empty() && req.lm_adapter_mode != "merge";
+    // n_ctx_needed and plan_rows: see the VRAM fit above. rows and kv_q8 are
+    // read after it, so they are the shape this job runs.
     const int  rows      = mm3_cfg_rows(g_mm3.lm_cfg) * st->n_takes * (plan_rows ? 2 : 1);
     const bool kv_q8     = mm3_lm_kv_type(req.lm_kv_q8) == GGML_TYPE_Q8_0;
 
@@ -1964,6 +2088,13 @@ static void mm3_handle_job(const httplib::Request & hreq, httplib::Response & re
     // Always reported, so a caller can tell a one-take render from an ensemble
     // without inspecting the request it sent.
     yyjson_mut_obj_add_int(o, orot, "takes", st->n_takes);
+    // VRAM fit: the planner's KV type and candidates per round as run (0 until
+    // the worker starts), and why, when the fit changed them.
+    yyjson_mut_obj_add_strcpy(o, orot, "lm_kv_type", st->lm_kv_type.c_str());
+    yyjson_mut_obj_add_int(o, orot, "fit_takes", st->fit_takes);
+    if (!st->vram_note.empty()) {
+        yyjson_mut_obj_add_strcpy(o, orot, "vram_note", st->vram_note.c_str());
+    }
     // Natural-ending candidates: what was planned vs what survived. The
     // per-take array is emitted whenever candidates were in play, even for a
     // single survivor, so a client can read its seed and round.

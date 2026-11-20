@@ -678,7 +678,10 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
       setPrepare(previous => ({
         ...previous,
         ...Object.fromEntries(Object.entries(defaults).filter(([key, value]) => key !== 'models' && takeDefault(previous[key as keyof PrepareForm], value))),
-        models: { ...previous.models, ...Object.fromEntries(Object.entries(defaults.models ?? {}).filter(([key, value]) => takeDefault(previous.models[key as keyof PrepareForm['models']], value))) },
+        // The model paths are provenance only (preparation runs none of them),
+        // and the server names what made the cache: show its answer, never a
+        // path saved before the cache was re-made.
+        models: { ...previous.models, ...defaults.models },
       }));
   }, [datasetId, trainingWorker, prepareQuery.data]);
 
@@ -1228,7 +1231,9 @@ export const Yue2AitkTrainCard: React.FC<{ datasetId: string; legacyManifest?: s
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
           <TrainingPresetChoice selected={form.method === 'fixed-recipe'} disabled={busy || presetLoading} onClick={() => { onLyricTimingChange(false); setForm(previous => ({ ...previous,
-            method: 'fixed-recipe', base: 'bf16', checkpoint: '', adapterType: 'lora', rank: 64, alpha: 64,
+            // The base is the user's pick, not part of the recipe: re-picking
+            // HOT-Approved keeps it (bf16 only when none was chosen).
+            method: 'fixed-recipe', base: previous.base || 'bf16', checkpoint: '', adapterType: 'lora', rank: 64, alpha: 64,
             ...FIXED_RECIPE_SCHEDULE,
             optimizer: 'adamw-lm', cautious: false, lr: 1e-4, weightDecay: 0.01,
             beta1: 0.9, beta2: 0.999, lrSchedule: 'constant', warmup: 0,

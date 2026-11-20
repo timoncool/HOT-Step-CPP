@@ -28,6 +28,7 @@ import { listAllYue2Runs, readSafetensorsMeta, type Yue2AdapterMeta } from '../.
 import { listAllYue2ArRuns } from '../../training/yue2ArRuns.js';
 import { listAllYue2AitkRuns, onYue2AitkSnapshotChange, yue2AitkWeightStamp, type Yue2AitkRunRecord } from '../../training/yue2AitkRuns.js';
 import { listDatasets } from '../../training/datasetsRepo.js';
+import { yue2AdapterHome, yue2LmVariant } from '../../training/yue2Train.js';
 import { yue2AdapterTrigger, setYue2ManualTrigger } from './jointAdapterContext.js';
 import { coverScoreChoices, transformCoverScore, type CoverScoreChoices } from './coverScoreTransform.js';
 import { EMPTY_COVER_SCORE_ERROR, hasSoundingScore, hasSoundingVocalBar } from './scoreHealth.js';
@@ -54,9 +55,9 @@ import type {
 import type { GenerationJob } from '../../generation/jobTypes.js';
 
 /** Mirrors capabilities().core.duration.max — the plan/semantic stages end on
- *  their own terminator; this is the honest v1 ceiling (§7 request fields:
- *  "duration ... max: 360, auto: true"). */
-const YUE2_MAX_DURATION_SEC = 360;
+ *  their own terminator; this is the most the Max Song Length knob
+ *  (yue2MaxMinutes) can ask for. The checkpoint default stays 6 min. */
+const YUE2_MAX_DURATION_SEC = 900;
 
 /** CC BY-NC 4.0, with the authors' individual-use carve-out. See the header
  *  note above and the Model Manager entry for the same text. */
@@ -125,21 +126,8 @@ function yue2Rebase(raw: unknown): number {
   return Math.min(1, yue2Dial(raw, YUE2_REBASE_DEFAULT));
 }
 
-/** A YuE2 LM variant: the LM file's type minus its quant, '' for the base model
- *  ('q8_0' -> '', 'rs-4.0x0.7-Q6_K' -> 'rs-4.0x0.7'). Mirrors yue2_lm_variant
- *  in engine/src/yue2/yue2-adapter.h, which decides whether to re-base. */
-export function yue2LmVariant(type: string): string {
-  const t = type.replace(/-imat$/i, '');
-  const dash = t.lastIndexOf('-');
-  return dash < 0 ? '' : t.slice(0, dash);
-}
-
-/** The variant an adapter was trained on, from its base_sha (the training LM's
- *  path). An adapter recording none predates the variants: the base model. */
-export function yue2AdapterHome(baseSha: string | undefined): string {
-  const m = /^yue2-lm-(.+)\.gguf$/i.exec(path.basename(baseSha ?? ''));
-  return m ? yue2LmVariant(m[1]) : '';
-}
+// The LM variant rule (re-base decisions here, the companion in training).
+export { yue2LmVariant, yue2AdapterHome };
 
 function yue2ReadScales(key: string): Yue2AdapterScales {
   const base = yue2DefaultScales();
@@ -296,9 +284,13 @@ export function yue2StackFrom(adapters: Record<Yue2LmAdapterKind, Yue2PersistedS
 }
 
 /** The stack a plan_only job loads: each slot's planner strength in place of
- *  its master. Equal to yue2StackFrom when no slot sets one. */
+ *  its master. Equal to yue2StackFrom when no slot sets one. A slot planning
+ *  at 0 is left out: the engine refuses an adapter that merges no tensors, and
+ *  the replan fallback would then plan at the master strength instead. */
 export function yue2PlanStackFrom(adapters: Record<Yue2LmAdapterKind, Yue2PersistedSlot>): Yue2AdapterRef[] {
-  return yue2StackFrom(adapters).map(a => ({ ...a, scales: { ...a.scales, global: a.scales.plan ?? a.scales.global } }));
+  return yue2StackFrom(adapters)
+    .map(a => ({ ...a, scales: { ...a.scales, global: a.scales.plan ?? a.scales.global } }))
+    .filter(a => a.scales.global !== 0);
 }
 
 /** Does planning need its own load? Only when some slot's planner strength
@@ -710,12 +702,6 @@ async function capabilities(): Promise<BackendCapabilities> {
         default: sd('semantic', 'min_tokens', 200), min: 0, max: 3000, step: 25,
       },
       {
-        key: 'yue2SemMaxTokens', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'Composer Max Frames',
-        hint: 'Cap on the song in codec frames (25 per second; 9000 = 6 min). A render that hits it '
-            + `reports limit_hit. Checkpoint: ${sd('semantic', 'max_tokens', 9000)}.`,
-        default: sd('semantic', 'max_tokens', 9000), min: 200, max: 9000, step: 100,
-      },
-      {
         key: 'yue2SemMinP', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'Composer Min-P',
         hint: 'After Top-P, drop every codec frame candidate whose probability is under this fraction of the '
             + 'top candidate\'s. Trims the long tail that produces stray noises without flattening the '
@@ -757,7 +743,7 @@ async function capabilities(): Promise<BackendCapabilities> {
       {
         key: 'yue2EndBiasFrom', group: 'lm', section: 'Composer (song)', type: 'slider', label: 'End Bias From (s)',
         hint: 'Seconds of song before the bias starts applying.',
-        default: 0, min: 0, max: 360, step: 5,
+        default: 0, min: 0, max: YUE2_MAX_DURATION_SEC, step: 5,
         visible_when: { key: 'yue2EndBias', not_equals: '0' },
       },
       {
@@ -765,6 +751,21 @@ async function capabilities(): Promise<BackendCapabilities> {
         hint: 'Seconds over which the bias ramps from 0 to full strength.',
         default: 0, min: 0, max: 120, step: 5,
         visible_when: { key: 'yue2EndBias', not_equals: '0' },
+      },
+      {
+        key: 'yue2MaxMinutes',
+        type: 'slider',
+        label: 'Max Song Length (min)',
+        hint: 'The longest the composer may run before the song is cut off. The model still ends '
+            + 'the song on its own when the lyrics and lead sheet are done, so this is a ceiling, not '
+            + 'a target. 6 minutes is the checkpoint default. Up to 15 minutes fits the model context '
+            + 'only with a short prompt: long lyrics or a dense lead sheet shorten the budget, and the '
+            + 'log says by how much. Longer songs take longer and need more VRAM, most of all with '
+            + 'several songs per batch.',
+        default: Math.round(sd('semantic', 'max_tokens', 9000) / 25 / 60 * 2) / 2,
+        min: 1,
+        max: YUE2_MAX_DURATION_SEC / 60,
+        step: 0.5,
       },
       {
         key: 'yue2Cot',
@@ -1065,7 +1066,7 @@ async function capabilities(): Promise<BackendCapabilities> {
         hint: 'A healthy lead sheet can still be composed into a runaway: the composer (semantic '
             + 'stage) runs well past the length the lead sheet asks for instead of ending the song. '
             + 'A song counts as a runaway once it passes 1.5x its lead sheet\'s length plus 20 s, or '
-            + 'six minutes. The engine then composes it again with new seeds, up to this many extra '
+            + 'the Max Song Length. The engine then composes it again with new seeds, up to this many extra '
             + 'tries, several side by side, and keeps the first one that ends properly. This all '
             + 'happens before any audio is rendered. 0 = render whatever came out.',
         default: 2,

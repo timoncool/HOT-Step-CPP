@@ -921,7 +921,11 @@ other jobs and use a single song, preserving their own seed and variation noise 
 ```
 style + lyrics (+ optional ABC) -> tokenizer and prompt assembly (yue2-tokenizer.h)
   -> plan stage: ABC lead sheet, only when cot is "melody" or "full"
-  -> semantic stage: the AR "composer" (yue2-lm-graph.h) samples codec ids
+     (server wait: inactivity timeout 5 min on phase/phase_step/adapter_progress, 60 min cap; on
+     timeout or cancel the job is cancelled and confirmed terminal, 30 s grace, before any fallback)
+  -> semantic stage: the AR "composer" (yue2-lm-graph.h) samples codec ids, up to
+     semantic_max_tokens (checkpoint 9000, request at most 22500), shortened to fit the
+     prompt in the 24576-token context
   -> NAR stage: mixture-of-transformers flow matching with a midpoint ODE solver
      (yue2-nar-graph.h), optionally chunked (nar_chunk_frames)
   -> Oobleck VAE decode, "standard", "legacy", "rs-x3" or local "dec2x" variant (yue2-vae-graph.h)
@@ -1398,6 +1402,16 @@ Other adapter paths:
   splitting into 8-row matrix-vector matmuls (`MM3_LM_ROW_SPLIT=1`): 31.5 against 38.2 ms
   per AR iteration at 16 rows on a 5090. The request's `lm_kv_q8` stores the KV cache at
   Q8_0 so 4 takes fit. The depth decoder and flow stage only see the adapter rows.
+- VRAM fit (`mm3-vram-fit.h`, `mm3_vram_admit` in `mm3_synth_worker` after the AR cache lookup;
+  a valid hit as sent is admitted unfitted, a changed KV type is looked up again): stage-1
+  weights (LM + depth when staged, every role file under keep-loaded) + this request's KV +
+  0.5 GiB against CUDA free + evictable ACE bytes + reused MM3 parts and KV. If it does not
+  fit, the KV goes to Q8_0, then with `stop_after_first_eos` candidates per round drop to 1;
+  otherwise the job fails before `mm3_load_parts`. Frames are never capped. No CUDA
+  measurement (Metal, Vulkan, CPU) or a valid AR hit means no gate; a saved plan the worker
+  ignores or rejects plans fresh and is gated.
+  `MM3_VRAM_BUDGET_GB` replaces the measured budget for tests. `mm3_vram_need` stays the
+  eviction and interleave figure. Unit check: `engine/tests/test-mm3-vram-fit.cpp`.
 - Natural endings (`require_eos`, `mm3-pipeline.h`): the first round with an ending wins.
   Every take of that round that ended (and passes `min_frames`) renders, up to the count
   asked for; no later round is planned for the rest (HOTSTEP-1201; before that, rounds ran

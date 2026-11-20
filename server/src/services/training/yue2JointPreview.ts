@@ -13,7 +13,7 @@ import { aceClient } from '../aceClient.js';
 import { getFFmpegPath } from '../../config.js';
 import { yue2PersistedSelection, type Yue2PersistedSelection } from '../backends/yue2/index.js';
 import { yue2LmOverrides } from '../backends/yue2/generate.js';
-import { yue2SelectModel, yue2Synth, yue2Warm, yue2Unload, yue2FinalDetail, splitMultipartMixed, type Yue2Selection } from '../backends/yue2/client.js';
+import { yue2SelectModel, yue2Synth, yue2Warm, yue2Unload, yue2FinalDetail, splitMultipartMixed, isYue2VaeVariant, type Yue2Selection } from '../backends/yue2/client.js';
 import { classifyYue2Score, yue2PlanUsable, yue2PickPlan, yue2StyleNormsForRun, type Yue2ScoreLegibility } from '../backends/yue2/scoreHealth.js';
 
 export const YUE2_JOINT_PREVIEW_DEFAULTS: Yue2JointPreviewOptions = {
@@ -288,7 +288,7 @@ export async function renderYue2JointPreview(input: {
       const unity = { global: 1, attn: 1, mlp: 1, early: 1, mid: 1, late: 1 };
       const selected: Yue2Selection = { lm: base.lm, lm_adapter: kind === 'baseline' ? [] : [
         { path: input.arAdapter, scales: { ...unity, global: input.options.arScale ?? YUE2_JOINT_PREVIEW_DEFAULTS.arScale! } }, { path: input.narAdapter, scales: unity },
-      ], vae_variant: base.vae_variant === 'legacy' ? 'legacy' : 'standard' };
+      ], vae_variant: isYue2VaeVariant(base.vae_variant) ? base.vae_variant : 'standard' };
       await api.select(selected);
       await api.warm({ vae_variant: selected.vae_variant });
       const records: Yue2JointPreviewRecord[] = seeds.map(seed => ({ id: randomUUID(), step: input.step, kind, status: 'rendering',
@@ -351,15 +351,16 @@ export async function renderYue2JointPreview(input: {
         for (const r of records) recordYue2JointPreview(input.output, r);
       }
       const requested = shared && supplied ? [supplied.seed, records[1].seed] : [supplied ? supplied.seed : seeds[0]];
-      const draft = { ...(input.options.odeSteps ? { ode_steps: input.options.odeSteps } : {}),
+      // vae_variant on the request itself: the engine decodes a request without
+      // one on Standard, whatever select/warm made resident.
+      const draft = { vae_variant: selected.vae_variant, ...(input.options.odeSteps ? { ode_steps: input.options.odeSteps } : {}),
         ...(input.options.narCacheRatio !== undefined ? { nar_cache_ratio: input.options.narCacheRatio } : {}) };
       const sub = shared && supplied
         ? await api.synth({ cot: 'full', semantic_retries: PREVIEW_REPLAN_ATTEMPTS, ...draft, ...sampler,
             songs: records.map((_, i) => ({ style: caption, lyrics, abc: takeAbc[i]!, seed: requested[i] })) } as Parameters<typeof api.synth>[0])
         : await api.synth({ style: kind === 'control' ? 'downtempo electronic, calm and spacious' : caption, lyrics: kind === 'control' ? '' : lyrics, cot: 'full', seed: requested[0], ...sampler,
         ...(supplied ? { abc: supplied.abc, semantic_retries: PREVIEW_REPLAN_ATTEMPTS } : { preview_max_frames: input.options.previewMaxFrames }),
-        ...(input.options.odeSteps ? { ode_steps: input.options.odeSteps } : {}),
-        ...(input.options.narCacheRatio !== undefined ? { nar_cache_ratio: input.options.narCacheRatio } : {}) });
+        ...draft });
       activeJob = sub.job_id;
       activeTerminal = false;
       const renderDeadline = Date.now() + 30 * 60_000;
@@ -441,7 +442,7 @@ export async function renderYue2JointPreview(input: {
     if (last && last.status === 'rendering') { last.status = 'failed'; last.error = err?.message || String(err); last.updatedAt = Date.now(); recordYue2JointPreview(input.output, last); }
     throw err;
   } finally {
-    const restore: Yue2Selection = { lm: base.lm, vae_variant: base.vae_variant === 'legacy' ? 'legacy' : 'standard', lm_adapter: [] };
+    const restore: Yue2Selection = { lm: base.lm, vae_variant: isYue2VaeVariant(base.vae_variant) ? base.vae_variant : 'standard', lm_adapter: [] };
     let cleanupError: unknown;
     if (activeJob && !activeTerminal) {
       try { await api.cancel(activeJob); } catch { /* bounded polling below */ }
